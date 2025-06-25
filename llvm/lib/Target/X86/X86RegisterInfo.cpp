@@ -1,5 +1,7 @@
 //===-- X86RegisterInfo.cpp - X86 Register Information --------------------===//
 //
+// Copyright (c) 2025, the Jeandle-LLVM Authors. All Rights Reserved.
+//
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
@@ -393,6 +395,9 @@ X86RegisterInfo::getCalleeSavedRegs(const MachineFunction *MF) const {
         return CSR_32_AllRegs_SSE_SaveList;
       return CSR_32_AllRegs_SaveList;
     }
+  case CallingConv::Hotspot_JIT:
+    assert(Is64Bit && " The Hotspot JIT CallingConv is only valid on x86-64.");
+    return CSR_64_Hotspot_JIT_SaveList;
   default:
     break;
   }
@@ -516,6 +521,9 @@ X86RegisterInfo::getCallPreservedMask(const MachineFunction &MF,
         return CSR_32_AllRegs_SSE_RegMask;
       return CSR_32_AllRegs_RegMask;
     }
+  case CallingConv::Hotspot_JIT:
+    assert(Is64Bit && " The Hotspot JIT CallingConv is only valid on x86-64.");
+    return CSR_64_Hotspot_JIT_RegMask;
   default:
     break;
   }
@@ -649,6 +657,15 @@ BitVector X86RegisterInfo::getReservedRegs(const MachineFunction &MF) const {
   // Reserve low half pair registers in case they are used by RA aggressively.
   Reserved.set(X86::TMM0_TMM1);
   Reserved.set(X86::TMM2_TMM3);
+
+  if (MF.getFunction().getCallingConv() == CallingConv::Hotspot_JIT) {
+    for (MCRegAliasIterator AI(X86::R15, this, true); AI.isValid(); ++AI)
+      Reserved.set(*AI);
+    if (MF.getFunction().hasFnAttribute("use-compressed-oops")) {
+      for (MCRegAliasIterator AI(X86::R12, this, true); AI.isValid(); ++AI)
+        Reserved.set(*AI);
+    }
+  }
 
   assert(checkAllSuperRegsMarked(Reserved,
                                  {X86::SIL, X86::DIL, X86::BPL, X86::SPL,

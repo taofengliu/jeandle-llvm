@@ -1,0 +1,37 @@
+//===- GCStrategy.cpp - Jeandle GC Strategy -------------------------------===//
+//
+// Copyright (c) 2025, the Jeandle-LLVM Authors. All Rights Reserved.
+//
+// Part of the Jeandle-LLVM project, under the Apache License v2.0 with LLVM
+// Exceptions. See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#include "llvm/IR/Jeandle/GCStrategy.h"
+#include "llvm/IR/GCStrategy.h"
+
+namespace {
+
+class HotspotGC : public llvm::GCStrategy {
+public:
+  HotspotGC() {
+    UseStatepoints = true;
+    UseRS4GC = true;
+    // These options are all gc.root specific, we specify them so that the
+    // gc.root lowering code doesn't run.
+    NeededSafePoints = false;
+    UsesMetadata = false;
+  }
+};
+
+} // end anonymous namespace
+
+namespace llvm::jeandle {
+
+static llvm::GCRegistry::Add<HotspotGC> A(llvm::jeandle::JeandleGC,
+                                          "For Jeandle GC.");
+
+void linkAllJeandleGCs() {}
+
+} // namespace llvm::jeandle

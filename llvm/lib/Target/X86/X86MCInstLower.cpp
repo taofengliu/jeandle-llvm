@@ -1,5 +1,7 @@
 //===-- X86MCInstLower.cpp - Convert X86 MachineInstr to an MCInst --------===//
 //
+// Copyright (c) 2025, the Jeandle-LLVM Authors. All Rights Reserved.
+//
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
@@ -795,7 +797,13 @@ void X86AsmPrinter::LowerSTATEPOINT(const MachineInstr &MI,
 
   StatepointOpers SOpers(&MI);
   if (unsigned PatchBytes = SOpers.getNumPatchBytes()) {
-    emitX86Nops(*OutStreamer, PatchBytes, Subtarget);
+    if (SOpers.getCallingConv() == CallingConv::Hotspot_JIT) {
+      assert(PatchBytes >= MCHotspotPatchPointFragment::CallSize &&
+             "At least a call instruction in patch point");
+      OutStreamer->emitHotspotPatchPoint(Subtarget, PatchBytes);
+    } else {
+      emitX86Nops(*OutStreamer, PatchBytes, Subtarget);
+    }
   } else {
     // Lower call target and choose correct opcode
     const MachineOperand &CallTarget = SOpers.getCallTarget();

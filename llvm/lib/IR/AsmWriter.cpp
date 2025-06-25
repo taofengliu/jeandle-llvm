@@ -1,5 +1,7 @@
 //===- AsmWriter.cpp - Printing LLVM as an assembly file ------------------===//
 //
+// Copyright (c) 2025, the Jeandle-LLVM Authors. All Rights Reserved.
+//
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
@@ -308,6 +310,9 @@ static void PrintCallingConv(unsigned cc, raw_ostream &Out) {
   case CallingConv::GHC:           Out << "ghccc"; break;
   case CallingConv::Tail:          Out << "tailcc"; break;
   case CallingConv::GRAAL:         Out << "graalcc"; break;
+  case CallingConv::Hotspot_JIT:
+    Out << "hotspotcc";
+    break;
   case CallingConv::CFGuard_Check: Out << "cfguard_checkcc"; break;
   case CallingConv::X86_StdCall:   Out << "x86_stdcallcc"; break;
   case CallingConv::X86_FastCall:  Out << "x86_fastcallcc"; break;

@@ -1,5 +1,7 @@
 //===----- X86CallFrameOptimization.cpp - Optimize x86 call sequences -----===//
 //
+// Copyright (c) 2025, the Jeandle-LLVM Authors. All Rights Reserved.
+//
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
@@ -234,6 +236,11 @@ bool X86CallFrameOptimization::isProfitable(MachineFunction &MF,
 }
 
 bool X86CallFrameOptimization::runOnMachineFunction(MachineFunction &MF) {
+  // The HotSpot VM requires that the stack pointer can only be modified through
+  // prologue and epilogue.
+  if (MF.getFunction().getCallingConv() == CallingConv::Hotspot_JIT)
+    return false;
+
   STI = &MF.getSubtarget<X86Subtarget>();
   TII = STI->getInstrInfo();
   TFL = STI->getFrameLowering();

@@ -1,5 +1,7 @@
 //===- GCStrategy.cpp - Garbage Collector Description ---------------------===//
 //
+// Copyright (c) 2025, the Jeandle-LLVM Authors. All Rights Reserved.
+//
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
@@ -14,6 +16,7 @@
 #include "llvm/IR/GCStrategy.h"
 #include "llvm/ADT/Twine.h"
 #include "llvm/IR/BuiltinGCs.h"
+#include "llvm/IR/Jeandle/GCStrategy.h"
 
 using namespace llvm;
 
@@ -35,6 +38,7 @@ std::unique_ptr<GCStrategy> llvm::getGCStrategy(const StringRef Name) {
   // obviously can't be removed by the linker, and here it won't affect
   // performance, since there's about to be a fatal error anyway.
   llvm::linkAllBuiltinGCs();
+  llvm::jeandle::linkAllJeandleGCs();
 
   if (GCRegistry::begin() == GCRegistry::end()) {
     // In normal operation, the registry should not be empty.  There should

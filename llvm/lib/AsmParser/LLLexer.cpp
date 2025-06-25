@@ -1,5 +1,7 @@
 //===- LLLexer.cpp - Lexer for .ll Files ----------------------------------===//
 //
+// Copyright (c) 2025, the Jeandle-LLVM Authors. All Rights Reserved.
+//
 // Part of the LLVM Project, under the Apache License v2.0 with LLVM Exceptions.
 // See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
@@ -683,6 +685,7 @@ lltok::Kind LLLexer::LexIdentifier() {
   KEYWORD(m68k_rtdcc);
   KEYWORD(graalcc);
   KEYWORD(riscv_vector_cc);
+  KEYWORD(hotspotcc);
 
   KEYWORD(cc);
   KEYWORD(c);

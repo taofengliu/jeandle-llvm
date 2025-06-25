@@ -1,4 +1,5 @@
 add_llvm_component_library(LLVMCore
+  Jeandle/GCStrategy.cpp
   AbstractCallSite.cpp
   AsmWriter.cpp
   Assumptions.cpp
