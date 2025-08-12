@@ -19,7 +19,9 @@ namespace llvm::jeandle {
 
 class Pipeline {
 public:
-  Pipeline(OptimizationLevel Level);
+  Pipeline();
+
+  static void buildJeandlePipeline(ModulePassManager &PM, PassBuilder &PB);
 
   void run(Module &M);
 

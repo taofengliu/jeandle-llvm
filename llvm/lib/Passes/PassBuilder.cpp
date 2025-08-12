@@ -151,6 +151,7 @@
 #include "llvm/IR/SafepointIRVerifier.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/IRPrinter/IRPrintingPasses.h"
+#include "llvm/Jeandle/Pipeline.h"
 #include "llvm/Passes/OptimizationLevel.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
@@ -351,7 +352,7 @@
 using namespace llvm;
 
 static const Regex DefaultAliasRegex(
-    "^(default|thinlto-pre-link|thinlto|lto-pre-link|lto)<(O[0123sz])>$");
+    "^(default|thinlto-pre-link|thinlto|lto-pre-link|lto|jeandle)<(O[0123sz])>$");
 
 namespace llvm {
 cl::opt<bool> PrintPipelinePasses(
@@ -1412,7 +1413,7 @@ parseBoundsCheckingOptions(StringRef Params) {
 /// alias.
 static bool startsWithDefaultPipelineAliasPrefix(StringRef Name) {
   return Name.starts_with("default") || Name.starts_with("thinlto") ||
-         Name.starts_with("lto");
+         Name.starts_with("lto") || Name.starts_with("jeandle");
 }
 
 /// Tests whether registered callbacks will accept a given pass name.
@@ -1724,6 +1725,8 @@ Error PassBuilder::parseModulePass(ModulePassManager &MPM,
         MPM.addPass(buildThinLTOPreLinkDefaultPipeline(L));
       else
         MPM.addPass(buildLTOPreLinkDefaultPipeline(L));
+    } else if (Matches[1] == "jeandle") {
+      jeandle::Pipeline::buildJeandlePipeline(MPM, *this);
     } else {
       assert(Matches[1] == "lto" && "Not one of the matched options!");
       MPM.addPass(buildLTODefaultPipeline(L, nullptr));
