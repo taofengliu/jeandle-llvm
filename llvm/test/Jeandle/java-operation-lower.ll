@@ -1,4 +1,4 @@
-; RUN: opt -S -passes=java-operation-lower0 %s 2>&1 | FileCheck %s
+; RUN: opt -S -passes='java-operation-lower<phase=0>' %s 2>&1 | FileCheck %s
 
 ; CHECK-NOT: call i32 @jeandle.instanceof(i32 7, ptr addrspace(1) %0)
 ; CHECK-NOT: define i32 @jeandle.instanceof
@@ -17,7 +17,7 @@ bci_0:                                            ; preds = %entry
 
 define i32 @jeandle.instanceof(i32 %super_kid, ptr addrspace(1) nocapture %oop) #1 {
   ret i32 1
-} 
+}
 
 define i32 @jeandle.test1(i32 %super_kid, ptr addrspace(1) nocapture %oop) #1 {
   ret i32 1
@@ -27,6 +27,6 @@ define i32 @jeandle.test2(i32 %super_kid, ptr addrspace(1) nocapture %oop) #2 {
   ret i32 1
 }
 
-attributes #0 = { "java-method" "use-compressed-oops" }
+attributes #0 = { "use-compressed-oops" }
 attributes #1 = { "lower-phase"="0" }
 attributes #2 = { "lower-phase"="1" }
