@@ -64,15 +64,15 @@ PreservedAnalyses TLSPointerRewrite::run(Function &F,
   Builder.SetInsertPoint(&*inst_begin(F));
   NamedMDNode *ThreadRegister =
       M->getNamedMetadata(jeandle::Metadata::CurrentThread);
-  assert(ThreadRegister != nullptr &&
-         "current_thread metadata must exist");
-  Value *ReadRegsArgs[] = {MetadataAsValue::get(F.getContext(),
-                                        ThreadRegister->getOperand(0))};
-  Instruction *TLSBase = Builder.CreateIntrinsic(Intrinsic::read_register, IntptrType, ReadRegsArgs);
+  assert(ThreadRegister != nullptr && "current_thread metadata must exist");
+  Value *ReadRegsArgs[] = {
+      MetadataAsValue::get(F.getContext(), ThreadRegister->getOperand(0))};
+  Instruction *TLSBase = Builder.CreateIntrinsic(Intrinsic::read_register,
+                                                 IntptrType, ReadRegsArgs);
 
   for (Value *Val : ValuesToRewrite) {
     LLVM_DEBUG(dbgs() << "Rewriting TLS pointer: " << *Val << "\n");
-  
+
     PointerType *ValueType = cast<PointerType>(Val->getType());
     if (Instruction *I = dyn_cast<Instruction>(Val)) {
       Builder.SetInsertPoint(++(I->getIterator()));
@@ -84,9 +84,10 @@ PreservedAnalyses TLSPointerRewrite::run(Function &F,
         Builder.CreatePtrToInt(Val, IntptrType, Val->getName() + ".int");
     Value *AddrValue =
         Builder.CreateAdd(PtrToInt, TLSBase, Val->getName() + ".address");
-    Value *NewPtr = Builder.CreateIntToPtr(AddrValue, ValueType,
-                                           Val->getName() + ".tls");
-    Val->replaceUsesWithIf(NewPtr, [PtrToInt](Use &U) { return U.getUser() != PtrToInt; });
+    Value *NewPtr =
+        Builder.CreateIntToPtr(AddrValue, ValueType, Val->getName() + ".tls");
+    Val->replaceUsesWithIf(
+        NewPtr, [PtrToInt](Use &U) { return U.getUser() != PtrToInt; });
   }
 
   PreservedAnalyses PA;
