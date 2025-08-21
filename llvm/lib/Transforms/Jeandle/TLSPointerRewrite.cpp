@@ -23,6 +23,7 @@ using namespace llvm;
 #define DEBUG_TYPE "tls-pointer-rewrite"
 
 // Add a TLS base for TLS pointers.
+// TLS pointers are not allowed for global values, return values and arguments.
 PreservedAnalyses TLSPointerRewrite::run(Function &F,
                                          FunctionAnalysisManager &) {
   LLVM_DEBUG(dbgs() << "Looking up TLS pointers in " << F.getName() << "\n");
@@ -33,6 +34,11 @@ PreservedAnalyses TLSPointerRewrite::run(Function &F,
     PointerType *ValueType = dyn_cast<PointerType>(Val->getType());
     if (ValueType &&
         ValueType->getAddressSpace() == jeandle::AddrSpace::TLSAddrSpace) {
+      assert((dyn_cast<Constant>(Val) ||
+              (dyn_cast<Instruction>(Val) && !dyn_cast<ReturnInst>(Val)) &&
+                  !dyn_cast<CallInst>(Val)) &&
+             !dyn_cast<GlobalVariable>(Val) && !dyn_cast<Argument>(Val) &&
+             "invalid TLS pointer");
       return true;
     }
     return false;
