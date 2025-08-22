@@ -35,8 +35,8 @@ PreservedAnalyses TLSPointerRewrite::run(Function &F,
     if (ValueType &&
         ValueType->getAddressSpace() == jeandle::AddrSpace::TLSAddrSpace) {
       assert((dyn_cast<Constant>(Val) ||
-              (dyn_cast<Instruction>(Val) && !dyn_cast<ReturnInst>(Val)) &&
-                  !dyn_cast<CallInst>(Val)) &&
+              (dyn_cast<Instruction>(Val) && !dyn_cast<ReturnInst>(Val) &&
+               !dyn_cast<CallInst>(Val))) &&
              !dyn_cast<GlobalVariable>(Val) && !dyn_cast<Argument>(Val) &&
              "invalid TLS pointer");
       return true;
