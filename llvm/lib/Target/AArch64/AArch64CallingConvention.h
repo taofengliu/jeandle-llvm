@@ -65,7 +65,7 @@ bool RetCC_AArch64_Arm64EC_CFGuard_Check(unsigned ValNo, MVT ValVT, MVT LocVT,
                                          CCValAssign::LocInfo LocInfo,
                                          ISD::ArgFlagsTy ArgFlags,
                                          CCState &State);
-bool CC_AArch64_Hotspot(unsigned ValNo, MVT ValVT, MVT LocVT,
+bool CC_AArch64_Hotspot_JIT(unsigned ValNo, MVT ValVT, MVT LocVT,
                         CCValAssign::LocInfo LocInfo, ISD::ArgFlagsTy ArgFlags,
                         CCState &State);
 } // namespace llvm
