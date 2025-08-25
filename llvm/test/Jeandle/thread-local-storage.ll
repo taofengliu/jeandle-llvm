@@ -2,15 +2,15 @@
 
 ; CHECK: %0 = call i64 @llvm.read_register.i64(metadata !0)
 ; CHECK: %.address = add i64 1160, %0
-; CHECK: %.tls = inttoptr i64 %.address to ptr addrspace(2)
-; CHECK: store i64 0, ptr addrspace(2) %.tls, align 8
-; CHECK: %1 = load i64, ptr addrspace(2) %.tls, align 8
+; CHECK: %.tls.ptr = inttoptr i64 %.address to ptr addrspace(2)
+; CHECK: store i64 0, ptr addrspace(2) %.tls.ptr, align 8
+; CHECK: %1 = load i64, ptr addrspace(2) %.tls.ptr, align 8
 ; CHECK: %2 = inttoptr i64 984 to ptr addrspace(2)
-; CHECK: %.int = ptrtoint ptr addrspace(2) %2 to i64
-; CHECK: %.address1 = add i64 %.int, %0
-; CHECK: %.tls2 = inttoptr i64 %.address1 to ptr addrspace(2)
-; CHECK: store i64 %1, ptr addrspace(2) %.tls2, align 8
-; CHECK: store i64 0, ptr addrspace(2) %.tls2, align 8
+; CHECK: %.offset = ptrtoint ptr addrspace(2) %2 to i64
+; CHECK: %.address1 = add i64 %.offset, %0
+; CHECK: %.tls.ptr2 = inttoptr i64 %.address1 to ptr addrspace(2)
+; CHECK: store i64 %1, ptr addrspace(2) %.tls.ptr2, align 8
+; CHECK: store i64 0, ptr addrspace(2) %.tls.ptr2, align 8
 
 define hotspotcc void @thread_local_storage() {
 entry:

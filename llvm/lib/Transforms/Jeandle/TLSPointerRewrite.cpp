@@ -87,11 +87,11 @@ PreservedAnalyses TLSPointerRewrite::run(Function &F,
     }
 
     Value *PtrToInt =
-        Builder.CreatePtrToInt(Val, IntptrType, Val->getName() + ".int");
+        Builder.CreatePtrToInt(Val, IntptrType, Val->getName() + ".offset");
     Value *AddrValue =
         Builder.CreateAdd(PtrToInt, TLSBase, Val->getName() + ".address");
     Value *NewPtr =
-        Builder.CreateIntToPtr(AddrValue, ValueType, Val->getName() + ".tls");
+        Builder.CreateIntToPtr(AddrValue, ValueType, Val->getName() + ".tls.ptr");
     Val->replaceUsesWithIf(
         NewPtr, [PtrToInt](Use &U) { return U.getUser() != PtrToInt; });
   }
