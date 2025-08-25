@@ -1052,13 +1052,12 @@ def CC_X86_64_Preserve_None : CallingConv<[
 //        |-------------------------------------------------------|
 //        | c_rarg0   c_rarg1  c_rarg2 c_rarg3 c_rarg4 c_rarg5    |
 //        |-------------------------------------------------------|
-//        | rcx       rdx      r8      r9      rdi*    rsi*       |
 //        | rdi       rsi      rdx     rcx     r8      r9         |
 //        |-------------------------------------------------------|
 //        | j_rarg5   j_rarg0  j_rarg1 j_rarg2 j_rarg3 j_rarg4    |
 //        |-------------------------------------------------------|
 //
-def CC_X86_64_Hotspot_JIT : CallingConv<[
+def CC_X86_64_Hotspot : CallingConv<[
   CCIfType<[i32], CCAssignToReg<[ESI, EDX, ECX, R8D, R9D, EDI]>>,
   CCIfType<[i64], CCAssignToReg<[RSI, RDX, RCX, R8, R9, RDI]>>,
 
@@ -1111,7 +1110,7 @@ def CC_X86_64 : CallingConv<[
   // Mingw64 and native Win64 use Win64 CC
   CCIfSubtarget<"isTargetWin64()", CCDelegateTo<CC_X86_Win64_C>>,
 
-  CCIfCC<"CallingConv::Hotspot_JIT", CCDelegateTo<CC_X86_64_Hotspot_JIT>>,
+  CCIfCC<"CallingConv::Hotspot_JIT", CCDelegateTo<CC_X86_64_Hotspot>>,
 
   // Otherwise, drop to normal X86-64 CC
   CCDelegateTo<CC_X86_64_C>
