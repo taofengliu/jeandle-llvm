@@ -31,6 +31,11 @@ PreservedAnalyses TLSPointerRewrite::run(Function &F,
   SmallSet<Value *, 16> ValuesToRewrite;
 
   auto NeedRewrite = [&](Value *Val) {
+    if (dyn_cast<PHINode>(Val)) {
+      // Never rewrite phi nodes.
+      return false;
+    }
+
     PointerType *ValueType = dyn_cast<PointerType>(Val->getType());
     if (ValueType &&
         ValueType->getAddressSpace() == jeandle::AddrSpace::TLSAddrSpace) {
