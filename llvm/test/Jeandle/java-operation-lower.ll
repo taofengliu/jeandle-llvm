@@ -7,7 +7,7 @@
 ; CHECK-NOT: define i32 @test5
 ; CHECK-NOT: "lower-phase"="0"
 
-;CHECK: define hotspotcc i32 @root(ptr addrspace(1) %0) #0 gc "hotspotgc" {
+;CHECK: define hotspotcc i32 @root123(ptr addrspace(1) %0) #0 gc "hotspotgc" {
 ;CHECK: entry:
 ;CHECK:   br label %bci_0
 ;CHECK: bci_0:                                            ; preds = %entry
