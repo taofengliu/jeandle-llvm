@@ -44,7 +44,8 @@ PreservedAnalyses TLSPointerRewrite::run(Function &F,
                !dyn_cast<CallInst>(Val))) &&
              !dyn_cast<GlobalVariable>(Val) && !dyn_cast<Argument>(Val) &&
              "invalid TLS pointer");
-      return true;
+      // Don't rewrite getelementptr instructions.
+      return !dyn_cast<GetElementPtrInst>(Val);
     }
     return false;
   };
@@ -79,24 +80,26 @@ PreservedAnalyses TLSPointerRewrite::run(Function &F,
   Value *ReadRegsArgs[] = {
       MetadataAsValue::get(F.getContext(), ThreadRegister->getOperand(0))};
   Instruction *TLSBase = Builder.CreateIntrinsic(Intrinsic::read_register,
-                                                 IntptrType, ReadRegsArgs);
+                                                 IntptrType, ReadRegsArgs,
+                                                 {} /* FMFSource */,
+                                                 "tls.base");
+  Value *TLSBasePtr = Builder.CreateIntToPtr(TLSBase, llvm::PointerType::get(F.getContext(), llvm::jeandle::AddrSpace::TLSAddrSpace), "tls.base.ptr");
+  BasicBlock::iterator TLSBaseReadyPoint = Builder.GetInsertPoint();
 
   for (Value *Val : ValuesToRewrite) {
     LLVM_DEBUG(dbgs() << "Rewriting TLS pointer: " << *Val << "\n");
 
-    PointerType *ValueType = cast<PointerType>(Val->getType());
     if (Instruction *I = dyn_cast<Instruction>(Val)) {
+      // Instruction.
       Builder.SetInsertPoint(++(I->getIterator()));
     } else {
-      Builder.SetInsertPoint(++(TLSBase->getIterator()));
+      // Constant.
+      Builder.SetInsertPoint(TLSBaseReadyPoint);
     }
 
     Value *PtrToInt =
-        Builder.CreatePtrToInt(Val, IntptrType, Val->getName() + ".offset");
-    Value *AddrValue =
-        Builder.CreateAdd(PtrToInt, TLSBase, Val->getName() + ".address");
-    Value *NewPtr =
-        Builder.CreateIntToPtr(AddrValue, ValueType, Val->getName() + ".tls.ptr");
+        Builder.CreatePtrToInt(Val, IntptrType, Val->getName() + ".tls.offset");
+    Value *NewPtr = Builder.CreateInBoundsPtrAdd(TLSBasePtr, PtrToInt, Val->getName() + ".tls.ptr");
     Val->replaceUsesWithIf(
         NewPtr, [PtrToInt](Use &U) { return U.getUser() != PtrToInt; });
   }

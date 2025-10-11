@@ -1,22 +1,31 @@
 ; RUN: opt -S --passes=tls-pointer-rewrite %s 2>&1 | FileCheck %s
 
-; CHECK: %0 = call i64 @llvm.read_register.i64(metadata !0)
-; CHECK-NEXT: %.address = add i64 1160, %0
-; CHECK-NEXT: %.tls.ptr = inttoptr i64 %.address to ptr addrspace(2)
+; CHECK: %tls.base = call i64 @llvm.read_register.i64(metadata !0)
+; CHECK-NEXT: %tls.base.ptr = inttoptr i64 %tls.base to ptr addrspace(2)
+; CHECK-NEXT: %.tls.ptr = getelementptr inbounds i8, ptr addrspace(2) %tls.base.ptr, i64 1160
 ; CHECK-NEXT: store i64 0, ptr addrspace(2) %.tls.ptr, align 8
-; CHECK-NEXT: %1 = load i64, ptr addrspace(2) %.tls.ptr, align 8
-; CHECK-NEXT: %2 = inttoptr i64 984 to ptr addrspace(2)
-; CHECK-NEXT: %.offset = ptrtoint ptr addrspace(2) %2 to i64
-; CHECK-NEXT: %.address1 = add i64 %.offset, %0
-; CHECK-NEXT: %.tls.ptr2 = inttoptr i64 %.address1 to ptr addrspace(2)
-; CHECK-NEXT: store i64 %1, ptr addrspace(2) %.tls.ptr2, align 8
-; CHECK-NEXT: store i64 0, ptr addrspace(2) %.tls.ptr2, align 8
-; CHECK-NEXT: %3 = icmp eq i64 %1, 0
-; CHECK-NEXT: br i1 %3, label %br1, label %br2
+; CHECK-NEXT: %0 = load i64, ptr addrspace(2) %.tls.ptr, align 8
+; CHECK-NEXT: %1 = inttoptr i64 984 to ptr addrspace(2)
+; CHECK-NEXT: %.tls.offset = ptrtoint ptr addrspace(2) %1 to i64
+; CHECK-NEXT: %.tls.ptr1 = getelementptr inbounds i8, ptr addrspace(2) %tls.base.ptr, i64 %.tls.offset
+; CHECK-NEXT: store i64 %0, ptr addrspace(2) %.tls.ptr1, align 8
+; CHECK-NEXT: store i64 0, ptr addrspace(2) %.tls.ptr1, align 8
+
+; CHECK: br1:                                              ; preds = %entry
+; CHECK-NEXT: %3 = inttoptr i64 1 to ptr addrspace(2)
+; CHECK-NEXT: %.tls.offset2 = ptrtoint ptr addrspace(2) %3 to i64
+; CHECK-NEXT: %.tls.ptr3 = getelementptr inbounds i8, ptr addrspace(2) %tls.base.ptr, i64 %.tls.offset2
+; CHECK-NEXT: br label %return
+
+; CHECK: br2:                                              ; preds = %entry
+; CHECK-NEXT: %4 = inttoptr i64 2 to ptr addrspace(2)
+; CHECK-NEXT: %.tls.offset4 = ptrtoint ptr addrspace(2) %4 to i64
+; CHECK-NEXT: %.tls.ptr5 = getelementptr inbounds i8, ptr addrspace(2) %tls.base.ptr, i64 %.tls.offset4
+; CHECK-NEXT: br label %return
 
 ; CHECK: return:                                           ; preds = %br2, %br1
-; CHECK-NEXT:   %6 = phi ptr addrspace(2) [ %.tls.ptr5, %br1 ], [ %.tls.ptr8, %br2 ]
-; CHECK-NEXT:   %7 = load i64, ptr addrspace(2) %6, align 8
+; CHECK-NEXT:   %5 = phi ptr addrspace(2) [ %.tls.ptr3, %br1 ], [ %.tls.ptr5, %br2 ]
+; CHECK-NEXT:   %6 = load i64, ptr addrspace(2) %5, align 8
 
 define hotspotcc i64 @thread_local_storage() {
 entry:
