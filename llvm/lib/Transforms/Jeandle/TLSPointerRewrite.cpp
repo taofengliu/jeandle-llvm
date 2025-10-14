@@ -79,11 +79,14 @@ PreservedAnalyses TLSPointerRewrite::run(Function &F,
   assert(ThreadRegister != nullptr && "current_thread metadata must exist");
   Value *ReadRegsArgs[] = {
       MetadataAsValue::get(F.getContext(), ThreadRegister->getOperand(0))};
-  Instruction *TLSBase = Builder.CreateIntrinsic(Intrinsic::read_register,
-                                                 IntptrType, ReadRegsArgs,
-                                                 {} /* FMFSource */,
-                                                 "tls.base");
-  Value *TLSBasePtr = Builder.CreateIntToPtr(TLSBase, llvm::PointerType::get(F.getContext(), llvm::jeandle::AddrSpace::TLSAddrSpace), "tls.base.ptr");
+  Instruction *TLSBase =
+      Builder.CreateIntrinsic(Intrinsic::read_register, IntptrType,
+                              ReadRegsArgs, {} /* FMFSource */, "tls.base");
+  Value *TLSBasePtr = Builder.CreateIntToPtr(
+      TLSBase,
+      llvm::PointerType::get(F.getContext(),
+                             llvm::jeandle::AddrSpace::TLSAddrSpace),
+      "tls.base.ptr");
   BasicBlock::iterator TLSBaseReadyPoint = Builder.GetInsertPoint();
 
   for (Value *Val : ValuesToRewrite) {
@@ -99,7 +102,8 @@ PreservedAnalyses TLSPointerRewrite::run(Function &F,
 
     Value *PtrToInt =
         Builder.CreatePtrToInt(Val, IntptrType, Val->getName() + ".tls.offset");
-    Value *NewPtr = Builder.CreateInBoundsPtrAdd(TLSBasePtr, PtrToInt, Val->getName() + ".tls.ptr");
+    Value *NewPtr = Builder.CreateInBoundsPtrAdd(TLSBasePtr, PtrToInt,
+                                                 Val->getName() + ".tls.ptr");
     Val->replaceUsesWithIf(
         NewPtr, [PtrToInt](Use &U) { return U.getUser() != PtrToInt; });
   }
