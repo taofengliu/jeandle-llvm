@@ -13,6 +13,7 @@
 
 #include "llvm/IR/PassManager.h"
 #include "llvm/Passes/PassBuilder.h"
+#include "llvm/Passes/StandardInstrumentations.h"
 #include "llvm/Support/Compiler.h"
 #include "llvm/Transforms/Jeandle/JavaOperationLower.h"
 
@@ -20,7 +21,7 @@ namespace llvm::jeandle {
 
 class Pipeline {
 public:
-  Pipeline(OptimizationLevel Level);
+  Pipeline(OptimizationLevel Level, LLVMContext &Ctx);
 
   LLVM_ABI static ModulePassManager
   buildJeandlePipeline(PassBuilder &PB, OptimizationLevel Level);
@@ -28,6 +29,8 @@ public:
   void run(Module &M);
 
 private:
+  PassInstrumentationCallbacks PIC;
+  StandardInstrumentations SI;
   ModulePassManager PM;
   LoopAnalysisManager LAM;
   CGSCCAnalysisManager CGAM;

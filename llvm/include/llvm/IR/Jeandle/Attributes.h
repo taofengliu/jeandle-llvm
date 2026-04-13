@@ -25,6 +25,10 @@ public:
       "statepoint-num-patch-bytes";
 
   static constexpr const char *LowerPhase = "lower-phase";
+
+  static constexpr const char *JavaKlass = "java-klass";
+
+  static constexpr const char *JavaKlassExact = "java-klass-exact";
 };
 
 } // namespace llvm::jeandle

@@ -17,7 +17,7 @@
 
 namespace llvm::jeandle {
 
-void optimize(Module *M, OptimizationLevel Level = OptimizationLevel::O3);
+void optimize(Module &M, OptimizationLevel Level = OptimizationLevel::O3);
 
 } // end namespace llvm::jeandle
 

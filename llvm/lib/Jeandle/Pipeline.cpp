@@ -12,16 +12,16 @@
 #include "llvm/Transforms/Jeandle/InsertGCBarriers.h"
 #include "llvm/Transforms/Jeandle/JavaOperationLower.h"
 #include "llvm/Transforms/Jeandle/TLSPointerRewrite.h"
+#include "llvm/Transforms/Jeandle/TypeCheckElimination.h"
 #include "llvm/Transforms/Scalar/RewriteStatepointsForGC.h"
 
 namespace llvm::jeandle {
 
-Pipeline::Pipeline(OptimizationLevel level) {
-  // Create the new pass manager builder.
-  // Take a look at the PassBuilder constructor parameters for more
-  // customization, e.g. specifying a TargetMachine or various debugging
-  // options.
-  PassBuilder PB;
+Pipeline::Pipeline(OptimizationLevel level, LLVMContext &Ctx)
+    : SI(Ctx, /*DebugLogging=*/false) {
+  SI.registerCallbacks(PIC, &MAM);
+
+  PassBuilder PB(nullptr, PipelineTuningOptions(), std::nullopt, &PIC);
 
   // Register all the basic analyses with the managers.
   PB.registerModuleAnalyses(MAM);
@@ -37,6 +37,7 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
                                                  OptimizationLevel level) {
   ModulePassManager PM;
   PM.addPass(JavaOperationLower(0));
+  PM.addPass(createModuleToFunctionPassAdaptor(TypeCheckElimination()));
   PM.addPass(std::move(PB.buildPerModuleDefaultPipeline(level)));
   PM.addPass(createModuleToFunctionPassAdaptor(InsertGCBarriers()));
   PM.addPass(JavaOperationLower(1));
