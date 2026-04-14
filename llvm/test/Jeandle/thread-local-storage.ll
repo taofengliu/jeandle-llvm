@@ -51,6 +51,6 @@ return:
   ret i64 %6
 }
 
-!current_thread = !{!0}
+!current-thread = !{!0}
 
 !0 = !{!"r15"}
