@@ -37,7 +37,7 @@ PreservedAnalyses TypeCheckElimination::run(Function &F,
     return PreservedAnalyses::all();
 
   const jeandle::VMCallbacks *CB = jeandle::getVMCallbacks();
-  assert(CB && CB->IsSubtype && "VMCallbacks must be set");
+  assert(CB && CB->IsSubtype && CB->IsInterface && "VMCallbacks must be set");
 
   Function *CheckFn = M->getFunction("jeandle.check_instanceof");
   if (!CheckFn)
@@ -73,6 +73,18 @@ PreservedAnalyses TypeCheckElimination::run(Function &F,
       Changed = true;
     } else if (ObjType.Exact) {
       LLVM_DEBUG(dbgs() << "TCE: exact type not subtype, replacing with false: "
+                        << *CI << "\n");
+      CI->replaceAllUsesWith(ConstantInt::getFalse(CI->getType()));
+      CI->eraseFromParent();
+      Changed = true;
+    } else if (!CB->IsSubtype(SuperKlass, ObjType.Klass) &&
+               !CB->IsInterface(ObjType.Klass) &&
+               !CB->IsInterface(SuperKlass)) {
+      // Neither type is a subtype of the other, and both are classes (not
+      // interfaces). Java's single class inheritance guarantees no object
+      // can be an instance of both — fold to false.
+      LLVM_DEBUG(dbgs() << "TCE: incompatible class types, replacing with "
+                           "false: "
                         << *CI << "\n");
       CI->replaceAllUsesWith(ConstantInt::getFalse(CI->getType()));
       CI->eraseFromParent();

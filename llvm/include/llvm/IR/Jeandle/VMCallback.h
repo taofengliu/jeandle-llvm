@@ -37,6 +37,10 @@ struct VMCallbacks {
   /// klass pointer. Returns 0 if unknown or non-object field.
   using FieldTypeFn = uintptr_t (*)(uintptr_t KlassPtr, int Offset);
   FieldTypeFn GetFieldType = nullptr;
+
+  /// Returns true if the klass is an interface.
+  using IsInterfaceFn = bool (*)(uintptr_t KlassPtr);
+  IsInterfaceFn IsInterface = nullptr;
 };
 
 /// Register VM callbacks. Must be called before running the optimization
