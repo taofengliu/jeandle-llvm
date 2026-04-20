@@ -18,6 +18,8 @@
 #ifndef JEANDLE_JAVA_TYPE_H
 #define JEANDLE_JAVA_TYPE_H
 
+#include "llvm/ADT/DenseSet.h"
+
 #include <cstdint>
 
 namespace llvm {
@@ -28,7 +30,8 @@ class Value;
 
 namespace jeandle {
 
-/// Represents the Java type of an LLVM IR value.
+/// Represents the Java type of an LLVM IR value, including both positive
+/// type knowledge and negative constraints (excluded classes).
 struct JavaType {
   /// The Klass pointer (from HotSpot JVM). 0 means unknown.
   uintptr_t Klass = 0;
@@ -36,8 +39,15 @@ struct JavaType {
   /// If true, the value is exactly this class, not a subclass.
   bool Exact = false;
 
-  bool isUnknown() const { return Klass == 0; }
+  /// Klasses this value is known NOT to be an instance of.
+  /// Populated from dominating failed type checks (type-denied paths).
+  /// Only the most general (uppermost) excluded classes are stored;
+  /// more specific subtypes are implied.
+  SmallDenseSet<uintptr_t, 2> ExcludedKlasses;
+
+  bool isUnknown() const { return Klass == 0 && ExcludedKlasses.empty(); }
   bool isKnown() const { return Klass != 0; }
+  bool hasExclusions() const { return !ExcludedKlasses.empty(); }
 };
 
 /// Get the Java type of a value.
@@ -55,10 +65,15 @@ struct JavaType {
 JavaType getJavaType(Value *V, DominatorTree &DT,
                      Instruction *Context = nullptr);
 
-/// Compute the lowest common ancestor (LCA) of two Java types.
-/// Returns unknown if either input is unknown or if the LCA cannot be
-/// determined.
-JavaType computeLCA(JavaType A, JavaType B);
+/// Compute the type union of two Java types. Used when the value could be
+/// either type (PHI, select). Widens positive type to LCA and intersects
+/// ExcludedKlasses (only exclusions common to both survive).
+JavaType typeUnion(JavaType A, JavaType B);
+
+/// Compute the type intersection of two Java types. Used when both constraints
+/// apply simultaneously to the same value (base type + sharpened type).
+/// Narrows to the more specific positive type and unions ExcludedKlasses.
+JavaType typeIntersect(JavaType A, JavaType B);
 
 /// Extract a Klass pointer constant from a Value.
 /// Handles inttoptr of ConstantInt and ConstantExpr patterns.

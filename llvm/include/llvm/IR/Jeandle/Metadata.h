@@ -23,6 +23,8 @@ public:
       "java-method-compilation";
 
   static constexpr const char *JavaKlass = "java-klass";
+
+  static constexpr const char *JavaKlassExact = "java-klass-exact";
 };
 
 enum AddrSpace : unsigned {

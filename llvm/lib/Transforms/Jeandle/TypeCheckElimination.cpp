@@ -62,30 +62,50 @@ PreservedAnalyses TypeCheckElimination::run(Function &F,
     Value *Obj = CI->getArgOperand(1);
     jeandle::JavaType ObjType = jeandle::getJavaType(Obj, DT, CI);
 
-    if (ObjType.isUnknown())
-      continue;
-
-    if (CB->IsSubtype(ObjType.Klass, SuperKlass)) {
+    // --- Fold to true: known subtype ---
+    if (ObjType.isKnown() && CB->IsSubtype(ObjType.Klass, SuperKlass)) {
       LLVM_DEBUG(dbgs() << "TCE: known subtype, replacing with true: " << *CI
                         << "\n");
       CI->replaceAllUsesWith(ConstantInt::getTrue(CI->getType()));
       CI->eraseFromParent();
       Changed = true;
-    } else if (ObjType.Exact) {
-      LLVM_DEBUG(dbgs() << "TCE: exact type not subtype, replacing with false: "
-                        << *CI << "\n");
-      CI->replaceAllUsesWith(ConstantInt::getFalse(CI->getType()));
-      CI->eraseFromParent();
-      Changed = true;
-    } else if (!CB->IsSubtype(SuperKlass, ObjType.Klass) &&
-               !CB->IsInterface(ObjType.Klass) &&
-               !CB->IsInterface(SuperKlass)) {
-      // Neither type is a subtype of the other, and both are classes (not
-      // interfaces). Java's single class inheritance guarantees no object
-      // can be an instance of both — fold to false.
-      LLVM_DEBUG(dbgs() << "TCE: incompatible class types, replacing with "
-                           "false: "
-                        << *CI << "\n");
+      continue;
+    }
+
+    // --- Fold to false ---
+    bool FoldToFalse = false;
+
+    if (ObjType.isKnown() && !CB->IsSubtype(ObjType.Klass, SuperKlass)) {
+      if (ObjType.Exact) {
+        // Exact type and not a subtype → definitely false.
+        LLVM_DEBUG(dbgs() << "TCE: exact type not subtype\n");
+        FoldToFalse = true;
+      } else if (!CB->IsSubtype(SuperKlass, ObjType.Klass) &&
+                 !CB->IsInterface(ObjType.Klass) &&
+                 !CB->IsInterface(SuperKlass)) {
+        // Neither type is a subtype of the other, and both are classes.
+        // Java's single class inheritance → no object can be both.
+        LLVM_DEBUG(dbgs() << "TCE: incompatible class types\n");
+        FoldToFalse = true;
+      }
+    }
+
+    // Check negative constraints: if SuperKlass is a subtype of any excluded
+    // klass, the object can't be SuperKlass (excluding X implies excluding
+    // all subtypes of X).
+    if (!FoldToFalse && ObjType.hasExclusions()) {
+      for (uintptr_t Excluded : ObjType.ExcludedKlasses) {
+        if (CB->IsSubtype(SuperKlass, Excluded)) {
+          LLVM_DEBUG(dbgs() << "TCE: denied by excluded klass " << Excluded
+                            << "\n");
+          FoldToFalse = true;
+          break;
+        }
+      }
+    }
+
+    if (FoldToFalse) {
+      LLVM_DEBUG(dbgs() << "TCE: replacing with false: " << *CI << "\n");
       CI->replaceAllUsesWith(ConstantInt::getFalse(CI->getType()));
       CI->eraseFromParent();
       Changed = true;

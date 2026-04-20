@@ -56,18 +56,150 @@ static bool isCheckInstanceofCall(const CallInst *CI, uintptr_t &Klass,
   return Klass != 0;
 }
 
-JavaType jeandle::computeLCA(JavaType A, JavaType B) {
-  if (A.isUnknown() || B.isUnknown())
-    return {};
-  if (A.Klass == B.Klass)
-    return {A.Klass, A.Exact && B.Exact};
+/// Check if klass K is excluded by set S, meaning there exists Y in S such
+/// that IsSubtype(K, Y). Excluding Y implies excluding all subtypes of Y.
+static bool isExcludedBy(uintptr_t K,
+                         const SmallDenseSet<uintptr_t, 2> &S) {
   const VMCallbacks *CB = getVMCallbacks();
-  assert(CB && CB->GetCommonSuperKlass && "VMCallbacks must be set");
+  assert(CB && CB->IsSubtype && "VMCallbacks must be set");
+  for (uintptr_t Y : S) {
+    if (CB->IsSubtype(K, Y))
+      return true;
+  }
+  return false;
+}
 
-  uintptr_t LCA = CB->GetCommonSuperKlass(A.Klass, B.Klass);
-  if (LCA == 0)
-    return {};
-  return {LCA, false};
+/// Add an excluded klass to the set, maintaining the invariant that only the
+/// most general (uppermost) excluded classes are stored.
+static void addExcludedKlass(SmallDenseSet<uintptr_t, 2> &Set, uintptr_t K) {
+  const VMCallbacks *CB = getVMCallbacks();
+  assert(CB && CB->IsSubtype && "VMCallbacks must be set");
+
+  // If K is already covered by a more general exclusion, skip.
+  if (isExcludedBy(K, Set))
+    return;
+
+  // Remove any existing entries that are more specific than K.
+  SmallVector<uintptr_t, 2> ToRemove;
+  for (uintptr_t Y : Set) {
+    if (CB->IsSubtype(Y, K))
+      ToRemove.push_back(Y);
+  }
+  for (uintptr_t Y : ToRemove)
+    Set.erase(Y);
+
+  Set.insert(K);
+}
+
+/// Compute the subtype-aware intersection of two ExcludedKlasses sets.
+/// A klass survives if it is excluded by BOTH sets.
+static SmallDenseSet<uintptr_t, 2>
+intersectExcludedKlasses(const SmallDenseSet<uintptr_t, 2> &A,
+                         const SmallDenseSet<uintptr_t, 2> &B) {
+  SmallDenseSet<uintptr_t, 2> Result;
+  for (uintptr_t X : A) {
+    if (isExcludedBy(X, B))
+      addExcludedKlass(Result, X);
+  }
+  for (uintptr_t Y : B) {
+    if (isExcludedBy(Y, A))
+      addExcludedKlass(Result, Y);
+  }
+  return Result;
+}
+
+/// Merge ExcludedKlasses from Src into Dst (union). Both sets of negative
+/// constraints apply to the same value at the same point.
+static void unionExcludedKlasses(SmallDenseSet<uintptr_t, 2> &Dst,
+                                 const SmallDenseSet<uintptr_t, 2> &Src) {
+  for (uintptr_t K : Src)
+    addExcludedKlass(Dst, K);
+}
+
+/// Enforce ExcludedKlasses invariants:
+/// 1. If Exact, clear ExcludedKlasses (type is fully determined).
+/// 2. If Klass is known, remove excluded klasses that are not subtypes of
+///    Klass (they are already impossible).
+static void normalizeExcludedKlasses(JavaType &T) {
+  if (T.ExcludedKlasses.empty())
+    return;
+  if (T.Exact) {
+    T.ExcludedKlasses.clear();
+    return;
+  }
+  if (T.Klass != 0) {
+    const VMCallbacks *CB = getVMCallbacks();
+    assert(CB && CB->IsSubtype && "VMCallbacks must be set");
+    SmallVector<uintptr_t, 2> ToRemove;
+    for (uintptr_t K : T.ExcludedKlasses) {
+      if (!CB->IsSubtype(K, T.Klass))
+        ToRemove.push_back(K);
+    }
+    for (uintptr_t K : ToRemove)
+      T.ExcludedKlasses.erase(K);
+  }
+}
+
+JavaType jeandle::typeUnion(JavaType A, JavaType B) {
+  if (A.Klass == 0 && B.Klass == 0) {
+    // Both have unknown positive type. Intersect exclusions.
+    JavaType Result;
+    if (!A.ExcludedKlasses.empty() && !B.ExcludedKlasses.empty())
+      Result.ExcludedKlasses = intersectExcludedKlasses(A.ExcludedKlasses,
+                                                        B.ExcludedKlasses);
+    return Result;
+  }
+  if (A.Klass == 0 || B.Klass == 0)
+    return {}; // One known, one unknown positive type → unknown.
+  JavaType Result;
+  if (A.Klass == B.Klass) {
+    Result.Klass = A.Klass;
+    Result.Exact = A.Exact && B.Exact;
+  } else {
+    const VMCallbacks *CB = getVMCallbacks();
+    assert(CB && CB->GetCommonSuperKlass && "VMCallbacks must be set");
+    uintptr_t LCA = CB->GetCommonSuperKlass(A.Klass, B.Klass);
+    if (LCA == 0)
+      return {};
+    Result.Klass = LCA;
+    Result.Exact = false;
+  }
+  // Intersect exclusions (value could be either A or B).
+  if (!A.ExcludedKlasses.empty() && !B.ExcludedKlasses.empty())
+    Result.ExcludedKlasses = intersectExcludedKlasses(A.ExcludedKlasses,
+                                                      B.ExcludedKlasses);
+  normalizeExcludedKlasses(Result);
+  return Result;
+}
+
+JavaType jeandle::typeIntersect(JavaType A, JavaType B) {
+  JavaType Result;
+
+  // Positive type: pick the more specific one.
+  if (A.isKnown() && B.isKnown()) {
+    const VMCallbacks *CB = getVMCallbacks();
+    assert(CB && CB->IsSubtype && "VMCallbacks must be set");
+    if (CB->IsSubtype(A.Klass, B.Klass)) {
+      Result.Klass = A.Klass;
+      Result.Exact = A.Exact;
+    } else {
+      Result.Klass = B.Klass;
+      Result.Exact = B.Exact;
+    }
+  } else if (A.isKnown()) {
+    Result.Klass = A.Klass;
+    Result.Exact = A.Exact;
+  } else if (B.isKnown()) {
+    Result.Klass = B.Klass;
+    Result.Exact = B.Exact;
+  }
+
+  // Negative constraints: union (both exclusions apply at the same point).
+  Result.ExcludedKlasses = A.ExcludedKlasses;
+  unionExcludedKlasses(Result.ExcludedKlasses, B.ExcludedKlasses);
+  normalizeExcludedKlasses(Result);
+
+  return Result;
 }
 
 // =============================================================================
@@ -116,8 +248,10 @@ static JavaType getBaseJavaType(Value *V,
         if (auto *CMD = dyn_cast<ConstantAsMetadata>(MD->getOperand(0))) {
           if (auto *CI = dyn_cast<ConstantInt>(CMD->getValue())) {
             uintptr_t Klass = CI->getZExtValue();
-            if (Klass != 0)
-              return {Klass, false}; // Field type is never exact.
+            if (Klass != 0) {
+              bool Exact = LI->getMetadata(jeandle::Metadata::JavaKlassExact) != nullptr;
+              return {Klass, Exact};
+            }
           }
         }
       }
@@ -146,7 +280,7 @@ static JavaType getBaseJavaType(Value *V,
         Result = IncType;
         First = false;
       } else {
-        Result = computeLCA(Result, IncType);
+        Result = typeUnion(Result, IncType);
         if (Result.isUnknown())
           return {};
       }
@@ -160,7 +294,7 @@ static JavaType getBaseJavaType(Value *V,
     if (TrueType.isUnknown())
       return {};
     JavaType FalseType = getBaseJavaType(SI->getFalseValue(), Visited);
-    return computeLCA(TrueType, FalseType);
+    return typeUnion(TrueType, FalseType);
   }
 
   // BitCast / AddrSpaceCast: pass through.
@@ -480,29 +614,39 @@ static JavaType sharpenFromDominators(Value *V, Instruction *Context,
     if (!TR.matched())
       continue;
 
-    // Determine the type-confirmed successor.
+    // Determine the type-confirmed and type-denied successors.
     BasicBlock *TypeConfirmedBB =
         TR.Negated ? BI->getSuccessor(1) : BI->getSuccessor(0);
+    BasicBlock *TypeDeniedBB =
+        TR.Negated ? BI->getSuccessor(0) : BI->getSuccessor(1);
 
-    if (!DT.dominates(TypeConfirmedBB, ContextBB))
-      continue;
+    if (DT.dominates(TypeConfirmedBB, ContextBB)) {
+      // V is a subtype of TR.Klass at Context (positive constraint).
+      LLVM_DEBUG(dbgs() << "JavaType: sharpened " << *V << " to klass "
+                        << TR.Klass << " from dominating check in "
+                        << BB->getName() << "\n");
 
-    // V is a subtype of TR.Klass at Context.
-    JavaType Sharpened = {TR.Klass, false};
-    LLVM_DEBUG(dbgs() << "JavaType: sharpened " << *V << " to klass "
-                      << TR.Klass << " from dominating check in "
-                      << BB->getName() << "\n");
-
-    if (Best.isUnknown()) {
-      Best = Sharpened;
-    } else {
-      // Keep the more specific type.
-      if (CB->IsSubtype(Sharpened.Klass, Best.Klass))
-        Best = Sharpened;
-      // else Best is already more specific, keep it.
+      if (!Best.isKnown()) {
+        Best.Klass = TR.Klass;
+        Best.Exact = false;
+      } else {
+        // Keep the more specific type.
+        if (CB->IsSubtype(TR.Klass, Best.Klass)) {
+          Best.Klass = TR.Klass;
+          Best.Exact = false;
+        }
+        // else Best is already more specific, keep it.
+      }
+    } else if (DT.dominates(TypeDeniedBB, ContextBB)) {
+      // V is NOT an instance of TR.Klass at Context (negative constraint).
+      LLVM_DEBUG(dbgs() << "JavaType: excluded " << *V << " from klass "
+                        << TR.Klass << " from dominating failed check in "
+                        << BB->getName() << "\n");
+      addExcludedKlass(Best.ExcludedKlasses, TR.Klass);
     }
   }
 
+  normalizeExcludedKlasses(Best);
   return Best;
 }
 
@@ -546,7 +690,7 @@ static JavaType getPhiJavaType(PHINode *PN, DominatorTree &DT,
       Result = IncType;
       First = false;
     } else {
-      Result = computeLCA(Result, IncType);
+      Result = typeUnion(Result, IncType);
       if (Result.isUnknown())
         return {};
     }
@@ -566,19 +710,10 @@ static JavaType getJavaTypeImpl(Value *V, DominatorTree &DT,
   // Get base type (context-insensitive).
   JavaType Base = getBaseJavaType(V, Visited);
 
-  // Context-sensitive sharpening.
+  // Context-sensitive sharpening: intersect with dominator-derived constraints.
   if (Context) {
     JavaType Sharpened = sharpenFromDominators(V, Context, DT);
-    if (Sharpened.isKnown()) {
-      if (Base.isUnknown())
-        return Sharpened;
-      // Both known: pick the more specific one.
-      const VMCallbacks *CB = getVMCallbacks();
-      assert(CB && CB->IsSubtype && "VMCallbacks must be set");
-      if (CB->IsSubtype(Base.Klass, Sharpened.Klass))
-        return Base; // Base is more specific.
-      return Sharpened;
-    }
+    Base = typeIntersect(Base, Sharpened);
   }
 
   return Base;
