@@ -602,7 +602,7 @@ static JavaType sharpenFromDominators(Value *V, Instruction *Context,
   BasicBlock *ContextBB = Context->getParent();
   JavaType Best;
 
-  for (auto *Node = DT.getNode(ContextBB); Node; Node = Node->getIDom()) {
+  for (auto *Node = DT.getNode(ContextBB)->getIDom(); Node; Node = Node->getIDom()) {
     BasicBlock *BB = Node->getBlock();
     auto *BI = dyn_cast<BranchInst>(BB->getTerminator());
     if (!BI || !BI->isConditional())
