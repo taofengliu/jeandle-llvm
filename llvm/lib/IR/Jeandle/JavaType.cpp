@@ -58,8 +58,7 @@ static bool isCheckInstanceofCall(const CallInst *CI, uintptr_t &Klass,
 
 /// Check if klass K is excluded by set S, meaning there exists Y in S such
 /// that IsSubtype(K, Y). Excluding Y implies excluding all subtypes of Y.
-static bool isExcludedBy(uintptr_t K,
-                         const SmallDenseSet<uintptr_t, 2> &S) {
+static bool isExcludedBy(uintptr_t K, const SmallDenseSet<uintptr_t, 2> &S) {
   const VMCallbacks *CB = getVMCallbacks();
   assert(CB && CB->IsSubtype && "VMCallbacks must be set");
   for (uintptr_t Y : S) {
@@ -145,8 +144,8 @@ JavaType jeandle::typeUnion(JavaType A, JavaType B) {
     // Both have unknown positive type. Intersect exclusions.
     JavaType Result;
     if (!A.ExcludedKlasses.empty() && !B.ExcludedKlasses.empty())
-      Result.ExcludedKlasses = intersectExcludedKlasses(A.ExcludedKlasses,
-                                                        B.ExcludedKlasses);
+      Result.ExcludedKlasses =
+          intersectExcludedKlasses(A.ExcludedKlasses, B.ExcludedKlasses);
     return Result;
   }
   if (A.Klass == 0 || B.Klass == 0)
@@ -166,8 +165,8 @@ JavaType jeandle::typeUnion(JavaType A, JavaType B) {
   }
   // Intersect exclusions (value could be either A or B).
   if (!A.ExcludedKlasses.empty() && !B.ExcludedKlasses.empty())
-    Result.ExcludedKlasses = intersectExcludedKlasses(A.ExcludedKlasses,
-                                                      B.ExcludedKlasses);
+    Result.ExcludedKlasses =
+        intersectExcludedKlasses(A.ExcludedKlasses, B.ExcludedKlasses);
   normalizeExcludedKlasses(Result);
   return Result;
 }
@@ -249,7 +248,8 @@ static JavaType getBaseJavaType(Value *V,
           if (auto *CI = dyn_cast<ConstantInt>(CMD->getValue())) {
             uintptr_t Klass = CI->getZExtValue();
             if (Klass != 0) {
-              bool Exact = LI->getMetadata(jeandle::Metadata::JavaKlassExact) != nullptr;
+              bool Exact =
+                  LI->getMetadata(jeandle::Metadata::JavaKlassExact) != nullptr;
               return {Klass, Exact};
             }
           }
@@ -602,7 +602,8 @@ static JavaType sharpenFromDominators(Value *V, Instruction *Context,
   BasicBlock *ContextBB = Context->getParent();
   JavaType Best;
 
-  for (auto *Node = DT.getNode(ContextBB)->getIDom(); Node; Node = Node->getIDom()) {
+  for (auto *Node = DT.getNode(ContextBB)->getIDom(); Node;
+       Node = Node->getIDom()) {
     BasicBlock *BB = Node->getBlock();
     auto *BI = dyn_cast<BranchInst>(BB->getTerminator());
     if (!BI || !BI->isConditional())

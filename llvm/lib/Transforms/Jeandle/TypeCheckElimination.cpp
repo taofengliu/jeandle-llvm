@@ -96,8 +96,8 @@ PreservedAnalyses TypeCheckElimination::run(Function &F,
     if (!FoldToFalse && ObjType.hasExclusions()) {
       for (uintptr_t Excluded : ObjType.ExcludedKlasses) {
         if (CB->IsSubtype(SuperKlass, Excluded)) {
-          LLVM_DEBUG(dbgs() << "TCE: denied by excluded klass " << Excluded
-                            << "\n");
+          LLVM_DEBUG(dbgs()
+                     << "TCE: denied by excluded klass " << Excluded << "\n");
           FoldToFalse = true;
           break;
         }
