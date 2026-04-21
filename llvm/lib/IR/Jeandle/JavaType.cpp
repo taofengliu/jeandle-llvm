@@ -594,19 +594,30 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
 // Context-sensitive sharpening
 // =============================================================================
 
+/// DestBB: for PHI incoming processing, the PHI's parent block. When provided,
+/// the incoming block's own branch is considered for sharpening (the branch
+/// targets DestBB, so it should be considered to sharpen the PHI's type).
+/// For non-PHI contexts, DestBB is nullptr and the context block's own branch
+/// is skipped.
 static JavaType sharpenFromDominators(Value *V, Instruction *Context,
-                                      DominatorTree &DT) {
+                                      DominatorTree &DT,
+                                      BasicBlock *DestBB = nullptr) {
   const VMCallbacks *CB = getVMCallbacks();
   assert(CB && CB->IsSubtype && "VMCallbacks must be set");
 
   BasicBlock *ContextBB = Context->getParent();
   JavaType Best;
 
-  for (auto *Node = DT.getNode(ContextBB)->getIDom(); Node;
-       Node = Node->getIDom()) {
+  for (auto *Node = DT.getNode(ContextBB); Node; Node = Node->getIDom()) {
     BasicBlock *BB = Node->getBlock();
     auto *BI = dyn_cast<BranchInst>(BB->getTerminator());
     if (!BI || !BI->isConditional())
+      continue;
+
+    // For ContextBB's own branch: skip unless DestBB is provided (PHI case).
+    // The branch hasn't executed for non-PHI contexts, but for PHI incomings
+    // the branch targets DestBB, so it should be considered for sharpening.
+    if (BB == ContextBB && !DestBB)
       continue;
 
     SmallPtrSet<Value *, 16> TraceVisited;
@@ -621,7 +632,11 @@ static JavaType sharpenFromDominators(Value *V, Instruction *Context,
     BasicBlock *TypeDeniedBB =
         TR.Negated ? BI->getSuccessor(0) : BI->getSuccessor(1);
 
-    if (DT.dominates(TypeConfirmedBB, ContextBB)) {
+    // For ContextBB's own branch, check against DestBB (the PHI's block).
+    // For dominator blocks above ContextBB, check against ContextBB as before.
+    BasicBlock *CheckBB = (BB == ContextBB) ? DestBB : ContextBB;
+
+    if (DT.dominates(TypeConfirmedBB, CheckBB)) {
       // V is a subtype of TR.Klass at Context (positive constraint).
       LLVM_DEBUG(dbgs() << "JavaType: sharpened " << *V << " to klass "
                         << TR.Klass << " from dominating check in "
@@ -638,7 +653,7 @@ static JavaType sharpenFromDominators(Value *V, Instruction *Context,
         }
         // else Best is already more specific, keep it.
       }
-    } else if (DT.dominates(TypeDeniedBB, ContextBB)) {
+    } else if (DT.dominates(TypeDeniedBB, CheckBB)) {
       // V is NOT an instance of TR.Klass at Context (negative constraint).
       LLVM_DEBUG(dbgs() << "JavaType: excluded " << *V << " from klass "
                         << TR.Klass << " from dominating failed check in "
@@ -657,7 +672,8 @@ static JavaType sharpenFromDominators(Value *V, Instruction *Context,
 
 static JavaType getJavaTypeImpl(Value *V, DominatorTree &DT,
                                 Instruction *Context,
-                                SmallPtrSetImpl<const PHINode *> &Visited);
+                                SmallPtrSetImpl<const PHINode *> &Visited,
+                                BasicBlock *DestBB = nullptr);
 
 /// Context-sensitive PHI handling: query each incoming with its own context.
 /// For PHI cycles (loop back-edges): when we re-encounter a PHI already in the
@@ -684,7 +700,8 @@ static JavaType getPhiJavaType(PHINode *PN, DominatorTree &DT,
         continue;
     }
 
-    JavaType IncType = getJavaTypeImpl(Inc, DT, IncContext, Visited);
+    JavaType IncType =
+        getJavaTypeImpl(Inc, DT, IncContext, Visited, PN->getParent());
     if (IncType.isUnknown())
       return {};
     if (First) {
@@ -701,11 +718,18 @@ static JavaType getPhiJavaType(PHINode *PN, DominatorTree &DT,
 
 static JavaType getJavaTypeImpl(Value *V, DominatorTree &DT,
                                 Instruction *Context,
-                                SmallPtrSetImpl<const PHINode *> &Visited) {
-  // Context-sensitive PHI handling.
+                                SmallPtrSetImpl<const PHINode *> &Visited,
+                                BasicBlock *DestBB) {
+  // Context-sensitive PHI handling: compute per-incoming types via
+  // getPhiJavaType, then also sharpen from dominators of the Context.
+  // The PHI's incoming analysis gives the base type; dominator checks at
+  // the use site (Context) can further narrow it.
   if (auto *PN = dyn_cast<PHINode>(V)) {
-    if (Context)
-      return getPhiJavaType(PN, DT, Visited);
+    if (Context) {
+      JavaType PhiType = getPhiJavaType(PN, DT, Visited);
+      JavaType Sharpened = sharpenFromDominators(V, Context, DT, DestBB);
+      return typeIntersect(PhiType, Sharpened);
+    }
   }
 
   // Get base type (context-insensitive).
@@ -713,7 +737,7 @@ static JavaType getJavaTypeImpl(Value *V, DominatorTree &DT,
 
   // Context-sensitive sharpening: intersect with dominator-derived constraints.
   if (Context) {
-    JavaType Sharpened = sharpenFromDominators(V, Context, DT);
+    JavaType Sharpened = sharpenFromDominators(V, Context, DT, DestBB);
     Base = typeIntersect(Base, Sharpened);
   }
 
