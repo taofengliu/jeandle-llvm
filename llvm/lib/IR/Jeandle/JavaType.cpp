@@ -181,10 +181,12 @@ JavaType jeandle::typeIntersect(JavaType A, JavaType B) {
     if (CB->IsSubtype(A.Klass, B.Klass)) {
       Result.Klass = A.Klass;
       Result.Exact = A.Exact;
-    } else {
+    } else if (CB->IsSubtype(B.Klass, A.Klass)) {
       Result.Klass = B.Klass;
       Result.Exact = B.Exact;
     }
+    // else: neither is a subtype of the other — contradictory constraints
+    // (dead code). Leave Result.Klass = 0 (unknown).
   } else if (A.isKnown()) {
     Result.Klass = A.Klass;
     Result.Exact = A.Exact;
