@@ -13,6 +13,7 @@
 #include "llvm/Transforms/Jeandle/JavaOperationLower.h"
 #include "llvm/Transforms/Jeandle/TLSPointerRewrite.h"
 #include "llvm/Transforms/Jeandle/TypeCheckElimination.h"
+#include "llvm/Transforms/Scalar/InstSimplifyPass.h"
 #include "llvm/Transforms/Scalar/RewriteStatepointsForGC.h"
 
 namespace llvm::jeandle {
@@ -37,6 +38,7 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
                                                  OptimizationLevel level) {
   ModulePassManager PM;
   PM.addPass(JavaOperationLower(0));
+  PM.addPass(createModuleToFunctionPassAdaptor(InstSimplifyPass()));
   PM.addPass(createModuleToFunctionPassAdaptor(TypeCheckElimination()));
   PM.addPass(std::move(PB.buildPerModuleDefaultPipeline(level)));
   PM.addPass(createModuleToFunctionPassAdaptor(InsertGCBarriers()));

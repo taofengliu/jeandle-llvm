@@ -332,6 +332,10 @@ namespace {
 struct TraceResult {
   uintptr_t Klass = 0;
   bool Negated = false;
+  bool PositiveOnly = false; // Klass is only valid for positive sharpening,
+                             // not for negative (type-denied) constraints.
+                             // Set when klass was computed via LCA from
+                             // incomings with different klasses.
 
   bool matched() const { return Klass != 0; }
 };
@@ -470,7 +474,7 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
         else
           // The comparison returns true when val=0 (check failed).
           // On the true-branch, the check FAILED → flip negation.
-          return {R.Klass, !R.Negated};
+          return {R.Klass, !R.Negated, R.PositiveOnly};
       }
       // ResultForZero == ResultForOne: the comparison is always true or always
       // false regardless of the check result (e.g., `sge %val, 0` is always
@@ -501,11 +505,12 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
         // Both matched — pick the more specific klass.
         const VMCallbacks *CB = getVMCallbacks();
         assert(CB && CB->IsSubtype && "VMCallbacks must be set");
+        bool PO = L.PositiveOnly || R.PositiveOnly;
         if (CB->IsSubtype(L.Klass, R.Klass))
-          return L; // L is more specific (subtype of R).
+          return {L.Klass, L.Negated, PO};
         if (CB->IsSubtype(R.Klass, L.Klass))
-          return R; // R is more specific (subtype of L).
-        return L;   // Unrelated types — either is a valid constraint.
+          return {R.Klass, R.Negated, PO};
+        return {L.Klass, L.Negated, PO}; // Unrelated — either is valid. 
       }
       if (L.matched())
         return L; // Only left matched.
@@ -529,24 +534,36 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
       return {}; // False arm doesn't trace — no match.
     if (T.Negated != F.Negated)
       return {}; // Conflicting negation — cannot combine.
-    if (T.Klass == F.Klass)
-      return T; // Same klass — no LCA needed.
+    if (T.Klass == F.Klass) {
+      // Same klass — propagate PositiveOnly if either arm has it.
+      return {T.Klass, T.Negated, T.PositiveOnly || F.PositiveOnly};
+    }
     // Different klasses: compute LCA (the least specific common supertype).
+    // LCA is only valid for positive sharpening — failing one check doesn't
+    // mean the object isn't the LCA type.
     const VMCallbacks *CB = getVMCallbacks();
     assert(CB && CB->GetCommonSuperKlass && "VMCallbacks must be set");
     uintptr_t LCA = CB->GetCommonSuperKlass(T.Klass, F.Klass);
     if (LCA != 0)
-      return {LCA, T.Negated}; // LCA covers both possibilities.
+      return {LCA, T.Negated, /*PositiveOnly=*/true};
     return {};                 // Cannot determine LCA — no match.
   }
 
-  // --- PHI: all non-constant incomings must trace to the same check ---
-  // This handles merged control flow where different predecessors computed the
-  // same type check result (e.g., inlined instanceof with a null-check PHI).
+  // --- PHI: compute LCA of non-constant incomings ---
+  // This handles merged control flow where different predecessors computed
+  // type check results (e.g., inlined instanceof with a null-check PHI).
+  // When incomings have different klasses, the LCA is a valid positive bound
+  // but must NOT be used for negative constraints (failing one check doesn't
+  // mean the object isn't the LCA type).
   if (auto *PN = dyn_cast<PHINode>(Cond)) {
-    uintptr_t MatchedKlass = 0;
+    const VMCallbacks *CB = getVMCallbacks();
+    assert(CB && CB->GetCommonSuperKlass && "VMCallbacks must be set");
+
+    uintptr_t RunningLCA = 0;
     bool MatchedNegated = false;
     bool HaveMatch = false;
+    bool PositiveOnly = false;
+
     for (unsigned I = 0, E = PN->getNumIncomingValues(); I != E; ++I) {
       Value *Inc = PN->getIncomingValue(I);
 
@@ -574,18 +591,25 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
       if (!R.matched())
         return {}; // This incoming doesn't trace to a check — no match.
       if (!HaveMatch) {
-        MatchedKlass = R.Klass;
+        RunningLCA = R.Klass;
         MatchedNegated = R.Negated;
+        PositiveOnly = R.PositiveOnly;
         HaveMatch = true;
       } else {
-        // All non-constant incomings must agree on the same klass and
-        // negation — otherwise different paths checked different types.
-        if (R.Klass != MatchedKlass || R.Negated != MatchedNegated)
-          return {};
+        if (R.Negated != MatchedNegated)
+          return {}; // Different negation — cannot combine.
+        if (R.Klass != RunningLCA) {
+          RunningLCA = CB->GetCommonSuperKlass(RunningLCA, R.Klass);
+          if (RunningLCA == 0)
+            return {};
+          PositiveOnly = true;
+        }
+        if (R.PositiveOnly)
+          PositiveOnly = true; // Propagate from any incoming.
       }
     }
     if (HaveMatch)
-      return {MatchedKlass, MatchedNegated}; // All incomings consistent.
+      return {RunningLCA, MatchedNegated, PositiveOnly};
     return {}; // No non-constant incomings (all were skipped) — no match.
   }
 
@@ -655,7 +679,7 @@ static JavaType sharpenFromDominators(Value *V, Instruction *Context,
         }
         // else Best is already more specific, keep it.
       }
-    } else if (DT.dominates(TypeDeniedBB, CheckBB)) {
+    } else if (DT.dominates(TypeDeniedBB, CheckBB) && !TR.PositiveOnly) {
       // V is NOT an instance of TR.Klass at Context (negative constraint).
       LLVM_DEBUG(dbgs() << "JavaType: excluded " << *V << " from klass "
                         << TR.Klass << " from dominating failed check in "
