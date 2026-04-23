@@ -510,7 +510,7 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
           return {L.Klass, L.Negated, PO};
         if (CB->IsSubtype(R.Klass, L.Klass))
           return {R.Klass, R.Negated, PO};
-        return {L.Klass, L.Negated, PO}; // Unrelated — either is valid. 
+        return {L.Klass, L.Negated, PO}; // Unrelated — either is valid.
       }
       if (L.matched())
         return L; // Only left matched.
