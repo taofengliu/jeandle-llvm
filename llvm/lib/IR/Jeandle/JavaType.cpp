@@ -546,7 +546,7 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
     uintptr_t LCA = CB->GetCommonSuperKlass(T.Klass, F.Klass);
     if (LCA != 0)
       return {LCA, T.Negated, /*PositiveOnly=*/true};
-    return {};                 // Cannot determine LCA — no match.
+    return {}; // Cannot determine LCA — no match.
   }
 
   // --- PHI: compute LCA of non-constant incomings ---
