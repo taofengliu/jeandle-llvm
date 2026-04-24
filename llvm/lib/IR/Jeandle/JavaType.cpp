@@ -314,33 +314,68 @@ static JavaType getBaseJavaType(Value *V,
 
 namespace {
 
-/// Result of tracing a branch condition back to a jeandle.check_instanceof
-/// call.
+/// Result of tracing a branch condition back to jeandle.check_instanceof calls.
 ///
 /// Given a conditional branch `br i1 %cond, label %true_bb, label %false_bb`,
-/// traceToCheckInstanceof attempts to determine whether %cond is derived from
-/// a check_instanceof on a specific object. If successful:
+/// traceToCheckInstanceof determines type constraints for each branch:
 ///
-///   - Klass: the super-klass pointer that was checked against.
-///   - Negated: whether the branch semantics are inverted. When false, the
-///     true-successor is the "type confirmed" path (the check returned true).
-///     When true, the false-successor is the "type confirmed" path (e.g., the
-///     condition was `icmp eq i32 %instanceof_result, 0`, so true means the
-///     check failed, and false means it succeeded).
+///   True-branch constraints (condition is true):
+///   - TrueKlass: positive constraint — obj IS this type (0 if unknown).
+///   - TrueExclusions: negative constraints — obj IS NOT these types.
 ///
-/// A Klass of 0 means the trace did not find a matching check_instanceof.
+///   False-branch constraints (condition is false):
+///   - FalseKlass: positive constraint — obj IS this type (0 if unknown).
+///   - FalseExclusions: negative constraints — obj IS NOT these types.
+///
+/// Merge semantics are handled by each handler:
+///   - And true-branch: AllOf (both operands true) — pickMostSpecific + union.
+///   - And false-branch: OneOf (at least one false) — computeLCA + intersect.
+///   - PHI/Select: OneOf (one arm selected) — computeLCA + intersect.
+///   - ICmp inversion: swap True ↔ False fields.
+///
+/// De Morgan duality (And of negated checks) is handled automatically:
+/// ICmp swaps True/False before And merges, so And(NOT A, NOT B) correctly
+/// produces TrueExclusions = {A, B} (both checks failed on true-branch).
 struct TraceResult {
-  uintptr_t Klass = 0;
-  bool Negated = false;
-  bool PositiveOnly = false; // Klass is only valid for positive sharpening,
-                             // not for negative (type-denied) constraints.
-                             // Set when klass was computed via LCA from
-                             // incomings with different klasses.
+  uintptr_t TrueKlass = 0;
+  SmallDenseSet<uintptr_t, 2> TrueExclusions;
+  uintptr_t FalseKlass = 0;
+  SmallDenseSet<uintptr_t, 2> FalseExclusions;
 
-  bool matched() const { return Klass != 0; }
+  bool matched() const {
+    return TrueKlass != 0 || !TrueExclusions.empty() || FalseKlass != 0 ||
+           !FalseExclusions.empty();
+  }
 };
 
 } // anonymous namespace
+
+/// AllOf: pick the more specific klass (both confirmed — tighter bound).
+/// Returns 0 if unrelated (e.g., two interfaces an object can implement).
+static uintptr_t pickMostSpecific(uintptr_t A, uintptr_t B) {
+  if (A == 0)
+    return B;
+  if (B == 0)
+    return A;
+  const VMCallbacks *CB = getVMCallbacks();
+  assert(CB && CB->IsSubtype && "VMCallbacks must be set");
+  if (CB->IsSubtype(A, B))
+    return A;
+  if (CB->IsSubtype(B, A))
+    return B;
+  return 0; // Unrelated — no useful positive constraint.
+}
+
+/// OneOf: compute LCA (don't know which — weakest common bound).
+static uintptr_t computeLCA(uintptr_t A, uintptr_t B) {
+  if (A == 0 || B == 0)
+    return 0;
+  if (A == B)
+    return A;
+  const VMCallbacks *CB = getVMCallbacks();
+  assert(CB && CB->GetCommonSuperKlass && "VMCallbacks must be set");
+  return CB->GetCommonSuperKlass(A, B);
+}
 
 /// Check if IncomingBB is reached only when Obj is null.
 /// Walks up the dominator tree from IncomingBB looking for a conditional branch
@@ -400,9 +435,13 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
   if (auto *CI = dyn_cast<CallInst>(Cond)) {
     uintptr_t Klass = 0;
     Value *Obj = nullptr;
-    if (isCheckInstanceofCall(CI, Klass, Obj) && Obj == QueryObj)
-      return {Klass, false}; // Direct match, not negated.
-    return {};               // Not a check_instanceof on QueryObj.
+    if (isCheckInstanceofCall(CI, Klass, Obj) && Obj == QueryObj) {
+      TraceResult R;
+      R.TrueKlass = Klass;             // check passed → obj IS Klass
+      R.FalseExclusions.insert(Klass); // check failed → obj IS NOT Klass
+      return R;
+    }
+    return {}; // Not a check_instanceof on QueryObj.
   }
 
   // --- ICmp: comparisons that test the result of a type check ---
@@ -469,12 +508,15 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
           return {}; // Val doesn't trace to a check — no match.
         if (ResultForOne)
           // The comparison returns true when val=1 (check passed).
-          // On the true-branch, the check passed → same negation as inner.
+          // True/False constraints are unchanged.
           return R;
-        else
+        else {
           // The comparison returns true when val=0 (check failed).
-          // On the true-branch, the check FAILED → flip negation.
-          return {R.Klass, !R.Negated, R.PositiveOnly};
+          // Swap True ↔ False constraints.
+          std::swap(R.TrueKlass, R.FalseKlass);
+          std::swap(R.TrueExclusions, R.FalseExclusions);
+          return R;
+        }
       }
       // ResultForZero == ResultForOne: the comparison is always true or always
       // false regardless of the check result (e.g., `sge %val, 0` is always
@@ -491,10 +533,9 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
     return {}; // Other casts (bitcast, fpcast, ...) — not meaningful here.
   }
 
-  // --- And i1 %a, %b: on the true-branch both operands are true ---
-  // Both constraints hold simultaneously, so if both trace to a check on
-  // QueryObj, we pick the more specific klass (tighter bound). If only one
-  // matches, that single constraint is still valid.
+  // --- And i1 %a, %b ---
+  // True-branch: both operands are true → AllOf (both constraints hold).
+  // False-branch: at least one is false → OneOf (don't know which failed).
   if (auto *BO = dyn_cast<BinaryOperator>(Cond)) {
     if (BO->getOpcode() == Instruction::And) {
       TraceResult L =
@@ -502,15 +543,16 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
       TraceResult R =
           traceToCheckInstanceof(BO->getOperand(1), QueryObj, Visited, DT);
       if (L.matched() && R.matched()) {
-        // Both matched — pick the more specific klass.
-        const VMCallbacks *CB = getVMCallbacks();
-        assert(CB && CB->IsSubtype && "VMCallbacks must be set");
-        bool PO = L.PositiveOnly || R.PositiveOnly;
-        if (CB->IsSubtype(L.Klass, R.Klass))
-          return {L.Klass, L.Negated, PO};
-        if (CB->IsSubtype(R.Klass, L.Klass))
-          return {R.Klass, R.Negated, PO};
-        return {L.Klass, L.Negated, PO}; // Unrelated — either is valid.
+        TraceResult M;
+        // True-branch: both L and R are true → AllOf.
+        M.TrueKlass = pickMostSpecific(L.TrueKlass, R.TrueKlass);
+        M.TrueExclusions = L.TrueExclusions;
+        unionExcludedKlasses(M.TrueExclusions, R.TrueExclusions);
+        // False-branch: at least one of L, R is false → OneOf.
+        M.FalseKlass = computeLCA(L.FalseKlass, R.FalseKlass);
+        M.FalseExclusions =
+            intersectExcludedKlasses(L.FalseExclusions, R.FalseExclusions);
+        return M;
       }
       if (L.matched())
         return L; // Only left matched.
@@ -520,9 +562,7 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
   }
 
   // --- Select: the result is one of two values, we don't know which ---
-  // On the true-branch of `br i1 (select %c, %a, %b)`, the selected value
-  // is true — but it could be either %a or %b. So we can only guarantee
-  // what holds for BOTH possibilities, i.e., the LCA of the two klasses.
+  // Both branches use OneOf semantics: LCA for klass, intersect for exclusions.
   if (auto *SI = dyn_cast<SelectInst>(Cond)) {
     TraceResult T =
         traceToCheckInstanceof(SI->getTrueValue(), QueryObj, Visited, DT);
@@ -532,37 +572,24 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
         traceToCheckInstanceof(SI->getFalseValue(), QueryObj, Visited, DT);
     if (!F.matched())
       return {}; // False arm doesn't trace — no match.
-    if (T.Negated != F.Negated)
-      return {}; // Conflicting negation — cannot combine.
-    if (T.Klass == F.Klass) {
-      // Same klass — propagate PositiveOnly if either arm has it.
-      return {T.Klass, T.Negated, T.PositiveOnly || F.PositiveOnly};
-    }
-    // Different klasses: compute LCA (the least specific common supertype).
-    // LCA is only valid for positive sharpening — failing one check doesn't
-    // mean the object isn't the LCA type.
-    const VMCallbacks *CB = getVMCallbacks();
-    assert(CB && CB->GetCommonSuperKlass && "VMCallbacks must be set");
-    uintptr_t LCA = CB->GetCommonSuperKlass(T.Klass, F.Klass);
-    if (LCA != 0)
-      return {LCA, T.Negated, /*PositiveOnly=*/true};
-    return {}; // Cannot determine LCA — no match.
+    TraceResult M;
+    M.TrueKlass = computeLCA(T.TrueKlass, F.TrueKlass);
+    M.TrueExclusions =
+        intersectExcludedKlasses(T.TrueExclusions, F.TrueExclusions);
+    M.FalseKlass = computeLCA(T.FalseKlass, F.FalseKlass);
+    M.FalseExclusions =
+        intersectExcludedKlasses(T.FalseExclusions, F.FalseExclusions);
+    if (!M.matched())
+      return {};
+    return M;
   }
 
-  // --- PHI: compute LCA of non-constant incomings ---
-  // This handles merged control flow where different predecessors computed
-  // type check results (e.g., inlined instanceof with a null-check PHI).
-  // When incomings have different klasses, the LCA is a valid positive bound
-  // but must NOT be used for negative constraints (failing one check doesn't
-  // mean the object isn't the LCA type).
+  // --- PHI: merge non-constant incomings with OneOf semantics ---
+  // Don't know which incoming was selected → LCA for klass, intersect for
+  // exclusions, on both branches.
   if (auto *PN = dyn_cast<PHINode>(Cond)) {
-    const VMCallbacks *CB = getVMCallbacks();
-    assert(CB && CB->GetCommonSuperKlass && "VMCallbacks must be set");
-
-    uintptr_t RunningLCA = 0;
-    bool MatchedNegated = false;
+    TraceResult M;
     bool HaveMatch = false;
-    bool PositiveOnly = false;
 
     for (unsigned I = 0, E = PN->getNumIncomingValues(); I != E; ++I) {
       Value *Inc = PN->getIncomingValue(I);
@@ -591,25 +618,20 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
       if (!R.matched())
         return {}; // This incoming doesn't trace to a check — no match.
       if (!HaveMatch) {
-        RunningLCA = R.Klass;
-        MatchedNegated = R.Negated;
-        PositiveOnly = R.PositiveOnly;
+        M = R;
         HaveMatch = true;
       } else {
-        if (R.Negated != MatchedNegated)
-          return {}; // Different negation — cannot combine.
-        if (R.Klass != RunningLCA) {
-          RunningLCA = CB->GetCommonSuperKlass(RunningLCA, R.Klass);
-          if (RunningLCA == 0)
-            return {};
-          PositiveOnly = true;
-        }
-        if (R.PositiveOnly)
-          PositiveOnly = true; // Propagate from any incoming.
+        // OneOf merge: LCA for klass, intersect for exclusions.
+        M.TrueKlass = computeLCA(M.TrueKlass, R.TrueKlass);
+        M.TrueExclusions =
+            intersectExcludedKlasses(M.TrueExclusions, R.TrueExclusions);
+        M.FalseKlass = computeLCA(M.FalseKlass, R.FalseKlass);
+        M.FalseExclusions =
+            intersectExcludedKlasses(M.FalseExclusions, R.FalseExclusions);
       }
     }
     if (HaveMatch)
-      return {RunningLCA, MatchedNegated, PositiveOnly};
+      return M;
     return {}; // No non-constant incomings (all were skipped) — no match.
   }
 
@@ -652,39 +674,43 @@ static JavaType sharpenFromDominators(Value *V, Instruction *Context,
     if (!TR.matched())
       continue;
 
-    // Determine the type-confirmed and type-denied successors.
-    BasicBlock *TypeConfirmedBB =
-        TR.Negated ? BI->getSuccessor(1) : BI->getSuccessor(0);
-    BasicBlock *TypeDeniedBB =
-        TR.Negated ? BI->getSuccessor(0) : BI->getSuccessor(1);
+    BasicBlock *TrueBB = BI->getSuccessor(0);
+    BasicBlock *FalseBB = BI->getSuccessor(1);
 
     // For ContextBB's own branch, check against DestBB (the PHI's block).
     // For dominator blocks above ContextBB, check against ContextBB as before.
     BasicBlock *CheckBB = (BB == ContextBB) ? DestBB : ContextBB;
 
-    if (DT.dominates(TypeConfirmedBB, CheckBB)) {
-      // V is a subtype of TR.Klass at Context (positive constraint).
-      LLVM_DEBUG(dbgs() << "JavaType: sharpened " << *V << " to klass "
-                        << TR.Klass << " from dominating check in "
-                        << BB->getName() << "\n");
+    // Apply constraints from whichever branch dominates the context.
+    uintptr_t Klass = 0;
+    const SmallDenseSet<uintptr_t, 2> *Exclusions = nullptr;
+    if (DT.dominates(TrueBB, CheckBB)) {
+      Klass = TR.TrueKlass;
+      Exclusions = &TR.TrueExclusions;
+    } else if (DT.dominates(FalseBB, CheckBB)) {
+      Klass = TR.FalseKlass;
+      Exclusions = &TR.FalseExclusions;
+    }
 
+    if (Klass != 0) {
+      LLVM_DEBUG(dbgs() << "JavaType: sharpened " << *V << " to klass " << Klass
+                        << " from dominating check in " << BB->getName()
+                        << "\n");
       if (!Best.isKnown()) {
-        Best.Klass = TR.Klass;
+        Best.Klass = Klass;
         Best.Exact = false;
-      } else {
-        // Keep the more specific type.
-        if (CB->IsSubtype(TR.Klass, Best.Klass)) {
-          Best.Klass = TR.Klass;
-          Best.Exact = false;
-        }
-        // else Best is already more specific, keep it.
+      } else if (CB->IsSubtype(Klass, Best.Klass)) {
+        Best.Klass = Klass;
+        Best.Exact = false;
       }
-    } else if (DT.dominates(TypeDeniedBB, CheckBB) && !TR.PositiveOnly) {
-      // V is NOT an instance of TR.Klass at Context (negative constraint).
-      LLVM_DEBUG(dbgs() << "JavaType: excluded " << *V << " from klass "
-                        << TR.Klass << " from dominating failed check in "
-                        << BB->getName() << "\n");
-      addExcludedKlass(Best.ExcludedKlasses, TR.Klass);
+    }
+    if (Exclusions) {
+      for (uintptr_t K : *Exclusions) {
+        LLVM_DEBUG(dbgs() << "JavaType: excluded " << *V << " from klass " << K
+                          << " from dominating check in " << BB->getName()
+                          << "\n");
+        addExcludedKlass(Best.ExcludedKlasses, K);
+      }
     }
   }
 
