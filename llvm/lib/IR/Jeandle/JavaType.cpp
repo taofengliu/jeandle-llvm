@@ -563,13 +563,55 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
 
   // --- Select: the result is one of two values, we don't know which ---
   // Both branches use OneOf semantics: LCA for klass, intersect for exclusions.
+  // Special case: if one arm is a constant, the other arm's constraints can
+  // be used directly on the branch where the constant could not contribute.
+  //   - Constant false arm: on true-branch, this arm can't be selected →
+  //     other arm was selected and is true → use other arm's True constraints.
+  //   - Constant true arm: on false-branch, this arm can't be selected →
+  //     other arm was selected and is false → use other arm's False
+  //     constraints.
   if (auto *SI = dyn_cast<SelectInst>(Cond)) {
-    TraceResult T =
-        traceToCheckInstanceof(SI->getTrueValue(), QueryObj, Visited, DT);
+    Value *TrueVal = SI->getTrueValue();
+    Value *FalseVal = SI->getFalseValue();
+    auto *TrueConst = dyn_cast<ConstantInt>(TrueVal);
+    auto *FalseConst = dyn_cast<ConstantInt>(FalseVal);
+
+    // Both constant → no check_instanceof involved.
+    if (TrueConst && FalseConst)
+      return {};
+
+    // One arm is constant.
+    if (TrueConst || FalseConst) {
+      bool IsZero = TrueConst ? TrueConst->isZero() : FalseConst->isZero();
+      Value *NonConstVal = TrueConst ? FalseVal : TrueVal;
+      TraceResult R =
+          traceToCheckInstanceof(NonConstVal, QueryObj, Visited, DT);
+      if (!R.matched())
+        return {};
+      TraceResult M;
+      if (IsZero) {
+        // Constant false: on the select's true-branch, the constant arm can't
+        // be selected → the non-constant arm was selected and is true.
+        M.TrueKlass = R.TrueKlass;
+        M.TrueExclusions = R.TrueExclusions;
+        // False-branch: could be constant false or R false → no useful info.
+      } else {
+        // Constant true: on the select's false-branch, the constant arm can't
+        // be selected → the non-constant arm was selected and is false.
+        M.FalseKlass = R.FalseKlass;
+        M.FalseExclusions = R.FalseExclusions;
+        // True-branch: could be constant true or R true → no useful info.
+      }
+      if (!M.matched())
+        return {};
+      return M;
+    }
+
+    // Both non-constant: OneOf merge.
+    TraceResult T = traceToCheckInstanceof(TrueVal, QueryObj, Visited, DT);
     if (!T.matched())
       return {}; // True arm doesn't trace — no match.
-    TraceResult F =
-        traceToCheckInstanceof(SI->getFalseValue(), QueryObj, Visited, DT);
+    TraceResult F = traceToCheckInstanceof(FalseVal, QueryObj, Visited, DT);
     if (!F.matched())
       return {}; // False arm doesn't trace — no match.
     TraceResult M;
