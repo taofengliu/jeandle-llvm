@@ -557,9 +557,23 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
             intersectExcludedKlasses(L.FalseExclusions, R.FalseExclusions);
         return M;
       }
-      if (L.matched())
-        return L; // Only left matched.
-      return R;   // Right matched, or no match at all.
+      // Only one side matched. True-branch is sound (both must be true for
+      // And to be true, so the matched operand is guaranteed true).
+      // False-branch is unsound: And being false could be due to the
+      // unmatched operand, not the matched one.
+      if (L.matched()) {
+        TraceResult M;
+        M.TrueKlass = L.TrueKlass;
+        M.TrueExclusions = L.TrueExclusions;
+        return M;
+      }
+      if (R.matched()) {
+        TraceResult M;
+        M.TrueKlass = R.TrueKlass;
+        M.TrueExclusions = R.TrueExclusions;
+        return M;
+      }
+      return {};
     }
     return {}; // Other binary ops (or, xor, ...) — not handled.
   }
@@ -727,13 +741,19 @@ static JavaType sharpenFromDominators(Value *V, Instruction *Context,
     // For dominator blocks above ContextBB, check against ContextBB as before.
     BasicBlock *CheckBB = (BB == ContextBB) ? DestBB : ContextBB;
 
-    // Apply constraints from whichever branch dominates the context.
+    // Apply constraints from whichever branch edge dominates the context.
+    // Block dominance alone (DT.dominates(SuccBB, CheckBB)) is insufficient:
+    // SuccBB might be reachable from both edges of the branch if it has
+    // multiple predecessors. Use edge dominance via BasicBlockEdge, which
+    // correctly handles loop back-edges and multi-predecessor successors.
+    BasicBlockEdge TrueEdge(BB, TrueBB);
+    BasicBlockEdge FalseEdge(BB, FalseBB);
     uintptr_t Klass = 0;
     const SmallDenseSet<uintptr_t, 2> *Exclusions = nullptr;
-    if (DT.dominates(TrueBB, CheckBB)) {
+    if (DT.dominates(TrueEdge, CheckBB)) {
       Klass = TR.TrueKlass;
       Exclusions = &TR.TrueExclusions;
-    } else if (DT.dominates(FalseBB, CheckBB)) {
+    } else if (DT.dominates(FalseEdge, CheckBB)) {
       Klass = TR.FalseKlass;
       Exclusions = &TR.FalseExclusions;
     }
