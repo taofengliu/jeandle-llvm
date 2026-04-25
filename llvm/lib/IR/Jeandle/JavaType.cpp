@@ -275,6 +275,9 @@ static JavaType getBaseJavaType(Value *V,
         if (Visited.count(IncPN))
           continue; // Skip cyclic incoming.
       }
+      // JavaType does not model nullability. Any positive facts derived from
+      // jeandle.check_instanceof remain sound here only because current
+      // consumers query it under check_instanceof's non-null oop contract.
       JavaType IncType = getBaseJavaType(Inc, Visited);
       if (IncType.isUnknown())
         return {};
@@ -645,7 +648,8 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
         // Constant true/non-zero: this path contributes "check passed"
         // WITHOUT an actual check_instanceof. This is safe to ignore ONLY
         // if the incoming is from a null-check path on QueryObj — since
-        // we assume queried value is non-null. (Type of a null pointer
+        // check_instanceof-derived sharpening is only used under the IR/API
+        // contract that the queried oop is non-null. (Type of a null pointer
         // is meaningless)
         if (isNullCheckPath(PN->getIncomingBlock(I), QueryObj, DT))
           continue;

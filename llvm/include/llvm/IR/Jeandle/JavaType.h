@@ -32,6 +32,10 @@ namespace jeandle {
 
 /// Represents the Java type of an LLVM IR value, including both positive
 /// type knowledge and negative constraints (excluded classes).
+///
+/// JavaType does not encode nullability. A known Klass describes the Java
+/// class of the referenced object when the queried value is known to denote a
+/// non-null oop.
 struct JavaType {
   /// The Klass pointer (from HotSpot JVM). 0 means unknown.
   uintptr_t Klass = 0;
@@ -58,6 +62,10 @@ struct JavaType {
 /// When Context is provided, additionally performs context-sensitive sharpening
 /// by examining dominating type checks (jeandle.check_instanceof calls) that
 /// constrain the value's type at the point of the context instruction.
+///
+/// JavaType does not model nullability. Sharpening derived from
+/// jeandle.check_instanceof is therefore only sound for consumers whose IR/API
+/// contract guarantees that the queried oop is non-null at the check site.
 ///
 /// The query handles arbitrary IR shapes including PHI nodes (with cycle
 /// detection), select instructions, casts, and various comparison patterns

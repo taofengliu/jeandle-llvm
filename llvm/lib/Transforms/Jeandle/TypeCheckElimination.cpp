@@ -60,6 +60,10 @@ PreservedAnalyses TypeCheckElimination::run(Function &F,
       continue;
 
     Value *Obj = CI->getArgOperand(1);
+    // TCE queries JavaType only at jeandle.check_instanceof call sites. The
+    // helper's IR contract requires this oop operand to be non-null, so
+    // check_instanceof-derived sharpening remains sound even though JavaType
+    // itself does not model nullability.
     jeandle::JavaType ObjType = jeandle::getJavaType(Obj, DT, CI);
 
     // --- Fold to true: known subtype ---
