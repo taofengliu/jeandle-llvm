@@ -417,8 +417,11 @@ static bool isNullCheckPath(BasicBlock *IncomingBB, Value *Obj,
     else
       continue;
 
-    // IncomingBB must be dominated by the null-path successor.
-    return DT.dominates(NullBB, IncomingBB);
+    // IncomingBB must be dominated by the null-path edge. Edge dominance
+    // is needed (not block dominance) because NullBB may be reachable from
+    // both edges of the branch if it has multiple predecessors.
+    BasicBlockEdge NullEdge(BB, NullBB);
+    return DT.dominates(NullEdge, IncomingBB);
   }
   return false;
 }
@@ -649,28 +652,31 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
   if (auto *PN = dyn_cast<PHINode>(Cond)) {
     TraceResult M;
     bool HaveMatch = false;
+    bool HasConstantFalse = false;
+    bool HasConstantTrue = false;
 
     for (unsigned I = 0, E = PN->getNumIncomingValues(); I != E; ++I) {
       Value *Inc = PN->getIncomingValue(I);
 
       if (auto *CI = dyn_cast<ConstantInt>(Inc)) {
-        // Constant false/zero: this path contributes "check failed" to the
-        // PHI. On the true-branch of `br i1 (ne phi, 0)`, this path could
-        // not have been taken, so it is safe to ignore.
-        if (CI->isZero())
-          continue;
-        // Constant true/non-zero: this path contributes "check passed"
-        // WITHOUT an actual check_instanceof. This is safe to ignore ONLY
-        // if the incoming is from a null-check path on QueryObj — since
-        // check_instanceof-derived sharpening is only used under the IR/API
-        // contract that the queried oop is non-null. (Type of a null pointer
-        // is meaningless)
+        // If the incoming is from a null-check path (obj IS null), type info
+        // is meaningless regardless of the constant value — safe to skip on
+        // both branches.
         if (isNullCheckPath(PN->getIncomingBlock(I), QueryObj, DT))
           continue;
-        // Constant true from an unknown origin: on the true-branch, this
-        // path could have been taken without any type check, so we cannot
-        // conclude anything about QueryObj's type.
-        return {};
+
+        if (CI->isZero()) {
+          // Constant false from non-null-check origin: on the true-branch
+          // this path can't be taken (safe to skip), but on the false-branch
+          // it could have been taken without any type check.
+          HasConstantFalse = true;
+          continue;
+        }
+        // Constant true from non-null-check origin: on the false-branch
+        // this path can't be taken (safe to skip), but on the true-branch
+        // it could have been taken without any type check.
+        HasConstantTrue = true;
+        continue;
       }
 
       // Non-constant incoming: must trace to a check_instanceof.
@@ -690,7 +696,20 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
             intersectExcludedKlasses(M.FalseExclusions, R.FalseExclusions);
       }
     }
-    if (HaveMatch)
+
+    // Invalidate branch info that is unsound due to constant incomings
+    // from non-null-check paths.
+    if (HaveMatch) {
+      if (HasConstantFalse) {
+        M.FalseKlass = 0;
+        M.FalseExclusions.clear();
+      }
+      if (HasConstantTrue) {
+        M.TrueKlass = 0;
+        M.TrueExclusions.clear();
+      }
+    }
+    if (HaveMatch && M.matched())
       return M;
     return {}; // No non-constant incomings (all were skipped) — no match.
   }
