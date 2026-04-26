@@ -67,9 +67,14 @@ struct JavaType {
 /// jeandle.check_instanceof is therefore only sound for consumers whose IR/API
 /// contract guarantees that the queried oop is non-null at the check site.
 ///
-/// The query handles arbitrary IR shapes including PHI nodes (with cycle
-/// detection), select instructions, casts, and various comparison patterns
-/// for branch conditions.
+/// The query traces through a limited set of IR patterns:
+/// - PHI nodes (with cycle detection for loop back-edges)
+/// - Select instructions (constant and non-constant arms)
+/// - Integer casts: zext, sext, trunc (but not bitcast, fpcast, etc.)
+/// - ICmp comparisons of a check_instanceof result against a constant
+/// - And (i1) of two traced conditions
+/// - Direct jeandle.check_instanceof calls
+/// Unrecognized patterns conservatively return unknown ({}).
 JavaType getJavaType(Value *V, DominatorTree &DT,
                      Instruction *Context = nullptr);
 
