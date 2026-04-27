@@ -365,11 +365,13 @@ static JavaType getBaseJavaType(Value *V,
     return typeUnion(TrueType, FalseType);
   }
 
-  // BitCast / AddrSpaceCast: pass through.
+  // BitCast / AddrSpaceCast / Freeze: pass through.
   if (auto *BC = dyn_cast<BitCastInst>(V))
     return getBaseJavaType(BC->getOperand(0), Visited);
   if (auto *ASC = dyn_cast<AddrSpaceCastInst>(V))
     return getBaseJavaType(ASC->getOperand(0), Visited);
+  if (auto *FI = dyn_cast<FreezeInst>(V))
+    return getBaseJavaType(FI->getOperand(0), Visited);
 
   return {};
 }
@@ -452,41 +454,68 @@ static uintptr_t computeLCA(uintptr_t A, uintptr_t B) {
 /// not just single-predecessor chains.
 static bool isNullCheckPath(BasicBlock *IncomingBB, Value *Obj,
                             DominatorTree &DT) {
+  Obj = Obj->stripPointerCasts();
   for (auto *Node = DT.getNode(IncomingBB); Node; Node = Node->getIDom()) {
     BasicBlock *BB = Node->getBlock();
-    auto *BI = dyn_cast<BranchInst>(BB->getTerminator());
-    if (!BI || !BI->isConditional())
-      continue;
 
-    auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition());
-    if (!Cmp)
-      continue;
+    // --- BranchInst: check `icmp eq/ne Obj, null` ---
+    if (auto *BI = dyn_cast<BranchInst>(BB->getTerminator())) {
+      if (!BI->isConditional())
+        continue;
 
-    // Check if condition is `icmp eq/ne Obj, null`.
-    Value *LHS = Cmp->getOperand(0);
-    Value *RHS = Cmp->getOperand(1);
-    bool LHSNull = isa<ConstantPointerNull>(LHS);
-    bool RHSNull = isa<ConstantPointerNull>(RHS);
-    Value *Tested = LHSNull ? RHS : (RHSNull ? LHS : nullptr);
-    if (Tested != Obj)
-      continue;
+      auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition());
+      if (!Cmp)
+        continue;
 
-    // Determine which successor means "Obj is null".
-    // icmp eq Obj, null → true successor = null path
-    // icmp ne Obj, null → false successor = null path
-    BasicBlock *NullBB = nullptr;
-    if (Cmp->getPredicate() == ICmpInst::ICMP_EQ)
-      NullBB = BI->getSuccessor(0);
-    else if (Cmp->getPredicate() == ICmpInst::ICMP_NE)
-      NullBB = BI->getSuccessor(1);
-    else
-      continue;
+      // Check if condition is `icmp eq/ne Obj, null`.
+      Value *LHS = Cmp->getOperand(0);
+      Value *RHS = Cmp->getOperand(1);
+      bool LHSNull = isa<ConstantPointerNull>(LHS);
+      bool RHSNull = isa<ConstantPointerNull>(RHS);
+      Value *Tested = LHSNull ? RHS : (RHSNull ? LHS : nullptr);
+      if (!Tested || Tested->stripPointerCasts() != Obj)
+        continue;
 
-    // IncomingBB must be dominated by the null-path edge. Edge dominance
-    // is needed (not block dominance) because NullBB may be reachable from
-    // both edges of the branch if it has multiple predecessors.
-    BasicBlockEdge NullEdge(BB, NullBB);
-    return DT.dominates(NullEdge, IncomingBB);
+      // Determine which successor means "Obj is null".
+      // icmp eq Obj, null → true successor = null path
+      // icmp ne Obj, null → false successor = null path
+      BasicBlock *NullBB = nullptr;
+      if (Cmp->getPredicate() == ICmpInst::ICMP_EQ)
+        NullBB = BI->getSuccessor(0);
+      else if (Cmp->getPredicate() == ICmpInst::ICMP_NE)
+        NullBB = BI->getSuccessor(1);
+      else
+        continue;
+
+      // IncomingBB must be dominated by the null-path edge.
+      BasicBlockEdge NullEdge(BB, NullBB);
+      if (DT.dominates(NullEdge, IncomingBB))
+        return true;
+      continue;
+    }
+
+    // --- SwitchInst: check `switch Obj [... case null: ...]` ---
+    if (auto *SI = dyn_cast<SwitchInst>(BB->getTerminator())) {
+      Value *Cond = SI->getCondition();
+      if (Cond->stripPointerCasts() != Obj)
+        continue;
+
+      // Find the null case.
+      BasicBlock *NullBB = nullptr;
+      for (auto &Case : SI->cases()) {
+        if (isa<ConstantPointerNull>(Case.getCaseValue())) {
+          NullBB = Case.getCaseSuccessor();
+          break;
+        }
+      }
+      if (!NullBB)
+        continue;
+
+      BasicBlockEdge NullEdge(BB, NullBB);
+      if (DT.dominates(NullEdge, IncomingBB))
+        return true;
+      continue;
+    }
   }
   return false;
 }
@@ -498,6 +527,7 @@ static bool isNullCheckPath(BasicBlock *IncomingBB, Value *Obj,
 static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
                                           SmallPtrSetImpl<Value *> &Visited,
                                           DominatorTree &DT) {
+  QueryObj = QueryObj->stripPointerCasts();
   // Avoid infinite recursion on cyclic value graphs.
   if (!Visited.insert(Cond).second)
     return {}; // Already visited — no match on this path.
@@ -506,7 +536,8 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
   if (auto *CI = dyn_cast<CallInst>(Cond)) {
     uintptr_t Klass = 0;
     Value *Obj = nullptr;
-    if (isCheckInstanceofCall(CI, Klass, Obj) && Obj == QueryObj) {
+    if (isCheckInstanceofCall(CI, Klass, Obj) &&
+        Obj->stripPointerCasts() == QueryObj) {
       TraceResult R;
       R.TrueKlass = Klass;             // check passed → obj IS Klass
       R.FalseExclusions.insert(Klass); // check failed → obj IS NOT Klass
@@ -681,7 +712,38 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
       }
       return {};
     }
-    return {}; // Other binary ops (xor, ...) — not handled.
+    // --- Xor i1 %a, true: logical NOT ---
+    // xor i1 %val, true is equivalent to !val. Trace the non-constant
+    // operand and swap True/False constraints.
+    // Note: xor i1 %val, false is simplified away by InstSimplify, so
+    // only the true-constant case needs handling.
+    if (BO->getOpcode() == Instruction::Xor) {
+      Value *LHS = BO->getOperand(0);
+      Value *RHS = BO->getOperand(1);
+      auto *LHSC = dyn_cast<ConstantInt>(LHS);
+      auto *RHSC = dyn_cast<ConstantInt>(RHS);
+
+      // We need exactly one constant-true operand.
+      Value *NonConstVal = nullptr;
+      if (LHSC && LHSC->isOne() && !RHSC)
+        NonConstVal = RHS;
+      else if (RHSC && RHSC->isOne() && !LHSC)
+        NonConstVal = LHS;
+
+      if (NonConstVal) {
+        TraceResult R =
+            traceToCheckInstanceof(NonConstVal, QueryObj, Visited, DT);
+        if (!R.matched())
+          return {};
+        // xor with true inverts the condition → swap True/False.
+        std::swap(R.TrueKlass, R.FalseKlass);
+        std::swap(R.TrueExclusions, R.FalseExclusions);
+        return R;
+      }
+      return {};
+    }
+
+    return {}; // Other binary ops — not handled.
   }
 
   // --- Select: the result is one of two values, we don't know which ---
@@ -884,12 +946,14 @@ static JavaType sharpenFromDominators(Value *V, Instruction *Context,
       LLVM_DEBUG(dbgs() << "JavaType: sharpened " << *V << " to klass " << Klass
                         << " from dominating check in " << BB->getName()
                         << "\n");
+      assert(CB->IsEffectivelyFinal && "IsEffectivelyFinal must be set");
+      bool IsExact = CB->IsEffectivelyFinal(Klass);
       if (!Best.isKnown()) {
         Best.Klass = Klass;
-        Best.Exact = false;
+        Best.Exact = IsExact;
       } else if (CB->IsSubtype(Klass, Best.Klass)) {
         Best.Klass = Klass;
-        Best.Exact = false;
+        Best.Exact = IsExact;
       }
     }
     if (Exclusions) {
@@ -986,6 +1050,11 @@ static JavaType getJavaTypeImpl(Value *V, DominatorTree &DT,
 
 JavaType jeandle::getJavaType(Value *V, DominatorTree *DT,
                               Instruction *Context) {
+  // Strip pointer casts at the API boundary so that downstream identity
+  // comparisons (traceToCheckInstanceof, isNullCheckPath) work correctly
+  // even when optimization passes introduce bitcast/addrspacecast wrappers.
+  V = V->stripPointerCasts();
+
   SmallPtrSet<const PHINode *, 8> Visited;
   if (DT)
     return getJavaTypeImpl(V, *DT, Context, Visited);

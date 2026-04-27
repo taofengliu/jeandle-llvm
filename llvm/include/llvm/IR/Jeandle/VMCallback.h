@@ -45,6 +45,12 @@ struct VMCallbacks {
   /// Returns true if the klass is java.lang.Object.
   using IsObjectKlassFn = bool (*)(uintptr_t KlassPtr);
   IsObjectKlassFn IsObjectKlass = nullptr;
+
+  /// Returns true if the klass is effectively final (no subclass can exist
+  /// at runtime). This includes final classes, type arrays, and object arrays
+  /// whose element type is effectively final.
+  using IsEffectivelyFinalFn = bool (*)(uintptr_t KlassPtr);
+  IsEffectivelyFinalFn IsEffectivelyFinal = nullptr;
 };
 
 /// Register VM callbacks. Must be called before running the optimization
