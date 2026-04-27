@@ -74,6 +74,7 @@ struct JavaType {
 /// - ICmp comparisons of a check_instanceof result against a constant
 /// - And (i1) of two traced conditions
 /// - Or (i1) of two traced conditions
+/// - Xor i1 %a, true: logical NOT
 /// - Direct jeandle.check_instanceof calls
 /// Unrecognized patterns conservatively return unknown ({}).
 JavaType getJavaType(Value *V, DominatorTree *DT = nullptr,
@@ -96,10 +97,12 @@ bool areKlassesIncompatible(uintptr_t Klass, bool KlassExact,
                             uintptr_t OtherKlass);
 
 /// Extract a Klass pointer constant from a Value.
-/// Strips pointer casts first, then handles: inttoptr of ConstantInt
-/// (instruction and ConstantExpr forms), inttoptr(ptrtoint(V)) round-trip
-/// chains, load from a constant GlobalVariable (recurses into initializer),
-/// and bare ConstantInt (reachable via GlobalVariable recursion).
+/// Strips pointer casts and aliases first, then handles: freeze passthrough,
+/// inttoptr of ConstantInt (instruction and ConstantExpr forms),
+/// inttoptr(zext/sext(V)) widening casts, inttoptr(ptrtoint(V)) round-trip
+/// chains, load from a constant GlobalVariable (recurses into initializer,
+/// follows GlobalAlias), and bare ConstantInt (reachable via GlobalVariable
+/// recursion). Has a recursion depth limit to prevent infinite recursion.
 /// Returns 0 if the value does not encode a constant klass pointer.
 uintptr_t extractKlassConstant(Value *V);
 

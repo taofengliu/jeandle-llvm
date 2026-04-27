@@ -28,41 +28,82 @@ using namespace llvm::jeandle;
 // Helpers
 // =============================================================================
 
-uintptr_t jeandle::extractKlassConstant(Value *V) {
-  // Strip pointer casts (bitcast, addrspacecast, zero-index GEP) to see
-  // through wrappers that optimization passes may introduce.
-  V = V->stripPointerCasts();
+/// Maximum recursion depth for extractKlassConstantImpl.
+/// Prevents infinite recursion on deeply nested or cyclic IR patterns.
+static constexpr unsigned MaxExtractKlassDepth = 16;
+
+static uintptr_t extractKlassConstantImpl(Value *V, unsigned Depth) {
+  if (Depth > MaxExtractKlassDepth)
+    return 0;
+
+  // Pattern A: freeze — LLVM may insert freeze for poison safety.
+  // freeze ptr %klass has the same klass constant as %klass.
+  // stripPointerCastsAndAliases does not look through FreezeInst.
+  if (auto *FI = dyn_cast<FreezeInst>(V))
+    return extractKlassConstantImpl(FI->getOperand(0), Depth + 1);
+
+  // Strip pointer casts (bitcast, addrspacecast, zero-index GEP) and
+  // aliases to see through wrappers that optimization passes may introduce.
+  V = V->stripPointerCastsAndAliases();
 
   // Pattern 1: inttoptr instruction.
   if (auto *I2P = dyn_cast<IntToPtrInst>(V)) {
-    if (auto *CI = dyn_cast<ConstantInt>(I2P->getOperand(0)))
+    Value *Src = I2P->getOperand(0);
+
+    // Pattern B: look through zext/sext on the inttoptr operand.
+    // Klass pointers are always positive (high bit zero), so zext/sext
+    // from a narrower type preserves the value. TruncInst is NOT safe
+    // because truncation can change the klass value.
+    if (auto *Cast = dyn_cast<CastInst>(Src)) {
+      if (isa<ZExtInst>(Cast) || isa<SExtInst>(Cast))
+        Src = Cast->getOperand(0);
+    }
+
+    if (auto *CI = dyn_cast<ConstantInt>(Src))
       return CI->getZExtValue();
     // Handle inttoptr(ptrtoint(V)) chains — strip the round-trip and recurse.
-    if (auto *P2I = dyn_cast<PtrToIntInst>(I2P->getOperand(0)))
-      return extractKlassConstant(P2I->getPointerOperand());
-    if (auto *CE = dyn_cast<ConstantExpr>(I2P->getOperand(0))) {
+    if (auto *P2I = dyn_cast<PtrToIntInst>(Src))
+      return extractKlassConstantImpl(P2I->getPointerOperand(), Depth + 1);
+    if (auto *CE = dyn_cast<ConstantExpr>(Src)) {
       if (CE->getOpcode() == Instruction::PtrToInt)
-        return extractKlassConstant(CE->getOperand(0));
+        return extractKlassConstantImpl(CE->getOperand(0), Depth + 1);
+      // Handle zext/sext ConstantExpr wrapping a PtrToInt.
+      if ((CE->getOpcode() == Instruction::ZExt ||
+           CE->getOpcode() == Instruction::SExt) &&
+          CE->getNumOperands() > 0) {
+        auto *Inner = dyn_cast<ConstantExpr>(CE->getOperand(0));
+        if (Inner && Inner->getOpcode() == Instruction::PtrToInt)
+          return extractKlassConstantImpl(Inner->getOperand(0), Depth + 1);
+      }
     }
   }
   // Pattern 2: inttoptr constant expression.
   if (auto *CE = dyn_cast<ConstantExpr>(V)) {
     if (CE->getOpcode() == Instruction::IntToPtr) {
-      if (auto *CI = dyn_cast<ConstantInt>(CE->getOperand(0)))
+      Value *Src = CE->getOperand(0);
+
+      // Pattern B: look through zext/sext ConstantExpr.
+      if (auto *InnerCE = dyn_cast<ConstantExpr>(Src)) {
+        if (InnerCE->getOpcode() == Instruction::ZExt ||
+            InnerCE->getOpcode() == Instruction::SExt)
+          Src = InnerCE->getOperand(0);
+      }
+
+      if (auto *CI = dyn_cast<ConstantInt>(Src))
         return CI->getZExtValue();
       // Handle inttoptr(ptrtoint(V)) constant expression chain.
-      if (auto *InnerCE = dyn_cast<ConstantExpr>(CE->getOperand(0))) {
+      if (auto *InnerCE = dyn_cast<ConstantExpr>(Src)) {
         if (InnerCE->getOpcode() == Instruction::PtrToInt)
-          return extractKlassConstant(InnerCE->getOperand(0));
+          return extractKlassConstantImpl(InnerCE->getOperand(0), Depth + 1);
       }
     }
   }
   // Pattern 3: load from a constant global variable (recurse into initializer).
   if (auto *LI = dyn_cast<LoadInst>(V)) {
     if (auto *GV = dyn_cast<GlobalVariable>(
-            LI->getPointerOperand()->stripPointerCasts())) {
+            LI->getPointerOperand()->stripPointerCastsAndAliases())) {
       if (GV->isConstant() && GV->hasInitializer())
-        return extractKlassConstant(GV->getInitializer());
+        return extractKlassConstantImpl(GV->getInitializer(), Depth + 1);
     }
   }
   // Pattern 4: bare ConstantInt — only reachable via recursion from pattern 3
@@ -72,6 +113,10 @@ uintptr_t jeandle::extractKlassConstant(Value *V) {
     return CI->getZExtValue();
 
   return 0;
+}
+
+uintptr_t jeandle::extractKlassConstant(Value *V) {
+  return extractKlassConstantImpl(V, 0);
 }
 
 bool jeandle::areKlassesIncompatible(uintptr_t Klass, bool KlassExact,
@@ -400,6 +445,7 @@ namespace {
 ///   - And false-branch: OneOf (at least one false) — computeLCA + intersect.
 ///   - Or true-branch: OneOf (at least one true) — computeLCA + intersect.
 ///   - Or false-branch: AllOf (both operands false) — pickMostSpecific + union.
+///   - Xor i1 %a, true: logical NOT
 ///   - PHI/Select: OneOf (one arm selected) — computeLCA + intersect.
 ///   - ICmp inversion: swap True ↔ False fields.
 ///
@@ -454,7 +500,7 @@ static uintptr_t computeLCA(uintptr_t A, uintptr_t B) {
 /// not just single-predecessor chains.
 static bool isNullCheckPath(BasicBlock *IncomingBB, Value *Obj,
                             DominatorTree &DT) {
-  Obj = Obj->stripPointerCasts();
+  Obj = Obj->stripPointerCastsAndAliases();
   for (auto *Node = DT.getNode(IncomingBB); Node; Node = Node->getIDom()) {
     BasicBlock *BB = Node->getBlock();
 
@@ -473,7 +519,7 @@ static bool isNullCheckPath(BasicBlock *IncomingBB, Value *Obj,
       bool LHSNull = isa<ConstantPointerNull>(LHS);
       bool RHSNull = isa<ConstantPointerNull>(RHS);
       Value *Tested = LHSNull ? RHS : (RHSNull ? LHS : nullptr);
-      if (!Tested || Tested->stripPointerCasts() != Obj)
+      if (!Tested || Tested->stripPointerCastsAndAliases() != Obj)
         continue;
 
       // Determine which successor means "Obj is null".
@@ -497,7 +543,7 @@ static bool isNullCheckPath(BasicBlock *IncomingBB, Value *Obj,
     // --- SwitchInst: check `switch Obj [... case null: ...]` ---
     if (auto *SI = dyn_cast<SwitchInst>(BB->getTerminator())) {
       Value *Cond = SI->getCondition();
-      if (Cond->stripPointerCasts() != Obj)
+      if (Cond->stripPointerCastsAndAliases() != Obj)
         continue;
 
       // Find the null case.
@@ -527,7 +573,7 @@ static bool isNullCheckPath(BasicBlock *IncomingBB, Value *Obj,
 static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
                                           SmallPtrSetImpl<Value *> &Visited,
                                           DominatorTree &DT) {
-  QueryObj = QueryObj->stripPointerCasts();
+  QueryObj = QueryObj->stripPointerCastsAndAliases();
   // Avoid infinite recursion on cyclic value graphs.
   if (!Visited.insert(Cond).second)
     return {}; // Already visited — no match on this path.
@@ -537,7 +583,7 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
     uintptr_t Klass = 0;
     Value *Obj = nullptr;
     if (isCheckInstanceofCall(CI, Klass, Obj) &&
-        Obj->stripPointerCasts() == QueryObj) {
+        Obj->stripPointerCastsAndAliases() == QueryObj) {
       TraceResult R;
       R.TrueKlass = Klass;             // check passed → obj IS Klass
       R.FalseExclusions.insert(Klass); // check failed → obj IS NOT Klass
@@ -1053,7 +1099,7 @@ JavaType jeandle::getJavaType(Value *V, DominatorTree *DT,
   // Strip pointer casts at the API boundary so that downstream identity
   // comparisons (traceToCheckInstanceof, isNullCheckPath) work correctly
   // even when optimization passes introduce bitcast/addrspacecast wrappers.
-  V = V->stripPointerCasts();
+  V = V->stripPointerCastsAndAliases();
 
   SmallPtrSet<const PHINode *, 8> Visited;
   if (DT)
