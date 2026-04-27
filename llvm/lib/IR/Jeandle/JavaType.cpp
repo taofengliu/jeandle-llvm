@@ -228,6 +228,7 @@ JavaType jeandle::typeIntersect(JavaType A, JavaType B) {
 // Context-insensitive type query
 // =============================================================================
 
+// No exclusions during context-insensitive type query.
 static JavaType getBaseJavaType(Value *V,
                                 SmallPtrSetImpl<const PHINode *> &Visited) {
   // Argument: check param attributes.
