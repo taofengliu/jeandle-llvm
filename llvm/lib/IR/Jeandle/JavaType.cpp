@@ -134,13 +134,14 @@ static bool isCheckInstanceofFn(const Function *F) {
   return F && F->getName() == "jeandle.check_instanceof";
 }
 
-/// If CI is a call to jeandle.check_instanceof, return the super klass and obj.
-static bool isCheckInstanceofCall(const CallInst *CI, uintptr_t &Klass,
+/// If CB is a call/invoke to jeandle.check_instanceof, return the super klass
+/// and obj.
+static bool isCheckInstanceofCall(const CallBase *CB, uintptr_t &Klass,
                                   Value *&Obj) {
-  if (!isCheckInstanceofFn(CI->getCalledFunction()))
+  if (!isCheckInstanceofFn(CB->getCalledFunction()))
     return false;
-  Klass = extractKlassConstant(CI->getArgOperand(0));
-  Obj = CI->getArgOperand(1);
+  Klass = extractKlassConstant(CB->getArgOperand(0));
+  Obj = CB->getArgOperand(1);
   return Klass != 0;
 }
 
@@ -576,11 +577,11 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
   if (!Visited.insert(Cond).second)
     return {}; // Already visited — no match on this path.
 
-  // --- Base case: direct call to jeandle.check_instanceof(klass, obj) ---
-  if (auto *CI = dyn_cast<CallInst>(Cond)) {
+  // --- Base case: direct call/invoke to jeandle.check_instanceof(klass, obj) ---
+  if (auto *CB = dyn_cast<CallBase>(Cond)) {
     uintptr_t Klass = 0;
     Value *Obj = nullptr;
-    if (isCheckInstanceofCall(CI, Klass, Obj) &&
+    if (isCheckInstanceofCall(CB, Klass, Obj) &&
         Obj->stripPointerCastsAndAliases() == QueryObj) {
       TraceResult R;
       R.TrueKlass = Klass;             // check passed → obj IS Klass

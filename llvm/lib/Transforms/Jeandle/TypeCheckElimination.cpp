@@ -46,17 +46,17 @@ PreservedAnalyses TypeCheckElimination::run(Function &F,
 
   DominatorTree &DT = FAM.getResult<DominatorTreeAnalysis>(F);
 
-  // Collect all check_instanceof calls.
-  SmallVector<CallInst *, 16> Checks;
+  // Collect all check_instanceof calls/invokes.
+  SmallVector<CallBase *, 16> Checks;
   for (auto &I : instructions(F)) {
-    auto *CI = dyn_cast<CallInst>(&I);
-    if (CI && CI->getCalledFunction() == CheckFn)
-      Checks.push_back(CI);
+    auto *CheckCB = dyn_cast<CallBase>(&I);
+    if (CheckCB && CheckCB->getCalledFunction() == CheckFn)
+      Checks.push_back(CheckCB);
   }
 
   bool Changed = false;
-  for (CallInst *CI : Checks) {
-    uintptr_t SuperKlass = jeandle::extractKlassConstant(CI->getArgOperand(0));
+  for (CallBase *CheckCB : Checks) {
+    uintptr_t SuperKlass = jeandle::extractKlassConstant(CheckCB->getArgOperand(0));
     if (SuperKlass == 0)
       continue;
 
@@ -65,26 +65,26 @@ PreservedAnalyses TypeCheckElimination::run(Function &F,
     // check_instanceof helper's IR contract guarantees non-null.
     if (CB->IsObjectKlass(SuperKlass)) {
       LLVM_DEBUG(dbgs() << "TCE: instanceof Object, replacing with true: "
-                        << *CI << "\n");
-      CI->replaceAllUsesWith(ConstantInt::getTrue(CI->getType()));
-      CI->eraseFromParent();
+                        << *CheckCB << "\n");
+      CheckCB->replaceAllUsesWith(ConstantInt::getTrue(CheckCB->getType()));
+      CheckCB->eraseFromParent();
       Changed = true;
       continue;
     }
 
-    Value *Obj = CI->getArgOperand(1);
+    Value *Obj = CheckCB->getArgOperand(1);
     // TCE queries JavaType only at jeandle.check_instanceof call sites. The
     // helper's IR contract requires this oop operand to be non-null, so
     // check_instanceof-derived sharpening remains sound even though JavaType
     // itself does not model nullability.
-    jeandle::JavaType ObjType = jeandle::getJavaType(Obj, &DT, CI);
+    jeandle::JavaType ObjType = jeandle::getJavaType(Obj, &DT, CheckCB);
 
     // --- Fold to true: known subtype ---
     if (ObjType.isKnown() && CB->IsSubtype(ObjType.Klass, SuperKlass)) {
-      LLVM_DEBUG(dbgs() << "TCE: known subtype, replacing with true: " << *CI
+      LLVM_DEBUG(dbgs() << "TCE: known subtype, replacing with true: " << *CheckCB
                         << "\n");
-      CI->replaceAllUsesWith(ConstantInt::getTrue(CI->getType()));
-      CI->eraseFromParent();
+      CheckCB->replaceAllUsesWith(ConstantInt::getTrue(CheckCB->getType()));
+      CheckCB->eraseFromParent();
       Changed = true;
       continue;
     }
@@ -113,9 +113,9 @@ PreservedAnalyses TypeCheckElimination::run(Function &F,
     }
 
     if (FoldToFalse) {
-      LLVM_DEBUG(dbgs() << "TCE: replacing with false: " << *CI << "\n");
-      CI->replaceAllUsesWith(ConstantInt::getFalse(CI->getType()));
-      CI->eraseFromParent();
+      LLVM_DEBUG(dbgs() << "TCE: replacing with false: " << *CheckCB << "\n");
+      CheckCB->replaceAllUsesWith(ConstantInt::getFalse(CheckCB->getType()));
+      CheckCB->eraseFromParent();
       Changed = true;
     }
   }
