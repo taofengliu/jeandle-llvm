@@ -41,6 +41,16 @@ uintptr_t jeandle::extractKlassConstant(Value *V) {
   return 0;
 }
 
+bool jeandle::areKlassesIncompatible(uintptr_t Klass, bool KlassExact,
+                                     uintptr_t OtherKlass) {
+  const VMCallbacks *CB = getVMCallbacks();
+  assert(CB && CB->IsSubtype && CB->IsInterface && "VMCallbacks must be set");
+  if (CB->IsSubtype(Klass, OtherKlass) || CB->IsInterface(Klass))
+    return false;
+  return KlassExact ||
+         (!CB->IsSubtype(OtherKlass, Klass) && !CB->IsInterface(OtherKlass));
+}
+
 /// Return true if F is jeandle.check_instanceof.
 static bool isCheckInstanceofFn(const Function *F) {
   return F && F->getName() == "jeandle.check_instanceof";
@@ -162,9 +172,7 @@ JavaType jeandle::typeUnion(JavaType A, JavaType B) {
         // E is excluded on B's path (explicit). Check A's path:
         // either A explicitly excludes E, or A's class type makes E impossible.
         if (isExcludedBy(E, A.ExcludedKlasses) ||
-            (!CB->IsSubtype(A.Klass, E) && !CB->IsInterface(A.Klass) &&
-             (A.Exact ||
-              (!CB->IsSubtype(E, A.Klass) && !CB->IsInterface(E))))) {
+            areKlassesIncompatible(A.Klass, A.Exact, E)) {
           addExcludedKlass(Result.ExcludedKlasses, E);
         }
       }

@@ -80,19 +80,9 @@ PreservedAnalyses TypeCheckElimination::run(Function &F,
     bool FoldToFalse = false;
 
     if (ObjType.isKnown() &&
-        !CB->IsSubtype(ObjType.Klass, SuperKlass) &&
-        !CB->IsInterface(ObjType.Klass)) {
-      if (ObjType.Exact) {
-        // Exact type and not a subtype → definitely false.
-        LLVM_DEBUG(dbgs() << "TCE: exact type not subtype\n");
-        FoldToFalse = true;
-      } else if (!CB->IsSubtype(SuperKlass, ObjType.Klass) &&
-                 !CB->IsInterface(SuperKlass)) {
-        // Neither type is a subtype of the other, and both are classes.
-        // Java's single class inheritance → no object can be both.
-        LLVM_DEBUG(dbgs() << "TCE: incompatible class types\n");
-        FoldToFalse = true;
-      }
+        jeandle::areKlassesIncompatible(ObjType.Klass, ObjType.Exact, SuperKlass)) {
+      LLVM_DEBUG(dbgs() << "TCE: incompatible class types\n");
+      FoldToFalse = true;
     }
 
     // Check negative constraints: if SuperKlass is a subtype of any excluded

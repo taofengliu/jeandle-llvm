@@ -88,6 +88,12 @@ JavaType typeUnion(JavaType A, JavaType B);
 /// Narrows to the more specific positive type and unions ExcludedKlasses.
 JavaType typeIntersect(JavaType A, JavaType B);
 
+/// Returns true if Klass and OtherKlass are provably incompatible under
+/// Java's single-class inheritance. Requires VM callbacks to be registered.
+/// \p KlassExact indicates whether Klass is known to be an exact type.
+bool areKlassesIncompatible(uintptr_t Klass, bool KlassExact,
+                            uintptr_t OtherKlass);
+
 /// Extract a Klass pointer constant from a Value.
 /// Handles inttoptr of ConstantInt and ConstantExpr patterns.
 /// Returns 0 if the value does not encode a constant klass pointer.
