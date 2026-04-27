@@ -92,8 +92,8 @@ PreservedAnalyses TypeCheckElimination::run(Function &F,
     // --- Fold to false ---
     bool FoldToFalse = false;
 
-    if (ObjType.isKnown() &&
-        jeandle::areKlassesIncompatible(ObjType.Klass, ObjType.Exact, SuperKlass)) {
+    if (ObjType.isKnown() && jeandle::areKlassesIncompatible(
+                                 ObjType.Klass, ObjType.Exact, SuperKlass)) {
       LLVM_DEBUG(dbgs() << "TCE: incompatible class types\n");
       FoldToFalse = true;
     }

@@ -245,7 +245,8 @@ JavaType jeandle::typeUnion(JavaType A, JavaType B) {
     // Preserve exclusions from B that are also excluded by A's knowledge.
     if (!B.ExcludedKlasses.empty()) {
       const VMCallbacks *CB = getVMCallbacks();
-      assert(CB && CB->IsSubtype && CB->IsInterface && "VMCallbacks must be set");
+      assert(CB && CB->IsSubtype && CB->IsInterface &&
+             "VMCallbacks must be set");
       for (uintptr_t E : B.ExcludedKlasses) {
         // E is excluded on B's path (explicit). Check A's path:
         // either A explicitly excludes E, or A's class type makes E impossible.
