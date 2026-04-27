@@ -148,8 +148,29 @@ JavaType jeandle::typeUnion(JavaType A, JavaType B) {
           intersectExcludedKlasses(A.ExcludedKlasses, B.ExcludedKlasses);
     return Result;
   }
-  if (A.Klass == 0 || B.Klass == 0)
-    return {}; // One known, one unknown positive type → unknown.
+  if (A.Klass == 0 || B.Klass == 0) {
+    // One known Klass, one unknown. Ensure A has the known Klass.
+    if (A.Klass == 0)
+      std::swap(A, B);
+    // Drop positive type (value could come from the unknown side).
+    JavaType Result;
+    // Preserve exclusions from B that are also excluded by A's knowledge.
+    if (!B.ExcludedKlasses.empty()) {
+      const VMCallbacks *CB = getVMCallbacks();
+      assert(CB && CB->IsSubtype && CB->IsInterface && "VMCallbacks must be set");
+      for (uintptr_t E : B.ExcludedKlasses) {
+        // E is excluded on B's path (explicit). Check A's path:
+        // either A explicitly excludes E, or A's class type makes E impossible.
+        if (isExcludedBy(E, A.ExcludedKlasses) ||
+            (!CB->IsSubtype(A.Klass, E) && !CB->IsInterface(A.Klass) &&
+             (A.Exact ||
+              (!CB->IsSubtype(E, A.Klass) && !CB->IsInterface(E))))) {
+          addExcludedKlass(Result.ExcludedKlasses, E);
+        }
+      }
+    }
+    return Result;
+  }
   JavaType Result;
   if (A.Klass == B.Klass) {
     Result.Klass = A.Klass;
