@@ -396,6 +396,8 @@ namespace {
 /// Merge semantics are handled by each handler:
 ///   - And true-branch: AllOf (both operands true) — pickMostSpecific + union.
 ///   - And false-branch: OneOf (at least one false) — computeLCA + intersect.
+///   - Or true-branch: OneOf (at least one true) — computeLCA + intersect.
+///   - Or false-branch: AllOf (both operands false) — pickMostSpecific + union.
 ///   - PHI/Select: OneOf (one arm selected) — computeLCA + intersect.
 ///   - ICmp inversion: swap True ↔ False fields.
 ///
@@ -641,7 +643,45 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
       }
       return {};
     }
-    return {}; // Other binary ops (or, xor, ...) — not handled.
+    // --- Or i1 %a, %b --- (De Morgan dual of And)
+    // True-branch: at least one operand is true → OneOf (don't know which).
+    // False-branch: both operands are false → AllOf (both constraints hold).
+    if (BO->getOpcode() == Instruction::Or) {
+      TraceResult L =
+          traceToCheckInstanceof(BO->getOperand(0), QueryObj, Visited, DT);
+      TraceResult R =
+          traceToCheckInstanceof(BO->getOperand(1), QueryObj, Visited, DT);
+      if (L.matched() && R.matched()) {
+        TraceResult M;
+        // True-branch: at least one of L, R is true → OneOf.
+        M.TrueKlass = computeLCA(L.TrueKlass, R.TrueKlass);
+        M.TrueExclusions =
+            intersectExcludedKlasses(L.TrueExclusions, R.TrueExclusions);
+        // False-branch: both L and R are false → AllOf.
+        M.FalseKlass = pickMostSpecific(L.FalseKlass, R.FalseKlass);
+        M.FalseExclusions = L.FalseExclusions;
+        unionExcludedKlasses(M.FalseExclusions, R.FalseExclusions);
+        return M;
+      }
+      // Only one side matched. False-branch is sound (both must be false for
+      // Or to be false, so the matched operand is guaranteed false).
+      // True-branch is unsound: Or being true could be due to the
+      // unmatched operand, not the matched one.
+      if (L.matched()) {
+        TraceResult M;
+        M.FalseKlass = L.FalseKlass;
+        M.FalseExclusions = L.FalseExclusions;
+        return M;
+      }
+      if (R.matched()) {
+        TraceResult M;
+        M.FalseKlass = R.FalseKlass;
+        M.FalseExclusions = R.FalseExclusions;
+        return M;
+      }
+      return {};
+    }
+    return {}; // Other binary ops (xor, ...) — not handled.
   }
 
   // --- Select: the result is one of two values, we don't know which ---

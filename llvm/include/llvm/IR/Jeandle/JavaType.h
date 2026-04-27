@@ -73,6 +73,7 @@ struct JavaType {
 /// - Integer casts: zext, sext, trunc (but not bitcast, fpcast, etc.)
 /// - ICmp comparisons of a check_instanceof result against a constant
 /// - And (i1) of two traced conditions
+/// - Or (i1) of two traced conditions
 /// - Direct jeandle.check_instanceof calls
 /// Unrecognized patterns conservatively return unknown ({}).
 JavaType getJavaType(Value *V, DominatorTree *DT = nullptr,
