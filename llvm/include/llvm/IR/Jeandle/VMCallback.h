@@ -41,6 +41,10 @@ struct VMCallbacks {
   /// Returns true if the klass is an interface.
   using IsInterfaceFn = bool (*)(uintptr_t KlassPtr);
   IsInterfaceFn IsInterface = nullptr;
+
+  /// Returns true if the klass is java.lang.Object.
+  using IsObjectKlassFn = bool (*)(uintptr_t KlassPtr);
+  IsObjectKlassFn IsObjectKlass = nullptr;
 };
 
 /// Register VM callbacks. Must be called before running the optimization

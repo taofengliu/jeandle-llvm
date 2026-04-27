@@ -37,7 +37,8 @@ PreservedAnalyses TypeCheckElimination::run(Function &F,
     return PreservedAnalyses::all();
 
   const jeandle::VMCallbacks *CB = jeandle::getVMCallbacks();
-  assert(CB && CB->IsSubtype && CB->IsInterface && "VMCallbacks must be set");
+  assert(CB && CB->IsSubtype && CB->IsInterface && CB->IsObjectKlass &&
+         "VMCallbacks must be set");
 
   Function *CheckFn = M->getFunction("jeandle.check_instanceof");
   if (!CheckFn)
@@ -58,6 +59,18 @@ PreservedAnalyses TypeCheckElimination::run(Function &F,
     uintptr_t SuperKlass = jeandle::extractKlassConstant(CI->getArgOperand(0));
     if (SuperKlass == 0)
       continue;
+
+    // --- Fold to true: instanceof java.lang.Object ---
+    // Every non-null object is an instance of Object, and the
+    // check_instanceof helper's IR contract guarantees non-null.
+    if (CB->IsObjectKlass(SuperKlass)) {
+      LLVM_DEBUG(dbgs() << "TCE: instanceof Object, replacing with true: "
+                        << *CI << "\n");
+      CI->replaceAllUsesWith(ConstantInt::getTrue(CI->getType()));
+      CI->eraseFromParent();
+      Changed = true;
+      continue;
+    }
 
     Value *Obj = CI->getArgOperand(1);
     // TCE queries JavaType only at jeandle.check_instanceof call sites. The
