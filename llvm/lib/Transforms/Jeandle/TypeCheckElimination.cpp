@@ -64,7 +64,7 @@ PreservedAnalyses TypeCheckElimination::run(Function &F,
     // helper's IR contract requires this oop operand to be non-null, so
     // check_instanceof-derived sharpening remains sound even though JavaType
     // itself does not model nullability.
-    jeandle::JavaType ObjType = jeandle::getJavaType(Obj, DT, CI);
+    jeandle::JavaType ObjType = jeandle::getJavaType(Obj, &DT, CI);
 
     // --- Fold to true: known subtype ---
     if (ObjType.isKnown() && CB->IsSubtype(ObjType.Klass, SuperKlass)) {

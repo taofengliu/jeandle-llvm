@@ -75,7 +75,7 @@ struct JavaType {
 /// - And (i1) of two traced conditions
 /// - Direct jeandle.check_instanceof calls
 /// Unrecognized patterns conservatively return unknown ({}).
-JavaType getJavaType(Value *V, DominatorTree &DT,
+JavaType getJavaType(Value *V, DominatorTree *DT = nullptr,
                      Instruction *Context = nullptr);
 
 /// Compute the type union of two Java types. Used when the value could be
@@ -95,7 +95,10 @@ bool areKlassesIncompatible(uintptr_t Klass, bool KlassExact,
                             uintptr_t OtherKlass);
 
 /// Extract a Klass pointer constant from a Value.
-/// Handles inttoptr of ConstantInt and ConstantExpr patterns.
+/// Strips pointer casts first, then handles: inttoptr of ConstantInt
+/// (instruction and ConstantExpr forms), inttoptr(ptrtoint(V)) round-trip
+/// chains, load from a constant GlobalVariable (recurses into initializer),
+/// and bare ConstantInt (reachable via GlobalVariable recursion).
 /// Returns 0 if the value does not encode a constant klass pointer.
 uintptr_t extractKlassConstant(Value *V);
 

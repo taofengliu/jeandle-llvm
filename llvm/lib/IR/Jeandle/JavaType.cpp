@@ -12,6 +12,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Jeandle/Attributes.h"
 #include "llvm/IR/Jeandle/Metadata.h"
@@ -28,16 +29,48 @@ using namespace llvm::jeandle;
 // =============================================================================
 
 uintptr_t jeandle::extractKlassConstant(Value *V) {
+  // Strip pointer casts (bitcast, addrspacecast, zero-index GEP) to see
+  // through wrappers that optimization passes may introduce.
+  V = V->stripPointerCasts();
+
+  // Pattern 1: inttoptr instruction.
   if (auto *I2P = dyn_cast<IntToPtrInst>(V)) {
     if (auto *CI = dyn_cast<ConstantInt>(I2P->getOperand(0)))
       return CI->getZExtValue();
+    // Handle inttoptr(ptrtoint(V)) chains — strip the round-trip and recurse.
+    if (auto *P2I = dyn_cast<PtrToIntInst>(I2P->getOperand(0)))
+      return extractKlassConstant(P2I->getPointerOperand());
+    if (auto *CE = dyn_cast<ConstantExpr>(I2P->getOperand(0))) {
+      if (CE->getOpcode() == Instruction::PtrToInt)
+        return extractKlassConstant(CE->getOperand(0));
+    }
   }
+  // Pattern 2: inttoptr constant expression.
   if (auto *CE = dyn_cast<ConstantExpr>(V)) {
     if (CE->getOpcode() == Instruction::IntToPtr) {
       if (auto *CI = dyn_cast<ConstantInt>(CE->getOperand(0)))
         return CI->getZExtValue();
+      // Handle inttoptr(ptrtoint(V)) constant expression chain.
+      if (auto *InnerCE = dyn_cast<ConstantExpr>(CE->getOperand(0))) {
+        if (InnerCE->getOpcode() == Instruction::PtrToInt)
+          return extractKlassConstant(InnerCE->getOperand(0));
+      }
     }
   }
+  // Pattern 3: load from a constant global variable (recurse into initializer).
+  if (auto *LI = dyn_cast<LoadInst>(V)) {
+    if (auto *GV = dyn_cast<GlobalVariable>(
+            LI->getPointerOperand()->stripPointerCasts())) {
+      if (GV->isConstant() && GV->hasInitializer())
+        return extractKlassConstant(GV->getInitializer());
+    }
+  }
+  // Pattern 4: bare ConstantInt — only reachable via recursion from pattern 3
+  // (e.g., @klass = constant i64 12345). Cannot appear as a direct ptr argument
+  // to check_instanceof because LLVM enforces type safety.
+  if (auto *CI = dyn_cast<ConstantInt>(V))
+    return CI->getZExtValue();
+
   return 0;
 }
 
@@ -911,8 +944,10 @@ static JavaType getJavaTypeImpl(Value *V, DominatorTree &DT,
   return Base;
 }
 
-JavaType jeandle::getJavaType(Value *V, DominatorTree &DT,
+JavaType jeandle::getJavaType(Value *V, DominatorTree *DT,
                               Instruction *Context) {
   SmallPtrSet<const PHINode *, 8> Visited;
-  return getJavaTypeImpl(V, DT, Context, Visited);
+  if (DT)
+    return getJavaTypeImpl(V, *DT, Context, Visited);
+  return getBaseJavaType(V, Visited);
 }
