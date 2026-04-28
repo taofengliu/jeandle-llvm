@@ -56,7 +56,8 @@ PreservedAnalyses TypeCheckElimination::run(Function &F,
 
   bool Changed = false;
   for (CallBase *CheckCB : Checks) {
-    uintptr_t SuperKlass = jeandle::extractKlassConstant(CheckCB->getArgOperand(0));
+    uintptr_t SuperKlass =
+        jeandle::extractKlassConstant(CheckCB->getArgOperand(0));
     if (SuperKlass == 0)
       continue;
 
@@ -81,8 +82,8 @@ PreservedAnalyses TypeCheckElimination::run(Function &F,
 
     // --- Fold to true: known subtype ---
     if (ObjType.isKnown() && CB->IsSubtype(ObjType.Klass, SuperKlass)) {
-      LLVM_DEBUG(dbgs() << "TCE: known subtype, replacing with true: " << *CheckCB
-                        << "\n");
+      LLVM_DEBUG(dbgs() << "TCE: known subtype, replacing with true: "
+                        << *CheckCB << "\n");
       CheckCB->replaceAllUsesWith(ConstantInt::getTrue(CheckCB->getType()));
       CheckCB->eraseFromParent();
       Changed = true;

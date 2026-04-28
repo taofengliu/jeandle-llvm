@@ -577,7 +577,7 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
   if (!Visited.insert(Cond).second)
     return {}; // Already visited — no match on this path.
 
-  // --- Base case: direct call/invoke to jeandle.check_instanceof(klass, obj) ---
+  // --- Base case: direct call/invoke to jeandle.check_instanceof ---
   if (auto *CB = dyn_cast<CallBase>(Cond)) {
     uintptr_t Klass = 0;
     Value *Obj = nullptr;
