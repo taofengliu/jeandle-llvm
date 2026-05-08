@@ -26,6 +26,7 @@
 #include "llvm/Config/llvm-config.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DebugInfo.h"
+#include "llvm/IR/Jeandle/VMCallbackLog.h"
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/LLVMRemarkStreamer.h"
 #include "llvm/IR/LegacyPassManager.h"
@@ -293,6 +294,11 @@ static cl::list<std::string>
 
 static cl::opt<bool> RunJeandle("jeandle",
                                 cl::desc("Run Jeandle pass pipeline"));
+
+static cl::opt<std::string> JeandleVMCallbackLog(
+    "jeandle-vm-callback-log",
+    cl::desc("Load a VM callback log for Jeandle passes"),
+    cl::value_desc("filename"));
 
 //===----------------------------------------------------------------------===//
 // CodeGen-related helper functions.
@@ -732,6 +738,15 @@ optMain(int argc, char **argv,
       return 1;
     }
     std::string Pipeline = PassPipeline;
+
+    // Load VM callback log for Jeandle passes if specified.
+    if (!JeandleVMCallbackLog.empty()) {
+      if (Error Err = jeandle::loadAndRegisterVMCallbackLog(JeandleVMCallbackLog)) {
+        errs() << argv[0] << ": error loading VM callback log: "
+               << toString(std::move(Err)) << "\n";
+        return 1;
+      }
+    }
 
     if (OptLevelO0)
       Pipeline = "default<O0>";

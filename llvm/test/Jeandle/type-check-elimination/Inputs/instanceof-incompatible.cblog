@@ -1,0 +1,6 @@
+# Incompatible exact type: obj has exact klass 2 (String, final), checking instanceof Runnable (klass 3).
+# IsSubtype(2, 3) = false, IsInterface(2) = false, Exact=true => areKlassesIncompatible => fold to false.
+IsObjectKlass 3 = false
+IsSubtype 2 3 = false
+IsSubtype 2 3 = false
+IsInterface 2 = false

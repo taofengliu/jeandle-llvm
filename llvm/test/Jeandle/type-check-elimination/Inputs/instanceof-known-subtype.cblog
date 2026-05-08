@@ -1,0 +1,4 @@
+# Known subtype: obj has klass 5 (SubRunnable), checking instanceof MyRunnable (klass 4).
+# IsSubtype(5, 4) = true => fold to true.
+IsObjectKlass 4 = false
+IsSubtype 5 4 = true

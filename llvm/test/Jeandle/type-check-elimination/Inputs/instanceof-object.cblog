@@ -1,0 +1,2 @@
+# instanceof Object (klass 1) always folds to true.
+IsObjectKlass 1 = true
