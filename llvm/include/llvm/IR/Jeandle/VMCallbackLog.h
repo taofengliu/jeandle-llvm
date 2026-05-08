@@ -48,8 +48,7 @@ struct CallbackInfo {
   llvm::SmallVector<VMCallbackValueType, 4> ArgTypes;
   VMCallbackValueType ResType;
 
-  CallbackInfo(const char *N,
-               std::initializer_list<VMCallbackValueType> AT,
+  CallbackInfo(const char *N, std::initializer_list<VMCallbackValueType> AT,
                VMCallbackValueType RT)
       : Name(N), ArgTypes(AT), ResType(RT) {}
 };
@@ -63,12 +62,11 @@ struct CallbackInfo {
 // jeandleVMCallback.cpp and wire it in register_jeandle_vm_callbacks().
 //
 
-#define DEF_CALLBACK_KIND(Name, RetType, ResType, Params, Args, ArgTypes, NumArgs) \
+#define DEF_CALLBACK_KIND(Name, RetType, ResType, Params, Args, ArgTypes,      \
+                          NumArgs)                                             \
   CK_##Name,
 
-enum CallbackKind : unsigned {
-  ALL_JEANDLE_VM_CALLBACKS(DEF_CALLBACK_KIND)
-};
+enum CallbackKind : unsigned { ALL_JEANDLE_VM_CALLBACKS(DEF_CALLBACK_KIND) };
 
 #undef DEF_CALLBACK_KIND
 
@@ -109,9 +107,7 @@ public:
   Error dump(StringRef FilePath);
 
   /// Get the active recorder for the current thread (used by trampolines).
-  static VMCallbackLogRecorder *getActiveRecorder() {
-    return ActiveRecorder;
-  }
+  static VMCallbackLogRecorder *getActiveRecorder() { return ActiveRecorder; }
 
   /// Append a log entry (used by recording trampolines).
   void appendEntry(LogEntry Entry) { Entries.push_back(std::move(Entry)); }
@@ -125,7 +121,9 @@ private:
 // Encoding/decoding helpers for recording and replay trampolines
 // =============================================================================
 
-inline int64_t encodeVMCallbackValue(uintptr_t V) { return static_cast<int64_t>(V); }
+inline int64_t encodeVMCallbackValue(uintptr_t V) {
+  return static_cast<int64_t>(V);
+}
 inline int64_t encodeVMCallbackValue(int V) { return static_cast<int64_t>(V); }
 inline int64_t encodeVMCallbackValue(bool V) { return V ? 1 : 0; }
 
@@ -136,7 +134,9 @@ inline LogEntry makeLogEntry(unsigned Kind, int64_t Result, Ts... Args) {
 }
 
 template <typename T> inline T decodeVMCallbackValue(int64_t V);
-template <> inline bool decodeVMCallbackValue<bool>(int64_t V) { return V != 0; }
+template <> inline bool decodeVMCallbackValue<bool>(int64_t V) {
+  return V != 0;
+}
 template <> inline uintptr_t decodeVMCallbackValue<uintptr_t>(int64_t V) {
   return static_cast<uintptr_t>(V);
 }

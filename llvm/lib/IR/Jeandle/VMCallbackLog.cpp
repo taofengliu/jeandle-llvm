@@ -27,8 +27,10 @@ using namespace llvm::jeandle;
 
 #define JEANDLE_STRIP_PARENS(...) __VA_ARGS__
 
-#define DEF_CALLBACK_TABLE_ENTRY(Name, RetType, ResType, Params, Args, ArgTypes, NumArgs) \
-  T.push_back(CallbackInfo(#Name, {JEANDLE_STRIP_PARENS ArgTypes}, VMCallbackValueType::ResType));
+#define DEF_CALLBACK_TABLE_ENTRY(Name, RetType, ResType, Params, Args,         \
+                                 ArgTypes, NumArgs)                            \
+  T.push_back(CallbackInfo(#Name, {JEANDLE_STRIP_PARENS ArgTypes},             \
+                           VMCallbackValueType::ResType));
 
 static llvm::ArrayRef<CallbackInfo> getCallbackTable() {
   static const SmallVector<CallbackInfo, 6> Table = [] {
@@ -45,7 +47,8 @@ static llvm::ArrayRef<CallbackInfo> getCallbackTable() {
 // Thread-local active recorder
 // =============================================================================
 
-thread_local VMCallbackLogRecorder *VMCallbackLogRecorder::ActiveRecorder = nullptr;
+thread_local VMCallbackLogRecorder *VMCallbackLogRecorder::ActiveRecorder =
+    nullptr;
 
 // =============================================================================
 // VMCallbackLogRecorder - RAII per-compilation recorder
@@ -99,8 +102,7 @@ Error VMCallbackLogRecorder::dump(StringRef FilePath) {
   }
 
   if (OS.has_error())
-    return createStringError("error writing file '%s'",
-                             FilePath.str().c_str());
+    return createStringError("error writing file '%s'", FilePath.str().c_str());
   return Error::success();
 }
 
@@ -115,14 +117,13 @@ Error VMCallbackLogRecorder::dump(StringRef FilePath) {
 
 static VMCallbacks RealCallbacks;
 
-#define RECORD_CALLBACK(Name, RetType, Params, Args)                            \
-  static RetType record##Name Params {                                          \
-    RetType Result = RealCallbacks.Name(JEANDLE_STRIP_PARENS Args);             \
-    if (auto *R = VMCallbackLogRecorder::getActiveRecorder())                   \
-      R->appendEntry(                                                           \
-          makeLogEntry(CK_##Name, static_cast<int64_t>(Result),                 \
-                       JEANDLE_STRIP_PARENS Args));                             \
-    return Result;                                                              \
+#define RECORD_CALLBACK(Name, RetType, Params, Args)                           \
+  static RetType record##Name Params {                                         \
+    RetType Result = RealCallbacks.Name(JEANDLE_STRIP_PARENS Args);            \
+    if (auto *R = VMCallbackLogRecorder::getActiveRecorder())                  \
+      R->appendEntry(makeLogEntry(CK_##Name, static_cast<int64_t>(Result),     \
+                                  JEANDLE_STRIP_PARENS Args));                 \
+    return Result;                                                             \
   }
 
 #define DEF_RECORD_CB(Name, RetType, ResType, Params, Args, ArgTypes, NumArgs) \
@@ -147,7 +148,8 @@ void jeandle::enableVMCallbackRecording() {
   RealCallbacks = *Current;
 
   VMCallbacks RecordingCallbacks;
-#define DEF_RECORD_WIRING(Name, RetType, ResType, Params, Args, ArgTypes, NumArgs) \
+#define DEF_RECORD_WIRING(Name, RetType, ResType, Params, Args, ArgTypes,      \
+                          NumArgs)                                             \
   RecordingCallbacks.Name = &record##Name;
   ALL_JEANDLE_VM_CALLBACKS(DEF_RECORD_WIRING)
 #undef DEF_RECORD_WIRING
@@ -170,8 +172,7 @@ static std::unique_ptr<ReplayData> LogData;
 /// Try to consume the next log entry. Returns true if it matches the
 /// expected callback kind and args, and advances the cursor.
 /// On mismatch or exhaustion, prints a warning and returns false.
-static bool consumeEntry(unsigned ExpectedKind,
-                         ArrayRef<int64_t> ExpectedArgs,
+static bool consumeEntry(unsigned ExpectedKind, ArrayRef<int64_t> ExpectedArgs,
                          const char *CallbackName) {
   if (!LogData) {
     errs() << "Warning: VMCallbackLog replay not initialized at "
@@ -213,13 +214,13 @@ static bool consumeEntry(unsigned ExpectedKind,
 
 // REPLAY_CALLBACK(Name, RetType, (param-decls), (arg-names))
 // Same parenthesized-params pattern as RECORD_CALLBACK.
-#define REPLAY_CALLBACK(Name, RetType, Params, Args)                            \
-  static RetType replay##Name Params {                                          \
-    if (consumeEntry(CK_##Name, encodeArgs(JEANDLE_STRIP_PARENS Args), #Name))  \
-      return decodeVMCallbackValue<RetType>(                                    \
-          LogData->Entries[LogData->Cursor - 1].Result);                        \
-    return decodeVMCallbackValue<RetType>(                                      \
-        defaultResult(getCallbackTable()[CK_##Name].ResType));                  \
+#define REPLAY_CALLBACK(Name, RetType, Params, Args)                           \
+  static RetType replay##Name Params {                                         \
+    if (consumeEntry(CK_##Name, encodeArgs(JEANDLE_STRIP_PARENS Args), #Name)) \
+      return decodeVMCallbackValue<RetType>(                                   \
+          LogData->Entries[LogData->Cursor - 1].Result);                       \
+    return decodeVMCallbackValue<RetType>(                                     \
+        defaultResult(getCallbackTable()[CK_##Name].ResType));                 \
   }
 
 #define DEF_REPLAY_CB(Name, RetType, ResType, Params, Args, ArgTypes, NumArgs) \
@@ -236,18 +237,20 @@ ALL_JEANDLE_VM_CALLBACKS(DEF_REPLAY_CB)
 // Log file parser — descriptor-driven
 // =============================================================================
 
-/// Look up a callback kind by name. Returns getCallbackTable().size() if not found.
+/// Look up a callback kind by name. Returns getCallbackTable().size() if not
+/// found.
 static unsigned findCallbackKind(StringRef Name) {
   return StringSwitch<unsigned>(Name)
-#define DEF_FIND_CB(Name, RetType, ResType, Params, Args, ArgTypes, NumArgs) \
+#define DEF_FIND_CB(Name, RetType, ResType, Params, Args, ArgTypes, NumArgs)   \
   .Case(#Name, CK_##Name)
       ALL_JEANDLE_VM_CALLBACKS(DEF_FIND_CB)
 #undef DEF_FIND_CB
-      .Default(getCallbackTable().size());
+          .Default(getCallbackTable().size());
 }
 
 /// Parse a token according to its expected value type.
-static std::optional<int64_t> parseValue(StringRef Token, VMCallbackValueType VT) {
+static std::optional<int64_t> parseValue(StringRef Token,
+                                         VMCallbackValueType VT) {
   switch (VT) {
   case VMCallbackValueType::Bool: {
     if (Token == "true")
@@ -276,8 +279,7 @@ static std::optional<int64_t> parseValue(StringRef Token, VMCallbackValueType VT
   return std::nullopt;
 }
 
-static Error parseLogBuffer(StringRef Buffer,
-                            std::vector<LogEntry> &Entries) {
+static Error parseLogBuffer(StringRef Buffer, std::vector<LogEntry> &Entries) {
   SmallVector<StringRef, 0> Lines;
   Buffer.split(Lines, '\n');
 
@@ -293,13 +295,13 @@ static Error parseLogBuffer(StringRef Buffer,
     Line.split(Tokens, ' ', /*MaxSplit=*/-1, /*KeepEmpty=*/false);
 
     if (Tokens.size() < 3)
-      return createStringError("line %zu: too few tokens: '%s'",
-                               LineNum + 1, Line.str().c_str());
+      return createStringError("line %zu: too few tokens: '%s'", LineNum + 1,
+                               Line.str().c_str());
 
     unsigned Kind = findCallbackKind(Tokens[0]);
     if (Kind >= getCallbackTable().size())
-      return createStringError("line %zu: unknown callback: '%s'",
-                               LineNum + 1, Tokens[0].str().c_str());
+      return createStringError("line %zu: unknown callback: '%s'", LineNum + 1,
+                               Tokens[0].str().c_str());
 
     const auto &Info = getCallbackTable()[Kind];
 
@@ -320,8 +322,8 @@ static Error parseLogBuffer(StringRef Buffer,
     if (ParsedArgCount != Info.ArgTypes.size())
       return createStringError("line %zu: callback '%s' expects %zu "
                                "argument(s), got %u",
-                               LineNum + 1, Info.Name,
-                               Info.ArgTypes.size(), ParsedArgCount);
+                               LineNum + 1, Info.Name, Info.ArgTypes.size(),
+                               ParsedArgCount);
 
     // Parse arguments according to their declared types.
     SmallVector<int64_t, 4> Args;
@@ -339,11 +341,10 @@ static Error parseLogBuffer(StringRef Buffer,
     auto Result = parseValue(ResultStr, Info.ResType);
     if (!Result)
       return createStringError("line %zu: invalid result for '%s': '%s'",
-                               LineNum + 1, Info.Name,
-                               ResultStr.str().c_str());
+                               LineNum + 1, Info.Name, ResultStr.str().c_str());
 
-    Entries.push_back({Kind, SmallVector<int64_t, 4>(Args.begin(), Args.end()),
-                       *Result});
+    Entries.push_back(
+        {Kind, SmallVector<int64_t, 4>(Args.begin(), Args.end()), *Result});
   }
 
   return Error::success();
@@ -360,11 +361,13 @@ Error jeandle::loadAndRegisterVMCallbackLog(StringRef FilePath) {
                              FilePath.str().c_str(), EC.message().c_str());
 
   LogData = std::make_unique<ReplayData>();
-  if (Error Err = parseLogBuffer(BufferOrErr.get()->getBuffer(), LogData->Entries))
+  if (Error Err =
+          parseLogBuffer(BufferOrErr.get()->getBuffer(), LogData->Entries))
     return Err;
 
   VMCallbacks ReplayCallbacks;
-#define DEF_REPLAY_WIRING(Name, RetType, ResType, Params, Args, ArgTypes, NumArgs) \
+#define DEF_REPLAY_WIRING(Name, RetType, ResType, Params, Args, ArgTypes,      \
+                          NumArgs)                                             \
   ReplayCallbacks.Name = &replay##Name;
   ALL_JEANDLE_VM_CALLBACKS(DEF_REPLAY_WIRING)
 #undef DEF_REPLAY_WIRING

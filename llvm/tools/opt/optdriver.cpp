@@ -295,10 +295,10 @@ static cl::list<std::string>
 static cl::opt<bool> RunJeandle("jeandle",
                                 cl::desc("Run Jeandle pass pipeline"));
 
-static cl::opt<std::string> JeandleVMCallbackLog(
-    "jeandle-vm-callback-log",
-    cl::desc("Load a VM callback log for Jeandle passes"),
-    cl::value_desc("filename"));
+static cl::opt<std::string>
+    JeandleVMCallbackLog("jeandle-vm-callback-log",
+                         cl::desc("Load a VM callback log for Jeandle passes"),
+                         cl::value_desc("filename"));
 
 //===----------------------------------------------------------------------===//
 // CodeGen-related helper functions.
@@ -741,7 +741,8 @@ optMain(int argc, char **argv,
 
     // Load VM callback log for Jeandle passes if specified.
     if (!JeandleVMCallbackLog.empty()) {
-      if (Error Err = jeandle::loadAndRegisterVMCallbackLog(JeandleVMCallbackLog)) {
+      if (Error Err =
+              jeandle::loadAndRegisterVMCallbackLog(JeandleVMCallbackLog)) {
         errs() << argv[0] << ": error loading VM callback log: "
                << toString(std::move(Err)) << "\n";
         return 1;

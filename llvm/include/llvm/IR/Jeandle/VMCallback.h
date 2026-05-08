@@ -40,57 +40,30 @@ enum class VMCallbackValueType : uint8_t {
 //   Name     — callback name (struct field, CK_ prefix, stringification)
 //   RetType  — C++ return type (bool, uintptr_t)
 //   ResType  — VMCallbackValueType enum suffix (Bool, Uintptr, Int)
-//   Params   — parenthesized parameter declarations, e.g. (uintptr_t a1, uintptr_t a2)
-//   Args     — parenthesized argument names, e.g. (a1, a2)
-//   ArgTypes — parenthesized VMCallbackValueType enum values, e.g. (VMCallbackValueType::Uintptr, VMCallbackValueType::Uintptr)
-//   NumArgs  — number of arguments
+//   Params   — parenthesized parameter declarations, e.g. (uintptr_t a1,
+//   uintptr_t a2) Args     — parenthesized argument names, e.g. (a1, a2)
+//   ArgTypes — parenthesized VMCallbackValueType enum values, e.g.
+//   (VMCallbackValueType::Uintptr, VMCallbackValueType::Uintptr) NumArgs  —
+//   number of arguments
 //
 // To add a new callback, add one row below, then implement the JDK-side
-// function in jeandleVMCallback.cpp and wire it in register_jeandle_vm_callbacks().
+// function in jeandleVMCallback.cpp and wire it in
+// register_jeandle_vm_callbacks().
 //
-#define ALL_JEANDLE_VM_CALLBACKS(def)                                    \
-  def(IsSubtype,                                                        \
-      bool,                                                             \
-      Bool,                                                             \
-      (uintptr_t a1, uintptr_t a2),                                     \
-      (a1, a2),                                                         \
-      (VMCallbackValueType::Uintptr, VMCallbackValueType::Uintptr),       \
-      2)                                                                \
-  def(GetCommonSuperKlass,                                              \
-      uintptr_t,                                                        \
-      Uintptr,                                                          \
-      (uintptr_t a1, uintptr_t a2),                                     \
-      (a1, a2),                                                         \
-      (VMCallbackValueType::Uintptr, VMCallbackValueType::Uintptr),     \
-      2)                                                                \
-  def(GetFieldType,                                                     \
-      uintptr_t,                                                        \
-      Uintptr,                                                          \
-      (uintptr_t a1, int a2),                                           \
-      (a1, a2),                                                         \
-      (VMCallbackValueType::Uintptr, VMCallbackValueType::Int),         \
-      2)                                                                \
-  def(IsInterface,                                                      \
-      bool,                                                             \
-      Bool,                                                             \
-      (uintptr_t a1),                                                   \
-      (a1),                                                             \
-      (VMCallbackValueType::Uintptr),                                   \
-      1)                                                                \
-  def(IsObjectKlass,                                                    \
-      bool,                                                             \
-      Bool,                                                             \
-      (uintptr_t a1),                                                   \
-      (a1),                                                             \
-      (VMCallbackValueType::Uintptr),                                   \
-      1)                                                                \
-  def(IsEffectivelyFinal,                                               \
-      bool,                                                             \
-      Bool,                                                             \
-      (uintptr_t a1),                                                   \
-      (a1),                                                             \
-      (VMCallbackValueType::Uintptr),                                   \
-      1)
+#define ALL_JEANDLE_VM_CALLBACKS(def)                                          \
+  def(IsSubtype, bool, Bool, (uintptr_t a1, uintptr_t a2), (a1, a2),           \
+      (VMCallbackValueType::Uintptr, VMCallbackValueType::Uintptr),            \
+      2) def(GetCommonSuperKlass, uintptr_t, Uintptr,                          \
+             (uintptr_t a1, uintptr_t a2), (a1, a2),                           \
+             (VMCallbackValueType::Uintptr, VMCallbackValueType::Uintptr), 2)  \
+      def(GetFieldType, uintptr_t, Uintptr, (uintptr_t a1, int a2), (a1, a2),  \
+          (VMCallbackValueType::Uintptr, VMCallbackValueType::Int), 2)         \
+          def(IsInterface, bool, Bool, (uintptr_t a1), (a1),                   \
+              (VMCallbackValueType::Uintptr), 1)                               \
+              def(IsObjectKlass, bool, Bool, (uintptr_t a1), (a1),             \
+                  (VMCallbackValueType::Uintptr), 1)                           \
+                  def(IsEffectivelyFinal, bool, Bool, (uintptr_t a1), (a1),    \
+                      (VMCallbackValueType::Uintptr), 1)
 
 // =============================================================================
 // VMCallbacks struct — generated from master list
@@ -98,9 +71,11 @@ enum class VMCallbackValueType : uint8_t {
 
 /// Generate a typedef + struct field for each callback.
 /// Params retains its outer parentheses, which become the function-pointer
-/// parameter list: RetType (*) Params => e.g. bool (*)(uintptr_t a1, uintptr_t a2)
-#define DEF_VM_CALLBACK_FIELD(Name, RetType, ResType, Params, Args, ArgTypes, NumArgs) \
-  using Name##Fn = RetType (*) Params;                                                 \
+/// parameter list: RetType (*) Params => e.g. bool (*)(uintptr_t a1, uintptr_t
+/// a2)
+#define DEF_VM_CALLBACK_FIELD(Name, RetType, ResType, Params, Args, ArgTypes,  \
+                              NumArgs)                                         \
+  using Name##Fn = RetType(*) Params;                                          \
   Name##Fn Name = nullptr;
 
 /// All VM callbacks used by Jeandle LLVM passes.
@@ -110,7 +85,8 @@ enum class VMCallbackValueType : uint8_t {
 ///   GetCommonSuperKlass — Given two klass pointers, return their lowest common
 ///                         ancestor. Returns 0 if unknown.
 ///   GetFieldType        — Given a klass pointer and byte offset, return the
-///                         field's declared type klass pointer. Returns 0 if unknown.
+///                         field's declared type klass pointer. Returns 0 if
+///                         unknown.
 ///   IsInterface         — Returns true if the klass is an interface.
 ///   IsObjectKlass       — Returns true if the klass is java.lang.Object.
 ///   IsEffectivelyFinal  — Returns true if no subclass can exist at runtime.
@@ -130,4 +106,3 @@ const VMCallbacks *getVMCallbacks();
 } // namespace llvm::jeandle
 
 #endif // JEANDLE_VM_CALLBACK_H
-
