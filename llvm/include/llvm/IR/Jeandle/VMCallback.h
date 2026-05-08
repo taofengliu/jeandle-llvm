@@ -130,3 +130,4 @@ const VMCallbacks *getVMCallbacks();
 } // namespace llvm::jeandle
 
 #endif // JEANDLE_VM_CALLBACK_H
+
