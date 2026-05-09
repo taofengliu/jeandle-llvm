@@ -40,30 +40,35 @@ enum class VMCallbackValueType : uint8_t {
 //   Name     — callback name (struct field, CK_ prefix, stringification)
 //   RetType  — C++ return type (bool, uintptr_t)
 //   ResType  — VMCallbackValueType enum suffix (Bool, Uintptr, Int)
-//   Params   — parenthesized parameter declarations, e.g. (uintptr_t a1,
-//   uintptr_t a2) Args     — parenthesized argument names, e.g. (a1, a2)
+//   Params   — parenthesized parameter declarations, e.g. (uintptr_t a1, uintptr_t a2)
+//   Args     — parenthesized argument names, e.g. (a1, a2)
 //   ArgTypes — parenthesized VMCallbackValueType enum values, e.g.
-//   (VMCallbackValueType::Uintptr, VMCallbackValueType::Uintptr) NumArgs  —
-//   number of arguments
+//              (VMCallbackValueType::Uintptr, VMCallbackValueType::Uintptr)
+//   NumArgs  — number of arguments
 //
 // To add a new callback, add one row below, then implement the JDK-side
 // function in jeandleVMCallback.cpp and wire it in
 // register_jeandle_vm_callbacks().
 //
-#define ALL_JEANDLE_VM_CALLBACKS(def)                                          \
-  def(IsSubtype, bool, Bool, (uintptr_t a1, uintptr_t a2), (a1, a2),           \
-      (VMCallbackValueType::Uintptr, VMCallbackValueType::Uintptr),            \
-      2) def(GetCommonSuperKlass, uintptr_t, Uintptr,                          \
-             (uintptr_t a1, uintptr_t a2), (a1, a2),                           \
-             (VMCallbackValueType::Uintptr, VMCallbackValueType::Uintptr), 2)  \
-      def(GetFieldType, uintptr_t, Uintptr, (uintptr_t a1, int a2), (a1, a2),  \
-          (VMCallbackValueType::Uintptr, VMCallbackValueType::Int), 2)         \
-          def(IsInterface, bool, Bool, (uintptr_t a1), (a1),                   \
-              (VMCallbackValueType::Uintptr), 1)                               \
-              def(IsObjectKlass, bool, Bool, (uintptr_t a1), (a1),             \
-                  (VMCallbackValueType::Uintptr), 1)                           \
-                  def(IsEffectivelyFinal, bool, Bool, (uintptr_t a1), (a1),    \
-                      (VMCallbackValueType::Uintptr), 1)
+#define ALL_JEANDLE_VM_CALLBACKS(def)                                            \
+  def(IsSubtype, bool, Bool,                                                     \
+      (uintptr_t a1, uintptr_t a2), (a1, a2),                                    \
+      (VMCallbackValueType::Uintptr, VMCallbackValueType::Uintptr), 2)           \
+  def(GetCommonSuperKlass, uintptr_t, Uintptr,                                   \
+      (uintptr_t a1, uintptr_t a2), (a1, a2),                                    \
+      (VMCallbackValueType::Uintptr, VMCallbackValueType::Uintptr), 2)           \
+  def(GetFieldType, uintptr_t, Uintptr,                                          \
+      (uintptr_t a1, int a2), (a1, a2),                                          \
+      (VMCallbackValueType::Uintptr, VMCallbackValueType::Int), 2)               \
+  def(IsInterface, bool, Bool,                                                   \
+      (uintptr_t a1), (a1),                                                      \
+      (VMCallbackValueType::Uintptr), 1)                                         \
+  def(IsObjectKlass, bool, Bool,                                                 \
+      (uintptr_t a1), (a1),                                                      \
+      (VMCallbackValueType::Uintptr), 1)                                         \
+  def(IsEffectivelyFinal, bool, Bool,                                            \
+      (uintptr_t a1), (a1),                                                      \
+      (VMCallbackValueType::Uintptr), 1)
 
 // =============================================================================
 // VMCallbacks struct — generated from master list
