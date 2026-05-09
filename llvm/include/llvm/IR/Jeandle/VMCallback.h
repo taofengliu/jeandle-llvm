@@ -40,7 +40,8 @@ enum class VMCallbackValueType : uint8_t {
 //   Name     — callback name (struct field, CK_ prefix, stringification)
 //   RetType  — C++ return type (bool, uintptr_t)
 //   ResType  — VMCallbackValueType enum suffix (Bool, Uintptr, Int)
-//   Params   — parenthesized parameter declarations, e.g. (uintptr_t a1, uintptr_t a2)
+//   Params   — parenthesized parameter declarations,
+//              e.g. (uintptr_t a1, uintptr_t a2)
 //   Args     — parenthesized argument names, e.g. (a1, a2)
 //   ArgTypes — parenthesized VMCallbackValueType enum values, e.g.
 //              (VMCallbackValueType::Uintptr, VMCallbackValueType::Uintptr)
