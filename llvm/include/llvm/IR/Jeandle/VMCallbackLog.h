@@ -121,11 +121,16 @@ private:
 // Encoding/decoding helpers for recording and replay trampolines
 // =============================================================================
 
-inline int64_t encodeVMCallbackValue(uintptr_t V) {
+template <typename T> inline int64_t encodeVMCallbackValue(T V);
+template <> inline int64_t encodeVMCallbackValue<uintptr_t>(uintptr_t V) {
   return static_cast<int64_t>(V);
 }
-inline int64_t encodeVMCallbackValue(int V) { return static_cast<int64_t>(V); }
-inline int64_t encodeVMCallbackValue(bool V) { return V ? 1 : 0; }
+template <> inline int64_t encodeVMCallbackValue<int>(int V) {
+  return static_cast<int64_t>(V);
+}
+template <> inline int64_t encodeVMCallbackValue<bool>(bool V) {
+  return V ? 1 : 0;
+}
 
 /// Build a LogEntry from a callback kind, result, and variadic arguments.
 template <typename... Ts>
