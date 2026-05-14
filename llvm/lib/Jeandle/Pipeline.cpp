@@ -12,7 +12,9 @@
 #include "llvm/Transforms/Jeandle/ConstantFieldFolding.h"
 #include "llvm/Transforms/Jeandle/InsertGCBarriers.h"
 #include "llvm/Transforms/Jeandle/JavaOperationLower.h"
+#include "llvm/Transforms/Jeandle/JeandleGCNarrowOopAnnotation.h"
 #include "llvm/Transforms/Jeandle/JeandleInliner.h"
+#include "llvm/Transforms/Jeandle/NarrowOopOpt.h"
 #include "llvm/Transforms/Jeandle/RepeatedConstantFolding.h"
 #include "llvm/Transforms/Jeandle/TLSPointerRewrite.h"
 #include "llvm/Transforms/Jeandle/TypeCheckElimination.h"
@@ -66,6 +68,7 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   // instructions. But the uninlined barrier calls can still block useful 
   // optimizations.
   PM.addPass(createModuleToFunctionPassAdaptor(InsertGCBarriers()));
+  PM.addPass(createModuleToFunctionPassAdaptor(NarrowOopOpt()));
   PM.addPass(JavaOperationLower(1));
   PM.addPass(std::move(PB.buildPerModuleDefaultPipeline(level)));
   PM.addPass(RewriteStatepointsForGC());
@@ -86,6 +89,7 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   PM.addPass(JavaOperationLower(9));
   PM.addPass(createModuleToFunctionPassAdaptor(TLSPointerRewrite()));
   PM.addPass(createModuleToFunctionPassAdaptor(InstSimplifyPass()));
+  PM.addPass(createModuleToFunctionPassAdaptor(JeandleGCNarrowOopAnnotation()));
   return PM;
 }
 
