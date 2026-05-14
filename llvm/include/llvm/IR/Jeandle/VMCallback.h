@@ -47,6 +47,24 @@ enum class VMCallbackValueType : uint8_t {
 //              (VMCallbackValueType::Uintptr, VMCallbackValueType::Uintptr)
 //   NumArgs  — number of arguments
 //
+// -----------------------------------------------------------------------------
+// CRITICAL: Sequential Consistency Requirement
+//
+// The VMCallback Replay mechanism relies on a strict total ordering of callback
+// invocations. For a replay to be successful, the sequence of VM calls during
+// compilation must be identical to the sequence recorded in the log.
+//
+// Developers must ensure that any logic triggering VM callbacks follows a
+// deterministic execution path. Avoid issuing callbacks while iterating over
+// unordered containers (e.g., llvm::DenseMap or std::unordered_map).
+//
+// Correct Example:
+//   for (Instruction &I : instructions(F)) { triggerCallback(I); }
+//
+// Incorrect Example:
+//   for (auto &Entry : UnorderedMap) { triggerCallback(Entry.second); }
+// -----------------------------------------------------------------------------
+//
 // To add a new callback, add one row below, then implement the JDK-side
 // function in jeandleVMCallback.cpp and wire it in
 // register_jeandle_vm_callbacks().

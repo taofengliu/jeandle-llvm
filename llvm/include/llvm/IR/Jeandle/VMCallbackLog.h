@@ -149,18 +149,6 @@ template <> inline int decodeVMCallbackValue<int>(int64_t V) {
   return static_cast<int>(V);
 }
 
-/// Default result value for a given result type (used on replay mismatch).
-inline int64_t defaultResult(VMCallbackValueType VT) {
-  switch (VT) {
-  case VMCallbackValueType::Bool:
-    return 0; // false
-  case VMCallbackValueType::Uintptr:
-  case VMCallbackValueType::Int:
-    return 0;
-  }
-  return 0;
-}
-
 /// Encode variadic args into a vector for replay matching.
 template <typename... Ts>
 inline SmallVector<int64_t, 4> encodeArgs(Ts... Args) {

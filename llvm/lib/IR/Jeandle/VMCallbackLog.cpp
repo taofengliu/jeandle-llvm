@@ -169,58 +169,58 @@ struct ReplayData {
 
 static std::unique_ptr<ReplayData> LogData;
 
-/// Try to consume the next log entry. Returns true if it matches the
-/// expected callback kind and args, and advances the cursor.
-/// On mismatch or exhaustion, prints a warning and returns false.
-static bool consumeEntry(unsigned ExpectedKind, ArrayRef<int64_t> ExpectedArgs,
+/// Consume the next log entry. Terminates if the log is not initialized,
+/// exhausted, or the entry does not match the expected callback kind and args.
+/// On success, advances the cursor.
+static void consumeEntry(unsigned ExpectedKind, ArrayRef<int64_t> ExpectedArgs,
                          const char *CallbackName) {
   if (!LogData) {
-    errs() << "Warning: VMCallbackLog replay not initialized at "
-           << CallbackName << "\n";
-    return false;
+    report_fatal_error("VMCallbackLog replay not initialized at " +
+                       Twine(CallbackName));
   }
   if (LogData->Cursor >= LogData->Entries.size()) {
-    errs() << "Warning: VMCallbackLog exhausted at " << CallbackName << "(";
+    std::string Args;
+    raw_string_ostream OS(Args);
     for (size_t I = 0; I < ExpectedArgs.size(); ++I) {
       if (I > 0)
-        errs() << ", ";
-      errs() << ExpectedArgs[I];
+        OS << ", ";
+      OS << ExpectedArgs[I];
     }
-    errs() << ")\n";
-    return false;
+    report_fatal_error("VMCallbackLog exhausted at " + Twine(CallbackName) +
+                       "(" + Args + ")");
   }
   const auto &Entry = LogData->Entries[LogData->Cursor];
   if (Entry.Kind != ExpectedKind ||
       ArrayRef<int64_t>(Entry.Args) != ExpectedArgs) {
-    errs() << "Warning: VMCallbackLog mismatch at " << CallbackName << "(";
+    std::string Expected, Actual;
+    raw_string_ostream ExpOS(Expected);
+    raw_string_ostream ActOS(Actual);
     for (size_t I = 0; I < ExpectedArgs.size(); ++I) {
       if (I > 0)
-        errs() << ", ";
-      errs() << ExpectedArgs[I];
+        ExpOS << ", ";
+      ExpOS << ExpectedArgs[I];
     }
-    errs() << "): expected entry [" << LogData->Cursor << "] is "
-           << getCallbackTable()[Entry.Kind].Name << "(";
+    ActOS << getCallbackTable()[Entry.Kind].Name << "(";
     for (size_t I = 0; I < Entry.Args.size(); ++I) {
       if (I > 0)
-        errs() << ", ";
-      errs() << Entry.Args[I];
+        ActOS << ", ";
+      ActOS << Entry.Args[I];
     }
-    errs() << ")\n";
-    return false;
+    ActOS << ")";
+    report_fatal_error("VMCallbackLog mismatch at " + Twine(CallbackName) +
+                       "(" + Expected + "): expected entry [" +
+                       Twine(LogData->Cursor) + "] is " + Actual);
   }
   LogData->Cursor++;
-  return true;
 }
 
 // REPLAY_CALLBACK(Name, RetType, (param-decls), (arg-names))
 // Same parenthesized-params pattern as RECORD_CALLBACK.
 #define REPLAY_CALLBACK(Name, RetType, Params, Args)                           \
   static RetType replay##Name Params {                                         \
-    if (consumeEntry(CK_##Name, encodeArgs(JEANDLE_STRIP_PARENS Args), #Name)) \
-      return decodeVMCallbackValue<RetType>(                                   \
-          LogData->Entries[LogData->Cursor - 1].Result);                       \
+    consumeEntry(CK_##Name, encodeArgs(JEANDLE_STRIP_PARENS Args), #Name);     \
     return decodeVMCallbackValue<RetType>(                                     \
-        defaultResult(getCallbackTable()[CK_##Name].ResType));                 \
+        LogData->Entries[LogData->Cursor - 1].Result);                         \
   }
 
 #define DEF_REPLAY_CB(Name, RetType, ResType, Params, Args, ArgTypes, NumArgs) \
