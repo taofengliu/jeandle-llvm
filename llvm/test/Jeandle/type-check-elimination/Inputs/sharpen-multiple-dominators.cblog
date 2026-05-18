@@ -1,0 +1,20 @@
+# Multiple dominating checks combine. check1(6) passes, check2(7) passes.
+# check1 preserved:
+IsObjectKlass 6 = false
+# check2: sharpened to klass 6 (from entry true-branch). IsEffectivelyFinal(6)=false.
+IsObjectKlass 7 = false
+IsEffectivelyFinal 6 = false
+#   TCE fold-to-true: IsSubtype(6, 7)=false.
+IsSubtype 6 7 = false
+#   TCE areKlassesIncompatible(6, false, 7):
+IsSubtype 6 7 = false
+IsInterface 6 = false
+IsSubtype 7 6 = true
+# check2 preserved (Dog is subtype of Animal: not incompatible).
+# check3: sharpened from is_animal(TrueKlass=7) then entry(TrueKlass=6).
+IsObjectKlass 6 = false
+IsEffectivelyFinal 7 = true
+IsEffectivelyFinal 6 = false
+IsSubtype 6 7 = false
+#   ObjType = {Klass=7, Exact=true}. TCE: IsSubtype(7, 6)=true => fold to true.
+IsSubtype 7 6 = true

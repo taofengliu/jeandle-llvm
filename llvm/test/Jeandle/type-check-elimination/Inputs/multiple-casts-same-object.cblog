@@ -1,0 +1,15 @@
+# Sequential narrowing: Animal check passes, then Dog check.
+# check1 (is_animal, super=6): preserved (unknown obj).
+IsObjectKlass 6 = false
+# check2 (is_dog, super=7): preserved (sharpened to non-exact Animal).
+IsObjectKlass 7 = false
+# sharpenFromDominators: entry's true-edge dominates check_dog.
+#   traceToCheckInstanceof(is_animal, obj): match! TrueKlass=6.
+IsEffectivelyFinal 6 = false
+# ObjType = {6, non-exact}.
+# fold-to-true: IsSubtype(6, 7)?
+IsSubtype 6 7 = false
+# areKlassesIncompatible(6, false, 7):
+IsSubtype 6 7 = false
+IsInterface 6 = false
+IsSubtype 7 6 = true

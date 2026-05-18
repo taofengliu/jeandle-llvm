@@ -1,0 +1,21 @@
+# typeIntersect: param attr Animal(6) + dominating Dog(7) check → Dog(7, exact).
+# check1 (is_dog, super=7): preserved (Animal is non-exact, Dog subtype of Animal).
+IsObjectKlass 7 = false
+IsSubtype 6 7 = false
+# areKlassesIncompatible(6, false, 7):
+IsSubtype 6 7 = false
+IsInterface 6 = false
+IsSubtype 7 6 = true
+# check2 (check, super=8): fold false (exact Dog vs Cat).
+IsObjectKlass 8 = false
+# sharpenFromDominators: entry true-edge → TrueKlass=7.
+IsEffectivelyFinal 7 = true
+# typeIntersect({6,false}, {7,true}): both known.
+IsSubtype 6 7 = false
+IsSubtype 7 6 = true
+# Result = {7, true}. No exclusions.
+# fold-to-true: IsSubtype(7, 8)?
+IsSubtype 7 8 = false
+# areKlassesIncompatible(7, true, 8):
+IsSubtype 7 8 = false
+IsInterface 7 = false

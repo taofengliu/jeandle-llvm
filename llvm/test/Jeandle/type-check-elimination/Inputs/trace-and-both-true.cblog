@@ -1,0 +1,20 @@
+# And true-branch: both checks passed → pickMostSpecific(6, 7) = 7.
+# checkA (klass 6): preserved.
+IsObjectKlass 6 = false
+# checkB (klass 7): preserved.
+IsObjectKlass 7 = false
+# check3 (klass 6): And true-branch sharpens.
+IsObjectKlass 6 = false
+#   traceToCheckInstanceof(And):
+#   pickMostSpecific(6, 7):
+IsSubtype 6 7 = false
+IsSubtype 7 6 = true
+#   intersectExcludedKlasses({6}, {7}):
+#   isExcludedBy(6, {7}):
+IsSubtype 6 7 = false
+#   isExcludedBy(7, {6}):
+IsSubtype 7 6 = true
+#   sharpenFromDominators: Klass=7, IsEffectivelyFinal(7)=true.
+IsEffectivelyFinal 7 = true
+#   TCE: IsSubtype(7, 6)=true => fold to true.
+IsSubtype 7 6 = true

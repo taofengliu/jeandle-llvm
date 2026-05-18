@@ -1,0 +1,9 @@
+# Non-exact Animal (6) instanceof interface Serializable (9): preserved.
+IsObjectKlass 9 = false
+# fold-to-true:
+IsSubtype 6 9 = false
+# areKlassesIncompatible(6, false, 9):
+IsSubtype 6 9 = false
+IsInterface 6 = false
+IsSubtype 9 6 = false
+IsInterface 9 = true

@@ -1,0 +1,6 @@
+# select %cond, true, %check. False-branch: check was selected and is false.
+# check1 preserved:
+IsObjectKlass 6 = false
+# check2: false-branch of select gets exclusion {6}. IsSubtype(7,6)=true => fold.
+IsObjectKlass 7 = false
+IsSubtype 7 6 = true

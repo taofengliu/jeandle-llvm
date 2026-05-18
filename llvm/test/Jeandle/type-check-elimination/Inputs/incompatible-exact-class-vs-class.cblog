@@ -1,0 +1,7 @@
+# Exact Dog (7) vs Cat (8): exact type, not subtype → incompatible → false.
+IsObjectKlass 8 = false
+# fold-to-true: IsSubtype(7, 8)?
+IsSubtype 7 8 = false
+# areKlassesIncompatible(7, true, 8):
+IsSubtype 7 8 = false
+IsInterface 7 = false

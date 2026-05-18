@@ -1,0 +1,4 @@
+# Object type through freeze: klass=5, checking instanceof 4.
+# IsSubtype(5, 4) = true => fold to true.
+IsObjectKlass 4 = false
+IsSubtype 5 4 = true

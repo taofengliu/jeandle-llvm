@@ -1,0 +1,3 @@
+# Select type: true=klass 11, false=klass 12. Checking instanceof Object (klass 1).
+# IsObjectKlass(1) = true => fold to true immediately (Object check).
+IsObjectKlass 1 = true

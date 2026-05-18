@@ -1,0 +1,6 @@
+# Dominating false-branch exclusion.
+# check1 (klass 6): preserved.
+IsObjectKlass 6 = false
+# check2 (klass 7): exclusion from dominator {6}. IsSubtype(7, 6)=true => fold to false.
+IsObjectKlass 7 = false
+IsSubtype 7 6 = true

@@ -1,0 +1,2 @@
+# Deeply nested klass: 17 freezes exceeds MaxExtractKlassDepth=16.
+# extractKlassConstant returns 0 → pass skips this check. No VM callbacks.

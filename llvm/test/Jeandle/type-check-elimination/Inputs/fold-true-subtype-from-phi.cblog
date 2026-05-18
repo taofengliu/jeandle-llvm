@@ -1,0 +1,3 @@
+# PHI: incomings klass 11, 12. LCA=10. Checking instanceof Object (klass 1).
+# IsObjectKlass(1) = true => fold to true immediately.
+IsObjectKlass 1 = true

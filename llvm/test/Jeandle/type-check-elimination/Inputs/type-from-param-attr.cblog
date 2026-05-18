@@ -1,0 +1,4 @@
+# Object type from param attr "java-klass"="5".
+# obj klass=5 (SubRunnable), super=4 (MyRunnable). IsSubtype(5,4)=true => fold to true.
+IsObjectKlass 4 = false
+IsSubtype 5 4 = true

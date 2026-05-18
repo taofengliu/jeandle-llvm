@@ -1,0 +1,7 @@
+# And with partial match: only checkA traces. True-branch still uses checkA's type.
+# checkA preserved:
+IsObjectKlass 6 = false
+# check2: And true-branch, partial match → TrueKlass=6. IsSubtype(6,6)=true => fold.
+IsObjectKlass 6 = false
+IsEffectivelyFinal 6 = false
+IsSubtype 6 6 = true

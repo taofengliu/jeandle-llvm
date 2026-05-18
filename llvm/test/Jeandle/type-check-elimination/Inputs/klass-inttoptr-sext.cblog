@@ -1,0 +1,4 @@
+# SuperKlass encoded via inttoptr(sext i32 4 to i64).
+# obj klass=5, super=4. IsSubtype(5,4)=true => fold to true.
+IsObjectKlass 4 = false
+IsSubtype 5 4 = true

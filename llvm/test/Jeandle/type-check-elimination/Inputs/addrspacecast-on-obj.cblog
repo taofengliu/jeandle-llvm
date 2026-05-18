@@ -1,0 +1,4 @@
+# Object wrapped in freeze. stripPointerCastsAndAliases strips it.
+# Dog (7, exact) instanceof Animal (6) → fold true.
+IsObjectKlass 6 = false
+IsSubtype 7 6 = true

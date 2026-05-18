@@ -1,0 +1,28 @@
+# Cascading instanceof: if (x instanceof Dog) ... else if (x instanceof Cat) ...
+# Object type: Animal (6, non-exact) from param attr.
+# check1 (is_dog, super=7): preserved.
+IsObjectKlass 7 = false
+# getJavaType: param attr {6,false}. Entry is ContextBB, skip own branch.
+# fold-to-true:
+IsSubtype 6 7 = false
+# areKlassesIncompatible(6, false, 7):
+IsSubtype 6 7 = false
+IsInterface 6 = false
+IsSubtype 7 6 = true
+# check2 (is_cat, super=8): preserved.
+IsObjectKlass 8 = false
+# getJavaType: param attr {6,false}.
+# sharpenFromDominators: entry's false-edge dominates not_dog.
+#   traceToCheckInstanceof(is_dog, obj): direct match, FalseExclusions={7}.
+#   addExcludedKlass({}, 7): empty set → just insert.
+# normalizeExcludedKlasses: IsSubtype(7, 6) → keep.
+IsSubtype 7 6 = true
+# typeIntersect result: {6, false, excl={7}}.
+# fold-to-true: IsSubtype(6, 8)?
+IsSubtype 6 8 = false
+# areKlassesIncompatible(6, false, 8):
+IsSubtype 6 8 = false
+IsInterface 6 = false
+IsSubtype 8 6 = true
+# exclusion check: IsSubtype(8, 7)?
+IsSubtype 8 7 = false

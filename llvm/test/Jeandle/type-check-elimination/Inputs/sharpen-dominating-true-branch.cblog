@@ -1,0 +1,5 @@
+# Dominating true-branch sharpening.
+# check1 (klass 6): no base type, preserved.
+IsObjectKlass 6 = false
+# check2 (klass 1): IsObjectKlass(1)=true => fold to true immediately.
+IsObjectKlass 1 = true

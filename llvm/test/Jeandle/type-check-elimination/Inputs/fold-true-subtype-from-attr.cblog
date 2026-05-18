@@ -1,0 +1,3 @@
+# Type from attr: klass=11 (ArrayList), checking instanceof Object (klass 1).
+# IsObjectKlass(1) = true => fold to true immediately.
+IsObjectKlass 1 = true

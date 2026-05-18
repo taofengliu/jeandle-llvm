@@ -1,0 +1,6 @@
+# PHI type: incoming klass 11 (ArrayList) and klass 12 (LinkedList).
+# LCA = klass 10 (AbstractList). Checking instanceof 10.
+# GetCommonSuperKlass(11, 12) = 10, then IsSubtype(10, 10) = true.
+IsObjectKlass 10 = false
+GetCommonSuperKlass 11 12 = 10
+IsSubtype 10 10 = true

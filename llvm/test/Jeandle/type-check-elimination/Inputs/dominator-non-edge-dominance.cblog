@@ -1,0 +1,7 @@
+# Edge dominance test: neither edge dominates merge → no sharpening.
+# check1 (is_dog, super=7): preserved (unknown obj).
+IsObjectKlass 7 = false
+# check2 (check, super=6): preserved (neither edge dominates merge).
+IsObjectKlass 6 = false
+# sharpenFromDominators: entry's branch matches, but neither edge dominates merge.
+# No sharpening → ObjType unknown → preserved.

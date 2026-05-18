@@ -1,0 +1,8 @@
+# Branch via `icmp ne %check, 0`. True means check passed.
+# check1 preserved:
+IsObjectKlass 6 = false
+# check2: sharpened from dominating icmp ne branch. IsEffectivelyFinal(6)=false.
+#   Klass=6, IsSubtype(6, 6)=true => fold to true.
+IsObjectKlass 6 = false
+IsEffectivelyFinal 6 = false
+IsSubtype 6 6 = true

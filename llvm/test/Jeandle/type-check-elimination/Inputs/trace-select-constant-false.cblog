@@ -1,0 +1,7 @@
+# select %cond, %check, false. True-branch: check was selected and is true.
+# check1 preserved:
+IsObjectKlass 6 = false
+# check2: sharpened from select trace. Klass=6. IsSubtype(6,6)=true => fold.
+IsObjectKlass 6 = false
+IsEffectivelyFinal 6 = false
+IsSubtype 6 6 = true

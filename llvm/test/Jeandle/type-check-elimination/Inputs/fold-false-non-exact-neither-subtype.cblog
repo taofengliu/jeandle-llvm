@@ -1,0 +1,10 @@
+# Non-exact incompatible: obj klass=6 (Animal), checking instanceof klass 2 (String).
+# areKlassesIncompatible(6, false, 2):
+#   IsSubtype(6, 2)=false, IsInterface(6)=false,
+#   Exact=false => IsSubtype(2, 6)=false, IsInterface(2)=false => incompatible.
+IsObjectKlass 2 = false
+IsSubtype 6 2 = false
+IsSubtype 6 2 = false
+IsInterface 6 = false
+IsSubtype 2 6 = false
+IsInterface 2 = false

@@ -1,0 +1,2 @@
+# Array store check: non-constant klass from load → extractKlassConstant=0.
+# Pass skips this check entirely — no VM callbacks made.

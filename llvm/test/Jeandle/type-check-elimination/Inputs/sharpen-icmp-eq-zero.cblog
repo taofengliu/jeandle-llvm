@@ -1,0 +1,7 @@
+# Branch via `icmp eq %check, 0` (negated). False-branch = check passed.
+# check1 preserved:
+IsObjectKlass 6 = false
+# check2 on false-branch: sharpened to klass 6. IsSubtype(6, 6)=true => fold.
+IsObjectKlass 6 = false
+IsEffectivelyFinal 6 = false
+IsSubtype 6 6 = true

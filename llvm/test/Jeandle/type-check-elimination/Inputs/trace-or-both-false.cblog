@@ -1,0 +1,24 @@
+# Or false-branch: both failed → exclusions={6, 10}.
+# checkA (klass 6): preserved.
+IsObjectKlass 6 = false
+# checkB (klass 10): preserved.
+IsObjectKlass 10 = false
+# check3 (klass 7): Or false-branch gives exclusions.
+IsObjectKlass 7 = false
+#   traceToCheckInstanceof(Or):
+#   computeLCA(6, 10):
+GetCommonSuperKlass 6 10 = 1
+#   unionExcludedKlasses({6}, {10}) for FalseExclusions:
+#   addExcludedKlass({6}, 10):
+IsSubtype 10 6 = false
+IsSubtype 6 10 = false
+#   sharpenFromDominators: Exclusions from Or false-branch.
+#   addExcludedKlass(empty, first) then addExcludedKlass({first}, second):
+IsSubtype 10 6 = false
+IsSubtype 6 10 = false
+#   typeIntersect → unionExcludedKlasses({}, {6,10}):
+#   addExcludedKlass({6}, 10):
+IsSubtype 10 6 = false
+IsSubtype 6 10 = false
+#   TCE exclusion loop: IsSubtype(7, 6)=true => fold to false.
+IsSubtype 7 6 = true

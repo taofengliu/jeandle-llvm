@@ -1,0 +1,7 @@
+# Object klass is interface Runnable (3): cannot prove incompatible → preserved.
+IsObjectKlass 2 = false
+# fold-to-true:
+IsSubtype 3 2 = false
+# areKlassesIncompatible(3, false, 2):
+IsSubtype 3 2 = false
+IsInterface 3 = true

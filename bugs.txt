@@ -1,0 +1,155 @@
+TypeCheckElimination / JavaType Bugs and Issues
+================================================
+
+Found during comprehensive test writing for the TypeCheckElimination pass.
+
+## Bug 1: Crash when folding `invoke` to check_instanceof (CRITICAL)
+
+File: jeandle-llvm/llvm/lib/Transforms/Jeandle/TypeCheckElimination.cpp
+Test: jeandle-llvm/llvm/test/Jeandle/type-check-elimination/invoke-check-instanceof.ll
+
+The pass uses `CallBase` to detect check_instanceof calls, which correctly
+matches both `call` and `invoke` instructions. However, when folding an
+`invoke` (replacing with constant + eraseFromParent), the pass removes the
+block's terminator without replacing it, leaving the BasicBlock without a
+terminator. This causes an LLVM verifier crash:
+
+    "Basic Block in function 'test' does not have terminator!"
+
+When folding an `invoke`, the pass should:
+  1. Replace uses with the constant (true/false).
+  2. Insert an unconditional `br` to the normal destination.
+  3. Remove the landingpad from the unwind destination if it becomes dead.
+  4. Erase the invoke.
+
+Example pattern:
+```cpp
+if (auto *II = dyn_cast<InvokeInst>(CheckCB)) {
+  BranchInst::Create(II->getNormalDest(), II);
+  II->getUnwindDest()->removePredecessor(II->getParent());
+}
+CheckCB->eraseFromParent();
+```
+
+Severity: Critical (crash on valid IR that can occur in practice with
+exception handling contexts).
+
+
+## Bug 2: SmallDenseSet iteration order non-determinism (LATENT)
+
+Files: jeandle-llvm/llvm/lib/Transforms/Jeandle/TypeCheckElimination.cpp (line 106)
+       jeandle-llvm/llvm/lib/IR/Jeandle/JavaType.cpp (multiple locations)
+
+ExcludedKlasses is a `SmallDenseSet<uintptr_t, 2>`. Several code paths iterate
+over this set while making VM callbacks (IsSubtype queries):
+
+1. TypeCheckElimination.cpp line 106: TCE exclusion check loop
+   `for (uintptr_t Excluded : ObjType.ExcludedKlasses)`
+
+2. JavaType.cpp isExcludedBy(): iterates the set calling IsSubtype per element.
+
+3. JavaType.cpp addExcludedKlass(): iterates set to find entries to remove.
+
+4. JavaType.cpp intersectExcludedKlasses(): iterates both sets.
+
+5. JavaType.cpp unionExcludedKlasses(): iterates source set.
+
+6. JavaType.cpp normalizeExcludedKlasses(): iterates set.
+
+SmallDenseSet iteration order depends on hash bucket layout, which can differ
+between builds, platforms, or even runs with ASLR. Since VMCallback.h documents
+"sequential consistency" as a requirement, non-deterministic iteration order
+could cause callback log mismatches in replay mode.
+
+In production (live VM callbacks), this is not a correctness issue — the
+callbacks are idempotent and order-independent. But for testing via
+VMCallbackLog replay, the exact sequence must match.
+
+Current status: The hash function for uintptr_t is deterministic for given
+values (DenseMapInfo<uintptr_t>::getHashValue is identity), so for small sets
+with specific values the iteration order IS predictable. But this is an
+implementation detail of DenseMap, not a guarantee.
+
+Recommendation: Either (a) sort excluded klasses before iterating for
+VM callbacks, or (b) use SmallVector<uintptr_t> instead of SmallDenseSet
+(maintaining sorted order), or (c) document that .cblog tests must account
+for the actual DenseSet iteration order for the specific values used.
+
+
+## Bug 3: Redundant VM callbacks from typeIntersect (INEFFICIENCY)
+
+File: jeandle-llvm/llvm/lib/IR/Jeandle/JavaType.cpp
+
+When sharpenFromDominators builds up a `Best` JavaType with ExcludedKlasses
+via addExcludedKlass (line 1009), and then the caller does
+`typeIntersect(Base, Sharpened)`, typeIntersect unconditionally calls
+`unionExcludedKlasses(Result.ExcludedKlasses, B.ExcludedKlasses)` which
+repeats all the addExcludedKlass work including IsSubtype VM callbacks.
+
+This doubles the number of VM callbacks in scenarios where dominator sharpening
+provides exclusion information that then gets unioned with an empty set.
+
+For fold-false-exclusion-from-dominator.ll, this results in 10 VM callbacks
+where logically only 5-6 are needed.
+
+Impact: Performance (unnecessary VM round-trips). Not a correctness issue.
+
+Recommendation: Skip unionExcludedKlasses when one set is empty, or have
+typeIntersect take ownership of B's exclusions when A's are empty (move
+instead of union).
+
+
+## Bug 4: PHI cycle detection doesn't cover indirect cycles (LIMITATION)
+
+File: jeandle-llvm/llvm/lib/IR/Jeandle/JavaType.cpp, getPhiJavaType (line 1032)
+
+The PHI cycle detection only handles the case where an incoming value is a PHI
+that's already in the Visited set. If a PHI feeds into a non-PHI instruction
+(e.g., a call that returns its input, a select, etc.) which then feeds back
+to the PHI, the cycle isn't detected and getBaseJavaType returns Unknown
+for the non-PHI intermediate value.
+
+In practice this works out: the PHI returns Unknown for untyped incomings,
+which is safe (conservative). But it means loops with non-trivial back-edge
+expressions always produce Unknown type even when the loop-entry incoming
+has good type info.
+
+Impact: Missed optimization opportunity. Not unsound.
+
+Example:
+  %loop = phi [%entry_obj (typed), %back_edge_call (call returns %loop)]
+  → returns Unknown (because call has no java-klass attr)
+
+  %loop = phi [%entry_obj (typed), %loop (self-ref)]
+  → correctly returns entry_obj's type
+
+
+## Bug 5: No check for null incoming in PHI type computation (LATENT)
+
+File: jeandle-llvm/llvm/lib/IR/Jeandle/JavaType.cpp, getPhiJavaType
+
+If a PHI has a `null` (ConstantPointerNull) incoming — common from null-check
+paths — getBaseJavaType(null) returns Unknown (it's not an Argument, CallBase,
+Load, PHI, Select, BitCast, AddrSpaceCast, or Freeze). This causes the entire
+PHI to return Unknown.
+
+However, isNullCheckPath exists to detect and skip null-check incomings. This
+is used in the context-sensitive PHI path (getPhiJavaType), but getBaseJavaType
+(context-insensitive) doesn't have this logic.
+
+Impact: Not a bug per se (the code correctly uses isNullCheckPath in
+getPhiJavaType for the context-sensitive path), but worth noting that the
+context-insensitive getBaseJavaType for PHIs with null incomings always
+returns Unknown even when the non-null incoming has type info.
+
+isNullCheckPath IS used in traceToCheckInstanceof (for PHI conditions at
+line 875), but NOT in getPhiJavaType (type derivation, lines 1032-1066).
+This means PHI nodes from nullable Java references (very common pattern:
+`phi [%typed_obj, %non_null], [null, %null_path]`) always return Unknown
+from getPhiJavaType, preventing type-based folding for checks on such values.
+
+Severity: Missed optimization. In practice, check_instanceof's contract
+guarantees non-null input, so the obj passed to it is typically already
+from the non-null branch. But if a PHI that merges null/non-null paths
+is used as the obj operand (e.g., after JavaOperationLower but before
+dead code elimination), this limitation applies.

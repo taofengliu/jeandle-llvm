@@ -1,0 +1,12 @@
+# Object is Animal (klass 6, non-exact), super is Runnable (interface, klass 3).
+# Cannot prove incompatible because super is an interface.
+IsObjectKlass 3 = false
+# getJavaType: param attr gives Klass=6. No dominating checks.
+# fold-to-true: IsSubtype(6, 3)?
+IsSubtype 6 3 = false
+# fold-to-false: areKlassesIncompatible(6, false, 3):
+IsSubtype 6 3 = false
+IsInterface 6 = false
+# Not exact, so check other direction:
+IsSubtype 3 6 = false
+IsInterface 3 = true

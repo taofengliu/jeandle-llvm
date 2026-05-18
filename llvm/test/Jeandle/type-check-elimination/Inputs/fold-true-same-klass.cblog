@@ -1,0 +1,4 @@
+# Same klass: obj has klass 4, checking instanceof 4.
+# IsSubtype(4, 4) = true => fold to true.
+IsObjectKlass 4 = false
+IsSubtype 4 4 = true

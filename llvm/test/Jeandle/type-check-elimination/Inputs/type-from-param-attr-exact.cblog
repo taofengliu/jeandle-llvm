@@ -1,0 +1,6 @@
+# Exact type from param attr: klass=7 (Dog, final), checking instanceof klass 8 (Cat).
+# IsSubtype(7, 8) = false, IsInterface(7) = false, Exact=true => incompatible => fold to false.
+IsObjectKlass 8 = false
+IsSubtype 7 8 = false
+IsSubtype 7 8 = false
+IsInterface 7 = false

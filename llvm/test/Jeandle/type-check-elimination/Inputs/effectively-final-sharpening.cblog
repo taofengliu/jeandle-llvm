@@ -1,0 +1,17 @@
+# Effectively-final sharpening: Dog (7, final) check passes → exact type.
+# check1 (is_dog, super=7): preserved (no type info on obj).
+IsObjectKlass 7 = false
+# getJavaType: no attrs. sharpenFromDominators: entry's own branch skipped.
+# ObjType unknown → preserved.
+# check2 (is_cat, super=8): fold false (exact Dog vs Cat → incompatible).
+IsObjectKlass 8 = false
+# getJavaType: no attrs. sharpenFromDominators: entry dominates is_dog_true.
+#   traceToCheckInstanceof(is_dog, obj): match! TrueKlass=7.
+#   TrueEdge dominates is_dog_true. IsEffectivelyFinal(7)=true.
+IsEffectivelyFinal 7 = true
+# ObjType = {7, exact=true}.
+# fold-to-true: IsSubtype(7, 8)?
+IsSubtype 7 8 = false
+# areKlassesIncompatible(7, true, 8):
+IsSubtype 7 8 = false
+IsInterface 7 = false

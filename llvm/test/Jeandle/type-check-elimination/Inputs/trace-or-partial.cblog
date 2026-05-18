@@ -1,0 +1,6 @@
+# Or with partial match: only checkA traces. False-branch uses checkA's exclusion.
+# checkA preserved:
+IsObjectKlass 6 = false
+# check2: Or false-branch, partial match → FalseExclusions={6}. IsSubtype(7,6)=true => fold.
+IsObjectKlass 7 = false
+IsSubtype 7 6 = true

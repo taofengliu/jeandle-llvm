@@ -1,0 +1,8 @@
+# PHI with self-cycle. Non-cyclic incoming %obj has type Dog (7, exact).
+# check (super=6): Dog instanceof Animal → fold true.
+IsObjectKlass 6 = false
+# getJavaType: PHI cycle detected, uses %obj → {7, exact}.
+# sharpenFromDominators: entry has unconditional br, loop's own br skipped.
+# typeIntersect({7,true}, {}) → {7,true}. No extra callbacks.
+# TCE fold-to-true:
+IsSubtype 7 6 = true

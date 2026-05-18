@@ -1,0 +1,7 @@
+# xor i1 %check, true negates. True-branch of negated = check failed.
+# check1 preserved:
+IsObjectKlass 6 = false
+# check2: xor swaps True/False. True-branch of negated gets FalseExclusions={6}.
+#   IsSubtype(7, 6)=true => fold to false.
+IsObjectKlass 7 = false
+IsSubtype 7 6 = true

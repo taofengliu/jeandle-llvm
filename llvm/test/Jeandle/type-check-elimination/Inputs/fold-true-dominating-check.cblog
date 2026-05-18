@@ -1,0 +1,9 @@
+# Dominating check sharpens type. First check for klass 6 passes.
+# Second check (same klass 6) folds to true.
+# First check_instanceof(6, obj): IsObjectKlass(6)=false, no base type => preserved.
+# Second check_instanceof(6, obj): IsObjectKlass(6)=false, sharpened to klass 6.
+#   IsEffectivelyFinal(6)=false (Animal not final), IsSubtype(6, 6)=true => fold to true.
+IsObjectKlass 6 = false
+IsObjectKlass 6 = false
+IsEffectivelyFinal 6 = false
+IsSubtype 6 6 = true

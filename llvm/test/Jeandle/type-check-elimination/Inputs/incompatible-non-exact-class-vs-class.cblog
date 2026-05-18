@@ -1,0 +1,9 @@
+# Non-exact Animal (6) vs String (2): neither subtype, neither interface → incompatible.
+IsObjectKlass 2 = false
+# fold-to-true:
+IsSubtype 6 2 = false
+# areKlassesIncompatible(6, false, 2):
+IsSubtype 6 2 = false
+IsInterface 6 = false
+IsSubtype 2 6 = false
+IsInterface 2 = false

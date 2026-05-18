@@ -1,0 +1,8 @@
+# Exclusion-based fold: first check for Animal (6) fails => excluded.
+# Second check for Dog (7): IsSubtype(7, 6)=true => excluded => fold to false.
+# check1 (klass 6): IsObjectKlass(6)=false, no base type => preserved.
+IsObjectKlass 6 = false
+# check2 (klass 7): IsObjectKlass(7)=false, sharpenFromDominators finds exclusion {6}.
+# Then TCE checks: IsSubtype(SuperKlass=7, Excluded=6)=true => fold to false.
+IsObjectKlass 7 = false
+IsSubtype 7 6 = true

@@ -1,0 +1,4 @@
+# SuperKlass via ConstantExpr inttoptr (i64 4 to ptr).
+# obj klass=5, super=4. IsSubtype(5,4)=true => fold to true.
+IsObjectKlass 4 = false
+IsSubtype 5 4 = true

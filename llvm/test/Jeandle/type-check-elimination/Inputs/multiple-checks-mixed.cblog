@@ -1,0 +1,23 @@
+# Multiple checks in one function: some fold, some preserved.
+# Object type: Animal (klass 6, non-exact) from param attr.
+# check1 (super=1): instanceof Object → fold true.
+IsObjectKlass 1 = true
+# check2 (super=6): same klass → fold true.
+IsObjectKlass 6 = false
+IsSubtype 6 6 = true
+# check3 (super=2): incompatible → fold false.
+IsObjectKlass 2 = false
+IsSubtype 6 2 = false
+# areKlassesIncompatible(6, false, 2):
+IsSubtype 6 2 = false
+IsInterface 6 = false
+IsSubtype 2 6 = false
+IsInterface 2 = false
+# check4 (super=3): interface → preserved.
+IsObjectKlass 3 = false
+IsSubtype 6 3 = false
+# areKlassesIncompatible(6, false, 3):
+IsSubtype 6 3 = false
+IsInterface 6 = false
+IsSubtype 3 6 = false
+IsInterface 3 = true

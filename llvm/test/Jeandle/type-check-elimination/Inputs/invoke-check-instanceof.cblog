@@ -1,0 +1,3 @@
+# invoke check_instanceof: same as call. Dog (7, exact) instanceof Animal (6).
+IsObjectKlass 6 = false
+IsSubtype 7 6 = true

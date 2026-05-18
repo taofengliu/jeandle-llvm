@@ -1,0 +1,2 @@
+# No VM callbacks are made because extractKlassConstant returns 0.
+# The pass skips this check entirely.

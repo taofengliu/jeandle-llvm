@@ -1,0 +1,6 @@
+# Post-inlining instanceof pattern: null check then check_instanceof.
+# Object is Dog (7, exact) from param attr. Super is Animal (6).
+IsObjectKlass 6 = false
+# getJavaType: param attr → {7, exact}. Dominator (entry) has icmp null → no match.
+# TCE fold-to-true:
+IsSubtype 7 6 = true

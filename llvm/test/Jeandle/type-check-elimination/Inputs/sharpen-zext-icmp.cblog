@@ -1,0 +1,7 @@
+# zext i1 to i32 then icmp ne i32, 0 — common post-inlining pattern.
+# check1 preserved:
+IsObjectKlass 6 = false
+# check2 on true-branch: sharpened via zext+icmp trace. IsSubtype(6,6)=true => fold.
+IsObjectKlass 6 = false
+IsEffectivelyFinal 6 = false
+IsSubtype 6 6 = true
