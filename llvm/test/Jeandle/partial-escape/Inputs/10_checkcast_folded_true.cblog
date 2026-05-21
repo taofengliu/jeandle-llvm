@@ -1,0 +1,3 @@
+# Checkcast fold: virtual object has klass=5 (Subclass) and we check
+# against klass=4 (Superclass). IsSubtype(5,4)=true => fold to true.
+IsSubtype 5 4 = true

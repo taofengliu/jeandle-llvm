@@ -1,0 +1,9 @@
+# Checkcast fold-to-false: virtual object has exact klass=5 and we
+# check against an incompatible klass=99. IsSubtype(5,99)=false, IsInterface(5)
+# =false, and because the virtual's klass is exact, areKlassesIncompatible
+# returns true => fold to false.
+# Sequence (RPO): evalSubtypeRelation calls IsSubtype once, then
+# areKlassesIncompatible calls IsSubtype again, then IsInterface(SubKlass).
+IsSubtype 5 99 = false
+IsSubtype 5 99 = false
+IsInterface 5 = false

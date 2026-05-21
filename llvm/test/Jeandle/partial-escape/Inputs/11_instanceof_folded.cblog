@@ -1,0 +1,3 @@
+# Instanceof fold: virtual object has klass=5 and we test against
+# klass=4. IsSubtype(5,4)=true => fold to i32 1.
+IsSubtype 5 4 = true

@@ -11,6 +11,8 @@
 #include "llvm/Jeandle/Pipeline.h"
 #include "llvm/Transforms/Jeandle/InsertGCBarriers.h"
 #include "llvm/Transforms/Jeandle/JavaOperationLower.h"
+#include "llvm/Transforms/Jeandle/PartialEscapeAnalysis.h"
+#include "llvm/Transforms/Jeandle/PartialEscapeTransform.h"
 #include "llvm/Transforms/Jeandle/TLSPointerRewrite.h"
 #include "llvm/Transforms/Jeandle/TypeCheckElimination.h"
 #include "llvm/Transforms/Scalar/InstSimplifyPass.h"
@@ -37,6 +39,9 @@ Pipeline::Pipeline(OptimizationLevel level, LLVMContext &Ctx)
 ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
                                                  OptimizationLevel level) {
   ModulePassManager PM;
+  PM.addPass(createModuleToFunctionPassAdaptor(
+      RequireAnalysisPass<PartialEscapeAnalysis, Function>()));
+  PM.addPass(createModuleToFunctionPassAdaptor(PartialEscapeTransform()));
   PM.addPass(JavaOperationLower(0));
   PM.addPass(createModuleToFunctionPassAdaptor(InstSimplifyPass()));
   PM.addPass(createModuleToFunctionPassAdaptor(TypeCheckElimination()));
