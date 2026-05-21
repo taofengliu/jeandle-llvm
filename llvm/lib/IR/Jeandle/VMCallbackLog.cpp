@@ -1,6 +1,6 @@
 //===- VMCallbackLog.cpp - VM Callback Recording & Replay -----------------===//
 //
-// Copyright (c) 2025, the Jeandle-LLVM Authors. All Rights Reserved.
+// Copyright (c) 2026, the Jeandle-LLVM Authors. All Rights Reserved.
 //
 // Part of the Jeandle-LLVM project, under the Apache License v2.0 with LLVM
 // Exceptions. See https://llvm.org/LICENSE.txt for license information.
@@ -17,6 +17,8 @@
 
 #include <cstdlib>
 #include <memory>
+#include <tuple>
+#include <utility>
 
 using namespace llvm;
 using namespace llvm::jeandle;
@@ -62,6 +64,25 @@ VMCallbackLogRecorder::VMCallbackLogRecorder() {
 
 VMCallbackLogRecorder::~VMCallbackLogRecorder() { ActiveRecorder = nullptr; }
 
+void VMCallbackLogRecorder::recordIfNew(unsigned Kind, ArrayRef<int64_t> Args,
+                                        int64_t Result) {
+  CallbackKey Key{Kind, SmallVector<int64_t, 4>(Args.begin(), Args.end())};
+  auto [It, Inserted] = Entries.try_emplace(Key, Result);
+  if (!Inserted && It->second != Result) {
+    const auto &Info = getCallbackTable()[Kind];
+    std::string ArgStr;
+    raw_string_ostream OS(ArgStr);
+    for (size_t I = 0; I < Args.size(); ++I) {
+      if (I > 0)
+        OS << ", ";
+      OS << Args[I];
+    }
+    report_fatal_error("VMCallbackLog purity violation: " + Twine(Info.Name) +
+                       "(" + ArgStr + ") returned " + Twine(Result) +
+                       ", previously " + Twine(It->second));
+  }
+}
+
 Error VMCallbackLogRecorder::dump(StringRef FilePath) {
   std::error_code EC;
   raw_fd_ostream OS(FilePath, EC, sys::fs::OF_Text);
@@ -69,33 +90,43 @@ Error VMCallbackLogRecorder::dump(StringRef FilePath) {
     return createStringError(EC, "cannot open file '%s': %s",
                              FilePath.str().c_str(), EC.message().c_str());
 
-  for (const auto &Entry : Entries) {
-    const auto &Info = getCallbackTable()[Entry.Kind];
+  // Collect entries and sort by (Kind, Args) for deterministic output.
+  SmallVector<std::pair<CallbackKey, int64_t>, 16> SortedEntries;
+  for (const auto &KV : Entries)
+    SortedEntries.emplace_back(KV.getFirst(), KV.getSecond());
+  llvm::sort(SortedEntries,
+             [](const auto &A, const auto &B) {
+               return std::tie(A.first.Kind, A.first.Args) <
+                      std::tie(B.first.Kind, B.first.Args);
+             });
+
+  for (const auto &[Key, Result] : SortedEntries) {
+    const auto &Info = getCallbackTable()[Key.Kind];
     OS << Info.Name;
     for (unsigned I = 0; I < Info.ArgTypes.size(); ++I) {
       OS << " ";
       switch (Info.ArgTypes[I]) {
       case VMCallbackValueType::Uintptr:
-        OS << static_cast<uintptr_t>(Entry.Args[I]);
+        OS << static_cast<uintptr_t>(Key.Args[I]);
         break;
       case VMCallbackValueType::Int:
-        OS << static_cast<int>(Entry.Args[I]);
+        OS << static_cast<int>(Key.Args[I]);
         break;
       case VMCallbackValueType::Bool:
-        OS << (Entry.Args[I] ? "true" : "false");
+        OS << (Key.Args[I] ? "true" : "false");
         break;
       }
     }
     OS << " = ";
     switch (Info.ResType) {
     case VMCallbackValueType::Bool:
-      OS << (Entry.Result ? "true" : "false");
+      OS << (Result ? "true" : "false");
       break;
     case VMCallbackValueType::Uintptr:
-      OS << static_cast<uintptr_t>(Entry.Result);
+      OS << static_cast<uintptr_t>(Result);
       break;
     case VMCallbackValueType::Int:
-      OS << static_cast<int>(Entry.Result);
+      OS << static_cast<int>(Result);
       break;
     }
     OS << "\n";
@@ -121,8 +152,8 @@ static VMCallbacks RealCallbacks;
   static RetType record##Name Params {                                         \
     RetType Result = RealCallbacks.Name(JEANDLE_STRIP_PARENS Args);            \
     if (auto *R = VMCallbackLogRecorder::getActiveRecorder())                  \
-      R->appendEntry(makeLogEntry(CK_##Name, static_cast<int64_t>(Result),     \
-                                  JEANDLE_STRIP_PARENS Args));                 \
+      R->recordIfNew(CK_##Name, encodeArgs(JEANDLE_STRIP_PARENS Args),         \
+                     static_cast<int64_t>(Result));                            \
     return Result;                                                             \
   }
 
@@ -163,64 +194,43 @@ void jeandle::enableVMCallbackRecording() {
 namespace {
 
 struct ReplayData {
-  std::vector<LogEntry> Entries;
-  size_t Cursor = 0;
+  DenseMap<CallbackKey, int64_t, CallbackKeyDenseMapInfo> Entries;
 };
 
 static std::unique_ptr<ReplayData> LogData;
 
-/// Consume the next log entry. Terminates if the log is not initialized,
-/// exhausted, or the entry does not match the expected callback kind and args.
-/// On success, advances the cursor.
-static void consumeEntry(unsigned ExpectedKind, ArrayRef<int64_t> ExpectedArgs,
-                         const char *CallbackName) {
+/// Look up a callback result by (Kind, Args). Terminates if the log is
+/// not initialized or the key is not found.
+static int64_t lookupResult(unsigned Kind, ArrayRef<int64_t> Args,
+                            const char *CallbackName) {
   if (!LogData) {
     report_fatal_error("VMCallbackLog replay not initialized at " +
                        Twine(CallbackName));
   }
-  if (LogData->Cursor >= LogData->Entries.size()) {
-    std::string Args;
-    raw_string_ostream OS(Args);
-    for (size_t I = 0; I < ExpectedArgs.size(); ++I) {
+  CallbackKey Key{Kind, SmallVector<int64_t, 4>(Args.begin(), Args.end())};
+  auto It = LogData->Entries.find(Key);
+  if (It == LogData->Entries.end()) {
+    std::string ArgStr;
+    raw_string_ostream OS(ArgStr);
+    for (size_t I = 0; I < Args.size(); ++I) {
       if (I > 0)
         OS << ", ";
-      OS << ExpectedArgs[I];
+      OS << Args[I];
     }
-    report_fatal_error("VMCallbackLog exhausted at " + Twine(CallbackName) +
-                       "(" + Args + ")");
+    report_fatal_error("VMCallbackLog missing entry for " +
+                       Twine(CallbackName) + "(" + ArgStr + ")");
   }
-  const auto &Entry = LogData->Entries[LogData->Cursor];
-  if (Entry.Kind != ExpectedKind ||
-      ArrayRef<int64_t>(Entry.Args) != ExpectedArgs) {
-    std::string Expected, Actual;
-    raw_string_ostream ExpOS(Expected);
-    raw_string_ostream ActOS(Actual);
-    for (size_t I = 0; I < ExpectedArgs.size(); ++I) {
-      if (I > 0)
-        ExpOS << ", ";
-      ExpOS << ExpectedArgs[I];
-    }
-    ActOS << getCallbackTable()[Entry.Kind].Name << "(";
-    for (size_t I = 0; I < Entry.Args.size(); ++I) {
-      if (I > 0)
-        ActOS << ", ";
-      ActOS << Entry.Args[I];
-    }
-    ActOS << ")";
-    report_fatal_error("VMCallbackLog mismatch at " + Twine(CallbackName) +
-                       "(" + Expected + "): expected entry [" +
-                       Twine(LogData->Cursor) + "] is " + Actual);
-  }
-  LogData->Cursor++;
+  return It->second;
 }
 
 // REPLAY_CALLBACK(Name, RetType, (param-decls), (arg-names))
 // Same parenthesized-params pattern as RECORD_CALLBACK.
 #define REPLAY_CALLBACK(Name, RetType, Params, Args)                           \
   static RetType replay##Name Params {                                         \
-    consumeEntry(CK_##Name, encodeArgs(JEANDLE_STRIP_PARENS Args), #Name);     \
-    return decodeVMCallbackValue<RetType>(                                     \
-        LogData->Entries[LogData->Cursor - 1].Result);                         \
+    int64_t RawResult = lookupResult(CK_##Name,                                \
+                                     encodeArgs(JEANDLE_STRIP_PARENS Args),    \
+                                     #Name);                                   \
+    return decodeVMCallbackValue<RetType>(RawResult);                          \
   }
 
 #define DEF_REPLAY_CB(Name, RetType, ResType, Params, Args, ArgTypes, NumArgs) \
@@ -279,7 +289,9 @@ static std::optional<int64_t> parseValue(StringRef Token,
   return std::nullopt;
 }
 
-static Error parseLogBuffer(StringRef Buffer, std::vector<LogEntry> &Entries) {
+static Error
+parseLogBuffer(StringRef Buffer,
+               DenseMap<CallbackKey, int64_t, CallbackKeyDenseMapInfo> &Entries) {
   SmallVector<StringRef, 0> Lines;
   Buffer.split(Lines, '\n');
 
@@ -343,8 +355,15 @@ static Error parseLogBuffer(StringRef Buffer, std::vector<LogEntry> &Entries) {
       return createStringError("line %zu: invalid result for '%s': '%s'",
                                LineNum + 1, Info.Name, ResultStr.str().c_str());
 
-    Entries.push_back(
-        {Kind, SmallVector<int64_t, 4>(Args.begin(), Args.end()), *Result});
+    // Insert into map; error on conflicting duplicates.
+    CallbackKey Key{Kind, SmallVector<int64_t, 4>(Args.begin(), Args.end())};
+    auto [It, Inserted] = Entries.try_emplace(Key, *Result);
+    if (!Inserted && It->second != *Result) {
+      return createStringError(
+          "line %zu: conflicting result for '%s': previously %lld, now %lld",
+          LineNum + 1, Info.Name, static_cast<long long>(It->second),
+          static_cast<long long>(*Result));
+    }
   }
 
   return Error::success();
@@ -360,10 +379,12 @@ Error jeandle::loadAndRegisterVMCallbackLog(StringRef FilePath) {
     return createStringError(EC, "cannot open file '%s': %s",
                              FilePath.str().c_str(), EC.message().c_str());
 
-  LogData = std::make_unique<ReplayData>();
+  auto ParsedData = std::make_unique<ReplayData>();
   if (Error Err =
-          parseLogBuffer(BufferOrErr.get()->getBuffer(), LogData->Entries))
+          parseLogBuffer(BufferOrErr.get()->getBuffer(), ParsedData->Entries))
     return Err;
+
+  LogData = std::move(ParsedData);
 
   VMCallbacks ReplayCallbacks;
 #define DEF_REPLAY_WIRING(Name, RetType, ResType, Params, Args, ArgTypes,      \

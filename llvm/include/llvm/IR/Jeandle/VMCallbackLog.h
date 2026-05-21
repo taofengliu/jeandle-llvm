@@ -1,6 +1,6 @@
 //===- VMCallbackLog.h - VM Callback Recording & Replay -------------------===//
 //
-// Copyright (c) 2025, the Jeandle-LLVM Authors. All Rights Reserved.
+// Copyright (c) 2026, the Jeandle-LLVM Authors. All Rights Reserved.
 //
 // Part of the Jeandle-LLVM project, under the Apache License v2.0 with LLVM
 // Exceptions. See https://llvm.org/LICENSE.txt for license information.
@@ -14,18 +14,24 @@
 //
 // Replay mode (--jeandle-vm-callback-log=<file>):
 //   Loads a callback log file and registers replay callbacks that answer
-//   queries from the recorded data. Entries are consumed sequentially.
+//   queries from the recorded data. Lookups are by (CallbackKind, Args) key,
+//   so replay is order-independent and deduplicated.
 //
 // Record mode (JVM-side):
 //   enableVMCallbackRecording() installs recording trampolines over the
 //   real VM callbacks. Each compilation creates a VMCallbackLogRecorder
 //   (RAII) to scope the recording, and calls dump() to write the log.
+//   Duplicate (Kind, Args) -> Result mappings are deduplicated; a
+//   conflicting result for the same (Kind, Args) triggers a fatal error
+//   (purity violation).
 //
 //===----------------------------------------------------------------------===//
 
 #ifndef JEANDLE_VM_CALLBACK_LOG_H
 #define JEANDLE_VM_CALLBACK_LOG_H
 
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/Hashing.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Jeandle/VMCallback.h"
 #include "llvm/Support/Error.h"
@@ -33,7 +39,6 @@
 
 #include <cstdint>
 #include <initializer_list>
-#include <vector>
 
 namespace llvm::jeandle {
 
@@ -71,17 +76,37 @@ enum CallbackKind : unsigned { ALL_JEANDLE_VM_CALLBACKS(DEF_CALLBACK_KIND) };
 #undef DEF_CALLBACK_KIND
 
 // =============================================================================
-// Log entry
+// Callback key for map-based lookup
 // =============================================================================
 
-/// A single recorded VM callback invocation.
-/// Args and Result are stored as int64_t to uniformly handle all types
-/// (uintptr_t, int, bool). Use the CallbackKind and CallbackInfo to
-/// interpret the types correctly during serialization and parsing.
-struct LogEntry {
+/// Key for deduplicated map-based recording and replay of VM callbacks.
+/// Each unique (Kind, Args) pair maps to exactly one Result, since all VM
+/// callbacks are pure functions.
+struct CallbackKey {
   unsigned Kind; // CallbackKind enum value
   SmallVector<int64_t, 4> Args;
-  int64_t Result;
+
+  bool operator==(const CallbackKey &Other) const {
+    return Kind == Other.Kind && Args == Other.Args;
+  }
+};
+
+/// DenseMapInfo for CallbackKey, using sentinel Kind values that cannot
+/// collide with valid CallbackKind enum values.
+struct CallbackKeyDenseMapInfo {
+  static inline CallbackKey getEmptyKey() {
+    return {DenseMapInfo<unsigned>::getEmptyKey(), {}};
+  }
+  static inline CallbackKey getTombstoneKey() {
+    return {DenseMapInfo<unsigned>::getTombstoneKey(), {}};
+  }
+  static unsigned getHashValue(const CallbackKey &Key) {
+    return hash_combine(Key.Kind,
+                        hash_combine_range(Key.Args.begin(), Key.Args.end()));
+  }
+  static bool isEqual(const CallbackKey &LHS, const CallbackKey &RHS) {
+    return LHS == RHS;
+  }
 };
 
 // =============================================================================
@@ -102,18 +127,20 @@ public:
   VMCallbackLogRecorder &operator=(const VMCallbackLogRecorder &) = delete;
 
   /// Write the recorded callback log to a file.
-  /// Each invocation appears as a separate line in call order.
+  /// Entries are deduplicated and sorted by (Kind, Args) for determinism.
   /// Returns Error::success() on success, or an error on failure.
   Error dump(StringRef FilePath);
 
   /// Get the active recorder for the current thread (used by trampolines).
   static VMCallbackLogRecorder *getActiveRecorder() { return ActiveRecorder; }
 
-  /// Append a log entry (used by recording trampolines).
-  void appendEntry(LogEntry Entry) { Entries.push_back(std::move(Entry)); }
+  /// Record a callback invocation result. If the (Kind, Args) key already
+  /// exists with a different Result, report a fatal error (purity violation).
+  /// If the key already exists with the same Result, this is a no-op (dedup).
+  void recordIfNew(unsigned Kind, ArrayRef<int64_t> Args, int64_t Result);
 
 private:
-  std::vector<LogEntry> Entries;
+  DenseMap<CallbackKey, int64_t, CallbackKeyDenseMapInfo> Entries;
   static thread_local VMCallbackLogRecorder *ActiveRecorder;
 };
 
@@ -130,12 +157,6 @@ template <> inline int64_t encodeVMCallbackValue<int>(int V) {
 }
 template <> inline int64_t encodeVMCallbackValue<bool>(bool V) {
   return V ? 1 : 0;
-}
-
-/// Build a LogEntry from a callback kind, result, and variadic arguments.
-template <typename... Ts>
-inline LogEntry makeLogEntry(unsigned Kind, int64_t Result, Ts... Args) {
-  return {Kind, {encodeVMCallbackValue(Args)...}, Result};
 }
 
 template <typename T> inline T decodeVMCallbackValue(int64_t V);
@@ -160,7 +181,9 @@ inline SmallVector<int64_t, 4> encodeArgs(Ts... Args) {
 // =============================================================================
 
 /// Parse a VM callback log file and register replay callbacks.
-/// Entries are consumed sequentially during replay.
+/// Entries are looked up by (CallbackKind, Args) key during replay.
+/// Duplicate entries with the same key and result are silently accepted;
+/// conflicting duplicates (same key, different result) produce an error.
 /// Returns Error::success() on success, or an error on failure.
 Error loadAndRegisterVMCallbackLog(StringRef FilePath);
 
