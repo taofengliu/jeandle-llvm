@@ -94,11 +94,10 @@ Error VMCallbackLogRecorder::dump(StringRef FilePath) {
   SmallVector<std::pair<CallbackKey, int64_t>, 16> SortedEntries;
   for (const auto &KV : Entries)
     SortedEntries.emplace_back(KV.getFirst(), KV.getSecond());
-  llvm::sort(SortedEntries,
-             [](const auto &A, const auto &B) {
-               return std::tie(A.first.Kind, A.first.Args) <
-                      std::tie(B.first.Kind, B.first.Args);
-             });
+  llvm::sort(SortedEntries, [](const auto &A, const auto &B) {
+    return std::tie(A.first.Kind, A.first.Args) <
+           std::tie(B.first.Kind, B.first.Args);
+  });
 
   for (const auto &[Key, Result] : SortedEntries) {
     const auto &Info = getCallbackTable()[Key.Kind];
@@ -227,9 +226,8 @@ static int64_t lookupResult(unsigned Kind, ArrayRef<int64_t> Args,
 // Same parenthesized-params pattern as RECORD_CALLBACK.
 #define REPLAY_CALLBACK(Name, RetType, Params, Args)                           \
   static RetType replay##Name Params {                                         \
-    int64_t RawResult = lookupResult(CK_##Name,                                \
-                                     encodeArgs(JEANDLE_STRIP_PARENS Args),    \
-                                     #Name);                                   \
+    int64_t RawResult =                                                        \
+        lookupResult(CK_##Name, encodeArgs(JEANDLE_STRIP_PARENS Args), #Name); \
     return decodeVMCallbackValue<RetType>(RawResult);                          \
   }
 
@@ -289,9 +287,9 @@ static std::optional<int64_t> parseValue(StringRef Token,
   return std::nullopt;
 }
 
-static Error
-parseLogBuffer(StringRef Buffer,
-               DenseMap<CallbackKey, int64_t, CallbackKeyDenseMapInfo> &Entries) {
+static Error parseLogBuffer(
+    StringRef Buffer,
+    DenseMap<CallbackKey, int64_t, CallbackKeyDenseMapInfo> &Entries) {
   SmallVector<StringRef, 0> Lines;
   Buffer.split(Lines, '\n');
 
