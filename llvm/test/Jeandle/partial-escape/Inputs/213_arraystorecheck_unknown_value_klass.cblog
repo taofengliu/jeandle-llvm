@@ -1,0 +1,5 @@
+# B5: Object[] (8888) with element klass 4444; value is an opaque arg
+# with no klass info — ValueKlass=0, bail conservatively.
+RequiresStrictLockOrder = 1
+ElementBasicTypeOfArrayKlass 8888 = 8
+ArrayElementKlass 8888 = 4444

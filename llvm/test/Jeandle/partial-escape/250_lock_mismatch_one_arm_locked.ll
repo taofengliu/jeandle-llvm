@@ -1,0 +1,56 @@
+; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+
+; PEA-Plan §A4: lock-count mismatch cascade at merge.
+;
+; entry: alloc o (virtual). branch on %c.
+; then: monitorenter(o) — folded, LockCount[o]=1 at then exit.
+; else: nothing — LockCount[o]=0 at else exit.
+; merge: counts disagree → A4 fires.
+;
+; Expected outcome (mirrors Graal MergeProcessor.merge:981-1003):
+; each pred materializes the VO with its OWN lock list. The then-pred
+; materialize cascades through C8's un-elide so the original monitorenter
+; survives in IR with its first operand snapped to the then-pred's new
+; materialized invoke. The else-pred materialize has no live locks and
+; just emits a fresh allocation invoke. The original entry alloc is
+; eliminated; downstream uses of %o resolve through the per-pred MatConts.
+
+declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
+declare hotspotcc i1 @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
+declare i32 @__gxx_personality_v0(...)
+
+define void @test_lock_mismatch_one_arm_locked(i1 %c) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
+entry:
+  %lock = alloca i64, align 8
+  %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+            ptr inttoptr (i64 12345 to ptr), i32 16)
+       to label %branch unwind label %u
+branch:
+  br i1 %c, label %then, label %else
+then:
+  %en = call hotspotcc i1 @jeandle.monitorenter_with_thin_lock(
+              ptr addrspace(1) %o, ptr %lock)
+  br label %merge
+else:
+  br label %merge
+merge:
+  ret void
+u:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
+; CHECK-LABEL: define void @test_lock_mismatch_one_arm_locked
+; The original entry alloc is eliminated; A4 materializes a fresh
+; allocation invoke at each pred. The first one we see comes from one
+; pred; the un-elided monitorenter in that pred's MatCont references its
+; per-pred NewInv (with the SSA-correct receiver). The second invoke
+; comes from the other pred. We don't rely on a specific RPO ordering of
+; then/else — we only need to see (a) a materialized invoke, (b) a
+; surviving monitorenter on a per-pred NewInv, and (c) a second
+; materialized invoke for the other pred.
+; CHECK: %[[MAT1:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
+; CHECK: call hotspotcc i1 @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %[[MAT1]],
+; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
+
+!java-method-compilation = !{}

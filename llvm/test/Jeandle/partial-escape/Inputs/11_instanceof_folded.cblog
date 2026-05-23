@@ -1,0 +1,10 @@
+# Analyzer ctor consults RequiresStrictLockOrder() once per compilation.
+RequiresStrictLockOrder = 1
+# B10: tier1Allocate queries IsBoxed per Instance alloc. Klass 5 is not
+# an autobox wrapper, so the callback returns JBasicType::Count (9).
+HasFinalizer 5 = false
+CanVirtualize 5 = true
+IsBoxed 5 = 9
+# Instanceof fold: virtual object has klass=5 and we test against
+# klass=4. IsSubtype(5,4)=true => fold to i32 1.
+IsSubtype 5 4 = true

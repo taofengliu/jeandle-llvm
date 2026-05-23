@@ -1,0 +1,32 @@
+; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/213_arraystorecheck_unknown_value_klass.cblog %s | FileCheck %s
+
+; B5: virtual Object[] (array klass 8888, element klass 4444) where the
+; stored value comes from an opaque function argument with no
+; java-klass attribute — getJavaType returns unknown, ValueKlass=0.
+; foldArrayStoreCheck bails conservatively: mark the array ineligible so
+; the alloc and the surviving array_store_check both stay in IR.
+
+declare hotspotcc ptr addrspace(1) @jeandle.newarray(ptr, i32)
+declare hotspotcc i1 @jeandle.array_store_check(ptr addrspace(1), ptr addrspace(1))
+
+declare i32 @__gxx_personality_v0(...)
+
+define i1 @test_storecheck_unknown(ptr addrspace(1) %v) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
+entry:
+  %arr = invoke hotspotcc ptr addrspace(1) @jeandle.newarray(
+            ptr inttoptr (i64 8888 to ptr), i32 4)
+         to label %n unwind label %u
+n:
+  %r = call hotspotcc i1 @jeandle.array_store_check(ptr addrspace(1) %v,
+                                                    ptr addrspace(1) %arr)
+  ret i1 %r
+u:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
+; CHECK-LABEL: define i1 @test_storecheck_unknown
+; CHECK: jeandle.newarray
+; CHECK: jeandle.array_store_check
+
+!java-method-compilation = !{}

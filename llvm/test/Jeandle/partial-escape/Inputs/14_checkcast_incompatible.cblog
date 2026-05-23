@@ -1,0 +1,17 @@
+# Checkcast fold-to-false: virtual object has exact klass=5 and we
+# check against an incompatible klass=99. IsSubtype(5,99)=false, IsInterface(5)
+# =false, and because the virtual's klass is exact, areKlassesIncompatible
+# returns true => fold to false.
+# Analyzer ctor consults RequiresStrictLockOrder() once per compilation
+# (before any per-instruction queries).
+RequiresStrictLockOrder = 1
+# B10: tier1Allocate queries IsBoxed per Instance alloc. Klass 5 is not
+# an autobox wrapper, so the callback returns JBasicType::Count (9).
+HasFinalizer 5 = false
+CanVirtualize 5 = true
+IsBoxed 5 = 9
+# Sequence (RPO): evalSubtypeRelation calls IsSubtype once, then
+# areKlassesIncompatible calls IsSubtype again, then IsInterface(SubKlass).
+IsSubtype 5 99 = false
+IsSubtype 5 99 = false
+IsInterface 5 = false

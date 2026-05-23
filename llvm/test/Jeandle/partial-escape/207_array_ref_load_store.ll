@@ -1,0 +1,34 @@
+; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/207_array_ref_load_store.cblog %s | FileCheck %s
+
+; B3: Object[] virtual — typed-element GEPs at constant indices, storing /
+; reloading a reference. Element type is ptr addrspace(1); element scale
+; defaults to compressed-oop size (4 bytes), so element[1] sits at byte
+; offset 20 etc.
+
+declare hotspotcc ptr addrspace(1) @jeandle.newarray(ptr, i32)
+
+declare i32 @__gxx_personality_v0(...)
+
+define ptr addrspace(1) @test_obj_array(ptr addrspace(1) %v) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
+entry:
+  %arr = invoke hotspotcc ptr addrspace(1) @jeandle.newarray(
+            ptr inttoptr (i64 22222 to ptr), i32 4)
+         to label %n unwind label %u
+n:
+  %base = getelementptr inbounds i8, ptr addrspace(1) %arr, i32 16
+  %p2 = getelementptr inbounds ptr addrspace(1), ptr addrspace(1) %base, i64 2
+  store atomic ptr addrspace(1) %v, ptr addrspace(1) %p2 unordered, align 4
+  %r = load atomic ptr addrspace(1), ptr addrspace(1) %p2 unordered, align 4
+  ret ptr addrspace(1) %r
+u:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
+; CHECK-LABEL: define ptr addrspace(1) @test_obj_array
+; CHECK-NOT: jeandle.newarray
+; CHECK-NOT: store
+; CHECK-NOT: load
+; CHECK: ret ptr addrspace(1) %v
+
+!java-method-compilation = !{}

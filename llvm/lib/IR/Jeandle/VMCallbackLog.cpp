@@ -27,6 +27,17 @@ using namespace llvm::jeandle;
 
 #define JEANDLE_STRIP_PARENS(...) __VA_ARGS__
 
+// Emits ", a1, a2, ..." when the callback has arguments, expands to nothing
+// otherwise. The token-paste against the literal NumArgs (0, 1, 2, ...)
+// selects the per-arity macro below, sidestepping the trailing-comma
+// problem that bites zero-arg callbacks like RequiresStrictLockOrder.
+#define JEANDLE_ARGS_LCOMMA_0(Args)
+#define JEANDLE_ARGS_LCOMMA_1(Args) , JEANDLE_STRIP_PARENS Args
+#define JEANDLE_ARGS_LCOMMA_2(Args) , JEANDLE_STRIP_PARENS Args
+#define JEANDLE_ARGS_LCOMMA_3(Args) , JEANDLE_STRIP_PARENS Args
+#define JEANDLE_ARGS_LCOMMA_4(Args) , JEANDLE_STRIP_PARENS Args
+#define JEANDLE_ARGS_LCOMMA(N, Args) JEANDLE_ARGS_LCOMMA_##N(Args)
+
 #define DEF_CALLBACK_TABLE_ENTRY(Name, RetType, ResType, Params, Args,         \
                                  ArgTypes, NumArgs)                            \
   T.push_back(CallbackInfo(#Name, {JEANDLE_STRIP_PARENS ArgTypes},             \
@@ -117,17 +128,17 @@ Error VMCallbackLogRecorder::dump(StringRef FilePath) {
 
 static VMCallbacks RealCallbacks;
 
-#define RECORD_CALLBACK(Name, RetType, Params, Args)                           \
+#define RECORD_CALLBACK(Name, RetType, Params, Args, NumArgs)                  \
   static RetType record##Name Params {                                         \
     RetType Result = RealCallbacks.Name(JEANDLE_STRIP_PARENS Args);            \
     if (auto *R = VMCallbackLogRecorder::getActiveRecorder())                  \
-      R->appendEntry(makeLogEntry(CK_##Name, static_cast<int64_t>(Result),     \
-                                  JEANDLE_STRIP_PARENS Args));                 \
+      R->appendEntry(makeLogEntry(CK_##Name, static_cast<int64_t>(Result)      \
+                                  JEANDLE_ARGS_LCOMMA(NumArgs, Args)));        \
     return Result;                                                             \
   }
 
 #define DEF_RECORD_CB(Name, RetType, ResType, Params, Args, ArgTypes, NumArgs) \
-  RECORD_CALLBACK(Name, RetType, Params, Args)
+  RECORD_CALLBACK(Name, RetType, Params, Args, NumArgs)
 
 ALL_JEANDLE_VM_CALLBACKS(DEF_RECORD_CB)
 

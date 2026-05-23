@@ -1,0 +1,9 @@
+# R12.P4a: tier1Allocate queries HasFinalizer (and CanVirtualize) for
+# every Instance allocation BEFORE registering a VirtualObject. Klass
+# 6666 represents a class whose Klass->has_finalizer() is true (e.g.
+# any class that overrides finalize()). The callback returning true
+# causes tier1Allocate to refuse virtualization — the alloc survives
+# in IR untouched, no IsBoxed call follows. The Analyzer ctor still
+# consults RequiresStrictLockOrder once at startup.
+RequiresStrictLockOrder = 1
+HasFinalizer 6666 = true

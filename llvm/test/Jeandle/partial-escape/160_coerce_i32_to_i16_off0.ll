@@ -1,0 +1,36 @@
+; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+
+; PEA / B6: store i32 into a virtual's slot, load i16 at the same byte
+; offset (within-slot byte offset 0). Emit a plain `trunc i32 ... to i16`;
+; no `lshr` needed since the low half of the slot is requested.
+
+declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
+
+declare i32 @__gxx_personality_v0(...)
+
+define i16 @test_coerce_i32_to_i16_off0() gc "hotspotgc" personality ptr @__gxx_personality_v0 {
+entry:
+  %obj = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+            ptr inttoptr (i64 12345 to ptr), i32 16)
+         to label %normal unwind label %unwind
+
+normal:
+  %slot = getelementptr inbounds i8, ptr addrspace(1) %obj, i64 8
+  store atomic i32 305419896, ptr addrspace(1) %slot unordered, align 4
+  %v = load atomic i16, ptr addrspace(1) %slot unordered, align 2
+  ret i16 %v
+
+unwind:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
+; CHECK-LABEL: define i16 @test_coerce_i32_to_i16_off0()
+; CHECK-NOT: jeandle.new_instance
+; CHECK-NOT: store
+; CHECK-NOT: load
+; CHECK-NOT: lshr
+; CHECK: %[[T:.*]] = trunc i32 305419896 to i16
+; CHECK: ret i16 %[[T]]
+
+!java-method-compilation = !{}

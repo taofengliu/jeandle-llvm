@@ -1,0 +1,9 @@
+# B10 test 265 (negative): klass 1234 is NOT an autobox wrapper.
+# Two Instance allocs of 1234 — IsBoxed returns Count (9) each time.
+RequiresStrictLockOrder = 1
+HasFinalizer 1234 = false
+CanVirtualize 1234 = true
+IsBoxed 1234 = 9
+HasFinalizer 1234 = false
+CanVirtualize 1234 = true
+IsBoxed 1234 = 9

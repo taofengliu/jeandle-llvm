@@ -1,0 +1,14 @@
+# Analyzer ctor consults RequiresStrictLockOrder() once per compilation.
+# This test has no locks, so the answer doesn't affect the IR — but the
+# replay log must still account for the call.
+RequiresStrictLockOrder = 1
+# B10: tier1Allocate queries IsBoxed for each Instance allocation. Klass
+# 5 is not one of the eight java.lang autobox wrapper classes, so the
+# callback returns JBasicType::Count (9). The fold paths below stay on
+# the conservative non-boxed path.
+HasFinalizer 5 = false
+CanVirtualize 5 = true
+IsBoxed 5 = 9
+# Checkcast fold: virtual object has klass=5 (Subclass) and we check
+# against klass=4 (Superclass). IsSubtype(5,4)=true => fold to true.
+IsSubtype 5 4 = true
