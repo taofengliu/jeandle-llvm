@@ -16,8 +16,11 @@
 #include "llvm/Transforms/Jeandle/PartialEscapeTransform.h"
 #include "llvm/Transforms/Jeandle/TLSPointerRewrite.h"
 #include "llvm/Transforms/Jeandle/TypeCheckElimination.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Scalar/ADCE.h"
 #include "llvm/Transforms/Scalar/InstSimplifyPass.h"
 #include "llvm/Transforms/Scalar/RewriteStatepointsForGC.h"
+#include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/Transforms/Utils/LoopSimplify.h"
 
 namespace llvm::jeandle {
@@ -41,20 +44,31 @@ Pipeline::Pipeline(OptimizationLevel level, LLVMContext &Ctx)
 ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
                                                  OptimizationLevel level) {
   ModulePassManager PM;
-  // Canonicalise loops before PEA so processLoop sees a unique
-  // preheader/single-backedge for every natural loop. LoopSimplify cannot
-  // recover irreducible or indirectbr-entered loops; PEA defends against
-  // those cases in processLoop's no-preheader fallback.
+  // Pre-PEA cleanup. PEA's correctness depends on the CFG containing no
+  // statically-unreachable edges: a constant-condition branch's dead arm
+  // would otherwise feed merges and PHIs with no-op contributions and (for
+  // edges into blocks with side-effecting calls) cause spurious
+  // materialisations of virtuals on paths that never execute. We delegate
+  // this to upstream LLVM: SimplifyCFG folds constant-cond branches and
+  // deletes blocks unreachable from entry (via removeUnreachableBlocks);
+  // ADCE drops the now-dead instructions that fed the folded conditions;
+  // InstCombine exposes any further foldable conditions for the next
+  // iteration. LoopSimplify runs after SimplifyCFG so it restores the
+  // unique-preheader / single-backedge canonical form that SimplifyCFG
+  // may have dismantled — processLoop relies on it for every natural
+  // loop, and falls back gracefully for irreducible or indirectbr-entered
+  // loops that LoopSimplify cannot recover. This mirrors the
+  // inter-iteration canonicalisation that PartialEscapeIterative runs
+  // between rounds.
+  PM.addPass(createModuleToFunctionPassAdaptor(ADCEPass()));
+  PM.addPass(createModuleToFunctionPassAdaptor(SimplifyCFGPass()));
   PM.addPass(createModuleToFunctionPassAdaptor(LoopSimplifyPass()));
+  PM.addPass(createModuleToFunctionPassAdaptor(InstCombinePass()));
   // Outer fixpoint. PartialEscapeIterative wraps the
   // analyze+transform pair in a bounded loop with InstCombine/SimplifyCFG/
   // ADCE between rounds. The iteration cap is controlled by
   // `-jeandle-pea-iterations=N` (default 2, matching Graal's
-  // EscapeAnalysisIterations). LoopSimplify still runs only once at the
-  // entry — the inner SimplifyCFG can dismantle preheaders, but PEA itself
-  // is robust to losing them (processLoop's no-preheader fallback handles
-  // it), and LoopSimplify is expensive enough that we don't want it per
-  // iteration.
+  // EscapeAnalysisIterations).
   //
   // Pipeline position decision.
   //   Graal runs PEA at exactly ONE position in its hosted tier pipeline —

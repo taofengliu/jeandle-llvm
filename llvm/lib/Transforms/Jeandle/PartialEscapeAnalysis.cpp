@@ -610,20 +610,6 @@ private:
   // merges keep their current single-shot PHI behaviour.
   DenseSet<BasicBlock *> LoopHeaderSet;
 
-  // Per-edge "dead" set. Populated up-front in Analyzer::run by
-  // walking every terminator: a `br i1 const, T, F` arm whose constant
-  // condition disagrees with the arm marks (Pred, T) or (Pred, F) dead;
-  // a `switch %const, default [...]` with a constant condition marks
-  // every (Pred, Case) pair other than the live one dead. exitDataFor
-  // returns nullptr for a dead edge so the merge code drops the pred's
-  // contribution; processBlockPhis fills the PHI incoming from a dead
-  // pred with undef (the PHI is otherwise unreachable but must remain
-  // well-formed for the verifier). Mirrors Graal's SSA-level treatment
-  // of unreachable branch arms: the incoming side of a PHI from a dead
-  // branch contributes nothing to analysis.
-  DenseSet<std::pair<BasicBlock *, BasicBlock *>> DeadEdges;
-  void computeDeadEdges();
-
   // Per-VO record of LLVM pointer-PHIs that processBlockPhis
   // aliased via Case-B (every incoming agrees on the same ObjectID).
   // commit() consults this to schedule explicit PHI erasures for VOs
@@ -632,9 +618,6 @@ private:
   // in the IR.
   DenseMap<jeandle::ObjectID, SmallVector<llvm::PHINode *, 2>>
       CaseBPhiAliases;
-  bool isDeadEdge(BasicBlock *Pred, BasicBlock *Succ) const {
-    return DeadEdges.count({Pred, Succ}) != 0;
-  }
 
   // Monotonicity guard for per-loop fixpoint iterations. For the loop
   // currently being processed, this records every loop block that has had a
@@ -943,36 +926,9 @@ void Analyzer::processBlock(BasicBlock *BB) {
   // "no processed preds" case, which can happen e.g. on irreducible loop
   // headers where the back-edge pred hasn't been visited yet — we treat
   // those conservatively as starting empty).
-  // Skip statically-unreachable blocks entirely. A non-entry BB
-  // is unreachable for our purposes if every incoming edge is a dead
-  // edge from a constant-condition branch. Processing such a block would
-  // (a) try to materialize on a path that never executes (escape inside
-  // an unreachable arm), (b) emit Effects that the transform commits to
-  // IR, leaving stranded materializations the next canonicalisation
-  // round has to clean up. Skipping leaves the dead block untouched in
-  // IR; subsequent ADCE/SimplifyCFG iterations remove it. Mirrors Graal's
-  // EffectsClosure treatment of unreachable blocks (the closure is
-  // simply never invoked on a block whose schedule entry is absent).
-  if (BB != &F.getEntryBlock()) {
-    bool AllPredsDead = true;
-    bool HasPred = false;
-    for (BasicBlock *P : predecessors(BB)) {
-      HasPred = true;
-      if (!isDeadEdge(P, BB)) {
-        AllPredsDead = false;
-        break;
-      }
-    }
-    if (HasPred && AllPredsDead) {
-      // Block is unreachable at runtime; do not visit its instructions.
-      // resetPerBlockState is still called so any leftover per-block
-      // state from the previous block walk does not pollute downstream
-      // blocks that may inherit through us (none should, by definition,
-      // but be defensive).
-      resetPerBlockState();
-      return;
-    }
-  }
+  // Statically-unreachable blocks (constant-condition dead arms, blocks
+  // unreachable from entry) are pruned by the pre-PEA SimplifyCFG pass in
+  // buildJeandlePipeline, so we never see them here.
 
   resetPerBlockState();
   if (BB == &F.getEntryBlock()) {
@@ -1107,12 +1063,6 @@ void Analyzer::resetPerBlockState() {
 }
 
 BlockExitData *Analyzer::exitDataFor(BasicBlock *Pred, BasicBlock *Succ) {
-  // Statically-dead edge from a constant-condition branch — the
-  // pred contributes nothing to Succ for any merge / PHI / dataflow
-  // purpose. Returning nullptr matches the "killed unwind edge" treatment
-  // below (the merge consumer drops this pred entirely).
-  if (isDeadEdge(Pred, Succ))
-    return nullptr;
   auto It = BlockExits.find(Pred);
   if (It == BlockExits.end())
     return nullptr;
@@ -1130,49 +1080,6 @@ BlockExitData *Analyzer::exitDataFor(BasicBlock *Pred, BasicBlock *Succ) {
   }
   // Normal successor (or unwind successor with no state-split needed).
   return &Info;
-}
-
-void Analyzer::computeDeadEdges() {
-  for (BasicBlock &BB : F) {
-    Instruction *Term = BB.getTerminator();
-    if (!Term)
-      continue;
-    if (auto *BI = dyn_cast<BranchInst>(Term)) {
-      if (!BI->isConditional())
-        continue;
-      auto *Cond = dyn_cast<ConstantInt>(BI->getCondition());
-      if (!Cond)
-        continue;
-      // True => second successor (else) is dead. False => first (then).
-      BasicBlock *DeadSucc =
-          Cond->isOne() ? BI->getSuccessor(1) : BI->getSuccessor(0);
-      DeadEdges.insert({&BB, DeadSucc});
-      continue;
-    }
-    if (auto *SI = dyn_cast<SwitchInst>(Term)) {
-      auto *Cond = dyn_cast<ConstantInt>(SI->getCondition());
-      if (!Cond)
-        continue;
-      // Identify the unique live successor: matching case, or default.
-      BasicBlock *Live = SI->getDefaultDest();
-      for (auto Case : SI->cases()) {
-        if (Case.getCaseValue() == Cond) {
-          Live = Case.getCaseSuccessor();
-          break;
-        }
-      }
-      // Mark every other unique successor block as dead. We mark by
-      // (Pred, Succ) pair, so duplicates collapse to a single dead edge.
-      // Note: if Live appears multiple times in the switch (default ==
-      // some case), we conservatively keep it live for all such edges.
-      DenseSet<BasicBlock *> AllSuccs;
-      for (unsigned i = 0, e = SI->getNumSuccessors(); i != e; ++i)
-        AllSuccs.insert(SI->getSuccessor(i));
-      for (BasicBlock *S : AllSuccs)
-        if (S != Live)
-          DeadEdges.insert({&BB, S});
-    }
-  }
 }
 
 void Analyzer::inheritFromExit(const BlockExitData &Exit) {
@@ -2302,13 +2209,6 @@ void Analyzer::processBlockPhis(BasicBlock *BB) {
       BasicBlock *Pred = Phi.getIncomingBlock(I);
       Value *V = Phi.getIncomingValue(I);
       std::optional<jeandle::ObjectID> Found;
-      // A statically-dead edge contributes nothing. Treat its
-      // incoming slot as if the value were a non-virtual scalar — no
-      // virtual to track, no materialize to schedule on the dead pred.
-      if (isDeadEdge(Pred, BB)) {
-        InIDs.push_back(std::nullopt);
-        continue;
-      }
       auto AID = Aliases.getVirtualAlias(V);
       BlockExitData *PredED = exitDataFor(Pred, BB);
       if (AID && PredED && PredED->Virtuals.count(*AID))
@@ -7223,11 +7123,6 @@ jeandle::PEAResult Analyzer::run() {
   for (BasicBlock &BB : F)
     if (LI.isLoopHeader(&BB))
       LoopHeaderSet.insert(&BB);
-
-  // Pre-compute the set of statically-dead edges so successor
-  // merges (and PHI fan-in) can skip a pred whose terminator's constant
-  // condition selects a different arm.
-  computeDeadEdges();
 
   // Outer walk: RPO over F. When we hit any block belonging to a top-level
   // loop, dispatch to processLoop on that top-level loop (which recursively

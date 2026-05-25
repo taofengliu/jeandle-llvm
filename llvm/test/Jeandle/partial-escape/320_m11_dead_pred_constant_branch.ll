@@ -1,11 +1,13 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -S -passes="simplifycfg,require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; R8.M11: a constant-condition branch's dead arm contributes nothing to
-; downstream merges / PHI fan-in. Without dead-edge tracking, processing
-; the unreachable arm's sink call would materialize the virtual (because
-; sink is an opaque escape consumer), preventing alloc elimination. With
-; R8.M11, PEA skips the dead block entirely and the virtual stays
-; eliminable on the live path.
+; downstream merges / PHI fan-in. Without cleanup, processing the
+; unreachable arm's sink call would materialize the virtual (because sink
+; is an opaque escape consumer), preventing alloc elimination. The
+; pre-PEA SimplifyCFG pass in buildJeandlePipeline prunes the dead arm
+; before PEA sees the IR, so PEA processes only the live path and the
+; virtual stays eliminable. The same upstream cleanup is invoked here
+; from the RUN line.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -40,13 +42,13 @@ u:
 }
 
 ; The alloc and stores/loads on the live path are fully eliminated; the
-; sink call on the dead arm survives in IR (its receiver becomes poison
-; after EliminateAllocation RAUWs %o → poison) until a downstream pass
-; reaps the unreachable block.
+; sink call on the dead arm is gone too (pruned by SimplifyCFG before PEA
+; runs).
 ; CHECK-LABEL: define void @test_dead_pred_const
 ; CHECK-NOT: jeandle.new_instance
 ; CHECK-NOT: store atomic
 ; CHECK-NOT: load atomic
+; CHECK-NOT: call void @sink
 ; CHECK: call void @use(i32 7)
 
 !java-method-compilation = !{}
