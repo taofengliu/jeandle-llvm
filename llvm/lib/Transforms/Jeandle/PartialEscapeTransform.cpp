@@ -1,6 +1,10 @@
-//===-- PartialEscapeTransform.cpp - PEA (transform pass) -----------------===//
+//===- PartialEscapeTransform.cpp - PEA (transform pass) ------------------===//
 //
-// Part of the Jeandle JIT compiler.
+// Copyright (c) 2026, the Jeandle-LLVM Authors. All Rights Reserved.
+//
+// Part of the Jeandle-LLVM project, under the Apache License v2.0 with LLVM
+// Exceptions. See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // Consume the PEAResult produced by PartialEscapeAnalysis and apply effects
 // in two ordered passes.
@@ -56,11 +60,11 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Jeandle/Attributes.h"
 #include "llvm/IR/Jeandle/Metadata.h"
-#include "llvm/IR/Jeandle/PartialEscape.h"
+#include "llvm/Analysis/Jeandle/PartialEscape.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Transforms/Jeandle/PartialEscapeAnalysis.h"
+#include "llvm/Analysis/Jeandle/PartialEscapeAnalysis.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
 

@@ -268,7 +268,7 @@
 #include "llvm/Transforms/Instrumentation/TypeSanitizer.h"
 #include "llvm/Transforms/Jeandle/InsertGCBarriers.h"
 #include "llvm/Transforms/Jeandle/JavaOperationLower.h"
-#include "llvm/Transforms/Jeandle/PartialEscapeAnalysis.h"
+#include "llvm/Analysis/Jeandle/PartialEscapeAnalysis.h"
 #include "llvm/Transforms/Jeandle/PartialEscapeIterative.h"
 #include "llvm/Transforms/Jeandle/PartialEscapeTransform.h"
 #include "llvm/Transforms/Jeandle/TLSPointerRewrite.h"

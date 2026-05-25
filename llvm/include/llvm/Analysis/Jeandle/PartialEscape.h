@@ -1,16 +1,20 @@
-//===-- PartialEscape.h - PEA shared data structures -----------*- C++ -*-===//
+//===- PartialEscape.h - PEA shared data structures -------------*- C++ -*-===//
 //
-// Part of the Jeandle JIT compiler.
+// Copyright (c) 2026, the Jeandle-LLVM Authors. All Rights Reserved.
+//
+// Part of the Jeandle-LLVM project, under the Apache License v2.0 with LLVM
+// Exceptions. See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // Shared data structures used by both PartialEscapeAnalysis and
 // PartialEscapeTransform. Light header: forward-declares LLVM IR
 // classes and only includes ADT containers. Method bodies are in
-// llvm/lib/Transforms/Jeandle/PartialEscape.cpp.
+// llvm/lib/Analysis/Jeandle/PartialEscape.cpp.
 //
 //===----------------------------------------------------------------------===//
 
-#ifndef LLVM_IR_JEANDLE_PARTIALESCAPE_H
-#define LLVM_IR_JEANDLE_PARTIALESCAPE_H
+#ifndef LLVM_ANALYSIS_JEANDLE_PARTIALESCAPE_H
+#define LLVM_ANALYSIS_JEANDLE_PARTIALESCAPE_H
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
@@ -656,4 +660,4 @@ public:
 } // namespace jeandle
 } // namespace llvm
 
-#endif // LLVM_IR_JEANDLE_PARTIALESCAPE_H
+#endif // LLVM_ANALYSIS_JEANDLE_PARTIALESCAPE_H

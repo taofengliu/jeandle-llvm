@@ -1,13 +1,15 @@
-//===-- PartialEscape.cpp - PEA shared data structure impls --------------===//
+//===- PartialEscape.cpp - PEA shared data structure impls ----------------===//
 //
-// Part of the Jeandle JIT compiler.
+// Copyright (c) 2026, the Jeandle-LLVM Authors. All Rights Reserved.
+//
+// Part of the Jeandle-LLVM project, under the Apache License v2.0 with LLVM
+// Exceptions. See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // Implementation of non-trivial method bodies for the PEA data structures
-// declared in llvm/include/llvm/IR/Jeandle/PartialEscape.h.
-//
-//===----------------------------------------------------------------------===//
+// declared in llvm/include/llvm/Analysis/Jeandle/PartialEscape.h.
 
-#include "llvm/IR/Jeandle/PartialEscape.h"
+#include "llvm/Analysis/Jeandle/PartialEscape.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Analysis/LoopInfo.h"
@@ -28,7 +30,7 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Transforms/Jeandle/PartialEscapeUtils.h"
+#include "llvm/Analysis/Jeandle/PartialEscapeUtils.h"
 
 #include <algorithm>
 
