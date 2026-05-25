@@ -1,6 +1,6 @@
 //===- VMCallback.h - VM Callback Interface -------------------------------===//
 //
-// Copyright (c) 2025, the Jeandle-LLVM Authors. All Rights Reserved.
+// Copyright (c) 2026, the Jeandle-LLVM Authors. All Rights Reserved.
 //
 // Part of the Jeandle-LLVM project, under the Apache License v2.0 with LLVM
 // Exceptions. See https://llvm.org/LICENSE.txt for license information.
@@ -48,21 +48,60 @@ enum class VMCallbackValueType : uint8_t {
 //   NumArgs  — number of arguments
 //
 // -----------------------------------------------------------------------------
-// CRITICAL: Sequential Consistency Requirement
+// Map-Based Replay and Purity Assumption
 //
-// The VMCallback Replay mechanism relies on a strict total ordering of callback
-// invocations. For a replay to be successful, the sequence of VM calls during
-// compilation must be identical to the sequence recorded in the log.
+// The VMCallback replay mechanism uses a map from (CallbackKind, Args) to
+// Result. Replay is order-independent: a callback during replay finds its
+// result by key lookup, not by sequential cursor advancement.
 //
-// Developers must ensure that any logic triggering VM callbacks follows a
-// deterministic execution path. Avoid issuing callbacks while iterating over
-// unordered containers (e.g., llvm::DenseMap or std::unordered_map).
+// All VM callbacks are assumed to be PURE FUNCTIONS: the same arguments
+// always produce the same result within a single compilation. If the same
+// (Kind, Args) is called with a different Result during recording, a fatal
+// error is reported (purity violation).
 //
-// Correct Example:
-//   for (Instruction &I : instructions(F)) { triggerCallback(I); }
+// DIVERGENCE RISK: While the map-based model eliminates ordering
+// requirements, callbacks must NOT be invoked in non-deterministic control
+// flow where the SET of callbacks invoked differs between record and replay.
+// This causes missing-key errors during replay.
 //
-// Incorrect Example:
-//   for (auto &Entry : UnorderedMap) { triggerCallback(Entry.second); }
+// The key question is: when is iteration order non-deterministic?
+//
+//   - SmallDenseSet<uintptr_t>: SAFE. LLVM's DenseMapInfo<uintptr_t> uses
+//     a pure deterministic hash (densemap::detail::mix) with no randomization
+//     or ASLR dependency. Iteration order is fully determined by the set of
+//     elements and their insertion/deletion history, which are the same
+//     between record and replay given the same IR and callback results.
+//
+//   - DenseMap<T*> / SmallDenseSet<T*> where T is a pointer type: UNSAFE.
+//     DenseMapInfo<T*> hashes the pointer address, which depends on ASLR
+//     and memory layout. Iteration order can differ between the JVM process
+//     (recording) and the opt process (replay).
+//
+//   - Any container with per-run randomization (e.g., LLVM's ReverseIterate
+//     mode with LLVM_ENABLE_REVERSE_ITERATION=1): UNSAFE.
+//
+// Patterns to AVOID:
+//   - Early exit (break/return) from iteration over a container with
+//     non-deterministic iteration order (e.g., DenseMap<T*>) where the
+//     exit condition depends on a callback result. Different iteration
+//     orders may cause different callbacks to be invoked before the exit,
+//     changing the recorded set.
+//
+//     BAD:  for (auto &Entry : DenseMap<SomeClass*, ...>) {
+//             if (IsSubtype(Entry.key, K)) return true;
+//           }
+//
+// Patterns that are SAFE:
+//   - Iterating SmallDenseSet<uintptr_t> with early exits (the current
+//     usage in isExcludedBy, addExcludedKlass, etc.). The hash function
+//     for uintptr_t is deterministic, so iteration order is reproducible.
+//   - Exhaustive iteration over any container (no early exit), where every
+//     callback in the set is always invoked regardless of iteration order.
+//     The map handles the ordering difference transparently.
+//   - Iterating ordered containers (arrays, sorted vectors, instruction
+//     lists) where iteration order is deterministic.
+//   - Any callback whose arguments are derived from deterministic inputs
+//     (instruction order, metadata, constants).
 // -----------------------------------------------------------------------------
 //
 // To add a new callback, add one row below, then implement the JDK-side
