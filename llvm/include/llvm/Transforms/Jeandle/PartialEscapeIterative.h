@@ -2,7 +2,7 @@
 //
 // Part of the Jeandle JIT compiler.
 //
-// D1: Outer fixpoint a la Graal's EffectsPhase.runAnalysis. Runs the
+// Outer fixpoint a la Graal's EffectsPhase.runAnalysis. Runs the
 // PartialEscapeAnalysis + PartialEscapeTransform pair in a bounded loop,
 // interleaving InstCombine + SimplifyCFG + ADCE between rounds so that
 // canonicalization can expose new scalar-replacement opportunities for the
