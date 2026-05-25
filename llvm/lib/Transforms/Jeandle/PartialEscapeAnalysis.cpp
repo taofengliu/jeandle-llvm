@@ -27,7 +27,7 @@
 // PHI as a virtual alias; Case A (mixed) marks every virtual incoming
 // ineligible.
 //
-// PHI Case C: when every incoming carries a virtual ObjectID
+// PHI Case: when every incoming carries a virtual ObjectID
 // but the IDs DIFFER across incomings, synthesizeCaseC attempts to merge
 // them into a single synthetic VirtualObject (cloned from the first per-pred
 // VO). Compatibility requires identical Klass / kind / entry count / lock
@@ -44,7 +44,7 @@
 // Current simplifications (carried as TODOs):
 //   * No iterative stabilization: the merge is a single pass; we don't
 //     re-process other successors of a predecessor whose state changed.
-//     A2's loop-header cache (CaseCVOCache) is forward-infrastructure for
+//     The loop-header cache (CaseCVOCache) is forward-infrastructure for
 //     that future iterative pass; under the single-pass RPO walk it never
 //     actually hits.
 //
@@ -731,7 +731,7 @@ private:
   //
   // WithinSlotByteOff is the byte offset of the load *within* the field-state
   // slot that holds V (i.e. LoadOffsetFromAlloc - EntryOffsetFromAlloc). It is
-  // used for sub-bit-width integer loads (B6): when EntryWidth > LoadWidth and
+  // used for sub-bit-width integer loads: when EntryWidth > LoadWidth and
   // both sides are integer-typed, an `lshr` (by WithinSlotByteOff*8) is
   // emitted before a `trunc`. Little-endian byte order assumed (x86/aarch64).
   Value *coerceToType(Value *V, Type *LoadTy, Instruction *InsertContext,
@@ -774,7 +774,7 @@ private:
   // when the exit successor is an EH-pad block (landingpad / catchpad /
   // cleanuppad). Graal triggers the same on stateAfter().is-
   // ExceptionHandlingBCI() to keep exception handlers from observing a
-  // partially-materialised state. K-block "deopt-bundle within reach"
+  // partially-materialised state. Downstream "deopt-bundle within reach"
   // detection is deferred because Jeandle currently has no deopt
   // machinery. Called from processLoop after convergence.
   void processLoopExit(Loop *L);
@@ -877,14 +877,14 @@ private:
   // pointer (e.g. `store ptr %virt, ptr @G`).
   bool tier2Store(StoreInst *SI);
   void tier2Load(LoadInst *LI);
-  // B17: try to fold an AtomicRMWInst / AtomicCmpXchgInst whose pointer base
+  // Try to fold an AtomicRMWInst / AtomicCmpXchgInst whose pointer base
   // is a virtual at a known constant field offset. Returns true if handled
   // (whether folded or conservatively bailed-by-eligibility-flip). Returns
   // false if the pointer base is NOT a virtual: caller proceeds to the
   // generic-escape fall-through (materializeAllVirtualOperands).
   bool tier2AtomicRMW(AtomicRMWInst *RMW);
   bool tier2CmpXchg(AtomicCmpXchgInst *CX);
-  // B9: fold llvm.memcpy / llvm.memmove whose destination is a virtual
+  // Fold llvm.memcpy / llvm.memmove whose destination is a virtual
   // array pointer into per-slot FieldStates updates. Returns true if the
   // call was handled (folded into per-slot transfer + EliminateStore, OR
   // bailed-by-eligibility-flip because dst resolves to a virtual we cannot
@@ -1221,7 +1221,7 @@ void Analyzer::inheritFromExit(const BlockExitData &Exit) {
   // Locks so the on-VO view matches the analyzer-side DenseMap from the
   // first instruction of this block. Without this, ObjectState::Locks would
   // be empty for an inherited VO until the first foldMonitorEnter in this
-  // block, and a downstream equivalentTo comparison (e.g. M4 fast path)
+  // block, and a downstream equivalentTo comparison (e.g. merge fast path)
   // would over-collapse two VOs with structurally different lock states.
   for (auto &Kv : Exit.LiveLockEnters) {
     if (!Eligible.lookup(Kv.first))
@@ -1314,7 +1314,7 @@ PHINode *Analyzer::getOrCreateLoopFieldPhi(BasicBlock *BB, jeandle::ObjectID ID,
 // Handles same-bit-width primitive↔primitive (BitCast), and sub-bit-width
 // integer loads of a wider integer-stored slot (`lshr` by within-slot byte
 // offset * 8, then `trunc`). Pointer↔primitive at the same slot is forbidden
-// by invariant F2 (PartialEscape.h): the slot's GC-ness must be stable, so a
+// because the slot's reference-vs-primitive nature must be stable, so a
 // ref cannot be re-read as a primitive (or vice-versa) without materializing.
 // Cross-addrspace pointer coercion is also bailed (rare, GC-risky).
 //
@@ -1342,7 +1342,7 @@ Value *Analyzer::coerceToType(Value *V, Type *LoadTy,
   uint64_t VBits = DL.getTypeSizeInBits(VTy);
   uint64_t LBits = DL.getTypeSizeInBits(LoadTy);
 
-  // Invariant F2: ref↔primitive at the same slot must materialize.
+  // Stable-slot-kind invariant: ref↔primitive at the same slot must materialize.
   if (VTy->isPointerTy() != LoadTy->isPointerTy())
     return nullptr;
 
@@ -1378,7 +1378,7 @@ Value *Analyzer::coerceToType(Value *V, Type *LoadTy,
     return Cast;
   }
 
-  // B6: EntryWidth > LoadWidth, both integer-typed, byte-aligned within the
+  // Sub-bit-width: EntryWidth > LoadWidth, both integer-typed, byte-aligned within the
   // slot. Emit `lshr V, WithinSlotByteOff*8` (omit if offset==0), then `trunc`
   // to LoadTy.
   if (VBits > LBits && VTy->isIntegerTy() && LoadTy->isIntegerTy()) {
@@ -1802,7 +1802,7 @@ void Analyzer::mergeStates(BasicBlock *BB) {
         // is per-pred materialize + merge-PHI (Graal
         // MergeProcessor.merge:982-1003). Until that lands, conservatively
         // mark the VO ineligible so the alloc and per-pred stores survive
-        // unmodified in IR. B3's typed-array-element virtualization can
+        // unmodified in IR. Typed-array-element virtualization can
         // legitimately reach this branch when an array alloc inside a loop
         // body is tracked at the loop exit on every pred (the alloc
         // dominates the loop body but not the post-loop merge).
@@ -2095,7 +2095,7 @@ void Analyzer::mergeStates(BasicBlock *BB) {
               // overwhelming common case (loop-invariant 0/1 stores)
               // so we cover that path here and skip non-const for
               // now (would need a per-pred CreatePHI shim, more
-              // plumbing than R8 carries).
+              // plumbing than currently warranted).
               if (auto *CI = dyn_cast<ConstantInt>(V)) {
                 In = ConstantInt::get(PhiType,
                                        CI->getValue().zext(
@@ -2479,7 +2479,7 @@ bool Analyzer::synthesizeCaseC(
     }
   }
 
-  // B10 Phase 4: when every per-pred VO is a same-kind boxed primitive
+  // Boxed-primitive fast path: when every per-pred VO is a same-kind boxed primitive
   // wrapper (Boolean/Byte/.../Double), drop the identity check entirely.
   // Graal's VirtualBoxingNode has `hasIdentity = false`, so Case-C-style
   // merges of two boxed allocations are permitted regardless of external
@@ -2523,8 +2523,8 @@ bool Analyzer::synthesizeCaseC(
   }
 
   // Identity check — Graal isSingleUsageAllocation. In Jeandle, every
-  // non-boxed VO has identity (VirtualBoxingNode is not modeled; see plan
-  // item B10). For each per-pred VO we require:
+  // non-boxed VO has identity (VirtualBoxingNode is not modeled). For each
+  // per-pred VO we require:
   //   (a) the LLVM PHI is the only "external" user of the per-pred alloc.
   //       An "external" user is one that is neither (i) covered by a planned
   //       PEA effect for that ID (EliminateStore, ReplaceLoad, ReplaceCall,
@@ -2886,7 +2886,7 @@ void Analyzer::applyThreeTier(Instruction *I) {
     return;
   }
 
-  // B17: atomicrmw / cmpxchg on a virtual field at a constant offset folds at
+  // atomicrmw / cmpxchg on a virtual field at a constant offset folds at
   // compile time (no other thread can race a virtual — atomic semantics are
   // trivially satisfied, no fence needed). tier2AtomicRMW / tier2CmpXchg
   // return true if the pointer base was a virtual (whether the fold succeeded
@@ -2990,7 +2990,7 @@ void Analyzer::applyThreeTier(Instruction *I) {
         break;
       }
     }
-    // B9: llvm.memcpy / llvm.memmove whose destination is a virtual array
+    // llvm.memcpy / llvm.memmove whose destination is a virtual array
     // pointer is folded into per-slot FieldStates writes; mirrors Graal's
     // BasicArrayCopyNode.virtualize (BasicArrayCopyNode.java:288-359).
     // Source forms accepted: another virtual array (per-slot copy of its
@@ -3004,7 +3004,7 @@ void Analyzer::applyThreeTier(Instruction *I) {
         return;
       // Fall through: virtual src (if any) materializes at the memcpy.
     }
-    // llvm.memset on a virtual array. Symmetric to B9 memcpy:
+    // llvm.memset on a virtual array. Symmetric to the memcpy fold above:
     // when length and value are constant and the destination is a virtual
     // array with element-aligned access, fold per-element by replicating
     // the source byte across the element width. Bail on volatile.
@@ -3013,7 +3013,7 @@ void Analyzer::applyThreeTier(Instruction *I) {
         return;
       // Fall through to generic-escape handling.
     }
-    // B14: llvm.reachability_fence (Graal's ReachabilityFenceNode.virtualize,
+    // llvm.reachability_fence (Graal's ReachabilityFenceNode.virtualize,
     // ReachabilityFenceNode.java:94-129). Status: NOT WIRED — the upstream
     // LLVM tree this Jeandle fork tracks does NOT define
     // Intrinsic::reachability_fence (verified against
@@ -3051,7 +3051,9 @@ void Analyzer::applyThreeTier(Instruction *I) {
     // lands.
     //
     // ----------------------------------------------------------------------
-    // Wiring-point TODOs: B11 / B12 / B15 / B16
+    // Wiring-point TODOs for the deferred virtualization handlers
+    // (ObjectClone, GetClass/load-hub, EnsureVirtualized, FinalFieldBarrier /
+    // RegisterFinalizer elide).
     // ----------------------------------------------------------------------
     // The following Graal PEA folds map to frontend constructs that the
     // current Jeandle frontend does NOT emit. The intrinsic-name inventory
@@ -3070,7 +3072,7 @@ void Analyzer::applyThreeTier(Instruction *I) {
     // frontend grows the corresponding JavaOp, wire each fold here and add
     // the isJeandle* predicate in PartialEscapeUtils.{h,cpp}.
     //
-    // §B11 ObjectClone — Graal's NewArrayNode/AllocatedObjectNode clone
+    // ObjectClone — Graal's NewArrayNode/AllocatedObjectNode clone
     // virtualizer (see VirtualObjectState + ObjectClone in
     // graal/compiler/src/jdk.graal.compiler/.../nodes/virtual/) duplicates
     // the receiver's VO ObjectState when virtual, else stages per-field
@@ -3096,7 +3098,7 @@ void Analyzer::applyThreeTier(Instruction *I) {
     //                                         // as tier1Allocate).
     //   Tests: 320-329 reserved.
     //
-    // §B12 Object.getClass / load-hub — Graal's GetClassNode.virtualize
+    // Object.getClass / load-hub — Graal's GetClassNode.virtualize
     // returns the java.lang.Class mirror constant when the receiver is a
     // virtual with known Klass. Existing foldLoadKlass already covers the
     // raw Klass* pointer case (see jeandle.load_klass dispatch above).
@@ -3123,7 +3125,7 @@ void Analyzer::applyThreeTier(Instruction *I) {
     //     return true;
     //   Tests: 320-329 reserved.
     //
-    // §B16 FinalFieldBarrier / RegisterFinalizer elide — Graal's
+    // FinalFieldBarrier / RegisterFinalizer elide — Graal's
     // FinalFieldBarrierNode.virtualize and RegisterFinalizerNode.virtualize
     // delete the barrier / registration when the receiver is virtual
     // (final-field publication and finalizer registration are meaningless on
@@ -3173,7 +3175,7 @@ void Analyzer::applyThreeTier(Instruction *I) {
     //     }
     //   Tests: 320-329 reserved.
     //
-    // §B15 EnsureVirtualized — Graal's EnsureVirtualizedNode lets clients
+    // EnsureVirtualized — Graal's EnsureVirtualizedNode lets clients
     // demand PEA succeed for a specific oop; on failure the compilation
     // bails (BailoutException). The loop fixpoint's MATERIALIZE_ALL fallback is the
     // analogue of Graal's "would-have-to-materialize" point and is now in
@@ -3185,7 +3187,7 @@ void Analyzer::applyThreeTier(Instruction *I) {
     //   MATERIALIZE_ALL-time hard-bail check would be dead code in this
     //   fork (the flag is never set, so the check never fires). This
     //   matches the project rule "no dead code without a production
-    //   caller" already applied to §B14.
+    //   caller" already applied to the reachability_fence wiring above.
     //   Wiring sketch when frontend producer lands:
     //     Phase 1: add `bool EnsureVirtualized = false;` to VirtualObject
     //              (PartialEscape.h §1.1, alongside MustPreserveLocks /
@@ -3223,7 +3225,7 @@ void Analyzer::applyThreeTier(Instruction *I) {
         bool Folded = false;
         bool EqResult = false;
         jeandle::ObjectID BaseID = jeandle::InvalidObjectID;
-        // B10 Phase 3: structural-equals fold for boxed primitive virtuals.
+        // Structural-equals fold for boxed primitive virtuals.
         // When both operands resolve to DIFFERENT virtual IDs whose Klass
         // is one of the eight java.lang autobox wrapper classes AND both
         // wrap the same primitive kind AND neither carries any live
@@ -3417,7 +3419,7 @@ void Analyzer::tier1Allocate(CallBase *CB) {
   // tracked and folded as usual. Mirrors Graal's
   // EffectsClosureMode.STOP_NEW_VIRTUALIZATIONS_LOOP_NEST in
   // PartialEscapeClosure (which short-circuits the virtualize attempt in
-  // the same way). B15 EnsureVirtualized override is deferred.
+  // the same way). The EnsureVirtualized override is deferred.
   if (CurrentMode == Mode::StopNewInLoopNest)
     return;
 
@@ -3530,7 +3532,7 @@ void Analyzer::tier1Allocate(CallBase *CB) {
         jeandle::InvalidObjectID, jeandle::VirtualObject::Instance, CB);
     VO->Klass = Klass;
     VO->SizeInBytes = *Size;
-    // B10 Phase 2: tag this Instance VO with the boxed-primitive kind if
+    // Tag this Instance VO with the boxed-primitive kind if
     // its Klass is one of the eight java.lang autobox wrapper classes.
     // The IsBoxed VMCallback returns the JBasicType integer of the boxed
     // primitive (0..7) for boxed classes and 9 (JBasicType::Count) for
@@ -3558,7 +3560,7 @@ void Analyzer::tier1Allocate(CallBase *CB) {
     VO->ArrayLength = *Length;
     // VO->ArrayLengthVal was a placeholder for symbolic-length
     // arrays; never read by the analyzer or transform.
-    // B3: populate per-element metadata so matchArrayElementGEP can match
+    // Populate per-element metadata so matchArrayElementGEP can match
     // typed-GEP / symbolic-byte-offset element accesses. If the VMCallback
     // is unregistered or cannot identify the element kind, leave
     // ArrayElementType nullptr — matchArrayElementGEP will refuse to fire
@@ -3629,7 +3631,7 @@ bool Analyzer::tier2Store(StoreInst *SI) {
 
   jeandle::VirtualObject &VObj = *Result.VirtualObjects[*BaseID];
 
-  // B3: for array VOs with populated element metadata, recognise the
+  // For array VOs with populated element metadata, recognise the
   // typed-element GEP chain that the abstract interpreter emits for
   // indexed accesses. matchArrayElementGEP returns Some(idx, etype) on a
   // recognised array-element GEP shape; idx is a ConstantInt for constant
@@ -3665,7 +3667,8 @@ bool Analyzer::tier2Store(StoreInst *SI) {
     return true;
   }
 
-  // Unsafe.putInt-into-byte-array decomposition. Inverse of V11.
+  // Unsafe.putInt-into-byte-array decomposition. Inverse of the
+  // byte-array reassembly load.
   // When the value is an integer of width N*8 and the VObj is an i8-element
   // array, decompose Val into N byte FieldStates entries (rather than
   // recording a single wider entry that would overlap any existing i8
@@ -3794,7 +3797,7 @@ void Analyzer::tier2Load(LoadInst *LI) {
 
   jeandle::VirtualObject &VObj = *Result.VirtualObjects[*BaseID];
 
-  // B3: array-element GEP matcher — see the tier2Store mirror for the
+  // Array-element GEP matcher — see the tier2Store mirror for the
   // rationale. Symbolic index forces the array to materialize.
   std::optional<int64_t> Offset;
   if (VObj.isArray() && VObj.ArrayElementType) {
@@ -3825,7 +3828,7 @@ void Analyzer::tier2Load(LoadInst *LI) {
 
   Type *LoadTy = LI->getType();
 
-  // B6: locate the FieldDesc whose recorded range contains the load. The
+  // Locate the FieldDesc whose recorded range contains the load. The
   // load may be at a sub-offset / sub-width of a wider stored entry (e.g.
   // store i64 at off 8, load i16 at off 12 → entry at off 8 with within-slot
   // byte offset 4). If the load straddles slot boundaries (overlaps without
@@ -4056,10 +4059,10 @@ void Analyzer::tier2Load(LoadInst *LI) {
   if (Existing->isScalar()) {
     Value *V = Existing->getScalar();
     // Coerce to LoadTy. Handles same-bit-width primitive↔primitive (bitcast)
-    // and sub-bit-width integer truncation (B6: lshr+trunc at within-slot
+    // and sub-bit-width integer truncation (lshr+trunc at within-slot
     // byte offset). Pointer↔primitive (or cross-AS pointer↔pointer, or a
-    // widening integer load) bails to ineligible per invariant F2 / B6
-    // policy.
+    // widening integer load) bails to ineligible per the stable-slot-kind
+    // and sub-bit-width policies.
     Value *Coerced = coerceToType(V, LoadTy, LI, WithinSlotByteOff);
     if (!Coerced) {
       Eligible[*BaseID] = false;
@@ -4135,9 +4138,9 @@ void Analyzer::tier2Load(LoadInst *LI) {
     // Type-compatibility. For ordinary reference loads, both LoadTy and the
     // inner allocation are `ptr addrspace(1)` and coerceToType returns Repl
     // unchanged. Cross-address-space or ptr↔primitive mismatch bails per
-    // invariant F2; a nonzero WithinSlotByteOff also bails (partial pointer
-    // loads are not virtualizable). We don't poison InnerID because other
-    // paths may still be able to virtualize it.
+    // the stable-slot-kind invariant; a nonzero WithinSlotByteOff also
+    // bails (partial pointer loads are not virtualizable). We don't poison
+    // InnerID because other paths may still be able to virtualize it.
     Value *Coerced = coerceToType(Repl, LoadTy, LI, WithinSlotByteOff);
     if (!Coerced) {
       Eligible[*BaseID] = false;
@@ -4175,8 +4178,9 @@ void Analyzer::tier2Load(LoadInst *LI) {
     }
     // A materialized ref slot can only be loaded back as a pointer (and in
     // practice, since LLVM 17 uses opaque pointers, only as the same
-    // ptr-AS). coerceToType bails on ptr↔primitive (F2), cross-AS pointer
-    // pairs, and on any partial (within-slot) pointer load.
+    // ptr-AS). coerceToType bails on ptr↔primitive (stable-slot-kind),
+    // cross-AS pointer pairs, and on any partial (within-slot) pointer
+    // load.
     Value *Coerced = coerceToType(V, LoadTy, LI, WithinSlotByteOff);
     if (!Coerced) {
       Eligible[*BaseID] = false;
@@ -4199,7 +4203,7 @@ void Analyzer::tier2Load(LoadInst *LI) {
 }
 
 // ---------------------------------------------------------------------------
-// B17: atomicrmw / cmpxchg on a virtual field at a constant offset.
+// atomicrmw / cmpxchg on a virtual field at a constant offset.
 // ---------------------------------------------------------------------------
 //
 // Why this is sound on a virtual: a virtual object hasn't escaped to any
@@ -4231,7 +4235,7 @@ void Analyzer::tier2Load(LoadInst *LI) {
 // "handled — Eligible flip will cause downstream commit() to drop effects;
 // the original IR survives".
 //
-// Mirrors the slot-resolution prologue of tier2Load (B6).
+// Mirrors the slot-resolution prologue of tier2Load.
 namespace {
 struct AtomicSlot {
   jeandle::ObjectID BaseID;
@@ -4264,7 +4268,7 @@ bool Analyzer::tier2AtomicRMW(AtomicRMWInst *RMW) {
     return true;
   }
 
-  // Locate containing slot (B6 within-slot logic, mirroring tier2Load).
+  // Locate containing slot (within-slot logic, mirroring tier2Load).
   uint64_t AccessBits = AccessTy->isSized() ? DL.getTypeSizeInBits(AccessTy) : 0;
   uint8_t AccessByteSize = static_cast<uint8_t>((AccessBits + 7) / 8);
   int64_t AccessEnd = *Offset + static_cast<int64_t>(AccessByteSize);
@@ -4482,7 +4486,7 @@ bool Analyzer::tier2AtomicRMW(AtomicRMWInst *RMW) {
   } else {
     FieldStates[*BaseID][EntryOffset] = jeandle::FieldValue::scalar(NewEntryV);
   }
-  // Record the slot's declared type for B6-style coercion on later loads.
+  // Record the slot's declared type for sub-bit-width coercion on later loads.
   FieldStates[*BaseID][EntryOffset].setDeclaredType(AccessTy);
 
   // RAUW the atomicrmw with its OLD value via a ReplaceLoad effect. The
@@ -4923,7 +4927,7 @@ bool Analyzer::foldMonitorEnter(CallBase *CB) {
   LiveLockEnters[*BaseID].push_back({CB, MyOrder, NewBytecodeDepth});
   // Keep the per-VO ObjectState::Locks mirror in lockstep with the analyzer-
   // side DenseMap. ObjectState::Locks does not carry the Order proxy —
-  // structural ObjectState equivalence (used by M4 identicalObjectStates and
+  // structural ObjectState equivalence (used by merge-time identicalObjectStates and
   // the PEABlockState::equivalentTo path) compares Call+BytecodeDepth only,
   // which is the Graal-parity semantic.
   if (CurrentState.hasObjectState(*BaseID)) {
@@ -4975,10 +4979,10 @@ bool Analyzer::foldMonitorExit(CallBase *CB) {
 }
 
 bool Analyzer::foldArrayStoreCheck(CallBase *CB) {
-  // jeandle.array_store_check(value, array). Section 2.3.14 of the PEA plan
+  // jeandle.array_store_check(value, array). §2.3.14 of the PEA paper
   // marks the op as read-only on the heap, so a virtual base by itself does
   // not constitute an escape. The fold compares the value's klass against
-  // the array's element klass (B5 — via VMCallback ArrayElementKlass) and
+  // the array's element klass (via VMCallback ArrayElementKlass) and
   // either elides the call (provably compatible / primitive element) or
   // forces materialization (provably incompatible / element klass unknown
   // / value klass unknown).
@@ -5057,7 +5061,7 @@ bool Analyzer::foldCheckIfValueBased(CallBase *CB) {
   // DiagnoseSyncOnValueBasedClasses warning when the dynamic klass is in fact
   // value-based.
   //
-  // B4 fold logic (mirrors Graal's value-based-class handling around
+  // Fold logic (mirrors Graal's value-based-class handling around
   // monitorenter: if the exact runtime class is known, the check collapses to
   // a compile-time constant). For a VIRTUAL receiver:
   //
@@ -5088,7 +5092,7 @@ bool Analyzer::foldCheckIfValueBased(CallBase *CB) {
   if (!VMCB || !VMCB->IsValueBased) {
     // No callback registered (offline tests without a callback log). Bail
     // conservatively so the virtual materializes; matches the prior
-    // pre-B4 behaviour.
+    // pre-fold behaviour.
     return false;
   }
   if (VMCB->IsValueBased(VObj.Klass)) {
@@ -5109,7 +5113,7 @@ bool Analyzer::foldCheckIfValueBased(CallBase *CB) {
   return true;
 }
 
-// B9: ArrayCopy fold. Folds llvm.memcpy / llvm.memmove whose destination is a
+// ArrayCopy fold. Folds llvm.memcpy / llvm.memmove whose destination is a
 // virtual array pointer into per-slot FieldStates writes and an EliminateStore
 // effect on the memcpy itself. Mirrors Graal's BasicArrayCopyNode.virtualize
 // (BasicArrayCopyNode.java:288-359):
@@ -5162,7 +5166,7 @@ bool Analyzer::tier2ArrayCopy(MemTransferInst *MI) {
   if (MI->isVolatile())
     return false;
 
-  // Dst must be a virtual array with populated element metadata (B3).
+  // Dst must be a virtual array with populated element metadata.
   if (!DstVO.isArray() || !DstVO.ArrayElementType ||
       DstVO.ArrayIndexScale == 0)
     return false;
@@ -5483,7 +5487,7 @@ bool Analyzer::tier2MemSet(MemSetInst *MSI) {
     return false;
   }
 
-  // Validate type-overlap on every dst slot (mirrors B9 logic).
+  // Validate type-overlap on every dst slot (mirrors the memcpy fold).
   for (uint64_t i = 0; i < Count; ++i) {
     int64_t DstOffBytes = static_cast<int64_t>(DstVO.ArrayBaseOffset) +
                           (DstElemOff + static_cast<int64_t>(i)) * Scale;
@@ -5688,8 +5692,8 @@ void Analyzer::materializeAt(jeandle::ObjectID ID,
   //   (c) unregister the PHI's virtual alias so any subsequent
   //       resolveVirtualRef on the PHI returns nullopt and downstream
   //       consumers stop trying to fold through it.
-  // Cascade-materialize (the Graal-equivalent path) is deferred until A2's
-  // follow-on (A2-extended or a dedicated task).
+  // Cascade-materialize (the Graal-equivalent path) is deferred to a
+  // follow-on change.
   if (VObj.IsSynthetic) {
     Eligible[ID] = false;
     for (jeandle::ObjectID PID : VObj.SyntheticSourceIDs)
@@ -6153,9 +6157,9 @@ void Analyzer::processLoopExit(Loop *L) {
   // ensures every still-virtual VO has a real allocation by the time the
   // EH handler executes.
   //
-  // K-blocks "downstream deopt-bundle" detection is deferred (Jeandle
-  // has no deopt machinery yet). Landingpad-block detection alone
-  // covers the immediate-EH path that motivated this code.
+  // Downstream "deopt-bundle" detection is deferred (Jeandle has no
+  // deopt machinery yet). Landingpad-block detection alone covers the
+  // immediate-EH path that motivated this code.
   SmallVector<BasicBlock *, 4> ExitingBBs;
   L->getExitingBlocks(ExitingBBs);
   for (BasicBlock *ExitingBB : ExitingBBs) {
@@ -6174,10 +6178,9 @@ void Analyzer::processLoopExit(Loop *L) {
       // invoke (which is the canonical Jeandle shape — every alloc IS
       // an invoke).
       //
-      // K-block downstream "deopt-bundle" detection is deferred
-      // (Jeandle has no deopt). Only catchswitch / catchpad headers
-      // and landingpads with at least one explicit clause qualify
-      // here.
+      // Downstream "deopt-bundle" detection is deferred (Jeandle has
+      // no deopt). Only catchswitch / catchpad headers and landingpads
+      // with at least one explicit clause qualify here.
       if (auto *CSI = dyn_cast<CatchSwitchInst>(&*Succ->getFirstNonPHIIt())) {
         (void)CSI;
         ExitsToEH = true;

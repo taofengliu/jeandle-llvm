@@ -117,15 +117,15 @@ public:
   bool IsSingleUsageAllocation = false;
   bool IdentityHashObserved = false;
 
-  // PEA B10 (boxed-primitive tagging): JBasicType index of the boxed
+  // PEA (boxed-primitive tagging): JBasicType index of the boxed
   // primitive when this VirtualObject's Klass is one of the eight
   // java.lang autobox wrapper classes (Boolean=0..Double=7); otherwise
   // 9 (JBasicType::Count, the sentinel "not boxed"). Populated in
   // tier1Allocate from the IsBoxed VMCallback (when registered) — kept at
   // the sentinel for lit tests without a callback log, which leaves the
-  // boxed-virtual fold path inert. Used by the icmp eq fold (B10 Phase 3)
+  // boxed-virtual fold path inert. Used by the icmp eq fold
   // to substitute structural value comparison for object-identity, and
-  // by synthesizeCaseC (B10 Phase 4) to drop the identity-bail when two
+  // by synthesizeCaseC to drop the identity-bail when two
   // boxed virtuals of the same primitive kind reach a merge.
   //
   // Held as a uint8_t to match the JBasicType enum's underlying type
@@ -135,8 +135,7 @@ public:
   uint8_t BoxedPrimitiveKind = 9; // JBasicType::Count sentinel
   bool isBoxedPrimitive() const { return BoxedPrimitiveKind != 9; }
 
-  // PHI Case C synthesis. A "synthetic" VirtualObject is one created at a
-  // multi-pred merge by the analyzer's processBlockPhis when every incoming
+  // A "synthetic" VirtualObject is one created at a multi-pred merge by the analyzer's processBlockPhis when every incoming
   // resolves to a DIFFERENT but COMPATIBLE virtual object (same Klass / kind
   // / entry count / lock state, and the per-pred allocations have no other
   // observable identity). There is no per-pred allocation backing this VO —
@@ -247,8 +246,7 @@ private:
   // Per-VO live monitor stack. Each element is a MonitorIdRef
   // identifying the (enter-call, bytecode-depth) pair pushed by a folded
   // monitorenter on this VO whose matching monitorexit hasn't yet been seen
-  // on this path. Replaces the prior `unsigned LockCount`: the size is the
-  // count, and the additional EnterCall + BytecodeDepth fields are needed
+  // on this path. The size is the count, and the additional EnterCall + BytecodeDepth fields are needed
   // for (a) un-elision of the original calls on materialisation, (b) the
   // narrow cascade rule (other.front().BytecodeDepth < this.back().
   // BytecodeDepth), and (c) merge-time stack-identity comparisons. The
@@ -270,8 +268,7 @@ public:
 
   // Custom copy/move so the per-slot CopyOnWrite annotation is reset on
   // clone — a freshly-constructed copy is by definition unshared. This
-  // matches Graal's `private ObjectState(ObjectState other)` (see
-  // ObjectState.java:88-94), which does not copy the `copyOnWrite` field.
+  // matches Graal's `private ObjectState(ObjectState other)`, which does not copy the `copyOnWrite` field.
   ObjectState(const ObjectState &Other)
       : Kind(Other.Kind), Entries(Other.Entries), Locks(Other.Locks),
         MaterializedValue(Other.MaterializedValue), CopyOnWrite(false) {}
@@ -611,7 +608,7 @@ public:
 
   // PHI nodes synthesized by mergeStates at a LOOP HEADER block. Stored
   // separately from OwnedPhis because they must SURVIVE rollback within the
-  // A1 loop-fixpoint iteration. The fixpoint may take up to 10 passes over
+  // the loop-fixpoint iteration. The fixpoint may take up to 10 passes over
   // the loop body; each pass re-runs mergeStates(Header) and would otherwise
   // allocate a fresh PHI per (ID, offset) per iteration, ballooning
   // OwnedPhis and (worse) producing fresh Value* pointers in FieldStates so

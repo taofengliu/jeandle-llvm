@@ -41,12 +41,12 @@ Pipeline::Pipeline(OptimizationLevel level, LLVMContext &Ctx)
 ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
                                                  OptimizationLevel level) {
   ModulePassManager PM;
-  // C6: canonicalise loops before PEA so processLoop sees a unique
+  // Canonicalise loops before PEA so processLoop sees a unique
   // preheader/single-backedge for every natural loop. LoopSimplify cannot
   // recover irreducible or indirectbr-entered loops; PEA defends against
   // those cases in processLoop's no-preheader fallback.
   PM.addPass(createModuleToFunctionPassAdaptor(LoopSimplifyPass()));
-  // D1 (Round 4): Outer fixpoint. PartialEscapeIterative wraps the
+  // Outer fixpoint. PartialEscapeIterative wraps the
   // analyze+transform pair in a bounded loop with InstCombine/SimplifyCFG/
   // ADCE between rounds. The iteration cap is controlled by
   // `-jeandle-pea-iterations=N` (default 2, matching Graal's
@@ -56,7 +56,7 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   // it), and LoopSimplify is expensive enough that we don't want it per
   // iteration.
   //
-  // D2 (Round 4): Pipeline position decision.
+  // Pipeline position decision.
   //   Graal runs PEA at exactly ONE position in its hosted tier pipeline —
   //   `FinalPartialEscapePhase` in HighTier (HighTier.java:110), after
   //   inlining/loop opts/GVN, before lowering. The "Final" prefix refers
@@ -90,7 +90,7 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   //       loop unroll) cannot SROA or fold addrspace(1) loads — they have
   //       no Java semantic model for the heap — so they neither destroy
   //       PEA invariants nor expose meaningful new escape decisions.
-  //     - D1's intra-PEA fixpoint already iterates through any re-foldable
+  //     - Intra-PEA fixpoint already iterates through any re-foldable
   //       materializations exposed by InstCombine+SimplifyCFG+ADCE between
   //       rounds, which is the same canonicalization Graal applies inside
   //       its single PEA slot.
