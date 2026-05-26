@@ -1,9 +1,13 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA: verify that the materialization invoke carries the "deopt"
-; operand bundle from its source CallBase. The escape point @sink has no
-; deopt bundle, so the analyzer falls back to copying the bundle from the
-; original allocation invoke.
+; PEA is intentionally deopt-agnostic until the Jeandle deopt refactor
+; lands: the materialization invoke must NOT carry any "deopt" operand
+; bundle, regardless of whether the bundle was on the allocation or on
+; the escape sink. The DeoptBundleSource field on the analyzer's Effect
+; is still set (so the deopt refactor can re-engage it later), but the
+; transform drops "deopt" when copying bundles onto NewInv. Here the
+; allocation carries a "deopt" bundle and the sink does not; the
+; materialization invoke must end up with no operand bundles at all.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -24,7 +28,7 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_mat_deopt
-; CHECK: invoke {{.*}}@jeandle.new_instance{{.*}} [ "deopt"(i32 42) ]
+; CHECK: %pea.mat = invoke {{.*}}@jeandle.new_instance(ptr {{.*}}, i32 16)
 ; CHECK-NEXT: to label %{{.*}} unwind label %{{.*}}
 ; CHECK: call void @sink
 

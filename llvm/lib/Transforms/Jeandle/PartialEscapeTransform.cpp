@@ -235,16 +235,23 @@ static void applyMaterialize(Function &F, const jeandle::PEAResult &Result,
   Origin->getTerminator()->eraseFromParent();
 
   // Step 5: collect operand bundles from the recorded source (escape-point
-  // CallBase or original allocation). Preserve EVERY operand bundle (deopt,
-  // funclet, gc-transition, cfguardtarget, ptrauth, kcfi, ...) — copying only
-  // the first "deopt" bundle would silently drop all others. Additionally, if
-  // the materialization-invoke insertion point is itself inside a Windows-EH
-  // funclet, prepend a matching "funclet" bundle so the Verifier accepts the
-  // call.
+  // CallBase or original allocation). Drop "deopt": PEA is deopt-agnostic
+  // until the Jeandle deopt refactor lands, and copying a "deopt" bundle
+  // here would plant OrigAlloc into NewInv's own bundle (the source CB's
+  // deopt slot for the VO holds OrigAlloc), which the step-8 RAUW would
+  // then rewrite to NewInv, producing a self-reference the verifier
+  // rejects. Preserve every non-deopt bundle (funclet, gc-transition,
+  // cfguardtarget, ptrauth, kcfi, ...). The funclet-bundle synthesis below
+  // handles the Windows-EH case for the materialization site itself.
   SmallVector<OperandBundleDef, 4> Bundles;
   if (E.DeoptBundleSource) {
-    if (auto *CBSrc = dyn_cast<CallBase>(E.DeoptBundleSource))
-      CBSrc->getOperandBundlesAsDefs(Bundles);
+    if (auto *CBSrc = dyn_cast<CallBase>(E.DeoptBundleSource)) {
+      SmallVector<OperandBundleDef, 4> All;
+      CBSrc->getOperandBundlesAsDefs(All);
+      for (OperandBundleDef &OBD : All)
+        if (OBD.getTag() != "deopt")
+          Bundles.emplace_back(std::move(OBD));
+    }
   }
   // Synthesize a funclet bundle when the materialization site sits inside an
   // EH funclet pad and the recorded source didn't already supply one. Jeandle
@@ -362,6 +369,30 @@ static void applyMaterialize(Function &F, const jeandle::PEAResult &Result,
   // post-merge uses are rewired by the matching CreatePHI effect
   // (RAUWOrigToPHI). The original alloc still becomes use-empty by the
   // end of Pass 1.
+  // PEA is intentionally deopt-agnostic until the Jeandle deopt refactor
+  // lands. Before the global RAUW, scrub OrigAlloc out of any existing
+  // "deopt" operand bundle on a CallBase: if we let the RAUW propagate
+  // OrigAlloc -> NewInv into another sink CB's deopt bundle, a subsequent
+  // sibling Materialize for the SAME OrigAlloc would copy that bundle
+  // and end up holding NewInv from a non-dominating block. Replacing
+  // those operands with a typed null leaves the bundle structurally
+  // intact (so the eventual deopt refactor can repopulate it) while
+  // making the slot verifier-legal and independent of where any sibling
+  // mat lands.
+  if (!E.IsPerPred && !OrigAlloc->use_empty()) {
+    Value *NullVO = ConstantPointerNull::get(
+        cast<PointerType>(OrigAlloc->getType()));
+    for (Use &U : llvm::make_early_inc_range(OrigAlloc->uses())) {
+      auto *CB = dyn_cast<CallBase>(U.getUser());
+      if (!CB)
+        continue;
+      unsigned OpIdx = U.getOperandNo();
+      if (!CB->isBundleOperand(OpIdx))
+        continue;
+      if (CB->getOperandBundleForOperand(OpIdx).isDeoptOperandBundle())
+        U.set(NullVO);
+    }
+  }
   if (!E.IsPerPred && !OrigAlloc->use_empty())
     OrigAlloc->replaceAllUsesWith(NewInv);
 }
