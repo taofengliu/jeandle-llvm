@@ -25,25 +25,43 @@
 // agree on the lock count. Any disagreement (mixed virtual / materialized,
 // missing on some path, field mismatch, lock mismatch) marks the object
 // ineligible — the commit() sweep drops every recorded effect for it and
-// the original IR survives unchanged. Explicit LLVM PHIs of java-heap
-// pointers are also walked: Case B (every incoming resolves to the same
-// ObjectID and the object is still virtual at merge entry) registers the
-// PHI as a virtual alias; Case A (mixed) marks every virtual incoming
-// ineligible.
+// the original IR survives unchanged.
 //
-// PHI Case: when every incoming carries a virtual ObjectID
-// but the IDs DIFFER across incomings, synthesizeCaseC attempts to merge
-// them into a single synthetic VirtualObject (cloned from the first per-pred
-// VO). Compatibility requires identical Klass / kind / entry count / lock
-// state across preds, and an identity check (the PHI is the only external
-// LLVM user of each per-pred alloc, and no other VO references the per-pred
-// VOs via virtualRef). Per-entry field PHIs are emitted for offsets where
-// the per-pred values disagree; constant entries fold to a single value.
-// If the synthetic VO later requires materialization (e.g. a downstream
-// escape consumes the PHI), it is conservatively dropped — both the
-// synthetic VO and every per-pred source VO are marked ineligible so the
-// original IR survives.  (Graal's cascade-materialize path that keeps the
-// PHI as the materialized pointer is deferred to a future task.)
+// PHI handling. processBlockPhis classifies every explicit LLVM PHI of
+// a java-heap pointer at a multi-predecessor merge into one of three cases.
+// The classification depends on how the PHI's incoming values resolve
+// against the per-pred BlockExits virtual sets:
+//
+//   - Case A (mixed or fallback). At least one incoming is non-virtual,
+//     OR a Case C attempt bailed. For every virtual incoming the analyzer
+//     materializes the VO at that incoming's predecessor terminator; the
+//     PHI itself stays in IR as a real-pointer merge over the materialized
+//     allocations and the already-non-virtual incomings.
+//
+//   - Case B (uniform ID). Every incoming resolves to the SAME ObjectID
+//     AND the object is still virtual at merge entry. The PHI is registered
+//     as an alias for that ObjectID in AliasMap so downstream load/store
+//     handlers fold through it; no new VO and no materialization. If the
+//     underlying allocation is later eliminated by Pass 2, the PHI is dead
+//     (all incomings RAUW'd to poison) and is erased explicitly so the IR
+//     doesn't carry a `phi [poison, ..., poison]` artefact past PEA.
+//
+//   - Case C (compatible but distinct IDs). Every incoming carries a
+//     virtual ObjectID but the IDs DIFFER across incomings. synthesizeCaseC
+//     attempts to merge them into a single synthetic VirtualObject (cloned
+//     from the first per-pred VO). Compatibility requires identical Klass /
+//     kind / entry count / lock state across preds, plus an identity check
+//     (the PHI is the only external LLVM user of each per-pred alloc, and
+//     no other VO references the per-pred VOs via virtualRef). Per-entry
+//     field PHIs are emitted for offsets where the per-pred values
+//     disagree; agreeing entries fold to a single value. If the synthetic
+//     VO later requires materialization (e.g. a downstream escape consumes
+//     the PHI), it is conservatively dropped: both the synthetic VO and
+//     every per-pred source VO are marked ineligible so the original IR
+//     survives. Graal's cascade-materialize path that keeps the PHI as
+//     the materialized pointer is deferred to a future task. On any
+//     compatibility / identity / per-entry-type failure the PHI falls
+//     through to Case A.
 //
 // Lock cascade: when materializing a virtual whose LockCount > 0, the
 // analyzer (1) drops the previously-recorded ReplaceCall(true) effects
