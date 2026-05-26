@@ -1,6 +1,10 @@
-//===-- PartialEscapeAnalysis.cpp - PEA (analysis pass) -------------------===//
+//===- PartialEscapeAnalysis.cpp - PEA (analysis pass) ---------------------===//
 //
-// Part of the Jeandle JIT compiler.
+// Copyright (c) 2026, the Jeandle-LLVM Authors. All Rights Reserved.
+//
+// Part of the Jeandle-LLVM project, under the Apache License v2.0 with LLVM
+// Exceptions. See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // Real partial-escape semantics. When a virtual object encounters an
 // instruction the analyzer can't fold (an "escape" point — generic call,
@@ -61,7 +65,7 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "llvm/Transforms/Jeandle/PartialEscapeAnalysis.h"
+#include "llvm/Analysis/Jeandle/PartialEscapeAnalysis.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
@@ -80,13 +84,13 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Jeandle/JavaType.h"
 #include "llvm/IR/Jeandle/Metadata.h"
-#include "llvm/IR/Jeandle/PartialEscape.h"
+#include "llvm/Analysis/Jeandle/PartialEscape.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Jeandle/VMCallback.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
-#include "llvm/Transforms/Jeandle/PartialEscapeUtils.h"
+#include "llvm/Analysis/Jeandle/PartialEscapeUtils.h"
 
 #include <unordered_map>
 
