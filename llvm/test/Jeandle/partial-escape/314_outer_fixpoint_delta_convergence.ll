@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes="partial-escape-iterative" -jeandle-pea-iterations=4 %s | FileCheck %s
 
-; R7.G1: plumb VirtualizationDelta + AllocationDelta into the outer
-; fixpoint's convergence check. The old break condition (TransformIdle &&
+; Plumb VirtualizationDelta + AllocationDelta into the outer fixpoint's
+; convergence check. A break condition of just (TransformIdle &&
 ; AllocsUnchanged) could miss progress when an iteration shuffled
 ; virtualisation effects without changing the surviving allocation count
 ; (e.g. a CommitAllocation that fuses multiple per-pred materialisations
@@ -9,9 +9,9 @@
 ;
 ; This test exercises a chain of three nested allocs whose virtualisation
 ; opportunities only fully resolve after multiple rounds of analyse +
-; canonicalise. With R7.G1 the outer loop requires both delta values to
-; be stable across consecutive iterations before breaking, so the third
-; round actually runs and completes the virtualisation.
+; canonicalise. The outer loop requires both delta values to be stable
+; across consecutive iterations before breaking, so the third round
+; actually runs and completes the virtualisation.
 
 @G_zero = private unnamed_addr constant i32 0
 

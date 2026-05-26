@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/263_box_case_c_merge.cblog %s | FileCheck %s
 
-; B10 Phase 4 (exercise / smoke test): if-else autobox of two values
+; Phase 4 (exercise / smoke test): if-else autobox of two values
 ; merges via a PHI; the post-merge unbox load resolves against the
 ; synthetic Case-C VO. Both per-pred allocations and stores must
 ; disappear and the load must collapse to a PHI of the two boxed

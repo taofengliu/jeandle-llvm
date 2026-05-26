@@ -1,9 +1,9 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; A1 — nested loops where the inner-body alloc escapes via a sink. The
-; inner loop's fixpoint converges with the obj marked escaped (every
-; iteration the materializeAt at the @sink emits a Materialize effect at
-; the alloc's SafeIP). The outer-loop fixpoint sees the inner-loop body
+; Nested loops where the inner-body alloc escapes via a sink. The inner
+; loop's fixpoint converges with the obj marked escaped (every iteration
+; the materializeAt at the @sink emits a Materialize effect at the
+; alloc's SafeIP). The outer-loop fixpoint sees the inner-loop body
 ; produce a stable BlockExits and converges. The alloc survives in IR.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)

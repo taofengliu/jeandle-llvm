@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="partial-escape-iterative" -jeandle-pea-iterations=4 %s | FileCheck %s
 
-; D1 convergence detection. Same input as 280 (two-round elimination) but
+; Outer-fixpoint convergence detection. Same input as 280 (two-round elimination) but
 ; runs with iterations=4. We expect the wrapper to converge in exactly
 ; two rounds (round 1 materializes, canonicalize folds the dead branch,
 ; round 2 eliminates the alloc), then detect convergence and short-circuit

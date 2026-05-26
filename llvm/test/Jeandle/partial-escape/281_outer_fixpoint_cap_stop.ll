@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="partial-escape-iterative" -jeandle-pea-iterations=4 %s | FileCheck %s
 
-; D1 cap-stop test. An allocation whose escape (an opaque sink call on every
+; Outer-fixpoint cap-stop test. An allocation whose escape (an opaque sink call on every
 ; path) cannot be removed by InstCombine / SimplifyCFG / ADCE in any round —
 ; %sink has no attributes the standard pipeline can exploit. We run the
 ; wrapper with the full iteration cap (4) and verify that:

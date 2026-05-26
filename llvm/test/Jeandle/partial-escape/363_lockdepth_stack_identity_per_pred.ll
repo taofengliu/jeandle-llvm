@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R10.X1b / R10.X17: lock-stack identity mismatch at a diamond merge.
+; Lock-stack identity mismatch at a diamond merge.
 ;
 ; A single virtual %o is allocated before the diamond. Each arm enters its
 ; OWN monitorenter call site on %o (lock_t and lock_e are distinct alloca
@@ -8,18 +8,11 @@
 ; preds report LockCount==1 on %o but the per-pred live stacks differ
 ; (CallSite_then != CallSite_else).
 ;
-; Before R10.X1b: the StacksMatch check intentionally ignored Order and
-; compared Call identity; the mismatch flipped Eligible[ID]=false and the
-; allocation, both enters, and the exit all survived in IR without any
-; materialisation effect being emitted. The merged %o stayed virtual but
-; ineligible — observable as: the alloca remained, no materialisation
-; invoke appeared in the merge block.
-;
-; After R10.X1b: per-pred materialise routes through
-; materializeAtPredFromExitInfo for each pred. The merged VO flips to
-; Materialized; the analyzer emits a per-pred Materialize at each branch
-; and a CreatePHI at the merge collecting both pred-side materialised
-; pointers. The downstream monitorexit and use see the merged pointer.
+; Per-pred materialise routes through materializeAtPredFromExitInfo for
+; each pred. The merged VO flips to Materialized; the analyzer emits a
+; per-pred Materialize at each branch and a CreatePHI at the merge
+; collecting both pred-side materialised pointers. The downstream
+; monitorexit and use see the merged pointer.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
@@ -60,7 +53,7 @@ u:
   resume i64 %lp
 }
 
-; After R10.X1b, %o is materialised at each pred (per-pred Materialize
+; %o is materialised at each pred (per-pred Materialize
 ; effects); a CreatePHI at the merge collects both pred-side materialised
 ; pointers; the sink sees the phi. The original allocation is replaced by
 ; the per-pred materialised invokes (the entry-block alloc is removed

@@ -1,11 +1,11 @@
 ; RUN: opt -S -passes="loop-simplify,require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; C6 — strategy A demonstration: the same IR shape as test 140 (header
-; with two forward predecessors), but with `loop-simplify` scheduled
-; before PEA. LoopSimplify inserts a synthetic preheader so PEA's A1
-; fixpoint path runs and the alloc-before-loop pattern is fully
-; folded. This is the path the Jeandle pipeline takes in production
-; (Pipeline.cpp now schedules LoopSimplifyPass before PEA).
+; Same IR shape as test 140 (header with two forward predecessors), but
+; with `loop-simplify` scheduled before PEA. LoopSimplify inserts a
+; synthetic preheader so PEA's loop fixpoint path runs and the
+; alloc-before-loop pattern is fully folded. This is the path the
+; Jeandle pipeline takes in production (Pipeline.cpp schedules
+; LoopSimplifyPass before PEA).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)
@@ -42,7 +42,7 @@ u:
   resume i64 %lp
 }
 
-; After LoopSimplify canonicalises the entry to the loop, A1's
+; After LoopSimplify canonicalises the entry to the loop, the loop
 ; fixpoint takes over and folds the alloc + field store/load.
 ; @use receives %i directly (the in-body store-load forwards through
 ; tier2Load on the virtual field).

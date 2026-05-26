@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA-Plan §B7: a Select between two arms that are different virtuals.
+; A Select between two arms that are different virtuals.
 ; resolveVirtualRefImpl returns nullopt (different ObjectIDs do not
 ; merge), and propagatePointerAlias falls through to
 ; materializeAllVirtualOperands, forcing BOTH allocs to escape. The

@@ -1,15 +1,14 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA / A1 (real loop fixpoint): an alloc lives in entry and is used
-; inside a loop only via a field load (no escape, no field mutation). With
-; the A1 loop fixpoint the analyzer tracks the object through the
-; back-edge — every iteration sees the same all-default field state, the
-; convergence check passes on iteration 2, and the alloc is FULLY
-; ELIMINATED (no preheader materialization). The load default-folds to
-; zero. Prior to A1 the preheader force-materialize safety net would
-; have produced a materialization invoke at the preheader; A1 now
-; recognises that the loop body never escapes the object and skips that
-; drain. The load still folds to zero on every iteration.
+; Real loop fixpoint: an alloc lives in entry and is used inside a loop
+; only via a field load (no escape, no field mutation). The loop
+; fixpoint tracks the object through the back-edge — every iteration
+; sees the same all-default field state, the convergence check passes
+; on iteration 2, and the alloc is FULLY ELIMINATED (no preheader
+; materialization). The load default-folds to zero. The analyser
+; recognises that the loop body never escapes the object and skips the
+; preheader force-materialise drain. The load folds to zero on every
+; iteration.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)

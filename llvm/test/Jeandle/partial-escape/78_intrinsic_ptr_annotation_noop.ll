@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R11.V38: extended intrinsic allowlist. The intrinsics ptr.annotation,
+; Extended intrinsic allowlist. The intrinsics ptr.annotation,
 ; var.annotation, is.constant, expect, expect.with.probability,
 ; allow.runtime.check, allow.ubsan.check are pointer-/value-identity-
 ; preserving and have no effect on a virtual's escape status. The

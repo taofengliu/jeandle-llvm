@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; B17: cmpxchg failure path. Expected does NOT match the slot's current
+; cmpxchg failure path. Expected does NOT match the slot's current
 ; entry, so the comparison folds to false; the slot stays unchanged; the
 ; cmpxchg's result struct is replaced with the constant `{prior, false}`.
 ; A subsequent load sees the unchanged (prior) value.

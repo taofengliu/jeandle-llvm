@@ -1,19 +1,17 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; A6 — alloc INSIDE the loop body, escape AFTER the loop exit. Before A1,
-; tier1Allocate refused to virtualize loop-body allocs so the original
-; invoke survived; after A1 the body alloc is tracked through the back-
-; edge, and the post-loop @sink call materializes the object at the
-; alloc's SafeIP (still inside the body). Function-wide RAUW on the
-; original alloc means the post-loop use sees the materialized pointer.
+; Alloc INSIDE the loop body, escape AFTER the loop exit. The body alloc
+; is tracked through the back-edge, and the post-loop @sink call
+; materializes the object at the alloc's SafeIP (still inside the body).
+; Function-wide RAUW on the original alloc means the post-loop use sees
+; the materialized pointer.
 ;
-; Pre-LCSSA, the original IR uses %o directly in the exit block: the body
-; block dominates the exit (single-pred exit from body). After RAUW, the
-; exit's use snaps onto the materialized invoke that also lives in the
-; body block — dominance is preserved by construction.
+; Pre-LCSSA, the original IR uses %o directly in the exit block: the
+; body block dominates the exit (single-pred exit from body). After
+; RAUW, the exit's use snaps onto the materialized invoke that also
+; lives in the body block — dominance is preserved by construction.
 ;
-; This exercises the "alloc-in-loop + escape-after-loop" path that the
-; pre-A1 force-materialize-at-preheader behaviour could not reach.
+; This exercises the "alloc-in-loop + escape-after-loop" path.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -39,8 +37,8 @@ cont:
   %i1 = add i32 %i, 1
   br label %loop
 exit_use:
-  ; Post-loop use of the body-local alloc. After A1 + RAUW, %o refers to
-  ; the materialized invoke produced inside the body block.
+  ; Post-loop use of the body-local alloc. After materialization + RAUW,
+  ; %o refers to the materialized invoke produced inside the body block.
   call void @sink(ptr addrspace(1) %o)
   ret void
 exit_null:

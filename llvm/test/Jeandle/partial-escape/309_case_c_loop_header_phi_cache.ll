@@ -1,17 +1,18 @@
 ; RUN: opt -S -passes="loop-simplify,require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R7.L9: a loop-header Case-C cache hit must rebuild FieldStates[Cached]
-; on iter (N+1) — the prior behaviour (early return after re-aliasing the
-; PHI to the cached ObjectID and adding an empty ObjectState) left the
+; A loop-header Case-C cache hit must rebuild FieldStates[Cached] on
+; iter (N+1) — naively early-returning after re-aliasing the PHI to the
+; cached ObjectID (and adding an empty ObjectState) would leave the
 ; synthetic VO functionally empty across iterations.
 ;
 ; Pattern: a loop whose header IS the Case-C merge block. The header
 ; receives two forward-edge incomings from a pre-loop diamond (each
 ; allocating a Point with field == 7) PLUS one back-edge incoming that
 ; replays the header PHI itself. The body LOAD of the merged Point's
-; field must fold to 7 across the iterative fixpoint; without R7.L9 the
-; cache-hit on iter 1 leaves FieldStates[Cached] empty and the load
-; resolves to "unknown", materializing the per-pred allocations.
+; field must fold to 7 across the iterative fixpoint; without the
+; rebuild the cache-hit on iter 1 leaves FieldStates[Cached] empty and
+; the load resolves to "unknown", materializing the per-pred
+; allocations.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)

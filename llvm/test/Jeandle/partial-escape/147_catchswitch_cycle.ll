@@ -1,9 +1,9 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R9.R7: a callbr-created back-edge that LoopInfo does NOT model. The
-; alloc + store at entry survive in IR because the analyzer's defensive
-; sweep marks every still-virtual VO at %head ineligible on detecting
-; the unvisited back-edge.
+; A callbr-created back-edge that LoopInfo does NOT model. The alloc +
+; store at entry survive in IR because the analyzer's defensive sweep
+; marks every still-virtual VO at %head ineligible on detecting the
+; unvisited back-edge.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @asm_callbr()

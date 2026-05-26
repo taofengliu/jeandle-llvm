@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/213_arraystorecheck_unknown_value_klass.cblog %s | FileCheck %s
 
-; B5: virtual Object[] (array klass 8888, element klass 4444) where the
+; Virtual Object[] (array klass 8888, element klass 4444) where the
 ; stored value comes from an opaque function argument with no
 ; java-klass attribute — getJavaType returns unknown, ValueKlass=0.
 ; foldArrayStoreCheck bails conservatively: mark the array ineligible so

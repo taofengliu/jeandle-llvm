@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R8.M4: identicalExitData fast path. An if/else diamond whose two arms
+; identicalExitData fast path. An if/else diamond whose two arms
 ; produce byte-identical BlockExitData (same Virtuals, same FieldStates,
 ; same LockCounts) skips the per-VO loop in mergeStates and inherits
 ; from preds[0] wholesale. End-to-end behaviour: alloc + store + load

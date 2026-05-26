@@ -1,8 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA-Plan §A4: nested lock-count mismatch. The then-pred holds two
+; Nested lock-count mismatch. The then-pred holds two
 ; live monitorenters on o (count=2), the else-pred holds one (count=1).
-; A4 materializes at both preds with each pred's OWN live lock stack —
+; The lock-cascade materializes at both preds with each pred's OWN live lock stack —
 ; the then-pred un-elides two enters, the else-pred un-elides one. The
 ; user's IR semantics are preserved exactly: two enters on then's path,
 ; one on else's path. No synthesized enters appear.

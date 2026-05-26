@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R11.V38: llvm.launder.invariant.group / llvm.strip.invariant.group are
+; llvm.launder.invariant.group / llvm.strip.invariant.group are
 ; pointer-identity-preserving — PEA routes them through propagatePointer-
 ; Alias so the result pointer carries the same VirtualAlias as the
 ; argument. A load through the laundered pointer must therefore resolve

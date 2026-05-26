@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/202_array_symbolic_index_bails.cblog %s | FileCheck %s
 
-; B3: int[] virtual access via the typed-element GEP chain with a SYMBOLIC
+; int[] virtual access via the typed-element GEP chain with a SYMBOLIC
 ; (non-constant) index. matchArrayElementGEP recognises the shape, the
 ; caller observes the non-ConstantInt index and forces the array to
 ; materialize. The newarray, the store, and the load all survive in IR.

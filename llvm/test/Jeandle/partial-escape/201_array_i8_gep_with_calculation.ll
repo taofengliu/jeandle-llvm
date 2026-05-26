@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/201_array_i8_gep_with_calculation.cblog %s | FileCheck %s
 
-; B3: int[] virtual where store and reload use a single i8 GEP whose
+; int[] virtual where store and reload use a single i8 GEP whose
 ; byte offset is structurally `add ArrayBaseOffset, (shl idx, log2(scale))`
 ; with the same symbolic %idx for both accesses. matchArrayElementGEP
 ; sees a non-constant index and (per Graal StoreIndexedNode's

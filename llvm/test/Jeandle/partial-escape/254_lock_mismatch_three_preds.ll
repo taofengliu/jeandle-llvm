@@ -1,19 +1,19 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA-Plan §A4: three preds joining at the same merge with lock counts
+; Three preds joining at the same merge with lock counts
 ; 0 / 1 / 2 on the same virtual object.
 ;
 ;   c0: no enter         → LC=0, no live enters.
 ;   c1: 1 enter          → LC=1, one live enter call.
 ;   c2: 2 enters         → LC=2, two live enter calls.
 ;
-; A4 fires (counts disagree). Materialize at every pred:
+; Lock-cascade fires (counts disagree). Materialize at every pred:
 ;   c0: no live locks → just emit the new alloc invoke.
 ;   c1: un-elide its one enter (operand snapped to c1's NewInv).
 ;   c2: un-elide its two enters (operand snapped to c2's NewInv).
 ;
 ; After all three materialize, the retry sees AllMaterialized with
-; per-pred-placeholder MaterializedValues; my §A4 fix detects the
+; per-pred-placeholder MaterializedValues; the lock-cascade fix detects the
 ; placeholders and builds a ptr addrspace(1) PHI of the three per-pred
 ; NewInvs, then RAUWs OrigAlloc → PHI for the post-merge sink user.
 ;

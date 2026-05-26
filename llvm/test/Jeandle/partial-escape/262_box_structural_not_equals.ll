@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/262_box_structural_not_equals.cblog %s | FileCheck %s
 
-; B10 Phase 3 (runtime path): two boxed virtuals of klass 9999 (Integer)
+; Phase 3 (runtime path): two boxed virtuals of klass 9999 (Integer)
 ; storing non-constant primitive values. The structural fold replaces
 ; the pointer `icmp eq %a, %b` with a runtime `icmp eq i32 %x, %y` over
 ; the stored boxed values — distinguishable from the default identity

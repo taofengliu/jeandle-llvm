@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; C6 — a loop unreachable from entry. The reachable function body just
+; A loop unreachable from entry. The reachable function body just
 ; returns; a dead loop with an alloc + escape exists in the IR (not
 ; reachable via any edge from entry). The analyzer's RPO walk over the
 ; reachable subgraph should not crash on the dead blocks, and the dead

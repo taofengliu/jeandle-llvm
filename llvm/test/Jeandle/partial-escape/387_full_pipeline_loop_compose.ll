@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="loop-simplify,partial-escape-iterative,instcombine,simplifycfg,adce" -jeandle-pea-iterations=2 %s | FileCheck %s
 
-; R12.P6: end-to-end pipeline composition. Wires up the same passes the
+; End-to-end pipeline composition. Wires up the same passes the
 ; production pipeline runs around PEA — LoopSimplify (preheader / LCSSA
 ; canonicalization) -> partial-escape-iterative (inner loop fixpoint +
 ; outer iteration) -> InstCombine + SimplifyCFG + ADCE (canonicalisation

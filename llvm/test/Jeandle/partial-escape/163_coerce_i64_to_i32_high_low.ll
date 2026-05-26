@@ -1,8 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA / B6: store i64 into a virtual's slot at offset 8, then read both
-; halves as i32. Offset 8 (low half) -> plain `trunc`. Offset 12 (high
-; half) -> `lshr by 32` + `trunc`. Little-endian semantics.
+; Store i64 into a virtual's slot at offset 8, then read both halves as
+; i32. Offset 8 (low half) -> plain `trunc`. Offset 12 (high half) ->
+; `lshr by 32` + `trunc`. Little-endian semantics.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 

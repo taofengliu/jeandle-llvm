@@ -1,18 +1,16 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; A1 — real loop fixpoint. An object is allocated BEFORE the loop, with a
+; Real loop fixpoint. An object is allocated BEFORE the loop, with a
 ; field stored in the preheader. The loop body writes a new value to the
 ; same field on every iteration and reads it back; the read flows into a
 ; scalar consumer (@use). The object itself never escapes the loop (no
 ; pointer-leak: only the loaded i32 is consumed).
 ;
-; Today's single-pass + preheader-force-materialize pipeline would have
-; materialised %o at the preheader. A1's loop fixpoint tracks the object
-; through the back-edge: iteration 1 sees both the preheader's f-value
-; (=1) and the backedge's f-value (=%i); a field PHI is synthesised at
-; the loop header; iteration 2 produces the same FieldStates / Virtuals
-; pattern at every loop block → convergence; the safety net is skipped;
-; the alloc is fully eliminated.
+; The loop fixpoint tracks the object through the back-edge: iteration 1
+; sees both the preheader's f-value (=1) and the backedge's f-value
+; (=%i); a field PHI is synthesised at the loop header; iteration 2
+; produces the same FieldStates / Virtuals pattern at every loop block →
+; convergence; the safety net is skipped; the alloc is fully eliminated.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)

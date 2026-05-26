@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; B2 (exception edge state splitting) — the snapshotting mechanism MUST
+; Exception edge state splitting — the snapshotting mechanism MUST
 ; capture the full pre-invoke per-object state, not just the entries that
 ; the invoke ends up materializing. An invoke that materializes one
 ; virtual (VO_A) leaves UNRELATED virtuals (VO_B) untouched on the unwind
@@ -30,9 +30,9 @@ n1:
   ; Virtual store into VO_B at offset 16 — tracked in FieldStates.
   %b_slot = getelementptr inbounds i8, ptr addrspace(1) %b, i64 16
   store i32 99, ptr addrspace(1) %b_slot, align 4
-  ; Escape VO_A through @sink. This invoke materializes VO_A. With B2,
-  ; the handler inherits a pre-invoke snapshot whose Virtuals set still
-  ; contains VO_B (and whose FieldStates still records the store above).
+  ; Escape VO_A through @sink. This invoke materializes VO_A. The handler
+  ; inherits a pre-invoke snapshot whose Virtuals set still contains VO_B
+  ; (and whose FieldStates still records the store above).
   invoke void @sink(ptr addrspace(1) %a)
        to label %nfinal unwind label %handler
 nfinal:

@@ -1,11 +1,11 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA A3: alloc-dominates fast path with escapes on BOTH arms via DIFFERENT
+; Alloc-dominates fast path with escapes on BOTH arms via DIFFERENT
 ; sink calls. The mergeStates "AllMaterialized" branch fires (every incoming
 ; has the object Materialized). Because every incoming's MaterializedValue
 ; resolves to the same OrigAlloc placeholder, no ptr addrspace(1) PHI is
 ; needed at the merge; RAUW makes both materializations point at the live
-; invoke. (This exercises the AllMaterialized fast path alongside A3's
+; invoke. (This exercises the AllMaterialized fast path alongside the
 ; alloc-dominates invariant.)
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)

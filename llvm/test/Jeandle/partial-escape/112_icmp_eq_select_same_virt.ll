@@ -5,12 +5,12 @@
 ; processBlockPhis Case B only handled PHINodes, not Selects, so the
 ; Select consumed virtual operands and forced materialization.
 ;
-; Now (PEA-Plan §B7): applyThreeTier dispatches SelectInst into
-; propagatePointerAlias, which uses resolveVirtualRefImpl's new Select
-; case to verify that both arms resolve to the same ObjectID and then
-; aliases the Select to that virtual. The icmp eq downstream resolves
-; both operands to the same ObjectID and folds to true; the diff arm
-; becomes unreachable and the allocation is eliminated.
+; Now: applyThreeTier dispatches SelectInst into propagatePointerAlias,
+; which uses resolveVirtualRefImpl's Select case to verify that both arms
+; resolve to the same ObjectID and then aliases the Select to that
+; virtual. The icmp eq downstream resolves both operands to the same
+; ObjectID and folds to true; the diff arm becomes unreachable and the
+; allocation is eliminated.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)
@@ -37,7 +37,7 @@ u:
   resume i64 %lp
 }
 
-; With §B7 in place:
+; Expected behavior:
 ;   - propagatePointerAlias aliases %sel to the same ObjectID as %o.
 ;   - icmp eq sees both operands resolve to that ObjectID -> folds to true.
 ;   - transform replaces the conditional branch with an unconditional one

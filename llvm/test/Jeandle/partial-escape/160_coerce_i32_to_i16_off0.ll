@@ -1,8 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA / B6: store i32 into a virtual's slot, load i16 at the same byte
-; offset (within-slot byte offset 0). Emit a plain `trunc i32 ... to i16`;
-; no `lshr` needed since the low half of the slot is requested.
+; Store i32 into a virtual's slot, load i16 at the same byte offset
+; (within-slot byte offset 0). Emit a plain `trunc i32 ... to i16`; no
+; `lshr` needed since the low half of the slot is requested.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 

@@ -1,13 +1,12 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R6.S5 — preserve all non-"deopt" operand bundles. PEA is intentionally
+; Preserve all non-"deopt" operand bundles. PEA is intentionally
 ; deopt-agnostic until the Jeandle deopt refactor lands (the transform
 ; drops "deopt" when copying bundles onto NewInv), but every other tag
 ; must survive. Here the allocation carries both a "deopt" and a
 ; "cfguardtarget" bundle; only the "cfguardtarget" bundle survives on
-; the materialisation invoke. This still catches the original R6.S5 bug
-; (a bundle-copy loop that broke after the first bundle, silently
-; dropping subsequent ones).
+; the materialisation invoke. This guards against a bundle-copy loop
+; that breaks after the first bundle and silently drops subsequent ones.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))

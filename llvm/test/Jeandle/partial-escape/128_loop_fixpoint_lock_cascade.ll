@@ -1,8 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; A1 — lock-elision inside a loop body that the fixpoint must handle.
-; Each iteration enters and exits the monitor on the body-local obj.
-; Without escape, the lock pair elides and the alloc disappears.
+; Lock-elision inside a loop body that the fixpoint must handle. Each
+; iteration enters and exits the monitor on the body-local obj. Without
+; escape, the lock pair elides and the alloc disappears.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc i1 @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)

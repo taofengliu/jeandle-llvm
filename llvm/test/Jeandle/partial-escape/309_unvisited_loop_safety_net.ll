@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R9.L11: the safety-net materializePreheaderVirtualsForUnvisitedLoops
-; only fires on loops processLoop never touched. The expected case is an
+; The safety-net materializePreheaderVirtualsForUnvisitedLoops only
+; fires on loops processLoop never touched. The expected case is an
 ; unreachable loop that the RPO walk skipped. Construct one by making
 ; the top-level CFG fall through to %exit unconditionally; the loop %hdr
 ; / %body / %latch is structurally a valid LoopInfo loop but is

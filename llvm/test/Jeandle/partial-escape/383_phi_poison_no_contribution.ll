@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R11.R3: poison incoming on a Select arm is treated as no-contribution by
+; Poison incoming on a Select arm is treated as no-contribution by
 ; resolveVirtualRef. A `select i1 %c, ptr alloc, ptr poison` resolves to
 ; the alloc — the poison-arm path would be UB if executed. PEA's
 ; resolveVirtualRefImpl Select handler ignores poison arms so the load

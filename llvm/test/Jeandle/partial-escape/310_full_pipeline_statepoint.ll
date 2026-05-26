@@ -2,7 +2,7 @@
 ; RUN:   -passes='function(require<partial-escape-analysis>,partial-escape-transform,insert-gc-barriers),rewrite-statepoints-for-gc,verify' \
 ; RUN:   %s | FileCheck %s
 
-; PEA Round 5 (C10): Anchor-supplier hook investigation regression test.
+; Anchor-supplier hook investigation regression test.
 ;
 ; Graal's `virtualAnchorSupplier` (PartialEscapePhase.java:187) defaults to
 ; `null` for all hosted/Substrate tiers; it is overridden only by

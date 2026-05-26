@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R8.M15: lit coverage for `select i1, %virt, null`. The select's two arms
+; Lit coverage for `select i1, %virt, null`. The select's two arms
 ; don't both resolve to the same virtual (one arm is null), so the
 ; SelectInst arm of propagatePointerAlias falls through to the generic
 ; escape path which materialises the virtual at the select. The null

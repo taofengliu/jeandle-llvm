@@ -1,15 +1,15 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; A6 — loop with TWO exit blocks. The alloc happens before the loop
-; (entry → prep, where prep is the unique loop-preheader so A1's fixpoint
+; Loop with TWO exit blocks. The alloc happens before the loop (entry →
+; prep, where prep is the unique loop-preheader so the loop fixpoint
 ; runs). Inside the loop body, the alloc escapes via @sink on every
 ; iteration → materializeAt hoists a new invoke to the alloc's SafeIP
 ; (prep's first non-PHI), and applyMaterialize RAUWs OrigAlloc → NewInv
 ; function-wide. Both exit blocks (one reached via the !c branch from the
 ; header, one via a break inside the body) read %o; after RAUW they both
 ; see the same materialized pointer with no per-exit-block PHI synthesis
-; needed — this is the "materialized at loop exit" branch of A6 that
-; reduces to function-wide RAUW in our LLVM model.
+; needed — this is the "materialized at loop exit" case that reduces to
+; function-wide RAUW in our LLVM model.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))

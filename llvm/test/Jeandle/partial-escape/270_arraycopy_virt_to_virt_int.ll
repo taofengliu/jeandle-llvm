@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/270_arraycopy_virt_to_virt_int.cblog %s | FileCheck %s
 
-; B9: virtual int[] -> virtual int[] arraycopy via llvm.memcpy. Both
+; Virtual int[] -> virtual int[] arraycopy via llvm.memcpy. Both
 ; allocations and the memcpy are eliminated; the loaded value sees the
 ; element copied from src into dst.
 

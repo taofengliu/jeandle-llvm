@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA / B6: a load that STRADDLES two separately-stored sub-slots cannot be
+; A load that STRADDLES two separately-stored sub-slots cannot be
 ; coerced — Graal would need a multi-slot read+concat which we don't
 ; implement. Here two i32 stores at adjacent offsets are followed by an
 ; i64 load spanning both: PEA must bail to ineligible, leaving the alloc,

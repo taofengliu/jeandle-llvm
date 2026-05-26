@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R11.V28: variant exercising the InsertValueInst chain for the {T, i1}
+; Variant exercising the InsertValueInst chain for the {T, i1}
 ; result struct. With non-constant expected, both the prior-value extract
 ; and the success-bit extract land on the synthesized struct. The bit-
 ; level shape after fold:

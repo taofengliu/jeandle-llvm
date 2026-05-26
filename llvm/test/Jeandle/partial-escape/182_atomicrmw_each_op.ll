@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; B17: exercise the full supported atomicrmw op set against one virtual:
+; Exercise the full supported atomicrmw op set against one virtual:
 ; xchg, add, sub, and, or, xor. Each op stores a constant first, then
 ; performs the op with a constant operand. The returned prior values
 ; should compile-time-fold and the allocation is eliminated.

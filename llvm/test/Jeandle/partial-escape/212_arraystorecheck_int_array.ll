@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/212_arraystorecheck_int_array.cblog %s | FileCheck %s
 
-; B5: virtual int[] (primitive array). ArrayElementKlass returns 0 (the
+; Virtual int[] (primitive array). ArrayElementKlass returns 0 (the
 ; "primitive" sentinel), so foldArrayStoreCheck unconditionally elides the
 ; check call. The int[] alloc is otherwise unused, so the alloc and the
 ; check both disappear.

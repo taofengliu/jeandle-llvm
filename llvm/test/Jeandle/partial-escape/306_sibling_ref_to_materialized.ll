@@ -1,17 +1,18 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R6.S8 — updateStatesForMaterialized for the outer VO.
+; updateStatesForMaterialized for the outer VO.
 ;
 ; Two virtual objects: A (outer) and B (sibling) where B holds a field that
 ; stores a reference to A (FS[B][0] = VirtualRef(A)). When A escapes via
 ; @sink BEFORE B does, materializeAt(A) flips A to Materialized but the
-; sibling B's FieldStates entry still names VirtualRef(A). Later, when B
-; itself escapes, the snapshotting loop would either fire the transform-side
-; debug assert ("VirtualRef field entries must have been rewritten to
-; MaterializedRef during analysis") or silently drop B's field-0 store.
+; sibling B's FieldStates entry still names VirtualRef(A). Without the
+; cross-VO rewrite, the later snapshotting loop when B escapes would
+; either fire the transform-side debug assert ("VirtualRef field entries
+; must have been rewritten to MaterializedRef during analysis") or
+; silently drop B's field-0 store.
 ;
-; Post-fix: after A's outer state flips to Materialized, the helper walks
-; every other VO's FieldStates and rewrites VirtualRef(A) entries to
+; After A's outer state flips to Materialized, the helper walks every
+; other VO's FieldStates and rewrites VirtualRef(A) entries to
 ; MaterializedRef(A.alloc). When B subsequently escapes, its snapshot has
 ; a clean MaterializedRef entry and the materialised invoke for B replays
 ; the field-0 store with A's materialised pointer.
@@ -35,7 +36,7 @@ n2:
   store atomic ptr addrspace(1) %a, ptr addrspace(1) %bf0 unordered, align 8
   ; Escape A first.
   call void @sink(ptr addrspace(1) %a)
-  ; Now escape B. Before R6.S8 this would assert or drop the field.
+  ; Now escape B. Without the cross-VO rewrite this would assert or drop the field.
   call void @sink(ptr addrspace(1) %b)
   ret void
 u:

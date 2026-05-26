@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="partial-escape-iterative" -jeandle-pea-iterations=2 %s | FileCheck %s
 
-; B8 natural-path re-foldable materialize. Round 1 of PEA materializes %o
+; Natural-path re-foldable materialize. Round 1 of PEA materializes %o
 ; at the escape arm via applyMaterialize, which emits a fresh
 ; `jeandle.new_instance` invoke ("pea.mat") followed by separate `store`
 ; instructions for each tracked field. After canonicalization between rounds
@@ -11,7 +11,7 @@
 ; up naturally as virtual-field writes, and the alloc is re-virtualized
 ; and eliminated.
 ;
-; This is the "B8 without metadata" path: no AllocatedObjectNode-style
+; This is the "without metadata" path: no AllocatedObjectNode-style
 ; back-pointer is needed because the IR shape the materializer emits is
 ; already in the form PEA can re-process.
 ;

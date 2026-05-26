@@ -1,12 +1,12 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA-Plan §A4: lock in one branch, escape (sink) at the merge after
-; A4 has materialized at both preds.
+; Lock in one branch, escape (sink) at the merge after
+; the lock-cascade has materialized at both preds.
 ;
 ; Sequence:
 ;   then: monitorenter(o) → LC[o]=1, enter is folded.
 ;   else: no lock → LC[o]=0.
-;   merge: counts disagree → A4 fires. Both preds materialize:
+;   merge: counts disagree → lock-cascade fires. Both preds materialize:
 ;     * then-pred: un-elides the enter (its receiver is rewritten to the
 ;       then-pred's NewInv via the PH-tagged ReplaceInput).
 ;     * else-pred: no live locks, just emits the alloc invoke.

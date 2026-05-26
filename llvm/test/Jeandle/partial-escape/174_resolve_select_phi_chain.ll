@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA-Plan §B7: nested Select-of-PHI-of-virtual. The merge PHI itself
+; Nested Select-of-PHI-of-virtual. The merge PHI itself
 ; gets aliased by processBlockPhis Case B; the downstream Select then
 ; resolves through resolveVirtualRefImpl's Select case (each arm is
 ; %phi, which aliases to the virtual ID). Tests that recursion composes

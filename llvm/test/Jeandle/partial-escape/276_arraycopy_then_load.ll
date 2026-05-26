@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/276_arraycopy_then_load.cblog %s | FileCheck %s
 
-; B9: arraycopy followed by an element load. The load reads the value that
+; Arraycopy followed by an element load. The load reads the value that
 ; arraycopy staged into dst's FieldStates, so it folds to the source's stored
 ; value (200) without any IR for the alloc / memcpy / store / load surviving.
 

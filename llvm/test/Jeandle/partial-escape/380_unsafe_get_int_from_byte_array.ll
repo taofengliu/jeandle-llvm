@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/380_unsafe_get_int_from_byte_array.cblog %s | FileCheck %s
 
-; R11.V11: Unsafe.getInt-style reassembly. A virtual byte[] is written
+; Unsafe.getInt-style reassembly. A virtual byte[] is written
 ; byte-by-byte at offsets 16..19 (the int[]/byte[] base offset is 16
 ; per the cblog), then read as a wider integer at the same offset.
 ; PEA reassembles the integer via the byte FieldStates entries — when

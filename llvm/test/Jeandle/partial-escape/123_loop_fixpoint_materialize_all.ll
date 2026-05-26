@@ -1,12 +1,10 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; A1 — MATERIALIZE_ALL fallback exercise. The body contains a real
-; escape (call to @sink with the pointer) on every iteration so the
-; object MUST materialize. Without A1 the preheader-force-materialize
-; safety net handles this; with A1 the fixpoint converges with the
-; object marked Materialized at the loop body, and the per-instruction
-; materializeAt emits the materialization invoke at the alloc site.
-; Either way the alloc must survive in IR.
+; MATERIALIZE_ALL fallback exercise. The body contains a real escape
+; (call to @sink with the pointer) on every iteration so the object MUST
+; materialize. The fixpoint converges with the object marked Materialized
+; at the loop body, and the per-instruction materializeAt emits the
+; materialization invoke at the alloc site. The alloc must survive in IR.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))

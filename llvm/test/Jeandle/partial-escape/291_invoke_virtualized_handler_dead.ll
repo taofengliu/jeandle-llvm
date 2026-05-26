@@ -1,22 +1,23 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; B2 (exception edge state splitting) — when an invoke is virtualized
+; Exception edge state splitting — when an invoke is virtualized
 ; away by tier2JavaOpFold (e.g. jeandle.array_length on a virtual array
 ; folds to a compile-time constant), the analyzer emits a ReplaceCall
 ; effect on the InvokeInst. The transform rewrites that invoke as an
 ; unconditional branch to the normal dest, dropping the unwind edge.
 ;
-; The analyzer's B2 logic detects this and marks the pred's unwind edge
-; "killed", so exitDataFor returns nullptr when the handler asks for its
-; pred's contribution. The handler therefore inherits NO virtual state
-; from this pred — references to virtuals registered upstream do NOT
-; resolve in the handler and so do NOT trigger materialization.
+; The analyzer detects this and marks the pred's unwind edge "killed",
+; so exitDataFor returns nullptr when the handler asks for its pred's
+; contribution. The handler therefore inherits NO virtual state from
+; this pred — references to virtuals registered upstream do NOT resolve
+; in the handler and so do NOT trigger materialization.
 ;
-; Without B2: the handler would inherit n2's post-block state (VO_A
-; still virtual + VO_A's IR alias intact); the @sink(%a) call inside the
-; handler would force VO_A to materialize, which would in turn keep VO_A's
-; allocation invoke in the output IR. With B2 the handler is unreachable
-; for analysis and VO_A's allocation is cleanly eliminated.
+; Without the killed-edge handling: the handler would inherit n2's
+; post-block state (VO_A still virtual + VO_A's IR alias intact); the
+; @sink(%a) call inside the handler would force VO_A to materialize,
+; which would in turn keep VO_A's allocation invoke in the output IR.
+; With the killed-edge handling the handler is unreachable for analysis
+; and VO_A's allocation is cleanly eliminated.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc ptr addrspace(1) @jeandle.newarray(ptr, i32)
@@ -44,10 +45,11 @@ normal:
   ret i32 %len
 handler:
   %lp = landingpad i64 cleanup
-  ; This @sink call would (without B2) materialize VO_A at the handler;
-  ; with B2 the handler inherits no virtual state from n2 (killed unwind
-  ; edge) and the call is a no-op for PEA. After EliminateAllocation the
-  ; %a operand is RAUW'd to poison and the handler block is unreachable.
+  ; This @sink call would (without killed-edge handling) materialize
+  ; VO_A at the handler; with it, the handler inherits no virtual state
+  ; from n2 (killed unwind edge) and the call is a no-op for PEA. After
+  ; EliminateAllocation the %a operand is RAUW'd to poison and the
+  ; handler block is unreachable.
   call void @sink(ptr addrspace(1) %a)
   resume i64 %lp
 u_arr:

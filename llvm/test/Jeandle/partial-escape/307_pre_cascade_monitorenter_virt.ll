@@ -1,15 +1,15 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R6.S9 — materializeVirtualLocksBefore pre-cascade.
+; materializeVirtualLocksBefore pre-cascade.
 ;
 ; Two virtuals A and B, both entered (virtual monitorenter). At sink(%a),
-; the existing narrow C8 cascade rule (other.minOrder < this.maxOrder)
-; would observe Order(B).front=1 vs A.back=0 → 1<0 false → no cascade
-; of B at A's escape. Without the R6.S9 pre-cascade, B would only
+; the narrow lock-cascade rule (other.minOrder < this.maxOrder) would
+; observe Order(B).front=1 vs A.back=0 → 1<0 false → no cascade of B at
+; A's escape. Without the pre-cascade at foldMonitorEnter, B would only
 ; materialise at sink(%b), so the lock-stack observable from sink(%a)
 ; would silently lack B's lock — a Java-semantics change.
 ;
-; Post-fix: at foldMonitorEnter(B) we pre-cascade A (because A.front=0 <
+; At foldMonitorEnter(B) we pre-cascade A (because A.front=0 <
 ; B.NewOrder=1) so A materialises BEFORE B's virtual lock is added. The
 ; result is that both monitorenters appear in IR before sink(%a), and the
 ; runtime lock stack at sink(%a) is correctly [A, B].
@@ -33,7 +33,7 @@ n1:
             ptr inttoptr (i64 22222 to ptr), i32 16)
        to label %n2 unwind label %u
 n2:
-  ; Virtual monitorenter on B — fires the R6.S9 pre-cascade of A.
+  ; Virtual monitorenter on B — fires the pre-cascade of A.
   %eb = call hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(
                   ptr addrspace(1) %b, ptr %lb)
   ; Escape A first.

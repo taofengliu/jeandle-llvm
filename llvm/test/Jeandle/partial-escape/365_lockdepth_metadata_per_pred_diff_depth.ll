@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R10.X1b: lock-stack identity mismatch where the SAME enter call site is
+; Lock-stack identity mismatch where the SAME enter call site is
 ; reached by two preds but each pred carries a DIFFERENT bytecode depth
 ; via metadata. This is only possible because the test attaches distinct
 ; `!jeandle.lock_depth` metadata at two distinct IR call sites that
@@ -8,12 +8,6 @@
 ;   S[i].Call == RefStack[i].Call && S[i].BytecodeDepth == RefStack[i].BytecodeDepth
 ; sees Call agreement but BytecodeDepth mismatch and routes to per-pred
 ; materialise.
-;
-; Before R10.X1b: BytecodeDepth was not consulted, the depth mismatch was
-; ignored, and the two preds would have merged silently with whichever
-; pred-side stack appeared first — semantically wrong because a downstream
-; un-elide would emit the wrong number of monitorenter calls for some
-; paths.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
@@ -50,7 +44,7 @@ u:
   resume i64 %lp
 }
 
-; After R10.X1b, %o is materialised at each pred (depth-mismatch routes
+; %o is materialised at each pred (depth-mismatch routes
 ; the merge through per-pred materialise instead of the legacy bail).
 ; The original allocation is replaced by the per-pred materialised invokes.
 ; CHECK-LABEL: define void @test_lockdepth_per_pred_diff_depth

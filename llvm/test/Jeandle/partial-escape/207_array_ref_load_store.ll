@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/207_array_ref_load_store.cblog %s | FileCheck %s
 
-; B3: Object[] virtual — typed-element GEPs at constant indices, storing /
+; Object[] virtual — typed-element GEPs at constant indices, storing /
 ; reloading a reference. Element type is ptr addrspace(1); element scale
 ; defaults to compressed-oop size (4 bytes), so element[1] sits at byte
 ; offset 20 etc.

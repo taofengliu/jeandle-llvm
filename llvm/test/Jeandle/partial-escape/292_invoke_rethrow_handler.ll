@@ -1,8 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; B2 (exception edge state splitting) — regression test for a handler
+; Exception edge state splitting — regression test for a handler
 ; whose only purpose is to re-throw via `resume`. Such handlers have no
-; per-object state of their own; the B2 state-split must not leave the
+; per-object state of their own; the state-split must not leave the
 ; analyzer in a confused state (e.g. by treating the pre-invoke snapshot
 ; as authoritative for a sink-only handler).
 ;

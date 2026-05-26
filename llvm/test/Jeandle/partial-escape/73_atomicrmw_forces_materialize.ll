@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; B17: atomicrmw on a virtual field at a constant offset is compile-time-
+; Atomicrmw on a virtual field at a constant offset is compile-time-
 ; folded. The slot's prior value is what the atomicrmw "returns" (RAUW'd
 ; replacement); the new value is recorded as the field's tracked entry.
 ; No other thread can race a virtual, so the atomic + ordering semantics

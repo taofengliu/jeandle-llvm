@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R8.M8: when a Case-C candidate PHI has a self-reference among its
+; When a Case-C candidate PHI has a self-reference among its
 ; incomings (the back-edge feeds the PHI back into itself), the
 ; synthesize-Case-C path early-bails. The fallback is Case-A: every
 ; virtual incoming materialised at its pred terminator. The lone

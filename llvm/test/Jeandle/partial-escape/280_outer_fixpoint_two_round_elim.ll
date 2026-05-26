@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="partial-escape-iterative" -jeandle-pea-iterations=2 %s | FileCheck %s
 
-; D1: outer fixpoint demonstration. The escape arm (%escape -> sink) is
+; Outer fixpoint demonstration. The escape arm (%escape -> sink) is
 ; guarded by an `icmp ne` of a load from a constant-zero global; the analyzer
 ; in round 1 cannot see through the load and so visits %escape, where the
 ; sink call forces materialization. Between rounds InstCombine folds the load

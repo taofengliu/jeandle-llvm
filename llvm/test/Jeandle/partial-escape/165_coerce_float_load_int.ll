@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA / B6: store float into a virtual's slot, load i32 at the same offset.
+; Store float into a virtual's slot, load i32 at the same offset.
 ; Same bit width (32 == 32), both primitives -> BitCast (float -> i32).
 ; Covers the float-->int direction (test 60 covers int-->float).
 

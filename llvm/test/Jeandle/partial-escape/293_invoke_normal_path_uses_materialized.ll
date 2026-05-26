@@ -1,8 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; B2 (exception edge state splitting) — regression test for the NORMAL
-; successor of an invoke that materialized one of its operands. With B2
-; we add a separate pre-invoke snapshot for the unwind successor, but
+; Exception edge state splitting — regression test for the NORMAL
+; successor of an invoke that materialized one of its operands. A
+; separate pre-invoke snapshot is used for the unwind successor, but
 ; the normal successor must continue to inherit the post-invoke state
 ; (i.e. it sees VO_A as Materialized, with the materialized invoke as
 ; its backing pointer).

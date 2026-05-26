@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA / C8: outer-lock holder escapes while inner-lock holder is still
+; Outer-lock holder escapes while inner-lock holder is still
 ; virtual. Under Graal's narrow cascade rule
 ;   other.minLockDepth < this.maxLockDepth
 ; we get B.min (1) NOT < A.max (0), so the inner virtual B is NOT
@@ -9,7 +9,7 @@
 ; (still-virtual) monitorenter/exit pair never touches the real lock
 ; stack, so no disorder can occur.
 ;
-; This is the case where C8 buys an actual win over the prior
+; This is the case where the narrow rule buys an actual win over a
 ; broad-cascade implementation (which would have over-materialized B).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)

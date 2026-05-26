@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R11.R19: atomicrmw fadd / fsub / fmin / fmax on a virtual slot with
+; atomicrmw fadd / fsub / fmin / fmax on a virtual slot with
 ; constant operands fold at compile time. The ConstantFoldBinaryOpOperands
 ; path handles fadd/fsub; APFloat::minnum/maxnum drives fmin/fmax.
 

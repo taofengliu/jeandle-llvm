@@ -1,18 +1,18 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R6.S9 + R10.X1c: materializeVirtualLocksBefore pre-cascade keyed on
-; bytecode depth metadata. We have two virtuals %a and %b. Enter A at
-; depth=0 (outer). Then enter B at depth=1 (inner). The pre-cascade fires
-; when we are ABOUT to push B's enter: A's front depth (0) < new depth
-; (1), so A must be materialised at B's enter site BEFORE the lock
-; counter for B is bumped. Without R6.S9, an escape of A downstream would
+; materializeVirtualLocksBefore pre-cascade keyed on bytecode depth
+; metadata. We have two virtuals %a and %b. Enter A at depth=0 (outer).
+; Then enter B at depth=1 (inner). The pre-cascade fires when we are
+; ABOUT to push B's enter: A's front depth (0) < new depth (1), so A
+; must be materialised at B's enter site BEFORE the lock counter for B
+; is bumped. Without the pre-cascade, an escape of A downstream would
 ; materialise A alone — leaving B's enter on the virtual lock stack
 ; corrupted because A's real monitorenter wouldn't be present in IR.
 ;
-; After R6.S9+R10.X1c, A materialises at B's enter; both A's enter and
-; the un-elide ReplaceInput emit a real call site for A. B stays virtual
-; until the actual sink (which only references A in this test); B has
-; nothing observable to materialise for, and its enter folds away.
+; A materialises at B's enter; both A's enter and the un-elide
+; ReplaceInput emit a real call site for A. B stays virtual until the
+; actual sink (which only references A in this test); B has nothing
+; observable to materialise for, and its enter folds away.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)

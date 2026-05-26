@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA-Plan §B7 risk note: a long Select chain. The depth cap in
+; A long Select chain. The depth cap in
 ; resolveVirtualRefImpl is 8; this chain is exactly 8 selects deep
 ; (depth 9 total counting the outermost). When the Select case
 ; dispatches, processBlockPhis Case B (and selects aliased by

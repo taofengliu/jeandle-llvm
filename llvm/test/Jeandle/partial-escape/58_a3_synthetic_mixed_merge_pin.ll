@@ -1,12 +1,13 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA A3 regression pin: a synthetic VO (created by A2's Case C at %M1)
-; flowing into a downstream mixed PHI Case A. Without the synthetic-VO bail
-; in materializeAtPredFromExitInfo, the Case A path would emit a Materialize
-; effect using the synthetic's borrowed OrigAlloc (one of the per-pred source
-; allocs), then RAUW that source alloc — which is the incoming value of the
-; Case-C merge PHI %p in %M1. The RAUW redirected %p's incoming onto the new
-; invoke in %X (downstream of M1), breaking SSA dominance:
+; A synthetic VO (created by Case C at %M1) flowing into a downstream
+; mixed PHI Case A. Without the synthetic-VO bail in
+; materializeAtPredFromExitInfo, the Case A path would emit a
+; Materialize effect using the synthetic's borrowed OrigAlloc (one of
+; the per-pred source allocs), then RAUW that source alloc — which is
+; the incoming value of the Case-C merge PHI %p in %M1. The RAUW
+; redirected %p's incoming onto the new invoke in %X (downstream of M1),
+; breaking SSA dominance:
 ;
 ;   "Instruction does not dominate all uses!"
 ;   %pea.mat = invoke ... @jeandle.new_instance ... to label %mat.cont ...
@@ -14,7 +15,7 @@
 ;
 ; With the bail in place, materializeAtPredFromExitInfo on a synthetic VO
 ; marks both the synthetic and every per-pred source ineligible, so the
-; original IR (allocs, PHI %p, sink call) survives unchanged. PEA-Plan §A3.
+; original IR (allocs, PHI %p, sink call) survives unchanged.
 ;
 ; The general "alloc doesn't dominate merge" case in mergeStates' true-mixed
 ; branch is unreachable for non-synthetic VOs by SSA dominance: ID can only
@@ -44,7 +45,7 @@ B:
 Bn:
   br label %M1
 M1:
-  ; A2 Case C synthesizes a single VO aliased to %p.
+  ; Case C synthesizes a single VO aliased to %p.
   %p = phi ptr addrspace(1) [ %oA, %An ], [ %oB, %Bn ]
   br i1 %c1, label %X, label %Z
 X:
@@ -54,7 +55,7 @@ Z:
 M2:
   ; Mixed PHI Case A: %p (synthetic VO alias) on the X edge, %arg
   ; (non-virtual) on the Z edge. Drives materializeAtPredFromExitInfo
-  ; on the synthetic at %X — bails per A3.
+  ; on the synthetic at %X — bails on the synthetic VO.
   %q = phi ptr addrspace(1) [ %p, %X ], [ %arg, %Z ]
   call void @sink(ptr addrspace(1) %q)
   ret ptr addrspace(1) %arg

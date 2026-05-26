@@ -1,9 +1,9 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R9.L10: processLoopExit force-materialises virtuals at any loop-exit
-; whose successor is a real catch-handler EH pad (landingpad with at
-; least one catch clause). In the loop below the EXIT block %check has
-; an invoke whose unwind dest is a landingpad with an explicit clause.
+; processLoopExit force-materialises virtuals at any loop-exit whose
+; successor is a real catch-handler EH pad (landingpad with at least one
+; catch clause). In the loop below the EXIT block %check has an invoke
+; whose unwind dest is a landingpad with an explicit clause.
 ; processLoopExit runs on %check and drains every still-virtual VO at
 ; the exit terminator. The alloc in the loop must survive in IR (the
 ; force-mat re-emits it).
@@ -46,14 +46,14 @@ ret:
 
 catchlp:
   ; Landingpad with one explicit catch clause — qualifies as a real EH
-  ; exit, so R9.L10 force-materialises at %check.
+  ; exit, so processLoopExit force-materialises at %check.
   %lp = landingpad i64
           catch ptr null
   call void @catch_handler(ptr addrspace(1) %obj)
   resume i64 %lp
 
 u:
-  ; Pure cleanup landingpad — does NOT trigger R9.L10.
+  ; Pure cleanup landingpad — does NOT trigger force-materialisation.
   %lpc = landingpad i64 cleanup
   resume i64 %lpc
 }

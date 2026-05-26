@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/205_array_index_in_constexpr_gep.cblog %s | FileCheck %s
 
-; B3: int[] virtual where the element address is computed by ConstantExpr
+; int[] virtual where the element address is computed by ConstantExpr
 ; GEPs (i.e. the typed GEP is folded into a constant expression of the
 ; chained shape). The stripPointerCastsAndOffsets walk + resolveFieldOffset
 ; together canonicalize the access to a constant byte offset that lands

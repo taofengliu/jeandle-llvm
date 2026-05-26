@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/272_arraycopy_from_constant_data.cblog %s | FileCheck %s
 
-; B9: virtual int[] initialized via llvm.memcpy from a global
+; Virtual int[] initialized via llvm.memcpy from a global
 ; ConstantDataArray. The per-slot loads stage as constants directly into the
 ; dst FieldStates; loading dst[1] folds to 200.
 

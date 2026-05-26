@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; B17: atomicrmw on a slot that was NEVER stored — the field-state lookup
+; atomicrmw on a slot that was NEVER stored — the field-state lookup
 ; misses, and tier2AtomicRMW (mirroring tier2Load's default-zero semantics)
 ; treats the prior value as the type's zero. `atomicrmw add 5` then folds
 ; against 0, returns the prior (0), and updates the slot to 5.

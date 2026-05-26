@@ -1,9 +1,9 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; B1 chained: a 3-deep VirtualRef-on-load chain.
+; Chained VirtualRef-on-load: a 3-deep chain.
 ;
 ; A.f(@8) = B, B.f(@8) = C; loading A.f yields B (still virtual via the
-; B1 alias install), loading that's f yields C (still virtual), and a
+; alias install), loading that's f yields C (still virtual), and a
 ; jeandle.array_length on the third-level load folds to C's compile-time
 ; length. Nothing escapes; all three allocations and both field stores
 ; disappear.

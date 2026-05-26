@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; B1: VirtualRef-on-load — recurse / load-of-inner.
+; VirtualRef-on-load — recurse / load-of-inner.
 ;
 ; The outer is a plain instance whose tracked field (offset 8) holds the
 ; inner array's pointer (a VirtualRef field entry). Loading outer.field

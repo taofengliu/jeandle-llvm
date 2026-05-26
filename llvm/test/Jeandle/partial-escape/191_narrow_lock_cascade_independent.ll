@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA / C8: two virtuals whose lock scopes are DISJOINT (sequential, not
+; Two virtuals whose lock scopes are DISJOINT (sequential, not
 ; nested). When B escapes, A is no longer live-locked, so there's no
 ; cascade to perform — A's monitorenter/exit pair fold away cleanly.
 ; Both the broad and narrow rules agree here; this test is a regression

@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA-Plan §B7 risk note: a self-referencing PHI in a loop header.
+; A self-referencing PHI in a loop header.
 ; processBlockPhis handles the loop PHI via its existing fixpoint
 ; logic; downstream consumers of the PHI may query resolveVirtualRef,
 ; which encounters the PHI's self-incoming and must terminate via the

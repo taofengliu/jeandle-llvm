@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/208_array_byte_load_store.cblog %s | FileCheck %s
 
-; B3: byte[] virtual — typed-element GEPs at constant byte indices with
+; byte[] virtual — typed-element GEPs at constant byte indices with
 ; scale 1, so the element address is `getelementptr i8, %arr_base, idx`.
 
 declare hotspotcc ptr addrspace(1) @jeandle.newarray(ptr, i32)

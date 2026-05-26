@@ -1,13 +1,13 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/260_box_unbox_chain.cblog %s | FileCheck %s
 
-; B10: synthetic autobox + unbox chain. The IR shape mirrors what the
+; Synthetic autobox + unbox chain. The IR shape mirrors what the
 ; future JDK frontend lowering of `Integer.intValue(Integer.valueOf(x))`
 ; would emit: a `jeandle.new_instance(Integer)` followed by a primitive
 ; store into the value slot, then a load from the same slot. PEA must
 ; eliminate the allocation and the store, and fold the load to the
-; stored primitive value (the standard alloc+store+load fold from B2 —
-; this test exists to confirm the B10 box tagging in tier1Allocate does
-; not perturb the basic chain).
+; stored primitive value (the standard alloc+store+load fold — this test
+; exists to confirm the box tagging in tier1Allocate does not perturb the
+; basic chain).
 ;
 ; Klass 9999 is registered as Integer (JBasicType::Int=4) via the cblog
 ; so VirtualObject::BoxedPrimitiveKind is set; with no escape downstream

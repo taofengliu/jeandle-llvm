@@ -1,10 +1,10 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R6.S4 — Materialised invoke preserves metadata and function/arg attrs of
-; the original allocation. Before R6.S4, applyMaterialize only carried over
-; the calling convention + three hard-coded return attrs (JavaKlass /
-; JavaKlassExact / NonNull); !prof, !alias.scope, !noalias, custom Jeandle
-; metadata, and function-level attrs (nofree, nosync, cold) were dropped.
+; Materialised invoke preserves metadata and function/arg attrs of the
+; original allocation. applyMaterialize carries over the calling convention,
+; the JavaKlass / JavaKlassExact / NonNull return attrs, plus !prof,
+; !alias.scope, !noalias, custom Jeandle metadata, and function-level attrs
+; (nofree, nosync, cold) onto the materialised invoke.
 ;
 ; The test forces a materialisation by passing the virtual to an opaque
 ; sink, then asserts the materialisation invoke still carries the

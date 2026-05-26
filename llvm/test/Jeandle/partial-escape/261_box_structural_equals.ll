@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/261_box_structural_equals.cblog %s | FileCheck %s
 
-; B10 Phase 3: two boxed virtuals of klass 9999 (Integer, JBasicType::Int)
+; Two boxed virtuals of klass 9999 (Integer, JBasicType::Int)
 ; with the SAME constant primitive value stored. `icmp eq` between the
 ; two boxed pointers must structural-fold to `true` (NOT to the default
 ; identity-based `false` for distinct virtuals). Mirrors Graal's
@@ -8,8 +8,7 @@
 ; whose effect is `IntegerEquals(boxA.value, boxB.value)` — and here
 ; both values are the same constant, so the result is the literal 1.
 ;
-; With Phase 3 the icmp folds and both allocations + stores are unused
-; → fully eliminated.
+; The icmp folds and both allocations + stores are unused → fully eliminated.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 

@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/230_value_based_check_non_value_based.cblog %s | FileCheck %s
 
-; B4: virtual receiver of jeandle.check_if_value_based whose exact klass
+; Virtual receiver of jeandle.check_if_value_based whose exact klass
 ; (4444) is NOT a value-based class. foldCheckIfValueBased queries
 ; IsValueBased(4444) = false and folds the call to constant `i1 false`.
 ; With no other use of the virtual, the allocation is fully eliminated.

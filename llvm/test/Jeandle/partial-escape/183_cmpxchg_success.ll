@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; B17: cmpxchg success path. Expected matches the slot's current entry,
+; cmpxchg success path. Expected matches the slot's current entry,
 ; so the comparison folds to true; the slot is updated to the NewVal; the
 ; cmpxchg's result struct is replaced with the constant `{prior, true}`.
 ; A subsequent load sees the new value.

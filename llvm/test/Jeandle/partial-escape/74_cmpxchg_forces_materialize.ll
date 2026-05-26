@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; B17: cmpxchg on a virtual field at a constant offset is compile-time-
+; Cmpxchg on a virtual field at a constant offset is compile-time-
 ; folded when Expected and the slot's current entry are both constants.
 ; Per Graal AbstractUnsafeCompareAndSwapNode.virtualize:117-189, the
 ; equality is evaluated and either updates the field entry (success) or

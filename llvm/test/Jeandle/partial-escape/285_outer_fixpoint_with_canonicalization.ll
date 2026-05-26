@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="partial-escape-iterative" -jeandle-pea-iterations=2 %s | FileCheck %s
 
-; D1 with-canonicalization test. This input is specifically constructed so
+; Outer-fixpoint with-canonicalization test. This input is specifically constructed so
 ; that:
 ;   - Round 1 PEA's analyzer CANNOT see the escape arm as dead (the guard
 ;     condition depends on two operations InstCombine can fold but PEA's

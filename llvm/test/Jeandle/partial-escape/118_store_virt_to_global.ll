@@ -1,17 +1,13 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R6.S1 — Value-side virtual leak in tier2Store.
+; Value-side virtual leak in tier2Store.
 ; `store ptr %virt, ptr @G` where %virt is a virtual allocation but @G is a
-; non-virtual global. Before R6.S1, tier2Store early-returned because the
-; pointer operand wasn't a virtual base, and applyThreeTier returned without
-; falling through to the generic hasVirtualInputs path. After
-; EliminateAllocation RAUW'd %virt to PoisonValue the surviving store would
-; write `poison` into @G — observable global corruption.
-;
-; Post-fix: tier2Store returns false on a non-virtual pointer; applyThreeTier
-; falls through to materializeAllVirtualOperands and escapes the value side,
-; so %virt is materialized at the store and the global receives the live
-; materialized pointer.
+; non-virtual global. tier2Store returns false on a non-virtual pointer;
+; applyThreeTier falls through to materializeAllVirtualOperands and escapes
+; the value side, so %virt is materialized at the store and the global
+; receives the live materialized pointer. Without this, EliminateAllocation
+; would RAUW %virt to PoisonValue and the surviving store would write
+; `poison` into @G — observable global corruption.
 
 @G = external global ptr addrspace(1)
 

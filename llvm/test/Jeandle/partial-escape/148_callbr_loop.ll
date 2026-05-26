@@ -1,9 +1,9 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R9.R7: a switch-created back-edge to a non-loop-header block. The
-; %head block has %indirect as an RPO-later pred via the switch's
-; default case. LoopInfo does not always recognise such constructs as a
-; loop, so the analyzer's defensive sweep bails virtuals at %head entry.
+; A switch-created back-edge to a non-loop-header block. The %head
+; block has %indirect as an RPO-later pred via the switch's default
+; case. LoopInfo does not always recognise such constructs as a loop,
+; so the analyzer's defensive sweep bails virtuals at %head entry.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare i32 @__gxx_personality_v0(...)
@@ -30,9 +30,9 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_switch_backedge
-; The R7 sweep recognises that LoopInfo did not see this as a loop; the
-; allocator's defensive ineligibility flip leaves the alloc and the
-; store untouched in IR.
+; The defensive sweep recognises that LoopInfo did not see this as a
+; loop; the allocator's defensive ineligibility flip leaves the alloc
+; and the store untouched in IR.
 ; CHECK: jeandle.new_instance({{.*}}i64 1111
 
 !java-method-compilation = !{}

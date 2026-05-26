@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/211_arraystorecheck_incompatible.cblog %s | FileCheck %s
 
-; B5: virtual Object[] (array klass 8888, element klass 4444) plus a
+; Virtual Object[] (array klass 8888, element klass 4444) plus a
 ; virtual instance value whose exact klass (7777) is provably incompatible
 ; with the array's element klass. evalSubtypeRelation returns false
 ; (IsSubtype false, areKlassesIncompatible true via Exact=true), and

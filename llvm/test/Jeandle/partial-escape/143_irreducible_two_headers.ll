@@ -1,8 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; C6 — classic irreducible CFG. Two blocks %a and %b each branch into
-; the other, so the cycle has no natural-loop header (LoopInfo refuses
-; to model it as a Loop at all). processLoop is never invoked for this
+; Classic irreducible CFG. Two blocks %a and %b each branch into the
+; other, so the cycle has no natural-loop header (LoopInfo refuses to
+; model it as a Loop at all). processLoop is never invoked for this
 ; region; the outer RPO walk processes each block once. The escape
 ; sites inside the cycle materialize the alloc per-escape, the alloc
 ; survives in IR, and there is no crash.

@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; B4: receiver of jeandle.check_if_value_based is a NON-virtual oop
+; Receiver of jeandle.check_if_value_based is a NON-virtual oop
 ; (incoming function argument — no allocation, no virtual to fold against).
 ; foldCheckIfValueBased's resolveVirtualRef returns nullopt, so the fold
 ; bails before touching the IsValueBased VMCallback (which is intentionally

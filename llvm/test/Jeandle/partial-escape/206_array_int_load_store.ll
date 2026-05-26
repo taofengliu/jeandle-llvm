@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/206_array_int_load_store.cblog %s | FileCheck %s
 
-; B3: int[] virtual — typed-element GEPs at constant indices, store + load.
+; int[] virtual — typed-element GEPs at constant indices, store + load.
 
 declare hotspotcc ptr addrspace(1) @jeandle.newarray(ptr, i32)
 

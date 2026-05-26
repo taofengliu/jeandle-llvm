@@ -1,22 +1,21 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R6.S7 — Order CreatePHI vs same-block per-pred Materialize.
+; Order CreatePHI vs same-block per-pred Materialize.
 ;
-; Self-loop where the loop header IS its own back-edge predecessor. Without
-; R6.S7, both the merge-block CreatePHI (lower SeqNo, emitted by
-; mergeStates) and the per-pred Materialize for the back-edge (higher
-; SeqNo, emitted by processBlockPhis) co-reside in BlockEffects[header].
-; CreatePHI applied first → MatPerBlock empty → back-edge incoming wired
-; to the OrigAlloc placeholder; Materialize applied second with
-; IsPerPred=true → skipped global RAUW; Pass 2 EliminateAllocation RAUW'd
-; OrigAlloc to PoisonValue → back-edge PHI incoming became `poison`.
-;
-; Post-fix: mergeStates DEFERS CreatePHI emission via PendingMergePhis;
-; processBlock drains the pending list AFTER the instruction walk, so the
-; CreatePHI is assigned a SeqNo strictly greater than the per-pred
-; Materialize. The transform now applies Materialize first (populating
-; MatPerBlock) and CreatePHI second (resolving its back-edge incoming
-; through MatPerBlock to the per-pred NewInv).
+; Self-loop where the loop header IS its own back-edge predecessor. The
+; merge-block CreatePHI (emitted by mergeStates) and the per-pred
+; Materialize for the back-edge (emitted by processBlockPhis) both
+; co-reside in BlockEffects[header]. mergeStates DEFERS CreatePHI
+; emission via PendingMergePhis; processBlock drains the pending list
+; AFTER the instruction walk, so the CreatePHI is assigned a SeqNo
+; strictly greater than the per-pred Materialize. The transform applies
+; Materialize first (populating MatPerBlock) and CreatePHI second
+; (resolving its back-edge incoming through MatPerBlock to the per-pred
+; NewInv). If the order were reversed, CreatePHI would wire the
+; back-edge incoming to the OrigAlloc placeholder, the per-pred
+; Materialize would skip global RAUW (IsPerPred=true), and Pass 2
+; EliminateAllocation would RAUW OrigAlloc to PoisonValue, leaving the
+; back-edge PHI incoming as `poison`.
 ;
 ; Test shape: alloc in entry, single-block loop body that stores to a
 ; field, escapes the receiver via @sink on the back-edge path, and exits

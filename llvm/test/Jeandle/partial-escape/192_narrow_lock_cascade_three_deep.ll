@@ -1,14 +1,14 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA / C8: three nested locks. The MIDDLE virtual escapes. Under
+; Three nested locks. The MIDDLE virtual escapes. Under
 ; Graal's narrow cascade rule
 ;   other.minLockDepth < this.maxLockDepth
 ; we get:
 ;   - A (outermost): A.min = 0 < B.max = 1 -> CASCADE.
 ;   - C (innermost): C.min = 2, NOT < B.max = 1 -> NO cascade.
 ; So A and B both materialize at the sink; C stays virtual and its
-; monitorenter/exit pair folds away. (Before C8, the broad cascade
-; rule materialized C too — over-conservative.)
+; monitorenter/exit pair folds away. (A broader cascade rule would
+; materialize C too — over-conservative.)
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)

@@ -1,17 +1,16 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; A6 — VO is STILL VIRTUAL at the loop exit (never escapes anywhere). The
+; VO is STILL VIRTUAL at the loop exit (never escapes anywhere). The
 ; loop body mutates a field, reads it back, and feeds the read scalar to
 ; @use. After the loop, the post-loop block reads the same field and
 ; consumes that scalar too. Both reads must fold to the just-stored value
 ; via tier2Load.
 ;
 ; This exercises the "for each VO still virtual at the loop exit's
-; snapshot, the FieldStates must be visible to the outer block" branch of
-; A6. The verification is that A1's existing snapshotExitState /
-; inheritFromExit machinery already carries Virtuals + FieldStates from
-; the loop's exiting block into the post-loop block, with no extra A6
-; code needed.
+; snapshot, the FieldStates must be visible to the outer block" branch.
+; The existing snapshotExitState / inheritFromExit machinery carries
+; Virtuals + FieldStates from the loop's exiting block into the post-loop
+; block.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)

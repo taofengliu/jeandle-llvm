@@ -1,12 +1,12 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/265_box_non_boxed_class.cblog %s | FileCheck %s
 
-; B10 negative test: two virtuals of klass 1234 (NOT a java.lang autobox
-; wrapper) storing the same constant primitive into the same field slot.
-; IsBoxed(1234) returns JBasicType::Count (9), so VirtualObject's
-; BoxedPrimitiveKind stays at the sentinel and the Phase 3 structural
-; fold path is INERT for these two VOs. The icmp eq must fold via the
-; default identity rule (two distinct virtual IDs → eq = false), NOT
-; via structural equality of the stored values (which would have been
+; Negative test for box folding: two virtuals of klass 1234 (NOT a
+; java.lang autobox wrapper) storing the same constant primitive into the
+; same field slot. IsBoxed(1234) returns JBasicType::Count (9), so
+; VirtualObject's BoxedPrimitiveKind stays at the sentinel and the
+; structural fold path is INERT for these two VOs. The icmp eq must fold
+; via the default identity rule (two distinct virtual IDs → eq = false),
+; NOT via structural equality of the stored values (which would have been
 ; true). This pins the gate that the boxed-only fold path doesn't leak
 ; into ordinary user classes.
 

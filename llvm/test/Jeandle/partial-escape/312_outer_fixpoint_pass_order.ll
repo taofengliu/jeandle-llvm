@@ -1,9 +1,9 @@
 ; RUN: opt -S -passes="partial-escape-iterative" -jeandle-pea-iterations=4 %s | FileCheck %s
 
-; R7.L14: the outer-fixpoint canonicalisation passes run in the order
-; ADCE → SimplifyCFG → LoopSimplify → InstCombine (was IC → SCFG → ADCE).
-; Putting DCE first means InstCombine never folds against now-dead IR
-; that PEA's prior round emitted as materialisation scaffolding.
+; The outer-fixpoint canonicalisation passes run in the order
+; ADCE → SimplifyCFG → LoopSimplify → InstCombine. Putting DCE first
+; means InstCombine never folds against now-dead IR that PEA's prior
+; round emitted as materialisation scaffolding.
 ;
 ; This pattern: round 0 materialises %o on the escape arm; ADCE in round
 ; 0 prunes the post-materialise dead invoke (after the SimplifyCFG pass
@@ -11,10 +11,9 @@
 ; the surviving control flow. Round 1's analysis sees a single straight-
 ; line shape and virtualises %o end-to-end.
 ;
-; If InstCombine ran FIRST (old order), it would observe the still-live
-; materialised invoke and could fold a select that depends on the
-; dying allocation pointer — wasting work on IR that ADCE will reap
-; one step later.
+; If InstCombine ran FIRST, it would observe the still-live materialised
+; invoke and could fold a select that depends on the dying allocation
+; pointer — wasting work on IR that ADCE will reap one step later.
 
 @G_zero = private unnamed_addr constant i32 0
 

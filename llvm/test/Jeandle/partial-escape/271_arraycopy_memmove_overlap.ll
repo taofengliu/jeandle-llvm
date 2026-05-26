@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/271_arraycopy_memmove_overlap.cblog %s | FileCheck %s
 
-; B9: memmove on the SAME virtual int[] with srcOff=0, dstOff=2, len=3 —
+; Memmove on the SAME virtual int[] with srcOff=0, dstOff=2, len=3 —
 ; classic overlap requiring backward semantics. We buffer the source values
 ; first then write them out, so the per-slot updates remain correct.
 ;

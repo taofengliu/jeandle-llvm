@@ -1,22 +1,21 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; C6 — loop without a unique preheader: the header has two forward
+; Loop without a unique preheader: the header has two forward
 ; predecessors (%fwd_a, %fwd_b) and one back-edge predecessor (%latch).
 ; LoopInfo classifies this as a natural loop (single header, single
 ; back-edge); getLoopPreheader() returns nullptr because there is no
 ; single forward pred. The alloc-before-region (%o, created in %entry)
-; is virtual at every forward pred's exit. With C6 in place,
-; processLoop's no-preheader branch marks every such VO INELIGIBLE
-; (graal-style "bail on irreducible region"), so the original alloc +
-; stores + body @sink survive unmodified. The pre-C6 single-pass
-; behaviour would have skipped the fixpoint and emitted a body-internal
-; materialize at the @sink escape, leading to the duplicate-materialize
-; pattern A6's report flagged.
+; is virtual at every forward pred's exit. processLoop's no-preheader
+; branch marks every such VO INELIGIBLE (graal-style "bail on
+; irreducible region"), so the original alloc + stores + body @sink
+; survive unmodified. The naive single-pass behaviour would skip the
+; fixpoint and emit a body-internal materialize at the @sink escape,
+; leading to a duplicate-materialize pattern.
 ;
 ; This test deliberately runs PEA directly (no `loop-simplify` in the
 ; pipeline) so we exercise the in-analyzer fallback. In the full
 ; Jeandle pipeline LoopSimplifyPass would canonicalise this shape and
-; A1's fixpoint would run instead.
+; the loop fixpoint would run instead.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -50,8 +49,9 @@ u:
   resume i64 %lp
 }
 
-; The alloc survives in IR (C6 bailout). Exactly one new_instance
-; invoke; exactly one @sink call (no duplicate materializations).
+; The alloc survives in IR (irreducible-region bailout). Exactly one
+; new_instance invoke; exactly one @sink call (no duplicate
+; materializations).
 ; CHECK-LABEL: define void @test_c6_no_preheader_virtual
 ; CHECK: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
 ; CHECK: call void @sink(ptr addrspace(1) %o)

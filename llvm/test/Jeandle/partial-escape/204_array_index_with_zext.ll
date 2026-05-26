@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/204_array_index_with_zext.cblog %s | FileCheck %s
 
-; B3: int[] virtual where the typed-GEP index is `zext i32 to i64` of a
+; int[] virtual where the typed-GEP index is `zext i32 to i64` of a
 ; ConstantInt. peelIndexWrappers strips the zext, so the underlying
 ; ConstantInt is recovered as the canonical element index.
 

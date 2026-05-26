@@ -1,9 +1,9 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA / B6: store i64 into a virtual's slot at offset 8, then perform 8
-; separate i8 loads, one at each byte offset 0..7 within the slot. The
-; low byte uses `trunc` only; the other seven use `lshr by 8*off` + `trunc`.
-; All sub-byte values are summed so each load's result is observed.
+; Store i64 into a virtual's slot at offset 8, then perform 8 separate
+; i8 loads, one at each byte offset 0..7 within the slot. The low byte
+; uses `trunc` only; the other seven use `lshr by 8*off` + `trunc`. All
+; sub-byte values are summed so each load's result is observed.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 

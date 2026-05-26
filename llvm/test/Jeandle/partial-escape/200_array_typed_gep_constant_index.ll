@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/200_array_typed_gep_constant_index.cblog %s | FileCheck %s
 
-; B3: int[] virtual array with typed-element GEP at constant indices 0/1/2.
+; int[] virtual array with typed-element GEP at constant indices 0/1/2.
 ; The abstract interpreter emits one i8 GEP for ArrayBaseOffset (=16) and a
 ; chained typed GEP per index, which matchArrayElementGEP must recognise.
 ; Stores then loads return the stored constants — the alloc, stores and

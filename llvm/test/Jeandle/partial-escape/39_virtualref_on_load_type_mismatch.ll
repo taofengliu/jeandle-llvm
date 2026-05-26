@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; B1 defensive: a VirtualRef field is loaded back at the wrong type. The
+; VirtualRef defensive: a VirtualRef field is loaded back at the wrong type. The
 ; outer's tracked field at offset 8 holds a `ptr addrspace(1)` (an oop),
 ; but the load reinterprets that slot as a `ptr addrspace(0)`
 ; (C-heap-typed pointer). coerceToType's same-bit-width pointer pair check

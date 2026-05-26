@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="simplifycfg,require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R8.M11: a constant-condition branch's dead arm contributes nothing to
+; A constant-condition branch's dead arm contributes nothing to
 ; downstream merges / PHI fan-in. Without cleanup, processing the
 ; unreachable arm's sink call would materialize the virtual (because sink
 ; is an opaque escape consumer), preventing alloc elimination. The

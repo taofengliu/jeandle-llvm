@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-assume-strict-lock-order=false %s | FileCheck %s
 
-; PEA / C8: even when the narrow rule WOULD cascade (the inner B escapes
+; Even when the narrow rule WOULD cascade (the inner B escapes
 ; while A is still virtually locked outside — cf. 190_narrow_lock_cascade_nested.ll),
 ; passing -jeandle-assume-strict-lock-order=false disables the entire
 ; cascade. Only B materializes; A stays virtual and its monitorenter /

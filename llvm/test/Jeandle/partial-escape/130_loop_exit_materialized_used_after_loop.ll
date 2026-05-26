@@ -1,15 +1,15 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; A6 — alloc BEFORE the loop, materialized INSIDE the loop body (via
-; @sink), then the same pointer is used AFTER the loop (the @ret_use call
-; in the exit block). The materialized invoke is hoisted to the alloc's
-; SafeIP (which is in entry's normal-dest = %prep), so NewInv dominates
-; both the loop body and the post-loop use. applyMaterialize RAUWs the
+; Alloc BEFORE the loop, materialized INSIDE the loop body (via @sink),
+; then the same pointer is used AFTER the loop (the @ret_use call in the
+; exit block). The materialized invoke is hoisted to the alloc's SafeIP
+; (which is in entry's normal-dest = %prep), so NewInv dominates both
+; the loop body and the post-loop use. applyMaterialize RAUWs the
 ; original alloc function-wide, so the post-loop call's argument
-; automatically snaps to the materialized pointer — no explicit exit-block
-; PHI synthesis is needed.
+; automatically snaps to the materialized pointer — no explicit
+; exit-block PHI synthesis is needed.
 ;
-; A6 verification: the post-loop use sees the materialized pointer.
+; Verifies the post-loop use sees the materialized pointer.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))

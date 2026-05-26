@@ -1,16 +1,15 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R8.M14: lit coverage for the Case-A fallback on a phi with a virtual
-; incoming on one arm and a null pointer on the other. The merge-time
-; AliasMap consultation marks the virtual-incoming side eligible for
-; per-pred materialization; the null side is treated as a non-virtual
-; pointer. The resulting Materialize lands on the virtual-side pred's
-; terminator and the PHI survives in IR with %[[MAT]] / null incomings.
+; Lit coverage for the Case-A fallback on a phi with a virtual incoming
+; on one arm and a null pointer on the other. The merge-time AliasMap
+; consultation marks the virtual-incoming side eligible for per-pred
+; materialization; the null side is treated as a non-virtual pointer.
+; The resulting Materialize lands on the virtual-side pred's terminator
+; and the PHI survives in IR with %[[MAT]] / null incomings.
 ;
 ; This is purely a regression guard — today's processBlockPhis Case-A
 ; fallback at PartialEscapeAnalysis.cpp already handles the pattern; we
-; assert the end-to-end behaviour stays sound across Round 8's PHI-loop
-; restructure (R8.M1).
+; assert the end-to-end behaviour stays sound.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))

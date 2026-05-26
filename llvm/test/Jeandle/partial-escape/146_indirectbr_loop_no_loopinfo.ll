@@ -1,9 +1,9 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R9.R7: an indirectbr-created back-edge that LoopInfo does NOT recognise
-; as a loop. The block %head has a pred from %indirect that is later in
-; RPO than %head (the indirectbr to %head); LoopInfo does not see it as
-; a loop. The defensive sweep in Analyzer::run bails every VO virtual at
+; An indirectbr-created back-edge that LoopInfo does NOT recognise as a
+; loop. The block %head has a pred from %indirect that is later in RPO
+; than %head (the indirectbr to %head); LoopInfo does not see it as a
+; loop. The defensive sweep in Analyzer::run bails every VO virtual at
 ; entry to %head, so the alloc + stores survive in IR.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)

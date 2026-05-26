@@ -1,8 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; A1 — nested loops. Inner loop allocates %inner that stays scoped to
-; the inner loop (consumed only by a scalar @use). Outer loop's body has
-; the inner loop nested inside it. Validates the recursive processLoop
+; Nested loops. Inner loop allocates %inner that stays scoped to the
+; inner loop (consumed only by a scalar @use). Outer loop's body has the
+; inner loop nested inside it. Validates the recursive processLoop
 ; dispatch (innermost-first) and that snapshots are correctly captured
 ; at each loop level.
 

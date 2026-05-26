@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA §A5 — verify that A5's snapshot/restore in mergeStates does not perturb
+; Verify that the snapshot/restore in mergeStates does not perturb
 ; the downstream Case C synthesis path in processBlockPhis when Case C itself
 ; triggers nested materializes. Both arms allocate `outer-klass` AND
 ; `inner-klass`, storing the local inner into the local outer's field; the
@@ -9,11 +9,10 @@
 ; pred-A and VirtualRef(inner_b) on pred-B, materializes inner_a at left and
 ; inner_b at right, and builds a field PHI selecting between them.
 ;
-; The do-while wrapper added by A5 ran while processing the merge's no-op
-; mergeStates pass (no outers tracked at merge entry because both o1 and o2
-; are allocated INSIDE their respective arms). The wrapper must be a no-op
-; on inputs where mergeStates has no virtual to process, so Case C runs
-; identically to the pre-A5 behavior.
+; The do-while wrapper around mergeStates must be a no-op on inputs where
+; mergeStates has no virtual to process (here, no outers are tracked at
+; merge entry because both o1 and o2 are allocated INSIDE their respective
+; arms), so Case C runs identically regardless of the wrapper.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))

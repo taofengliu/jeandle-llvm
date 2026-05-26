@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R11.V28: cmpxchg with a non-constant Expected operand and a constant
+; cmpxchg with a non-constant Expected operand and a constant
 ; current slot value is folded into a Conditional pattern (icmp + select),
 ; mirroring Graal AbstractUnsafeCompareAndSwapNode.virtualize lines
 ; 117-189. The slot's post-CAS value becomes

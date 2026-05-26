@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/386_alloc_reference_subtype_bails.cblog %s | FileCheck %s
 
-; R12.P4b: CanVirtualize VMCallback. tier1Allocate refuses to virtualize
+; CanVirtualize VMCallback. tier1Allocate refuses to virtualize
 ; identity-sensitive Instance allocations (java.lang.ref.Reference and
 ; java.lang.Thread subtypes). For those classes, the runtime's lifecycle
 ; tracking (pending-reference list, thread-list registration) keys off

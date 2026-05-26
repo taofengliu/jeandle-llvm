@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA-Plan §B7: a three-way PHI whose incomings all alias to the same
+; A three-way PHI whose incomings all alias to the same
 ; virtual. processBlockPhis Case B already covers this at the merge
 ; block (because the AliasMap has all three incomings registered for
 ; the same ObjectID), so resolveVirtualRefImpl's PHINode case is a

@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; B17: atomicrmw add with constant current + constant operand → constant
+; atomicrmw add with constant current + constant operand → constant
 ; fold. Slot starts as 10 (from the store), atomicrmw add 5 returns the
 ; prior 10 and sets the slot to 15. Returning the "prior" produces
 ; `ret i32 10`.

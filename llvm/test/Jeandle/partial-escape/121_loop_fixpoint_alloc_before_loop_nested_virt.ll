@@ -1,16 +1,16 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; A1 — alloc-before-loop holding a nested virtual whose own primitive
-; field is mutated inside the body. Outer object %o is allocated in
-; entry; its reference field is left default (null). Inside the body
-; we allocate %inner and store an i32 into %inner's primitive field
-; via a load-then-store cycle on the outer's reference slot. The body
-; otherwise consumes only loaded scalars; no pointer leaks.
+; Alloc-before-loop holding a nested virtual whose own primitive field is
+; mutated inside the body. Outer object %o is allocated in entry; its
+; reference field is left default (null). Inside the body we allocate
+; %inner and store an i32 into %inner's primitive field via a
+; load-then-store cycle on the outer's reference slot. The body otherwise
+; consumes only loaded scalars; no pointer leaks.
 ;
-; This exercises the recursive nested-virtual handling under the A1
-; loop fixpoint. The convergence check must agree on (a) %o is virtual
-; at the loop header, (b) %inner is body-local and is created/destroyed
-; each iteration with the same ID (AllocSiteToVO).
+; This exercises the recursive nested-virtual handling under the loop
+; fixpoint. The convergence check must agree on (a) %o is virtual at the
+; loop header, (b) %inner is body-local and is created/destroyed each
+; iteration with the same ID (AllocSiteToVO).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)

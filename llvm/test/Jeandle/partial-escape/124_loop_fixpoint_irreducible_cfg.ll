@@ -1,10 +1,10 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; A1 — irreducible CFG (two entry points to a cycle). LoopInfo refuses
-; to model it as a natural loop; processLoop's "no preheader" branch
-; falls through to the pessimistic single-pass walk, and the
-; per-instruction escape handler covers any in-cycle escape. The alloc
-; in entry survives via materialise-at-escape inside the cycle.
+; Irreducible CFG (two entry points to a cycle). LoopInfo refuses to
+; model it as a natural loop; processLoop's "no preheader" branch falls
+; through to the pessimistic single-pass walk, and the per-instruction
+; escape handler covers any in-cycle escape. The alloc in entry survives
+; via materialise-at-escape inside the cycle.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))

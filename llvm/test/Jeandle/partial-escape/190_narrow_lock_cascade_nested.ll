@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA / C8: narrow cascade fires when the INNER lock holder escapes.
+; Narrow cascade fires when the INNER lock holder escapes.
 ; Lock order: enter A (outer), enter B (inner). Sink leaks B. Under
 ; Graal's narrow cascade rule (PartialEscapeBlockState.materializeWithCommit
 ; lines 323-333), materializing B cascades A because

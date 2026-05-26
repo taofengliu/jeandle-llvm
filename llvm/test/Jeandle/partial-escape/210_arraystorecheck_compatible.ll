@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/210_arraystorecheck_compatible.cblog %s | FileCheck %s
 
-; B5: virtual Object[] (array klass 8888, element klass 4444) plus a
+; Virtual Object[] (array klass 8888, element klass 4444) plus a
 ; virtual instance value whose exact klass (5555) is a subtype of the
 ; array's element klass. foldArrayStoreCheck queries
 ; ArrayElementKlass(8888)=4444, then evalSubtypeRelation calls

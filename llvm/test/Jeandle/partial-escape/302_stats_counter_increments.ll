@@ -2,7 +2,7 @@
 ; RUN: opt -disable-output -passes="require<partial-escape-analysis>,partial-escape-transform" \
 ; RUN:     -stats %s 2>&1 | FileCheck %s
 
-; PEA Round 5 (C11): the STATISTIC counters defined in
+; The STATISTIC counters defined in
 ; PartialEscapeAnalysis.cpp must surface via standard `-stats`. This test
 ; exercises a virtualized allocation plus a materialization triggered by a
 ; sibling escape; the relevant counters should advance.

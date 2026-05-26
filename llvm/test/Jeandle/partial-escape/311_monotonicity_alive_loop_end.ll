@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R7.L6: monotonicity guard on alive loop ends. When the loop fixpoint
+; Monotonicity guard on alive loop ends. When the loop fixpoint
 ; iterates over a structurally non-trivial loop, the per-iteration
 ; BlockExits map for any loop block that has produced exit state on at
 ; least one iter MUST continue to produce exit state on every subsequent

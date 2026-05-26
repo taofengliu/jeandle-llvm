@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s --check-prefix=DEFAULT
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-pea-loop-cutoff=2 %s | FileCheck %s --check-prefix=OVERRIDE
 
-; R9.L2: -jeandle-pea-loop-cutoff exposes the depth threshold. Default is
+; -jeandle-pea-loop-cutoff exposes the depth threshold. Default is
 ; 20, so a 3-deep nest does NOT trip Mode::StopNewInLoopNest and the
 ; loop-local alloc at depth 3 follows normal Regular-mode handling
 ; (escapes via @sink so materializes; OrigAlloc invoke RAUW'd to a new

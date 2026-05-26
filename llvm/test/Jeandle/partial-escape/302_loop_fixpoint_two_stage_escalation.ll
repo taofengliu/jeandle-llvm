@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R9.L3: 2-stage MATERIALIZE_ALL escalation. A loop body whose stores
+; 2-stage MATERIALIZE_ALL escalation. A loop body whose stores
 ; reference an unknown global pointer mid-loop creates a state-split that
 ; the regular fixpoint cannot collapse. After the iter cap, the analyzer
 ; falls back to MATERIALIZE_ALL, runs one body pass, re-checks

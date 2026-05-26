@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/274_arraycopy_type_mismatch.cblog %s | FileCheck %s
 
-; B9: memcpy where src is a virtual byte[] (scale 1) and dst is a virtual
+; Memcpy where src is a virtual byte[] (scale 1) and dst is a virtual
 ; int[] (scale 4). The element type / scale mismatch fails Graal's component-
 ; type check (BasicArrayCopyNode.java:311) — bail. Both allocations are
 ; materialized at the memcpy and the memcpy survives.

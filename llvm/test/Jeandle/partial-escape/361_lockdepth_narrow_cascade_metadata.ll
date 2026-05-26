@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R10.X1c: narrow cascade now keyed by !jeandle.lock_depth metadata. Mirrors
+; Narrow cascade keyed by !jeandle.lock_depth metadata. Mirrors
 ; partial-escape/190_narrow_lock_cascade_nested.ll but with explicit depth
 ; metadata on each monitorenter. Outer A (depth=0), inner B (depth=1).
 ; Inner B escapes; the cascade rule
@@ -8,7 +8,7 @@
 ; selects A (A.minDepth=0 < B.maxDepth=1), so A also materialises.
 ;
 ; The behaviour is identical to test 190 — the point here is to drive the
-; depth-aware rule (R10.X1c) end-to-end with metadata present.
+; depth-aware rule end-to-end with metadata present.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)

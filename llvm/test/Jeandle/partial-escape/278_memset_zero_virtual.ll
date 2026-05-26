@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/278_memset_zero_virtual.cblog %s | FileCheck %s
 
-; R11.V39: llvm.memset on a virtual int[]. Constant length and constant
+; llvm.memset on a virtual int[]. Constant length and constant
 ; byte value (0xFF) decompose into per-element constants by replicating
 ; the byte across the element width. For 0xFF/i32 = 0xFFFFFFFF = -1.
 ; A read of element 1 must observe -1.

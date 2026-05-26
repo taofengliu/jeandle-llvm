@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/203_array_mixed_gep_forms.cblog %s | FileCheck %s
 
-; B3: int[] virtual where one element is accessed via the i8 + constant
+; int[] virtual where one element is accessed via the i8 + constant
 ; byte-offset form (resolveFieldOffset's natural path) and a second
 ; element via the typed-element GEP chain (matchArrayElementGEP path).
 ; The two forms must agree on the canonical byte offsets so both stores

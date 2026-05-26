@@ -1,11 +1,11 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-pea-force-materialize-all=true %s | FileCheck %s
 
-; R9.L4: MATERIALIZE_ALL preserves intra-block folds. The
+; MATERIALIZE_ALL preserves intra-block folds. The
 ; -jeandle-pea-force-materialize-all=true testing knob forces every
 ; top-level processLoop into MaterializeAll, so the deferred-end-of-block
 ; Materialize emission path is exercised deterministically.
 ;
-; Body: alloc + store(7) + load. With L4's "virtualize-then-materialise",
+; Body: alloc + store(7) + load. With "virtualize-then-materialise",
 ; the alloc is registered (intra-block FieldStates are populated), the
 ; load against the same slot folds against FieldStates to the constant
 ; 7, and @sink_i32 is called with that constant. The end-of-block

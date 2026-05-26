@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/385_alloc_with_finalizer_bails.cblog %s | FileCheck %s
 
-; R12.P4a: HasFinalizer VMCallback. tier1Allocate refuses to virtualize
+; HasFinalizer VMCallback. tier1Allocate refuses to virtualize
 ; an Instance allocation whose Klass has a finalizer because HotSpot
 ; must run the original allocation site so InstanceKlass's finalizer
 ; registration fires; eliding the alloc would skip that registration

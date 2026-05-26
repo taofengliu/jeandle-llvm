@@ -1,9 +1,9 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R8.M7: a Case-B PHI (both incomings agree on the same ObjectID) for a
+; A Case-B PHI (both incomings agree on the same ObjectID) for a
 ; NeverEscapes VO is explicitly erased after EliminateAllocation, so the
 ; IR doesn't carry a `phi ptr addrspace(1) [poison, poison]` survivor.
-; Before R8.M7 the PHI survived (with poison incomings) until a
+; Otherwise the PHI would survive (with poison incomings) until a
 ; downstream InstCombine reaped it — invisible in iterative mode but
 ; observable in single-shot PEA lit runs.
 
@@ -27,7 +27,7 @@ merge:
   %phi = phi ptr addrspace(1) [ %o, %left ], [ %o, %right ]
   ; The PHI is Case-B aliased to %o's VO; no real downstream user touches
   ; it as a pointer, so the VO ends up NeverEscapes and the PHI itself
-  ; is dead-but-aliased after EliminateAllocation. R8.M7 erases it.
+  ; is dead-but-aliased after EliminateAllocation, which erases it.
   call void @use(i32 1)
   ret void
 u:

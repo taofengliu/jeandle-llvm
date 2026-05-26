@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R8.M2: per-VO loop iterates the INTERSECTION (not the union) of preds'
+; Per-VO loop iterates the INTERSECTION (not the union) of preds'
 ; tracked IDs. A loop-local alloc that's virtual on the back-edge but
 ; absent on the entry-edge falls out of the intersection at the loop
 ; header — the per-VO loop does not consider it, which is exactly the

@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA-Plan §B7: a Select between two arms both aliased to the same
-; virtual ObjectID. resolveVirtualRefImpl recurses through Select arms,
+; A Select between two arms both aliased to the same virtual ObjectID.
+; resolveVirtualRefImpl recurses through Select arms,
 ; both resolve to the same ID, propagatePointerAlias aliases the Select
 ; itself to the virtual, downstream consumers fold, and the alloc is
 ; eliminated. Equivalent to test 112's new behavior but exercised

@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R10.X1a smoke test: a single virtual whose monitorenter carries the
+; Lock-depth metadata smoke test: a single virtual whose monitorenter carries the
 ; `!jeandle.lock_depth` metadata. The fold-elide path must still fire (the
 ; alloc, enter, exit and field stores all eliminate). This exercises the
 ; readBytecodeLockDepth() path on a positive case and confirms the

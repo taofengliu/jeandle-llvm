@@ -1,9 +1,10 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; B1 + nested-virtual materialization: the load result from a VirtualRef
-; field is passed to an opaque sink. The B1 alias install makes the load
-; result resolve to the inner ObjectID, so the sink call escapes the
-; *inner* virtual (not the outer). The inner must materialize; the outer
+; VirtualRef-on-load + nested-virtual materialization: the load result
+; from a VirtualRef field is passed to an opaque sink. The alias install
+; makes the load result resolve to the inner ObjectID, so the sink call
+; escapes the *inner* virtual (not the outer). The inner must
+; materialize; the outer
 ; stays virtual end-to-end (no live use of the outer pointer except its
 ; field, which is folded). After PEA we expect exactly one materialization
 ; invoke (for the inner array's klass 12345) and the sink to receive the

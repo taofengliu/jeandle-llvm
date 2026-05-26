@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R10.X10: lit coverage for narrow cascade with explicit mixed depths.
+; Lit coverage for narrow cascade with explicit mixed depths.
 ; Three locks; B (the middle one) escapes. With metadata depths
 ;   A.depth = 0, B.depth = 1, C.depth = 2
 ; the narrow rule

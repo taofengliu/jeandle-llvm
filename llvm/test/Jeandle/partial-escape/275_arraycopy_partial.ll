@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/275_arraycopy_partial.cblog %s | FileCheck %s
 
-; B9: copy only a portion of the array (srcOff=1, dstOff=2, len=2 ints).
+; Copy only a portion of the array (srcOff=1, dstOff=2, len=2 ints).
 ; Per-slot copy of the chosen window; dst's untouched slots keep their
 ; default-zero (or independently-stored) values.
 ;

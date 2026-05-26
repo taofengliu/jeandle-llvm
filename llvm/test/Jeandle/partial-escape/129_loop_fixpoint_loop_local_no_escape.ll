@@ -1,9 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; A1 regression — verify the loop-LOCAL alloc (= alloc inside the loop
-; body, never escapes) still virtualizes after the rewrite to the loop
-; fixpoint driver. This is the same shape as test 50 but kept under the
-; A1 number range for completeness. tier1Allocate registers a VO; the
+; Regression — verify the loop-LOCAL alloc (= alloc inside the loop
+; body, never escapes) still virtualizes under the loop fixpoint driver.
+; This is the same shape as test 50. tier1Allocate registers a VO; the
 ; AllocSiteToVO cache ensures the same ID is reused across iterations
 ; (otherwise the fixpoint would diverge on Virtuals-set comparison).
 

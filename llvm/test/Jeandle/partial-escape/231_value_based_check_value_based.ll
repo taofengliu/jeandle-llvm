@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/231_value_based_check_value_based.cblog %s | FileCheck %s
 
-; B4: virtual receiver of jeandle.check_if_value_based whose exact klass
+; Virtual receiver of jeandle.check_if_value_based whose exact klass
 ; (7777) IS a value-based class. foldCheckIfValueBased queries
 ; IsValueBased(7777) = true and forces materialization — Eligible[ID]=false
 ; discards every PEA effect for the virtual, so the original allocation and

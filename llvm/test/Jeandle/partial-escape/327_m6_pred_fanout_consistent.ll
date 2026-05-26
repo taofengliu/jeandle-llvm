@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R8.M6: post-materialise pred FieldStates update. When a per-pred
+; Post-materialise pred FieldStates update. When a per-pred
 ; materialise emitted during mergeStates flips an inner VO to
 ; Materialized, the outer VO's pred FieldStates entry for the offset
 ; that held VirtualRef(InnerID) must rewrite to MaterializedRef so

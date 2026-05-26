@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; B17: an atomicrmw updates the field-state entry; a subsequent load on the
+; An atomicrmw updates the field-state entry; a subsequent load on the
 ; same slot sees the new value (whether the slot is constant or carries an
 ; unparented binop). Covers both a constant case (add 3 to a constant 10
 ; → slot = 13) and a non-constant case (add %k to slot 13 → slot becomes

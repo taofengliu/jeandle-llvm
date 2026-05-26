@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; B17: atomicrmw xchg with a non-constant value still folds. Xchg's new
+; atomicrmw xchg with a non-constant value still folds. Xchg's new
 ; entry IS the operand (no binop required), so the slot is updated to
 ; %arg and the atomicrmw RAUW's to the prior value. A later load of the
 ; slot sees %arg. The function returns prior + new = 7 + %arg.

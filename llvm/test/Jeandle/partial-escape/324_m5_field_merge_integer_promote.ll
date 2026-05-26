@@ -1,15 +1,15 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R8.M5: integer-width promotion in the field-merge PHI synthesis. When
-; two preds store integers of different widths into the same offset
-; (e.g. i32 vs i64), the merged PHI type promotes to the WIDER integer
-; and the narrower-width per-pred constant zero-extends inline. Before
-; R8.M5 a type mismatch BailObject=true'd the entire VO; with R8.M5 the
-; merge succeeds and the alloc still virtualises.
+; Integer-width promotion in the field-merge PHI synthesis. When two
+; preds store integers of different widths into the same offset (e.g.
+; i32 vs i64), the merged PHI type promotes to the WIDER integer and the
+; narrower-width per-pred constant zero-extends inline. Without that
+; promotion, a type mismatch would set BailObject=true on the entire VO;
+; with it the merge succeeds and the alloc still virtualises.
 ;
 ; This test exercises only the constant-zext path (the non-constant
-; widen path bails LocalBail under the conservative R8 scope). Both
-; arms store a CONSTANT integer at offset 8; types differ.
+; widen path bails LocalBail under the conservative scope). Both arms
+; store a CONSTANT integer at offset 8; types differ.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i64)

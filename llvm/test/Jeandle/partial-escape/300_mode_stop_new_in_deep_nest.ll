@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-pea-loop-cutoff=2 %s | FileCheck %s
 
-; R9.L1: Mode::StopNewInLoopNest. With -jeandle-pea-loop-cutoff=2, a 3-deep
+; Mode::StopNewInLoopNest. With -jeandle-pea-loop-cutoff=2, a 3-deep
 ; nest has max depth = 3 which exceeds the threshold, so processLoop
 ; (called at top-level on the outer loop) transiently enters
 ; Mode::StopNewInLoopNest. In that mode, tier1Allocate refuses to register

@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="loop-simplify,require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R7.L12: getOrCreateLoopFieldPhi sizes the cached PHI shell for the loop
+; getOrCreateLoopFieldPhi sizes the cached PHI shell for the loop
 ; header's FULL fan-in (numForwardPreds + numBackedges) on first creation
 ; — not just the caller's N visible on iter 0 — so iter (N+1) does not
 ; suffer a PHI operand-list reallocation. The post-LoopSimplify shape

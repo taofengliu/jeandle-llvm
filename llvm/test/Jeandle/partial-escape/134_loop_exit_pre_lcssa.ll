@@ -1,16 +1,17 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; A6 — pre-LCSSA loop shape: the post-loop block consumes a body-defined
+; Pre-LCSSA loop shape: the post-loop block consumes a body-defined
 ; value (the field-load %v) directly, with no LCSSA-style single-incoming
 ; PHI at the exit. Jeandle's pipeline runs PEA BEFORE LLVM's
 ; LoopSimplify/LCSSA, so this is the realistic input shape.
 ;
 ; The alloc is before the loop; the body stores %i into a field and reads
-; it back; the post-loop block reads the field too. Because the field-load
-; in the exit folds via the loop-header's field PHI (synthesized by A1),
-; the post-loop @use receives the PHI value — no separate exit-block PHI
-; is needed for this branch. This verifies A6's "still-virtual at exit"
-; path in the absence of canonical LCSSA structure.
+; it back; the post-loop block reads the field too. Because the
+; field-load in the exit folds via the loop-header's field PHI
+; (synthesized by the loop fixpoint), the post-loop @use receives the
+; PHI value — no separate exit-block PHI is needed for this branch.
+; Verifies the "still-virtual at exit" path in the absence of canonical
+; LCSSA structure.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)
@@ -46,8 +47,8 @@ u:
 
 ; The alloc and all field stores/loads are eliminated. The post-loop
 ; return value is fed by the loop-header field PHI [preheader=%x,
-; body=%i] — this is the "still-virtual at loop exit, field PHI from A1
-; carries through" case.
+; body=%i] — this is the "still-virtual at loop exit, field PHI carries
+; through" case.
 ; CHECK-LABEL: define i32 @test_a6_pre_lcssa
 ; CHECK-NOT: jeandle.new_instance
 ; CHECK-NOT: store atomic

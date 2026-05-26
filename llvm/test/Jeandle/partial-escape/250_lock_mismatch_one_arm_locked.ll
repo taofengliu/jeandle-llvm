@@ -1,15 +1,15 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA-Plan §A4: lock-count mismatch cascade at merge.
+; Lock-count mismatch cascade at merge.
 ;
 ; entry: alloc o (virtual). branch on %c.
 ; then: monitorenter(o) — folded, LockCount[o]=1 at then exit.
 ; else: nothing — LockCount[o]=0 at else exit.
-; merge: counts disagree → A4 fires.
+; merge: counts disagree → lock-cascade fires.
 ;
 ; Expected outcome (mirrors Graal MergeProcessor.merge:981-1003):
 ; each pred materializes the VO with its OWN lock list. The then-pred
-; materialize cascades through C8's un-elide so the original monitorenter
+; materialize cascades through the un-elide so the original monitorenter
 ; survives in IR with its first operand snapped to the then-pred's new
 ; materialized invoke. The else-pred materialize has no live locks and
 ; just emits a fresh allocation invoke. The original entry alloc is
@@ -41,7 +41,7 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_lock_mismatch_one_arm_locked
-; The original entry alloc is eliminated; A4 materializes a fresh
+; The original entry alloc is eliminated; the lock-cascade materializes a fresh
 ; allocation invoke at each pred. The first one we see comes from one
 ; pred; the un-elided monitorenter in that pred's MatCont references its
 ; per-pred NewInv (with the SSA-correct receiver). The second invoke

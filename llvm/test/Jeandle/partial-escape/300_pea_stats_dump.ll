@@ -1,7 +1,7 @@
 ; RUN: opt -disable-output -passes="require<partial-escape-analysis>" \
 ; RUN:     -jeandle-dump-pea-stats %s 2>&1 | FileCheck %s
 
-; PEA Round 5 (C5): EscapeClassification population + -jeandle-dump-pea-stats.
+; EscapeClassification population + -jeandle-dump-pea-stats.
 ;
 ; Three functions are crafted to populate each enum value at least once:
 ;

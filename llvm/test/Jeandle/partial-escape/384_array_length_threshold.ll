@@ -2,7 +2,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-pea-max-array-length=32 %s | FileCheck --check-prefix=LOW %s
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-pea-max-array-length=128 %s | FileCheck --check-prefix=HIGH %s
 
-; R12.P1b: jeandle-pea-max-array-length default is 128 (Graal parity).
+; jeandle-pea-max-array-length default is 128 (Graal parity).
 ; This test pins both a 33-element array (between the old 32 default and
 ; the new 128 default) and a 129-element array (always above the cap)
 ; into the same IR so the cap can be exercised by varying the cl::opt:

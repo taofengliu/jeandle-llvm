@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R6.S2 — Split critical edges before per-pred materialisation.
+; Split critical edges before per-pred materialisation.
 ;
 ; The pre-Pass-1 critical-edge split in PartialEscapeTransform inspects
 ; every IsPerPred Materialize effect and, when the recorded PH has
@@ -9,7 +9,7 @@
 ; its OOM-throwing unwind) only lives on the merge-bound path.
 ;
 ; Under the current SkipGlobalRAUW=true policy in mergeStates, the only
-; analyzer path that emits IsPerPred Materialize effects is the A4
+; analyzer path that emits IsPerPred Materialize effects is the
 ; lock-mismatch cascade (PartialEscapeAnalysis.cpp:1386-1396). That path
 ; also emits ReplaceInput effects for the un-elided monitorenter calls
 ; that sit in PH; moving the Materialize to a new edge-block PH' would
@@ -18,11 +18,11 @@
 ; effect.
 ;
 ; This test exercises the lock-mismatch + critical-edge path and asserts
-; the IR remains well-formed (verifyFunction passes — R6.S3) and the
-; A4 lock-cascade machinery still materialises both arms per the
-; existing 250_lock_mismatch_one_arm_locked.ll contract. The full
-; OOM-only-on-merge guarantee will be restored in a future round when a
-; richer un-elide model or the LockState port (R10) becomes available.
+; the IR remains well-formed (verifyFunction passes) and the
+; lock-cascade machinery still materialises both arms per the existing
+; 250_lock_mismatch_one_arm_locked.ll contract. The full
+; OOM-only-on-merge guarantee will be restored when a richer un-elide
+; model or the LockState port becomes available.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc i1 @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
@@ -53,9 +53,9 @@ u:
   resume i64 %lp
 }
 
-; The A4 cascade must still materialise %o per-pred; the verifyFunction
-; gate (R6.S3) ensures the resulting IR is well-formed even when the
-; pre-pass declines to split the critical edge.
+; The lock-mismatch cascade must still materialise %o per-pred; the
+; verifyFunction gate ensures the resulting IR is well-formed even when
+; the pre-pass declines to split the critical edge.
 ; CHECK-LABEL: define void @critical_edge_lock_mismatch
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
 

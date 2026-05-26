@@ -1,10 +1,10 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; A1 — verify the fixpoint handles a non-trivial loop with multiple
-; field mutations across iterations. Two field slots, both written on
-; every iteration with the loop counter. The body reads both back and
-; passes them to scalar @use. The convergence check passes once the
-; back-edge state is stable.
+; Verify the fixpoint handles a non-trivial loop with multiple field
+; mutations across iterations. Two field slots, both written on every
+; iteration with the loop counter. The body reads both back and passes
+; them to scalar @use. The convergence check passes once the back-edge
+; state is stable.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use2(i32, i32)
@@ -42,11 +42,11 @@ u:
   resume i64 %lp
 }
 
-; The object is fully eliminated under A1. Two field-PHIs are emitted at
-; the loop header (one per slot), with incoming [preheader-const, body-
-; store-result]. The body's loads fold to the PHIs, the body's stores
-; are gone, and @use2 consumes the PHI values. Without A1's back-edge
-; propagation (restoreLoopSnapshot preserves loop-block BlockExits across
+; The object is fully eliminated. Two field-PHIs are emitted at the loop
+; header (one per slot), with incoming [preheader-const, body-store-
+; result]. The body's loads fold to the PHIs, the body's stores are
+; gone, and @use2 consumes the PHI values. Without back-edge propagation
+; (restoreLoopSnapshot preserves loop-block BlockExits across
 ; iterations), the body's @use2 would have been fed by the preheader
 ; constants 7/11 — unsound for n > 1, since the body's stores update the
 ; field on each iteration.

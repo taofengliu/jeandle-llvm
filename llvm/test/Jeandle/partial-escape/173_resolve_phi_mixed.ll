@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA-Plan §B7: a PHI mixing a virtual incoming with a non-virtual
+; A PHI mixing a virtual incoming with a non-virtual
 ; incoming (a function-argument pointer). resolveVirtualRefImpl returns
 ; nullopt because one arm resolves to None. processBlockPhis Case A
 ; handles this at the merge (per-pred materialization of the virtual

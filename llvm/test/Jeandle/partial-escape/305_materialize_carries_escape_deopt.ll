@@ -1,13 +1,13 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R6.S10 — DeoptBundleSource prefers the escape-point CallBase when it
-; carries a "deopt" bundle. The analyzer's DeoptBundleSource still
-; reflects this preference (so the future Jeandle deopt refactor can
-; engage with the bundle properly), but the transform is intentionally
-; deopt-agnostic: it filters "deopt" out when copying bundles onto
-; NewInv. So even though the sink carries a rich "deopt" bundle and the
-; allocation has none, the materialization invoke must end up with no
-; operand bundles at all, and the sink's "deopt" operand referencing the
+; DeoptBundleSource prefers the escape-point CallBase when it carries a
+; "deopt" bundle. The analyzer's DeoptBundleSource still reflects this
+; preference (so the future Jeandle deopt refactor can engage with the
+; bundle properly), but the transform is intentionally deopt-agnostic:
+; it filters "deopt" out when copying bundles onto NewInv. So even
+; though the sink carries a rich "deopt" bundle and the allocation has
+; none, the materialization invoke must end up with no operand bundles
+; at all, and the sink's "deopt" operand referencing the
 ; about-to-be-deleted OrigAlloc must be scrubbed to null before the
 ; global RAUW (otherwise the verifier would see a self-reference once
 ; OrigAlloc is replaced by NewInv).

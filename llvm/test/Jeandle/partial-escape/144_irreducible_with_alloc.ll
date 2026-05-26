@@ -1,14 +1,13 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; C6 — irreducible region whose VIRTUAL VO would cross the cycle.
-; %o is allocated in %entry and used by @sink inside both cycle nodes.
+; Irreducible region whose VIRTUAL VO would cross the cycle. %o is
+; allocated in %entry and used by @sink inside both cycle nodes.
 ; LoopInfo does not recognise the cycle as a natural loop, so
 ; processLoop is never invoked; the outer RPO walk handles each block
 ; once. The first escape inside the cycle (whichever block RPO visits
 ; first) drives a per-instruction materialise; the alloc survives in
-; IR and the analyzer does not crash. This is the "alloc whose
-; virtual would cross the irreducible region" case the plan asked
-; to cover.
+; IR and the analyzer does not crash. This is the "alloc whose virtual
+; would cross the irreducible region" case.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))

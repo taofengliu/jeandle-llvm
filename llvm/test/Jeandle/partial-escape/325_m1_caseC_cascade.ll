@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; R8.M1: when processBlockPhis Case-A fallback materialises a virtual
+; When processBlockPhis Case-A fallback materialises a virtual
 ; incoming at a pred, the per-VO loop must re-run so subsequent decisions
 ; see the updated pred ExitInfo. The unified do-while (per-VO loop +
 ; phi loop, both inside the same `do ... while (Changed)`) provides
@@ -40,7 +40,7 @@ u:
 }
 
 ; The alloc must survive (escape arm uses it); IR remains well-formed
-; (verifyFunction passes courtesy of R6.S3).
+; (verifyFunction passes).
 ; CHECK-LABEL: define void @test_caseA_retriggers_per_vo
 ; CHECK: invoke{{.*}}@jeandle.new_instance
 ; CHECK: call void @sink

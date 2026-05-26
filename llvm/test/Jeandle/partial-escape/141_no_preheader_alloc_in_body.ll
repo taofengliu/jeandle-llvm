@@ -1,9 +1,9 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; C6 — loop without unique preheader (two forward preds into the
-; header), but the only alloc is INSIDE the body. The body alloc is
-; loop-local (a stored value is read back and the i32 is consumed).
-; C6's bail-on-virtual-at-forward-pred step doesn't touch it (the
+; Loop without unique preheader (two forward preds into the header),
+; but the only alloc is INSIDE the body. The body alloc is loop-local
+; (a stored value is read back and the i32 is consumed). The
+; bail-on-virtual-at-forward-pred step doesn't touch it (the
 ; forward-pred BlockExits carry no virtuals — the alloc didn't exist
 ; pre-loop). The single REGULAR-mode body pass folds the
 ; store/load/use chain on the loop-local alloc.
