@@ -45,13 +45,6 @@
 // original IR survives.  (Graal's cascade-materialize path that keeps the
 // PHI as the materialized pointer is deferred to a future task.)
 //
-// Current simplifications (carried as TODOs):
-//   * No iterative stabilization: the merge is a single pass; we don't
-//     re-process other successors of a predecessor whose state changed.
-//     The loop-header cache (CaseCVOCache) is forward-infrastructure for
-//     that future iterative pass; under the single-pass RPO walk it never
-//     actually hits.
-//
 // Lock cascade: when materializing a virtual whose LockCount > 0, the
 // analyzer (1) drops the previously-recorded ReplaceCall(true) effects
 // targeting the unbalanced enter call sites, (2) emits ReplaceInput effects
@@ -685,10 +678,12 @@ private:
   // value is the synthesized VO id; the caller looks it up and reuses the
   // existing VO + alias rather than calling createVirtualObject.
   //
-  // Under the current single-pass RPO walk this cache never actually hits
-  // (every loop header is visited exactly once). It is forward infrastructure,
-  // populated unconditionally so a future iterative-stabilization patch is
-  // purely additive.
+  // Under processLoop's body fixpoint the cache hits on iter >= 1: it
+  // survives across iterations (not snapshotted by take/restoreLoopSnapshot)
+  // so the same synthetic VO ID is reused at the header. Combined with
+  // LoopFieldPhiCache (stable per-offset PHI shells), this keeps FieldStates
+  // structurally equal across iterations, which the convergence check
+  // (loopBlockExitsEquivalent) requires.
   struct CaseCKey {
     BasicBlock *Block;
     SmallVector<jeandle::ObjectID, 4> SourceIDs;
