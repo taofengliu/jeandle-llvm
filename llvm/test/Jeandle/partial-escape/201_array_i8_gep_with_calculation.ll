@@ -3,8 +3,8 @@
 ; int[] virtual where store and reload use a single i8 GEP whose
 ; byte offset is structurally `add ArrayBaseOffset, (shl idx, log2(scale))`
 ; with the same symbolic %idx for both accesses. matchArrayElementGEP
-; sees a non-constant index and (per Graal StoreIndexedNode's
-; "index constant only" policy) forces the array to materialize so that
+; sees a non-constant index and (per the "index constant only" policy)
+; forces the array to materialize so that
 ; both accesses execute against a real array pointer.
 
 declare hotspotcc ptr addrspace(1) @jeandle.newarray(ptr, i32)

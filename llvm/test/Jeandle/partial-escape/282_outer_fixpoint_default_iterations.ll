@@ -3,9 +3,8 @@
 ; RUN: opt -S -passes="partial-escape-iterative" -jeandle-pea-iterations=1 %s \
 ; RUN:   | FileCheck %s --check-prefix=ONE
 
-; The wrapper's default iteration cap is 2, matching Graal's
-; EscapeAnalysisIterations default. This test pins both sides of that
-; contract:
+; The wrapper's default iteration cap is 2. This test pins both sides
+; of that contract:
 ;
 ;   DEFAULT prefix  -- no `-jeandle-pea-iterations` flag, so the cl::opt
 ;                      default (now 2) applies. Same input as 280; we

@@ -6,8 +6,7 @@
 // Exceptions. See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Outer fixpoint a la Graal's EffectsPhase.runAnalysis
-// (EffectsPhase.java:94-147). Wraps the existing PartialEscapeAnalysis +
+// Outer fixpoint. Wraps the existing PartialEscapeAnalysis +
 // PartialEscapeTransform pair in a bounded loop that interleaves the standard
 // canonicalization passes (InstCombine + SimplifyCFG + ADCE) between rounds.
 //
@@ -15,9 +14,8 @@
 // point. After DCE removes the now-dead branch that forced materialization,
 // the next round can re-virtualize the freshly emitted `jeandle.new_instance`
 // invoke (its field stores are still in IR and are picked up naturally by
-// tier1Allocate's RPO walk). Graal calls this pattern
-// AllocatedObjectNode/CommitAllocationNode re-fold; we get it for free as
-// long as we re-run analysis on the canonicalized IR (see the re-foldable
+// tier1Allocate's RPO walk). We get this re-fold for free as long as we
+// re-run analysis on the canonicalized IR (see the re-foldable
 // materialization note below).
 //
 // Convergence detection
@@ -31,9 +29,9 @@
 //       fuse multiple CommitAllocations into one — alloc count stable but
 //       virtualisation delta still positive), AND
 //     - round (N-1)'s canonicalisation did not mutate IR (no
-//       `postTriggered` signal — Graal's term for "the previous iter's
-//       canonicalisation moved IR around enough that this iter's analyser
-//       should re-check before we accept convergence").
+//       `postTriggered` signal — i.e. the previous iter's canonicalisation
+//       did not move IR around enough that this iter's analyser should
+//       re-check before we accept convergence).
 //   The first condition is the analyzer's own "I have nothing to do"
 //   signal; the rest guard against transforms that touch IR without
 //   eliminating an allocation (e.g. ReplaceLoad on a still-live virtual)
@@ -93,12 +91,8 @@
 
 using namespace llvm;
 
-// Mirrors Graal's EscapeAnalysisIterations
-// (GraalOptions.java: `EscapeAnalysisIterations = new OptionKey<>(2)`),
-// which is consumed by PartialEscapePhase's iterative ctor in HighTier via
-// `FinalPartialEscapePhase`. We match that default so Jeandle's pipeline
-// behaves like Graal's hosted compilation by default. We bumped
-// this default from 1 to 2 after confirming:
+// Default iteration cap. We bumped this default from 1 to 2 after
+// confirming:
 //   1. 177/183 lit tests bypass this wrapper (they invoke
 //      `partial-escape-analysis,partial-escape-transform` directly) and so
 //      are unaffected by the default.
@@ -115,15 +109,13 @@ using namespace llvm;
 static cl::opt<unsigned> JeandlePEAIterations(
     "jeandle-pea-iterations", cl::init(2), cl::Hidden,
     cl::desc("PEA: maximum number of analyze+transform+canonicalize rounds "
-             "in the outer fixpoint. Mirrors Graal's "
-             "EscapeAnalysisIterations (default 2). Set to 1 for "
+             "in the outer fixpoint. Default 2. Set to 1 for "
              "single-round semantics, 3-4 for aggressive re-fold."));
 
 // PEA-only IR dump hook. When the option is non-empty and
 // F.getName() contains the supplied substring, the wrapper dumps F to
 // errs() before AND after each PartialEscapeTransform round. Default empty
-// (no dump). Mirrors Graal's PartialEscapePhase debug hooks but scoped
-// tighter — only PEA rounds dump, so a `2>&1 | grep PEA-DUMP` filter is
+// (no dump). Only PEA rounds dump, so a `2>&1 | grep PEA-DUMP` filter is
 // enough to focus on PEA's IR transitions without polluting the log with
 // non-PEA passes. ~10 LOC site at the Iter loop body.
 static cl::opt<std::string> JeandleDumpPEAIR(
@@ -288,23 +280,15 @@ PartialEscapeIterative::run(Function &F, FunctionAnalysisManager &FAM) {
     PrevADelta = CurADelta;
 
     // Canonicalize between rounds — but skip on the last iter (no point
-    // since we won't analyze again). Mirrors Graal's
-    // postIteration(canonicalizer.applyIncremental) + DeadCodeElimination.
+    // since we won't analyze again).
     //
-    // Reorder: DCE → CFG simplification → LoopSimplify → InstCombine.
-    // Old order was IC → SCFG → ADCE. ADCE-first matches Graal's intent
-    // (DeadCodeEliminationPhase fires before CanonicalizerPhase in
-    // EffectsPhase.postIteration) and prevents InstCombine from canon-
-    // icalising against stale-but-dead IR (e.g. a now-dangling materialised
-    // alloc whose loads have not been pruned yet, producing a select-fold
-    // on a dying value). LoopSimplifyPass re-canonicalises preheaders that
-    // SimplifyCFG may have eaten, so a subsequent PEA iteration still sees
-    // a single-edge preheader for the loop fixpoint path. We use the new-PM
-    // equivalents:
-    //   ADCEPass           ≈ Graal's DeadCodeEliminationPhase(Required)
-    //   SimplifyCFGPass    ≈ Graal's CFG cleanup
-    //   LoopSimplifyPass   ≈ post-CFG loop-canon recovery
-    //   InstCombinePass    ≈ Graal's CanonicalizerPhase
+    // Order: DCE → CFG simplification → LoopSimplify → InstCombine.
+    // ADCE-first prevents InstCombine from canonicalising against
+    // stale-but-dead IR (e.g. a now-dangling materialised alloc whose loads
+    // have not been pruned yet, producing a select-fold on a dying value).
+    // LoopSimplifyPass re-canonicalises preheaders that SimplifyCFG may
+    // have eaten, so a subsequent PEA iteration still sees a single-edge
+    // preheader for the loop fixpoint path.
     bool CanonChanged = false;
     if (Iter + 1 < IterCap) {
       ADCEPass Dc;

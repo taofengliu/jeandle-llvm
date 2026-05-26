@@ -1,9 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; cmpxchg with a non-constant Expected operand and a constant Current
-; slot value is folded into a Conditional pattern, mirroring Graal
-; AbstractUnsafeCompareAndSwapNode.virtualize lines 175-188 (the
-; "Unknown outcome" branch). The allocation, the store, and the cmpxchg
+; slot value is folded into a Conditional pattern (the "Unknown outcome"
+; branch). The allocation, the store, and the cmpxchg
 ; are all eliminated; the cmpxchg is replaced by a synthesized
 ; { insertvalue / icmp eq } pair packaged into the {i32, i1} result struct.
 ; The extractvalue chain reads the prior slot value (the constant 0).

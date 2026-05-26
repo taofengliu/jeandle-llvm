@@ -3,8 +3,8 @@
 ; Contradiction rule: a Case-B PHI carries the virtual ObjectID forward
 ; through both arms, then `icmp eq %phi, %arg` where %arg is a non-null,
 ; non-virtual pointer must fold to false (distinct identity).
-; Per Graal ObjectEqualsNode.java: a virtual is a fresh, just-allocated
-; object — it cannot alias any pre-existing reference. eq -> false.
+; A virtual is a fresh, just-allocated object — it cannot alias any
+; pre-existing reference. eq -> false.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)

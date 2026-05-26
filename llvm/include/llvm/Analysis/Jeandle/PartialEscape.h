@@ -56,20 +56,19 @@ using ObjectID = unsigned;
 static constexpr ObjectID InvalidObjectID = ~0u;
 
 // Identity of a virtual monitorenter, carried per element of an
-// ObjectState's live lock stack. The pair (EnterCall, BytecodeDepth) is the
-// Jeandle analogue of Graal's LockState (jdk.graal.compiler.nodes.virtual.
-// LockState): EnterCall is the original jeandle.monitorenter call site (the
-// effects-side anchor used when un-eliding the call on materialisation);
-// BytecodeDepth is the Java-bytecode-level monitor depth at the enter site,
-// stable across re-pushes within a loop fixpoint. When the JDK frontend
-// supplies a `!jeandle.lock_depth = !{i32 N}` metadata node on the call,
+// ObjectState's live lock stack. EnterCall is the original
+// jeandle.monitorenter call site (the effects-side anchor used when
+// un-eliding the call on materialisation); BytecodeDepth is the
+// Java-bytecode-level monitor depth at the enter site, stable across
+// re-pushes within a loop fixpoint. When the JDK frontend supplies a
+// `!jeandle.lock_depth = !{i32 N}` metadata node on the call,
 // foldMonitorEnter uses that value. Lit tests that omit the metadata fall
 // back to the analyzer's monotonic NextLockEnterOrder proxy (so the depth is
 // then an Analyzer-run-monotonic identifier, NOT the true bytecode depth).
 // Cascade rules and merge-time stack-identity checks compare BytecodeDepth
-// instead of the Order proxy when the metadata is available, recovering
-// Graal parity. See also LockEnter (private,
-// PartialEscapeAnalysis.cpp), which mirrors this struct for the analyzer-
+// instead of the Order proxy when the metadata is available. See also
+// LockEnter (private, PartialEscapeAnalysis.cpp), which mirrors this
+// struct for the analyzer-
 // side LiveLockEnters DenseMap and additionally carries the legacy Order
 // tag used by loop-fixpoint convergence checks (which must compare CallBase
 // identity ONLY because the Order is monotonically refreshed on every
@@ -150,9 +149,9 @@ public:
   // analyzer later attempts to materialize a synthetic VO (e.g. a downstream
   // escape consumes the PHI), it conservatively marks both the synthetic VO
   // AND every per-pred source VO ineligible so the original allocations and
-  // stores survive in IR — the cascade-materialize path is not implemented
-  // (Graal's MergeProcessor.processPhi with synthesized VirtualObjectNode
-  // and ensureMaterialized at each predecessor).
+  // stores survive in IR — the cascade-materialize path (synthesized
+  // VirtualObject merged from per-pred sources, with materialization at
+  // each predecessor) is not implemented.
   bool IsSynthetic = false;
   SmallVector<ObjectID, 4> SyntheticSourceIDs;
   PHINode *SyntheticPhi = nullptr;
@@ -271,8 +270,7 @@ public:
       : Entries(numEntries, FieldValue::unknown()) {}
 
   // Custom copy/move so the per-slot CopyOnWrite annotation is reset on
-  // clone — a freshly-constructed copy is by definition unshared. This
-  // matches Graal's `private ObjectState(ObjectState other)`, which does not copy the `copyOnWrite` field.
+  // clone — a freshly-constructed copy is by definition unshared.
   ObjectState(const ObjectState &Other)
       : Kind(Other.Kind), Entries(Other.Entries), Locks(Other.Locks),
         MaterializedValue(Other.MaterializedValue), CopyOnWrite(false) {}
@@ -315,8 +313,7 @@ public:
   ArrayRef<MonitorIdRef> getLocks() const { return Locks; }
   // Element-wise lock-stack comparison used by the depth-aware merge-time
   // stack-identity check (mergeStates) and the pre-cascade in
-  // foldMonitorEnter. Compares both EnterCall AND
-  // BytecodeDepth, which gives Graal-parity locksEqual semantics when the
+  // foldMonitorEnter. Compares both EnterCall AND BytecodeDepth when the
   // JDK frontend supplies !jeandle.lock_depth metadata. When the metadata
   // is absent (lit tests, JDK build that predates Phase-1 emission), the
   // BytecodeDepth field holds the Analyzer's monotonic NextLockEnterOrder
@@ -388,8 +385,7 @@ public:
 class PEABlockState {
 public:
   // Refcount object shared by every PEABlockState that holds the same
-  // ObjectStates backing vector. Logically parallel to Graal's
-  // PartialEscapeBlockState.RefCount (PartialEscapeBlockState.java:77-79).
+  // ObjectStates backing vector.
   // Count == 1 means we are the sole owner: mutations may happen in place.
   // Count > 1 means the backing is shared with at least one other block
   // state: any mutator must clone the vector first (drop our ref, point
@@ -634,10 +630,8 @@ public:
   // Without an explicit erase the PHI survives as
   // `phi ptr addrspace(1) [poison, %a], [poison, %b]` until a downstream
   // InstCombine canonicalisation reaps it; in single-shot PEA tests
-  // (no iterative wrapper) it survives forever. Mirrors Graal's
-  // PartialEscapeClosure.deleteNode(phi) at
-  // PartialEscapeClosure.java:1410-1413. WeakTrackingVH so a parallel
-  // delete path (e.g. unreachable-block pruning) leaves a null
+  // (no iterative wrapper) it survives forever. WeakTrackingVH so a
+  // parallel delete path (e.g. unreachable-block pruning) leaves a null
   // handle that the transform safely skips.
   SmallVector<WeakTrackingVH, 4> CaseBAliasedPhisToErase;
 

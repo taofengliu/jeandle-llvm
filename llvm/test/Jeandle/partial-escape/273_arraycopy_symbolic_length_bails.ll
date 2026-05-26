@@ -1,10 +1,9 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/273_arraycopy_symbolic_length_bails.cblog %s | FileCheck %s
 
-; Memcpy with a symbolic (function-arg) length. Graal's
-; BasicArrayCopyNode.virtualize requires `replacedLength.isConstant()`; we
-; mirror that — symbolic length flips the dst VO ineligible. dst's alloc and
-; the memcpy must survive in IR (src is virtual too and also flipped
-; ineligible so its alloc + stores survive).
+; Memcpy with a symbolic (function-arg) length. Virtualization requires
+; a constant length — symbolic length flips the dst VO ineligible. dst's
+; alloc and the memcpy must survive in IR (src is virtual too and also
+; flipped ineligible so its alloc + stores survive).
 
 declare hotspotcc ptr addrspace(1) @jeandle.newarray(ptr, i32)
 declare void @llvm.memcpy.p1.p1.i64(ptr addrspace(1), ptr addrspace(1), i64, i1)

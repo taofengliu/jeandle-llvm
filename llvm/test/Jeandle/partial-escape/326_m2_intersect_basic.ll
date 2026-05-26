@@ -3,9 +3,9 @@
 ; Per-VO loop iterates the INTERSECTION (not the union) of preds'
 ; tracked IDs. A loop-local alloc that's virtual on the back-edge but
 ; absent on the entry-edge falls out of the intersection at the loop
-; header — the per-VO loop does not consider it, which is exactly the
-; behaviour Graal's MergeProcessor.intersectVirtualObjects provides.
-; The alloc remains eliminable because it dies inside the body.
+; header — the per-VO loop does not consider it, which is the
+; intersect-virtual-objects behaviour. The alloc remains eliminable
+; because it dies inside the body.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)

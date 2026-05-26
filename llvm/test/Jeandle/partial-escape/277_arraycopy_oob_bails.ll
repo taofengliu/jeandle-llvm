@@ -1,9 +1,9 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/277_arraycopy_oob_bails.cblog %s | FileCheck %s
 
-; dstOff + count > dst.ArrayLength must bail (Graal's
-; checkBounds, BasicArrayCopyNode.java:301). dst.length=2, dstOff=1,
-; count=2 -> needs slots 1 and 2 but dst only has slots 0..1. Bail; both
-; allocations are materialized and the memcpy stays.
+; dstOff + count > dst.ArrayLength must bail (checkBounds).
+; dst.length=2, dstOff=1, count=2 -> needs slots 1 and 2 but dst only
+; has slots 0..1. Bail; both allocations are materialized and the
+; memcpy stays.
 
 declare hotspotcc ptr addrspace(1) @jeandle.newarray(ptr, i32)
 declare void @llvm.memcpy.p1.p1.i64(ptr addrspace(1), ptr addrspace(1), i64, i1)

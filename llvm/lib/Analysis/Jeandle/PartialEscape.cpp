@@ -39,10 +39,9 @@ using namespace llvm::jeandle;
 
 // Per-effect dbgs() trace. When enabled, every Effect routed through
 // PEAResult::addBlockEffect emits a one-line summary on dbgs().
-// Off by default; turn on with -jeandle-trace-pea. Mirrors Graal's
-// per-effect logging in EffectList.add. Defined here (rather than in
-// PartialEscapeAnalysis.cpp) so the central emission site can read it
-// without a separate accessor.
+// Off by default; turn on with -jeandle-trace-pea. Defined here (rather
+// than in PartialEscapeAnalysis.cpp) so the central emission site can
+// read it without a separate accessor.
 static llvm::cl::opt<bool> JeandleTracePEA(
     "jeandle-trace-pea", llvm::cl::init(false), llvm::cl::Hidden,
     llvm::cl::desc("PEA: emit a one-line dbgs() trace on every major "
@@ -423,9 +422,7 @@ llvm::hash_code ObjectState::hash() const {
 
 // Mark every present ObjectState in the given vector as "shared". Called at
 // the moment our backing vector goes from sole-ownership (Count==1) to
-// shared (Count==2). Mirrors Graal's
-// `if (arrayRefCount.refCount == 1) { for (state : objectStates) state.share(); }`
-// in PartialEscapeBlockState.adoptAddObjectStates.
+// shared (Count==2).
 static void
 markAllSlotsShared(const SmallVector<std::optional<ObjectState>, 8> &Arr) {
   for (const auto &Slot : Arr) {
@@ -443,8 +440,8 @@ PEABlockState::PEABlockState(const PEABlockState &Other)
     : ObjectStates(Other.ObjectStates), ArrayRefCount(Other.ArrayRefCount),
       Dead(Other.Dead) {
   if (ArrayRefCount) {
-    // Graal-faithful "share handshake": if the array is about to transition
-    // from sole-ownership to shared (Count 1 -> 2), mark every slot as
+    // "Share handshake": if the array is about to transition from
+    // sole-ownership to shared (Count 1 -> 2), mark every slot as
     // CopyOnWrite so a later per-slot mutation triggers a per-slot clone
     // rather than stomping the value that the now-shared peer can still see.
     if (ArrayRefCount->Count == 1 && ObjectStates)
@@ -510,9 +507,8 @@ PEABlockState::getArrayForModification() {
   // a slot still flagged isShared() after the array clone is duplicated
   // before the caller writes through the returned reference.
   //
-  // Because Jeandle stores `SmallVector<optional<ObjectState>>` by value
-  // (vs. Graal's `ObjectState[]` which is an array of references), the
-  // vector copy at the array level already deep-copies each slot. The
+  // Because Jeandle stores `SmallVector<optional<ObjectState>>` by value,
+  // the vector copy at the array level already deep-copies each slot. The
   // per-slot CopyOnWrite flag therefore mostly serves as a one-shot tag —
   // copies inherit `CopyOnWrite=true`, the next mutator clones once and
   // resets it to false (ObjectState's custom copy ctor), and subsequent
@@ -611,10 +607,9 @@ void PEABlockState::resetObjectStates(unsigned NumObjects) {
 }
 
 void PEABlockState::adoptObjectStates(const PEABlockState &Other) {
-  // True shared_ptr handoff (mirrors Graal's adoptAddObjectStates,
-  // PartialEscapeBlockState.java:426-441). No deep clone — we point at
-  // Other's backing vector AND Other's RefCount, then bump the count. On
-  // first share (Count was 1, becomes 2) mark every present ObjectState as
+  // True shared_ptr handoff. No deep clone — we point at Other's backing
+  // vector AND Other's RefCount, then bump the count. On first share
+  // (Count was 1, becomes 2) mark every present ObjectState as
   // CopyOnWrite so subsequent per-slot mutations on either side go through
   // a slot clone rather than corrupting the peer's view.
   if (!Other.ObjectStates) {
@@ -803,8 +798,8 @@ void PEAResult::addBlockEffect(Effect E) {
   assert(E.Block);
   // Per-effect trace (gated on -jeandle-trace-pea, off by default).
   // Centralised here so every emission site routes through a single trace
-  // call. Mirrors Graal's per-effect logging in EffectList.add. The trace
-  // identifies the effect kind, the owning ObjectID (when set), the block
+  // call. The trace identifies the effect kind, the owning ObjectID (when
+  // set), the block
   // label, and a short Target/Replacement summary so a `2>&1 | grep PEA:`
   // sweep is enough to follow the analyser's decisions.
   if (JeandleTracePEA) {

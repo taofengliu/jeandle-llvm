@@ -3,10 +3,9 @@
 ; Two boxed virtuals of klass 9999 (Integer, JBasicType::Int)
 ; with the SAME constant primitive value stored. `icmp eq` between the
 ; two boxed pointers must structural-fold to `true` (NOT to the default
-; identity-based `false` for distinct virtuals). Mirrors Graal's
-; ObjectEqualsNode boxed-Integer path (ObjectEqualsNode.java:157-195),
-; whose effect is `IntegerEquals(boxA.value, boxB.value)` — and here
-; both values are the same constant, so the result is the literal 1.
+; identity-based `false` for distinct virtuals). The effect is
+; `IntegerEquals(boxA.value, boxB.value)` — and here both values are
+; the same constant, so the result is the literal 1.
 ;
 ; The icmp folds and both allocations + stores are unused → fully eliminated.
 

@@ -8,12 +8,10 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Outer fixpoint a la Graal's EffectsPhase.runAnalysis. Runs the
-// PartialEscapeAnalysis + PartialEscapeTransform pair in a bounded loop,
-// interleaving InstCombine + SimplifyCFG + ADCE between rounds so that
-// canonicalization can expose new scalar-replacement opportunities for the
-// next round. Mirrors Graal's PartialEscapePhase(iterative=true) ->
-// EffectsPhase(maxIterations = EscapeAnalysisIterations).
+// Outer fixpoint. Runs the PartialEscapeAnalysis + PartialEscapeTransform
+// pair in a bounded loop, interleaving InstCombine + SimplifyCFG + ADCE
+// between rounds so that canonicalization can expose new scalar-replacement
+// opportunities for the next round.
 //
 //===----------------------------------------------------------------------===//
 

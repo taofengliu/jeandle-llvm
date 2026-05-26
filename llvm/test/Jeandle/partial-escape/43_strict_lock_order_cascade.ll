@@ -3,9 +3,8 @@
 ; PEA: two synchronized regions on two different virtuals, properly
 ; nested (A is the OUTER lock, B is the INNER lock). The INNER virtual B
 ; escapes via a sink call while both locks are held. With strict-lock
-; order assumed, Graal's narrow cascade rule
-; (PartialEscapeBlockState.materializeWithCommit lines 323-333:
-;  "other.minLockDepth < this.maxLockDepth") FIRES for A because A's
+; order assumed, the narrow cascade rule
+; ("other.minLockDepth < this.maxLockDepth") FIRES for A because A's
 ; outermost lock was acquired BEFORE B's most-recent lock — i.e. A is
 ; on the LM_LIGHTWEIGHT lock stack below B. To preserve the monitor
 ; stack ordering when B materializes, A must also be materialized at

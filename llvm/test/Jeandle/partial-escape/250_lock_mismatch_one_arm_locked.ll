@@ -7,7 +7,7 @@
 ; else: nothing — LockCount[o]=0 at else exit.
 ; merge: counts disagree → lock-cascade fires.
 ;
-; Expected outcome (mirrors Graal MergeProcessor.merge:981-1003):
+; Expected outcome:
 ; each pred materializes the VO with its OWN lock list. The then-pred
 ; materialize cascades through the un-elide so the original monitorenter
 ; survives in IR with its first operand snapped to the then-pred's new

@@ -1,8 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; A widening load (EntryWidth < LoadWidth) cannot be coerced from a
-; single sub-bit-width slot — Graal would require a multi-slot read and
-; concat. We bail to ineligible: the original alloc, store, and load
+; single sub-bit-width slot — coercion would require a multi-slot read
+; and concat. We bail to ineligible: the original alloc, store, and load
 ; survive intact, no coercion synthesized.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)

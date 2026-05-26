@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Three nested locks. The MIDDLE virtual escapes. Under
-; Graal's narrow cascade rule
+; the narrow cascade rule
 ;   other.minLockDepth < this.maxLockDepth
 ; we get:
 ;   - A (outermost): A.min = 0 < B.max = 1 -> CASCADE.

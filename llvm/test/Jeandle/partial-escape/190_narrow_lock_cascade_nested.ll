@@ -2,8 +2,7 @@
 
 ; Narrow cascade fires when the INNER lock holder escapes.
 ; Lock order: enter A (outer), enter B (inner). Sink leaks B. Under
-; Graal's narrow cascade rule (PartialEscapeBlockState.materializeWithCommit
-; lines 323-333), materializing B cascades A because
+; the narrow cascade rule, materializing B cascades A because
 ;   A.minLockDepth (0) < B.maxLockDepth (1).
 ; Both A and B end up materialized; their monitorenter/monitorexit
 ; calls survive on the materialized pointers, preserving the LM_LIGHTWEIGHT

@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Outer-lock holder escapes while inner-lock holder is still
-; virtual. Under Graal's narrow cascade rule
+; virtual. Under the narrow cascade rule
 ;   other.minLockDepth < this.maxLockDepth
 ; we get B.min (1) NOT < A.max (0), so the inner virtual B is NOT
 ; cascaded — it stays virtual and folds away cleanly. The runtime

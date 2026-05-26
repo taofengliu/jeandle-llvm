@@ -1,9 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; cmpxchg with a non-constant Expected operand and a constant
-; current slot value is folded into a Conditional pattern (icmp + select),
-; mirroring Graal AbstractUnsafeCompareAndSwapNode.virtualize lines
-; 117-189. The slot's post-CAS value becomes
+; current slot value is folded into a Conditional pattern (icmp + select).
+; The slot's post-CAS value becomes
 ; `select(eq(prior, expected), newVal, prior)` so a subsequent atomic load
 ; of the slot sees that select. The cmpxchg's {T, i1} result is built via
 ; an InsertValueInst chain.

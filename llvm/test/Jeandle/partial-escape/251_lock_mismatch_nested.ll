@@ -7,9 +7,8 @@
 ; user's IR semantics are preserved exactly: two enters on then's path,
 ; one on else's path. No synthesized enters appear.
 ;
-; This mirrors Graal MergeProcessor.merge:981-1003 + materializeWithCommit
-; (which feeds CommitAllocationNode the pred's OWN locks list — no extra
-; enters are added on the lower-count side).
+; Each pred is fed its OWN locks list — no extra enters are added on the
+; lower-count side.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc i1 @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)

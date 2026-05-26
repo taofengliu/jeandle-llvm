@@ -4,12 +4,9 @@
 
 ; Anchor-supplier hook investigation regression test.
 ;
-; Graal's `virtualAnchorSupplier` (PartialEscapePhase.java:187) defaults to
-; `null` for all hosted/Substrate tiers; it is overridden only by
-; `TruffleEarlyEscapeAnalysisPhase` to prevent Truffle PE from duplicating
-; virtual instances across loop-explosion merges. That is a Truffle-PE
-; concern, not a stack-map or deopt-target concern, so Jeandle (which does
-; not implement Truffle PE) has no need for an anchor.
+; PEA emits no virtual-anchor hook: anchors are only relevant to runtimes
+; that perform loop-explosion / partial-evaluation merges, which Jeandle
+; does not.
 ;
 ; This test exercises the FULL Jeandle pipeline relevant to materialized
 ; allocations:

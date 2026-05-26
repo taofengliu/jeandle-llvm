@@ -5,7 +5,7 @@
 ; java.lang.Thread subtypes). For those classes, the runtime's lifecycle
 ; tracking (pending-reference list, thread-list registration) keys off
 ; the actual object identity; eliding the alloc would silently drop that
-; registration. Mirrors Graal's MetaAccessExtensionProvider.canVirtualize.
+; registration.
 ;
 ; Klass 7777 represents one such class (its cblog returns false for
 ; CanVirtualize). tier1Allocate calls HasFinalizer first (returns false,

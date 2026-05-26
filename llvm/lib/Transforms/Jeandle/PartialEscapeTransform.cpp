@@ -151,14 +151,10 @@ static BasicBlock *findOrSynthesizeUnwindDest(Function &F,
 // BlockRename so the PHI's incoming-block argument names the live merge-pred
 // after splitBasicBlock.
 //
-// No virtual-anchor hook is emitted here. Graal's
-// `virtualAnchorSupplier` (PartialEscapePhase.java:187) defaults to `null`
-// for ALL hosted/Substrate tiers; it is overridden non-null only by
-// `TruffleEarlyEscapeAnalysisPhase` to prevent VirtualObjects from floating
-// into the merge of an exploded loop and being duplicated by Truffle's
-// partial evaluator (TruffleEarlyEscapeAnchorNode). That is a Truffle-PE
-// concern, not a Substrate-deopt or stack-map concern. Jeandle does not
-// implement Truffle PE.
+// No virtual-anchor hook is emitted here. Anchors only matter to runtimes
+// that perform loop-explosion / partial-evaluation merges and can otherwise
+// duplicate VirtualObjects across an exploded merge. Jeandle does not do
+// loop explosion / partial evaluation, so no anchor is needed.
 //
 // For the GC-statepoint pipeline (PEA → InsertGCBarriers → ... →
 // RewriteStatepointsForGC), the materialized invoke emitted below is
@@ -607,10 +603,10 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
           break;
         Instruction *Target = E->Target;
         Value *Repl = E->Replacement;
-        // Graal's GraphUtil.replaceAtUsages injects a Pi
-        // node when the replacement's stamp is wider than the original.
-        // LLVM has no per-Value stamp at this layer — the closest analogue
-        // is the load-only metadata (`!nonnull`, `!dereferenceable`,
+        // When the replacement's stamp is wider than the original, a Pi
+        // node would normally be injected. LLVM has no per-Value stamp at
+        // this layer — the closest analogue is the load-only metadata
+        // (`!nonnull`, `!dereferenceable`,
         // `!dereferenceable_or_null`, `!align`, `!invariant.load`,
         // `!noundef`) the original load may have carried. Transfer those
         // (only when both sides are LoadInsts and the Replacement is

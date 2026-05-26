@@ -8,8 +8,7 @@
 ; runtime check survives unchanged in IR.
 ;
 ; This is the "no compile-time klass evidence" conservative path: PEA leaves
-; the call alone and the runtime decides at execution time. Mirrors Graal's
-; behaviour when the AbstractObjectStamp doesn't have an exact klass.
+; the call alone and the runtime decides at execution time.
 ;
 ; Note: per tier1Allocate, the VObj.Klass == 0 case is unreachable today
 ; (the analyzer refuses to register a virtual when the alloc's klass operand
