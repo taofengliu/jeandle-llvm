@@ -3,7 +3,6 @@ add_llvm_component_library(LLVMJeandleTransforms
   InsertGCBarriers.cpp
   JavaOperationLower.cpp
   JeandleDevirtualization.cpp
-  JeandleGCNarrowOopAnnotation.cpp
   JeandleInlineDriver.cpp
   JeandleInliner.cpp
   NarrowOopOpt.cpp

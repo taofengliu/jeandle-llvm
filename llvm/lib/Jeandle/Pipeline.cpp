@@ -12,7 +12,6 @@
 #include "llvm/Transforms/Jeandle/ConstantFieldFolding.h"
 #include "llvm/Transforms/Jeandle/InsertGCBarriers.h"
 #include "llvm/Transforms/Jeandle/JavaOperationLower.h"
-#include "llvm/Transforms/Jeandle/JeandleGCNarrowOopAnnotation.h"
 #include "llvm/Transforms/Jeandle/JeandleInliner.h"
 #include "llvm/Transforms/Jeandle/NarrowOopOpt.h"
 #include "llvm/Transforms/Jeandle/RepeatedConstantFolding.h"
@@ -89,7 +88,6 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   PM.addPass(JavaOperationLower(9));
   PM.addPass(createModuleToFunctionPassAdaptor(TLSPointerRewrite()));
   PM.addPass(createModuleToFunctionPassAdaptor(InstSimplifyPass()));
-  PM.addPass(createModuleToFunctionPassAdaptor(JeandleGCNarrowOopAnnotation()));
   return PM;
 }
 
