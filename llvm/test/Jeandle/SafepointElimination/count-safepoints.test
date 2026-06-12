@@ -1,0 +1,6 @@
+# RUN: %python %S/../../../utils/jeandle/count-safepoints.py %S/Inputs/count-input.ll | FileCheck %s
+
+# CHECK: explicit_polls	2
+# CHECK-NEXT: direct_handler_calls	1
+# CHECK-NEXT: poll_derived_statepoints	1
+# CHECK-NEXT: nonpoll_statepoints	2
