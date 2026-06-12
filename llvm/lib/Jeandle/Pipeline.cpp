@@ -20,6 +20,7 @@
 #include "llvm/Transforms/Jeandle/JeandleInliner.h"
 #include "llvm/Transforms/Jeandle/JeandleNarrowOopMarker.h"
 #include "llvm/Transforms/Jeandle/RepeatedConstantFolding.h"
+#include "llvm/Transforms/Jeandle/SafepointElimination.h"
 #include "llvm/Transforms/Jeandle/TLSPointerRewrite.h"
 #include "llvm/Transforms/Jeandle/TypeCheckElimination.h"
 #include "llvm/Transforms/Scalar/ADCE.h"
@@ -80,6 +81,9 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   PM.addPass(createModuleToFunctionPassAdaptor(TypeCheckElimination()));
   PM.addPass(createModuleToFunctionPassAdaptor(RepeatedConstantFolding()));
   PM.addPass(createModuleToFunctionPassAdaptor(TypeCheckElimination()));
+  // Clean up redundant safepoint polls before JavaOperationLower(1) inlines
+  // them away and before the default optimization pipeline.
+  PM.addPass(createModuleToFunctionPassAdaptor(SafepointElimination()));
   // TODO: InsertGCBarriers currently inserts high-level barrier calls before
   // O3 because it cannot handle O3 generated memory intrinsics and vector
   // instructions. But the uninlined barrier calls can still block useful

@@ -9,6 +9,7 @@ add_llvm_component_library(LLVMJeandleTransforms
   JeandleInlineDriver.cpp
   JeandleInliner.cpp
   RepeatedConstantFolding.cpp
+  SafepointElimination.cpp
   TLSPointerRewrite.cpp
   TypeCheckElimination.cpp
   JeandleTransformUtils.cpp
