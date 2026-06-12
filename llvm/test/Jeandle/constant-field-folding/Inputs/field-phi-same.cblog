@@ -1,3 +1,2 @@
-IsConstantField 0 12 = true
-GetFieldBasicTypeByOop 0 12 = 10
+GetConstantFieldInfo 0 12 = 10
 GetConstantFieldInt 0 12 = 42

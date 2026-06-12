@@ -1,0 +1,6 @@
+GetConstantFieldInfo 0 208 = 12
+GetConstantFieldOop 0 208 = 1
+GetConstantFieldInfo 1 16 = 12
+GetConstantFieldOop 1 16 = 2
+GetConstantFieldInfo 2 16 = 10
+GetConstantFieldInt 2 16 = 77

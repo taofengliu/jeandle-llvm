@@ -148,6 +148,9 @@ enum class VMCallbackValueType : uint8_t {
       (VMCallbackValueType::Int, VMCallbackValueType::Int), 2)                   \
   def(GetConstantFieldOop, int, Int,                                             \
       (int a1, int a2), (a1, a2),                                                \
+      (VMCallbackValueType::Int, VMCallbackValueType::Int), 2)                   \
+  def(GetConstantFieldInfo, int, Int,                                            \
+      (int a1, int a2), (a1, a2),                                                \
       (VMCallbackValueType::Int, VMCallbackValueType::Int), 2)
 
 // =============================================================================
@@ -188,6 +191,9 @@ enum class VMCallbackValueType : uint8_t {
 ///                       — Returns raw long bits for double fields.
 ///   GetConstantFieldOop — Returns stable oop id for object/array field value,
 ///                         or -1 for null.
+///   GetConstantFieldInfo
+///                       — Combined query: returns -1 if the field is not
+///                         foldable, or the HotSpot BasicType (>=0) if it is.
 struct VMCallbacks {
   ALL_JEANDLE_VM_CALLBACKS(DEF_VM_CALLBACK_FIELD)
 };

@@ -9,15 +9,23 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Jeandle/ConstantFieldFolding.h"
+#include "llvm/ADT/APFloat.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/Statistic.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstIterator.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Jeandle/Metadata.h"
 #include "llvm/IR/Jeandle/VMCallback.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/Support/Debug.h"
 
 #include <climits>
@@ -27,6 +35,10 @@
 #define DEBUG_TYPE "constant-field-folding"
 
 using namespace llvm;
+
+STATISTIC(NumFieldsFolded, "Number of constant field loads folded");
+STATISTIC(NumRounds, "Number of folding rounds");
+STATISTIC(NumOopChains, "Number of oop chains followed");
 
 namespace {
 
@@ -43,15 +55,50 @@ enum HotSpotBasicType {
   T_ARRAY = 13,
 };
 
-struct ConstOop {
-  int Id;
+// Three-state lattice used by the ConstOop dataflow analysis.
+//
+//   Top      — we have not seen any source for this value yet; acts as the
+//              identity element under meet.
+//   Constant — we know the value originates from a specific oop_handle_*
+//              global, identified by Id.
+//   Bottom   — we have proven the value cannot be tied to a single
+//              oop_handle (either two distinct sources flow in, or some
+//              opaque producer flows in).
+//
+// meet: Top ⊓ x = x ; Bottom ⊓ x = Bottom ; C{a} ⊓ C{a} = C{a} ;
+//       C{a} ⊓ C{b} = Bottom (when a != b).
+struct ConstOopLattice {
+  enum class Kind : uint8_t { Top, Constant, Bottom };
+  Kind K = Kind::Top;
+  int Id = 0;
 
-  bool operator==(const ConstOop &Other) const { return Id == Other.Id; }
-  bool operator!=(const ConstOop &Other) const { return !(*this == Other); }
+  static ConstOopLattice top() { return {Kind::Top, 0}; }
+  static ConstOopLattice bottom() { return {Kind::Bottom, 0}; }
+  static ConstOopLattice constant(int Id) { return {Kind::Constant, Id}; }
+
+  bool isTop() const { return K == Kind::Top; }
+  bool isConstant() const { return K == Kind::Constant; }
+  bool isBottom() const { return K == Kind::Bottom; }
+
+  ConstOopLattice meet(ConstOopLattice O) const {
+    if (K == Kind::Top)
+      return O;
+    if (O.K == Kind::Top)
+      return *this;
+    if (K == Kind::Bottom || O.K == Kind::Bottom)
+      return bottom();
+    return Id == O.Id ? *this : bottom();
+  }
+
+  bool operator==(ConstOopLattice O) const {
+    return K == O.K && (K != Kind::Constant || Id == O.Id);
+  }
+  bool operator!=(ConstOopLattice O) const { return !(*this == O); }
 };
 
 struct FieldLoadMatch {
   LoadInst *Load;
+  GetElementPtrInst *GEP; // null for direct-base loads or constant-expr GEPs.
   int OopId;
   int Offset;
 };
@@ -82,133 +129,165 @@ std::optional<int> getOopHandleId(Value *V) {
   return parseOopHandleId(GV->getName());
 }
 
-std::optional<ConstOop>
-getMappedConstOop(Value *V, const DenseMap<Value *, ConstOop> &ConstOops) {
+// If `LI` is a load from an oop_handle_* global, return its id.
+std::optional<int> getOopHandleLoadId(LoadInst *LI) {
+  if (!LI || !isJavaOopType(LI->getType()))
+    return std::nullopt;
+  return getOopHandleId(LI->getPointerOperand());
+}
+
+// Returns true for instructions that we treat as a one-step pointer
+// forwarder in the lattice — i.e. their result's ConstOop lattice value
+// is determined by their operands.
+//
+// Sources (loads from oop_handle_* globals) are handled separately as
+// initial seeds and are NOT forwarders.
+bool isForwarder(Instruction &I) {
+  if (!isJavaOopType(I.getType()))
+    return false;
+  if (isa<PHINode>(&I) || isa<SelectInst>(&I) || isa<BitCastInst>(&I) ||
+      isa<AddrSpaceCastInst>(&I) || isa<FreezeInst>(&I))
+    return true;
+  if (auto *GEP = dyn_cast<GetElementPtrInst>(&I))
+    return GEP->hasAllZeroIndices();
+  return false;
+}
+
+// Look up V's lattice value. Any oop-typed value not in `States` is
+// implicitly Bottom — it is some opaque producer we cannot trace. Non-oop
+// values are also Bottom (they cannot originate a ConstOop).
+ConstOopLattice getLattice(Value *V,
+                           const DenseMap<Value *, ConstOopLattice> &States) {
+  auto It = States.find(V);
+  if (It != States.end())
+    return It->second;
+  return ConstOopLattice::bottom();
+}
+
+// Compute the lattice value for a forwarder instruction by taking the meet
+// of its operand lattice values.
+ConstOopLattice transferForwarder(Instruction &I,
+                                  const DenseMap<Value *, ConstOopLattice> &States) {
+  if (auto *PN = dyn_cast<PHINode>(&I)) {
+    ConstOopLattice Result = ConstOopLattice::top();
+    for (Value *Inc : PN->incoming_values()) {
+      Result = Result.meet(getLattice(Inc, States));
+      if (Result.isBottom())
+        return Result;
+    }
+    return Result;
+  }
+
+  if (auto *SI = dyn_cast<SelectInst>(&I))
+    return getLattice(SI->getTrueValue(), States)
+        .meet(getLattice(SI->getFalseValue(), States));
+
+  if (isa<BitCastInst>(&I) || isa<AddrSpaceCastInst>(&I) ||
+      isa<FreezeInst>(&I))
+    return getLattice(I.getOperand(0), States);
+
+  if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
+    assert(GEP->hasAllZeroIndices() && "non-zero GEP is not a forwarder");
+    return getLattice(GEP->getPointerOperand(), States);
+  }
+
+  llvm_unreachable("transferForwarder called on non-forwarder");
+}
+
+// Compute, for every Value in F that is provably a known ConstOop, its
+// oop id. Implementation is a monotonic worklist over the three-state
+// ConstOopLattice. Sources (loads from oop_handle_* globals) are seeded
+// to Constant{Id}; forwarders (PHI, Select, casts, zero-index GEPs,
+// pointer-preserving intrinsics) start at Top and are pulled down to
+// Constant or Bottom by repeated meets. This converges in O(N * h) where
+// h = 3, regardless of PHI cycles.
+DenseMap<Value *, int> computeConstOops(Function &F) {
+  DenseMap<Value *, ConstOopLattice> States;
+  SmallVector<Value *, 32> Worklist;
+
+  // Seed: every LoadInst from an oop_handle_* global has a fixed Constant
+  // value. Every other tracked instruction starts at Top.
+  for (BasicBlock &BB : F) {
+    for (Instruction &I : BB) {
+      if (auto *LI = dyn_cast<LoadInst>(&I)) {
+        if (std::optional<int> Id = getOopHandleLoadId(LI)) {
+          States[&I] = ConstOopLattice::constant(*Id);
+          Worklist.push_back(&I);
+          continue;
+        }
+      }
+      if (isForwarder(I))
+        States[&I] = ConstOopLattice::top();
+    }
+  }
+
+  // Worklist propagation. Whenever a value's lattice state changes, push
+  // all forwarder users so they can re-evaluate. Sources never change
+  // after seeding.
+  while (!Worklist.empty()) {
+    Value *V = Worklist.pop_back_val();
+    for (User *U : V->users()) {
+      auto *I = dyn_cast<Instruction>(U);
+      if (!I || !isForwarder(*I))
+        continue;
+      ConstOopLattice NewState = transferForwarder(*I, States);
+      auto It = States.find(I);
+      if (It == States.end() || It->second != NewState) {
+        States[I] = NewState;
+        Worklist.push_back(I);
+      }
+    }
+  }
+
+  DenseMap<Value *, int> Result;
+  for (auto &Entry : States) {
+    if (Entry.second.isConstant())
+      Result[Entry.first] = Entry.second.Id;
+  }
+  return Result;
+}
+
+std::optional<int>
+lookupConstOop(Value *V, const DenseMap<Value *, int> &ConstOops) {
   auto It = ConstOops.find(V);
   if (It == ConstOops.end())
     return std::nullopt;
   return It->second;
 }
 
-std::optional<ConstOop>
-transferConstOop(Instruction &I, const DenseMap<Value *, ConstOop> &ConstOops) {
-  if (!isJavaOopType(I.getType()))
-    return std::nullopt;
-
-  if (auto *LI = dyn_cast<LoadInst>(&I)) {
-    if (std::optional<int> Id = getOopHandleId(LI->getPointerOperand()))
-      return ConstOop{*Id};
-    return std::nullopt;
-  }
-
-  if (auto *BC = dyn_cast<BitCastInst>(&I))
-    return getMappedConstOop(BC->getOperand(0), ConstOops);
-
-  if (auto *ASC = dyn_cast<AddrSpaceCastInst>(&I))
-    return getMappedConstOop(ASC->getOperand(0), ConstOops);
-
-  if (auto *FI = dyn_cast<FreezeInst>(&I))
-    return getMappedConstOop(FI->getOperand(0), ConstOops);
-
-  if (auto *SI = dyn_cast<SelectInst>(&I)) {
-    std::optional<ConstOop> TrueOop =
-        getMappedConstOop(SI->getTrueValue(), ConstOops);
-    std::optional<ConstOop> FalseOop =
-        getMappedConstOop(SI->getFalseValue(), ConstOops);
-    if (TrueOop && FalseOop && *TrueOop == *FalseOop)
-      return TrueOop;
-    return std::nullopt;
-  }
-
-  if (auto *PN = dyn_cast<PHINode>(&I)) {
-    std::optional<ConstOop> Merged;
-    bool SawIncoming = false;
-    for (Value *Incoming : PN->incoming_values()) {
-      if (Incoming == PN)
-        continue;
-      std::optional<ConstOop> IncomingOop =
-          getMappedConstOop(Incoming, ConstOops);
-      if (!IncomingOop)
-        return std::nullopt;
-      if (!Merged) {
-        Merged = IncomingOop;
-      } else if (*Merged != *IncomingOop) {
-        return std::nullopt;
-      }
-      SawIncoming = true;
-    }
-    if (SawIncoming)
-      return Merged;
-  }
-
-  return std::nullopt;
-}
-
-DenseMap<Value *, ConstOop> computeConstOops(Function &F) {
-  DenseMap<Value *, ConstOop> ConstOops;
-  ReversePostOrderTraversal<Function *> RPOT(&F);
-
-  bool Changed = false;
-  do {
-    Changed = false;
-    for (BasicBlock *BB : RPOT) {
-      for (Instruction &I : *BB) {
-        std::optional<ConstOop> NewState = transferConstOop(I, ConstOops);
-        auto It = ConstOops.find(&I);
-        if (!NewState) {
-          if (It != ConstOops.end()) {
-            ConstOops.erase(It);
-            Changed = true;
-          }
-          continue;
-        }
-
-        if (It == ConstOops.end()) {
-          ConstOops.insert({&I, *NewState});
-          Changed = true;
-        } else if (It->second != *NewState) {
-          It->second = *NewState;
-          Changed = true;
-        }
-      }
-    }
-  } while (Changed);
-
-  return ConstOops;
-}
-
-std::optional<int> getSingleConstantGEPOffset(GetElementPtrInst *GEP) {
-  if (!GEP || GEP->getNumIndices() != 1)
-    return std::nullopt;
-
-  auto Idx = GEP->idx_begin();
-  auto *CI = dyn_cast<ConstantInt>(Idx->get());
-  if (!CI)
-    return std::nullopt;
-
-  int64_t Offset = CI->getSExtValue();
-  if (Offset < INT_MIN || Offset > INT_MAX)
-    return std::nullopt;
-  return static_cast<int>(Offset);
-}
-
+// Match a load whose pointer resolves, through any chain of constant-
+// offset GEPs and pointer-preserving casts, to a known ConstOop.
+//
+// Uses `stripAndAccumulateConstantOffsets`, the canonical LLVM helper.
+// It correctly scales by source-element size, handles GEPs with any
+// number of constant indices, walks through nested GEPs, and strips
+// bitcast / addrspacecast.
 std::optional<FieldLoadMatch>
-matchFieldLoad(LoadInst *LI, const DenseMap<Value *, ConstOop> &ConstOops) {
+matchFieldLoad(LoadInst *LI, const DenseMap<Value *, int> &ConstOops,
+               const DataLayout &DL) {
   if (!LI)
     return std::nullopt;
 
-  auto *GEP =
-      dyn_cast<GetElementPtrInst>(LI->getPointerOperand()->stripPointerCasts());
-  std::optional<int> Offset = getSingleConstantGEPOffset(GEP);
-  if (!Offset)
+  Value *Ptr = LI->getPointerOperand();
+  unsigned IdxBits = DL.getIndexTypeSizeInBits(Ptr->getType());
+  APInt Offset(IdxBits, 0, /*isSigned=*/true);
+  Value *Base = Ptr->stripAndAccumulateConstantOffsets(
+      DL, Offset, /*AllowNonInbounds=*/true);
+
+  std::optional<int> BaseId = lookupConstOop(Base, ConstOops);
+  if (!BaseId)
     return std::nullopt;
 
-  std::optional<ConstOop> Base =
-      getMappedConstOop(GEP->getPointerOperand(), ConstOops);
-  if (!Base)
+  if (!Offset.isSignedIntN(sizeof(int) * CHAR_BIT))
     return std::nullopt;
+  int OffsetVal = static_cast<int>(Offset.getSExtValue());
 
-  return FieldLoadMatch{LI, Base->Id, *Offset};
+  // For cleanup we only delete the immediate GEP if it is an Instruction
+  // GEP that becomes use-empty after the fold; ConstantExpr GEPs and
+  // direct loads have no instruction to erase.
+  GetElementPtrInst *ImmediateGEP = dyn_cast<GetElementPtrInst>(Ptr);
+
+  return FieldLoadMatch{LI, ImmediateGEP, *BaseId, OffsetVal};
 }
 
 bool isSubIntBasicType(int BasicType) {
@@ -248,7 +327,8 @@ bool replaceSubIntLoad(LoadInst *LI, int BasicType, int Value) {
   }
 
   if (auto *IntTy = dyn_cast<IntegerType>(LI->getType())) {
-    auto *C = ConstantInt::get(IntTy, Value, /*isSigned=*/true);
+    bool IsSigned = (BasicType == T_BYTE || BasicType == T_SHORT);
+    auto *C = ConstantInt::get(IntTy, Value, IsSigned);
     LI->replaceAllUsesWith(C);
     LI->eraseFromParent();
     return true;
@@ -263,10 +343,10 @@ bool foldFieldLoad(Module &M, const jeandle::VMCallbacks &CB,
   int OopId = Match.OopId;
   int Offset = Match.Offset;
 
-  if (!CB.IsConstantField(OopId, Offset))
+  int BasicType = CB.GetConstantFieldInfo(OopId, Offset);
+  if (BasicType < 0)
     return false;
 
-  int BasicType = CB.GetFieldBasicTypeByOop(OopId, Offset);
   IRBuilder<> Builder(LI);
 
   switch (BasicType) {
@@ -297,11 +377,10 @@ bool foldFieldLoad(Module &M, const jeandle::VMCallbacks &CB,
   case T_FLOAT: {
     if (!LI->getType()->isFloatTy())
       return false;
-    auto *Bits =
-        ConstantInt::get(Type::getInt32Ty(M.getContext()),
-                         static_cast<uint32_t>(
-                             CB.GetConstantFieldFloatBits(OopId, Offset)));
-    auto *C = ConstantExpr::getBitCast(Bits, LI->getType());
+    uint32_t RawBits =
+        static_cast<uint32_t>(CB.GetConstantFieldFloatBits(OopId, Offset));
+    auto *C = ConstantFP::get(
+        LI->getType(), APFloat(APFloat::IEEEsingle(), APInt(32, RawBits)));
     LI->replaceAllUsesWith(C);
     LI->eraseFromParent();
     return true;
@@ -309,11 +388,10 @@ bool foldFieldLoad(Module &M, const jeandle::VMCallbacks &CB,
   case T_DOUBLE: {
     if (!LI->getType()->isDoubleTy())
       return false;
-    auto *Bits =
-        ConstantInt::get(Type::getInt64Ty(M.getContext()),
-                         static_cast<uint64_t>(
-                             CB.GetConstantFieldDoubleBits(OopId, Offset)));
-    auto *C = ConstantExpr::getBitCast(Bits, LI->getType());
+    uint64_t RawBits =
+        static_cast<uint64_t>(CB.GetConstantFieldDoubleBits(OopId, Offset));
+    auto *C = ConstantFP::get(
+        LI->getType(), APFloat(APFloat::IEEEdouble(), APInt(64, RawBits)));
     LI->replaceAllUsesWith(C);
     LI->eraseFromParent();
     return true;
@@ -328,6 +406,7 @@ bool foldFieldLoad(Module &M, const jeandle::VMCallbacks &CB,
       NewValue = ConstantPointerNull::get(cast<PointerType>(LI->getType()));
     } else {
       NewValue = createConstOopLoad(M, Builder, NewOopId);
+      ++NumOopChains;
     }
     LI->replaceAllUsesWith(NewValue);
     LI->eraseFromParent();
@@ -347,16 +426,25 @@ PreservedAnalyses ConstantFieldFolding::run(Function &F,
     return PreservedAnalyses::all();
 
   const jeandle::VMCallbacks *CB = jeandle::getVMCallbacks();
-  assert(CB && CB->IsConstantField && CB->GetFieldBasicTypeByOop &&
-         CB->GetConstantFieldInt && CB->GetConstantFieldLong &&
-         CB->GetConstantFieldFloatBits && CB->GetConstantFieldDoubleBits &&
-         CB->GetConstantFieldOop && "VMCallbacks must be set");
+  assert(CB && CB->GetConstantFieldInfo && CB->GetConstantFieldInt &&
+         CB->GetConstantFieldLong && CB->GetConstantFieldFloatBits &&
+         CB->GetConstantFieldDoubleBits && CB->GetConstantFieldOop &&
+         "VMCallbacks must be set");
 
+  const DataLayout &DL = M->getDataLayout();
+
+  constexpr unsigned MaxRounds = 64;
+  unsigned Round = 0;
   bool Changed = false;
   bool RoundChanged = false;
   do {
+    if (++Round > MaxRounds) {
+      LLVM_DEBUG(dbgs() << "CFF: max rounds reached, stopping\n");
+      break;
+    }
+    ++NumRounds;
     RoundChanged = false;
-    DenseMap<Value *, ConstOop> ConstOops = computeConstOops(F);
+    DenseMap<Value *, int> ConstOops = computeConstOops(F);
     ReversePostOrderTraversal<Function *> RPOT(&F);
 
     SmallVector<LoadInst *, 16> Loads;
@@ -370,15 +458,18 @@ PreservedAnalyses ConstantFieldFolding::run(Function &F,
     for (LoadInst *LI : Loads) {
       if (LI->getParent() == nullptr)
         continue;
-      std::optional<FieldLoadMatch> Match = matchFieldLoad(LI, ConstOops);
+      std::optional<FieldLoadMatch> Match = matchFieldLoad(LI, ConstOops, DL);
       if (!Match)
         continue;
 
       LLVM_DEBUG(dbgs() << "CFF: candidate " << *LI << " oop=" << Match->OopId
                         << " offset=" << Match->Offset << "\n");
       if (foldFieldLoad(*M, *CB, *Match)) {
+        ++NumFieldsFolded;
         RoundChanged = true;
         Changed = true;
+        if (Match->GEP && Match->GEP->use_empty())
+          Match->GEP->eraseFromParent();
       }
     }
   } while (RoundChanged);
