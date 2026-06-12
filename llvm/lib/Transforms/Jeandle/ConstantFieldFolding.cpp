@@ -22,6 +22,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/Jeandle/JeandleUtils.hpp"
 #include "llvm/IR/Jeandle/Metadata.h"
 #include "llvm/IR/Jeandle/VMCallback.h"
 #include "llvm/IR/Module.h"
@@ -42,18 +43,18 @@ STATISTIC(NumOopChains, "Number of oop chains followed");
 
 namespace {
 
-enum HotSpotBasicType {
-  T_BOOLEAN = 4,
-  T_CHAR = 5,
-  T_FLOAT = 6,
-  T_DOUBLE = 7,
-  T_BYTE = 8,
-  T_SHORT = 9,
-  T_INT = 10,
-  T_LONG = 11,
-  T_OBJECT = 12,
-  T_ARRAY = 13,
-};
+using llvm::jeandle::HotspotBasicType;
+using llvm::jeandle::isJavaOopType;
+using llvm::jeandle::T_ARRAY;
+using llvm::jeandle::T_BOOLEAN;
+using llvm::jeandle::T_BYTE;
+using llvm::jeandle::T_CHAR;
+using llvm::jeandle::T_DOUBLE;
+using llvm::jeandle::T_FLOAT;
+using llvm::jeandle::T_INT;
+using llvm::jeandle::T_LONG;
+using llvm::jeandle::T_OBJECT;
+using llvm::jeandle::T_SHORT;
 
 // Three-state lattice used by the ConstOop dataflow analysis.
 //
@@ -103,11 +104,13 @@ struct FieldLoadMatch {
   int Offset;
 };
 
-bool isJavaOopType(Type *Ty) {
-  auto *PT = dyn_cast<PointerType>(Ty);
-  return PT && PT->getAddressSpace() == jeandle::AddrSpace::JavaHeapAddrSpace;
-}
-
+// Recognize both naming conventions produced by the frontend / runtime:
+//   "oop_handle_<id>"           — alias form, used by chain folds here and
+//                                 registered by JDK via ensure_oop_handle_alias.
+//   "oop_handle_<klass>_<id>"   — descriptive form produced by the abstract
+//                                 interpreter in find_or_insert_oop.
+// Convention: whatever follows the LAST '_' is the decimal oop id. Any name
+// that does not end in a decimal segment is rejected.
 std::optional<int> parseOopHandleId(StringRef Name) {
   if (!Name.starts_with("oop_handle_"))
     return std::nullopt;
@@ -150,6 +153,9 @@ bool isForwarder(Instruction &I) {
     return true;
   if (auto *GEP = dyn_cast<GetElementPtrInst>(&I))
     return GEP->hasAllZeroIndices();
+  if (auto *II = dyn_cast<IntrinsicInst>(&I))
+    return II->getIntrinsicID() == Intrinsic::launder_invariant_group ||
+           II->getIntrinsicID() == Intrinsic::strip_invariant_group;
   return false;
 }
 
@@ -191,6 +197,13 @@ ConstOopLattice transferForwarder(Instruction &I,
     return getLattice(GEP->getPointerOperand(), States);
   }
 
+  if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
+    assert((II->getIntrinsicID() == Intrinsic::launder_invariant_group ||
+            II->getIntrinsicID() == Intrinsic::strip_invariant_group) &&
+           "unexpected intrinsic in transferForwarder");
+    return getLattice(II->getArgOperand(0), States);
+  }
+
   llvm_unreachable("transferForwarder called on non-forwarder");
 }
 
@@ -199,14 +212,25 @@ ConstOopLattice transferForwarder(Instruction &I,
 // ConstOopLattice. Sources (loads from oop_handle_* globals) are seeded
 // to Constant{Id}; forwarders (PHI, Select, casts, zero-index GEPs,
 // pointer-preserving intrinsics) start at Top and are pulled down to
-// Constant or Bottom by repeated meets. This converges in O(N * h) where
-// h = 3, regardless of PHI cycles.
+// Constant or Bottom by repeated meets. Opaque oop-typed producers
+// (calls, non-source loads, atomic rmw, ...) are seeded to Bottom AND
+// pushed to the worklist, so that Bottom propagates through forwarders
+// even when no source feeds them transitively. Convergence is O(N * h)
+// where h = 3, regardless of PHI cycles.
 DenseMap<Value *, int> computeConstOops(Function &F) {
   DenseMap<Value *, ConstOopLattice> States;
   SmallVector<Value *, 32> Worklist;
 
-  // Seed: every LoadInst from an oop_handle_* global has a fixed Constant
-  // value. Every other tracked instruction starts at Top.
+  // Seed three categories of oop-typed Instructions:
+  //   source     — load from oop_handle_*  → Constant{Id}, pushed
+  //   forwarder  — PHI / Select / cast / freeze / zero-GEP / invariant.group
+  //                                       → Top, not pushed (driven by users
+  //                                          of sources/opaques)
+  //   opaque     — any other oop-typed instruction (calls, non-source loads,
+  //                atomic ops, etc.)       → Bottom, pushed
+  //
+  // Non-Instruction oop values (Argument, Constant) remain implicitly Bottom
+  // via getLattice's fallback — they have no def site to push from.
   for (BasicBlock &BB : F) {
     for (Instruction &I : BB) {
       if (auto *LI = dyn_cast<LoadInst>(&I)) {
@@ -216,8 +240,14 @@ DenseMap<Value *, int> computeConstOops(Function &F) {
           continue;
         }
       }
-      if (isForwarder(I))
+      if (isForwarder(I)) {
         States[&I] = ConstOopLattice::top();
+        continue;
+      }
+      if (isJavaOopType(I.getType())) {
+        States[&I] = ConstOopLattice::bottom();
+        Worklist.push_back(&I);
+      }
     }
   }
 
@@ -261,7 +291,8 @@ lookupConstOop(Value *V, const DenseMap<Value *, int> &ConstOops) {
 // Uses `stripAndAccumulateConstantOffsets`, the canonical LLVM helper.
 // It correctly scales by source-element size, handles GEPs with any
 // number of constant indices, walks through nested GEPs, and strips
-// bitcast / addrspacecast.
+// bitcast / addrspacecast. With AllowInvariantGroup=true it also walks
+// through llvm.launder.invariant.group / llvm.strip.invariant.group.
 std::optional<FieldLoadMatch>
 matchFieldLoad(LoadInst *LI, const DenseMap<Value *, int> &ConstOops,
                const DataLayout &DL) {
@@ -272,7 +303,7 @@ matchFieldLoad(LoadInst *LI, const DenseMap<Value *, int> &ConstOops,
   unsigned IdxBits = DL.getIndexTypeSizeInBits(Ptr->getType());
   APInt Offset(IdxBits, 0, /*isSigned=*/true);
   Value *Base = Ptr->stripAndAccumulateConstantOffsets(
-      DL, Offset, /*AllowNonInbounds=*/true);
+      DL, Offset, /*AllowNonInbounds=*/true, /*AllowInvariantGroup=*/true);
 
   std::optional<int> BaseId = lookupConstOop(Base, ConstOops);
   if (!BaseId)
@@ -295,14 +326,13 @@ bool isSubIntBasicType(int BasicType) {
          BasicType == T_CHAR || BasicType == T_SHORT;
 }
 
-std::string oopHandleName(int OopId) {
-  return (Twine("oop_handle_") + Twine(OopId)).str();
-}
-
 LoadInst *createConstOopLoad(Module &M, IRBuilder<> &Builder, int OopId) {
   LLVMContext &Ctx = M.getContext();
   Type *OopTy = PointerType::get(Ctx, jeandle::AddrSpace::JavaHeapAddrSpace);
-  GlobalVariable *GV = M.getOrInsertGlobal(oopHandleName(OopId), OopTy);
+  const auto *CB = jeandle::getVMCallbacks();
+  assert(CB && CB->GetOopHandleName && "GetOopHandleName callback required");
+  const char *Name = CB->GetOopHandleName(OopId);
+  GlobalVariable *GV = cast<GlobalVariable>(M.getOrInsertGlobal(Name, OopTy));
   GV->setDSOLocal(true);
   return Builder.CreateLoad(OopTy, GV, "folded.oop");
 }
@@ -311,6 +341,22 @@ bool replaceSubIntLoad(LoadInst *LI, int BasicType, int Value) {
   if (!isSubIntBasicType(BasicType))
     return false;
 
+  // The load must read exactly one byte for boolean/byte fields and two
+  // bytes for char/short fields. Anything else is a layout mismatch and
+  // we conservatively refuse to fold — the `Value` returned by the VM is
+  // a widened int and would not match the actual memory contents.
+  unsigned ExpectedBits =
+      (BasicType == T_BOOLEAN || BasicType == T_BYTE) ? 8 : 16;
+  auto *IntTy = dyn_cast<IntegerType>(LI->getType());
+  if (!IntTy || IntTy->getBitWidth() != ExpectedBits)
+    return false;
+
+  // Fast path: if the load has a single CastInst user that matches the
+  // field's natural sign-extension (zext for boolean/char, sext for
+  // byte/short), fold the (load + cast) pair into a single widened
+  // ConstantInt at the cast's type. A non-matching cast falls through
+  // to the slow path, which is still correct (the truncated constant
+  // produces the same observed bits when subsequently widened).
   if (LI->hasOneUse()) {
     if (auto *Ext = dyn_cast<CastInst>(*LI->user_begin())) {
       if ((BasicType == T_BOOLEAN || BasicType == T_CHAR)
@@ -326,15 +372,11 @@ bool replaceSubIntLoad(LoadInst *LI, int BasicType, int Value) {
     }
   }
 
-  if (auto *IntTy = dyn_cast<IntegerType>(LI->getType())) {
-    bool IsSigned = (BasicType == T_BYTE || BasicType == T_SHORT);
-    auto *C = ConstantInt::get(IntTy, Value, IsSigned);
-    LI->replaceAllUsesWith(C);
-    LI->eraseFromParent();
-    return true;
-  }
-
-  return false;
+  bool IsSigned = (BasicType == T_BYTE || BasicType == T_SHORT);
+  auto *C = ConstantInt::get(IntTy, Value, IsSigned);
+  LI->replaceAllUsesWith(C);
+  LI->eraseFromParent();
+  return true;
 }
 
 bool foldFieldLoad(Module &M, const jeandle::VMCallbacks &CB,
@@ -347,73 +389,76 @@ bool foldFieldLoad(Module &M, const jeandle::VMCallbacks &CB,
   if (BasicType < 0)
     return false;
 
+  int64_t RawValue = CB.GetConstantFieldValue(OopId, Offset);
+
   IRBuilder<> Builder(LI);
 
   switch (BasicType) {
-  case T_BOOLEAN:
-  case T_BYTE:
-  case T_CHAR:
-  case T_SHORT:
-    return replaceSubIntLoad(LI, BasicType,
-                             CB.GetConstantFieldInt(OopId, Offset));
-  case T_INT: {
-    if (!LI->getType()->isIntegerTy(32))
-      return false;
-    auto *C = ConstantInt::get(LI->getType(),
-                              CB.GetConstantFieldInt(OopId, Offset));
-    LI->replaceAllUsesWith(C);
-    LI->eraseFromParent();
-    return true;
-  }
-  case T_LONG: {
-    if (!LI->getType()->isIntegerTy(64))
-      return false;
-    auto *C = ConstantInt::get(LI->getType(),
-                              CB.GetConstantFieldLong(OopId, Offset));
-    LI->replaceAllUsesWith(C);
-    LI->eraseFromParent();
-    return true;
-  }
-  case T_FLOAT: {
-    if (!LI->getType()->isFloatTy())
-      return false;
-    uint32_t RawBits =
-        static_cast<uint32_t>(CB.GetConstantFieldFloatBits(OopId, Offset));
-    auto *C = ConstantFP::get(
-        LI->getType(), APFloat(APFloat::IEEEsingle(), APInt(32, RawBits)));
-    LI->replaceAllUsesWith(C);
-    LI->eraseFromParent();
-    return true;
-  }
-  case T_DOUBLE: {
-    if (!LI->getType()->isDoubleTy())
-      return false;
-    uint64_t RawBits =
-        static_cast<uint64_t>(CB.GetConstantFieldDoubleBits(OopId, Offset));
-    auto *C = ConstantFP::get(
-        LI->getType(), APFloat(APFloat::IEEEdouble(), APInt(64, RawBits)));
-    LI->replaceAllUsesWith(C);
-    LI->eraseFromParent();
-    return true;
-  }
-  case T_OBJECT:
-  case T_ARRAY: {
-    if (!isJavaOopType(LI->getType()))
-      return false;
-    int NewOopId = CB.GetConstantFieldOop(OopId, Offset);
-    Value *NewValue = nullptr;
-    if (NewOopId < 0) {
-      NewValue = ConstantPointerNull::get(cast<PointerType>(LI->getType()));
-    } else {
-      NewValue = createConstOopLoad(M, Builder, NewOopId);
-      ++NumOopChains;
+    case T_BOOLEAN:
+    case T_BYTE:
+    case T_CHAR:
+    case T_SHORT:
+      return replaceSubIntLoad(LI, BasicType, static_cast<int>(RawValue));
+
+    case T_INT: {
+      if (!LI->getType()->isIntegerTy(32))
+        return false;
+      auto *C = ConstantInt::get(LI->getType(), static_cast<int>(RawValue));
+      LI->replaceAllUsesWith(C);
+      LI->eraseFromParent();
+      return true;
     }
-    LI->replaceAllUsesWith(NewValue);
-    LI->eraseFromParent();
-    return true;
-  }
-  default:
-    return false;
+
+    case T_LONG: {
+      if (!LI->getType()->isIntegerTy(64))
+        return false;
+      auto *C = ConstantInt::get(LI->getType(), RawValue);
+      LI->replaceAllUsesWith(C);
+      LI->eraseFromParent();
+      return true;
+    }
+
+    case T_FLOAT: {
+      if (!LI->getType()->isFloatTy())
+        return false;
+      uint32_t RawBits = static_cast<uint32_t>(RawValue);
+      auto *C = ConstantFP::get(
+          LI->getType(), APFloat(APFloat::IEEEsingle(), APInt(32, RawBits)));
+      LI->replaceAllUsesWith(C);
+      LI->eraseFromParent();
+      return true;
+    }
+
+    case T_DOUBLE: {
+      if (!LI->getType()->isDoubleTy())
+        return false;
+      uint64_t RawBits = static_cast<uint64_t>(RawValue);
+      auto *C = ConstantFP::get(
+          LI->getType(), APFloat(APFloat::IEEEdouble(), APInt(64, RawBits)));
+      LI->replaceAllUsesWith(C);
+      LI->eraseFromParent();
+      return true;
+    }
+
+    case T_OBJECT:
+    case T_ARRAY: {
+      if (!isJavaOopType(LI->getType()))
+        return false;
+      int NewOopId = static_cast<int>(RawValue);
+      Value *NewValue = nullptr;
+      if (NewOopId < 0) {
+        NewValue = ConstantPointerNull::get(cast<PointerType>(LI->getType()));
+      } else {
+        NewValue = createConstOopLoad(M, Builder, NewOopId);
+        ++NumOopChains;
+      }
+      LI->replaceAllUsesWith(NewValue);
+      LI->eraseFromParent();
+      return true;
+    }
+
+    default:
+      return false;
   }
 }
 
@@ -426,9 +471,7 @@ PreservedAnalyses ConstantFieldFolding::run(Function &F,
     return PreservedAnalyses::all();
 
   const jeandle::VMCallbacks *CB = jeandle::getVMCallbacks();
-  assert(CB && CB->GetConstantFieldInfo && CB->GetConstantFieldInt &&
-         CB->GetConstantFieldLong && CB->GetConstantFieldFloatBits &&
-         CB->GetConstantFieldDoubleBits && CB->GetConstantFieldOop &&
+  assert(CB && CB->GetConstantFieldInfo && CB->GetConstantFieldValue &&
          "VMCallbacks must be set");
 
   const DataLayout &DL = M->getDataLayout();
@@ -456,8 +499,6 @@ PreservedAnalyses ConstantFieldFolding::run(Function &F,
     }
 
     for (LoadInst *LI : Loads) {
-      if (LI->getParent() == nullptr)
-        continue;
       std::optional<FieldLoadMatch> Match = matchFieldLoad(LI, ConstOops, DL);
       if (!Match)
         continue;

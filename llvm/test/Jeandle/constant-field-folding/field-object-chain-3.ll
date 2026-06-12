@@ -17,6 +17,8 @@ entry:
   ret i32 %6
 }
 
+; CHECK: @oop_handle_Child_1 = external dso_local global ptr addrspace(1)
+; CHECK: @oop_handle_Grandchild_2 = external dso_local global ptr addrspace(1)
 ; CHECK: ret i32 77
 
 !java-method-compilation = !{}

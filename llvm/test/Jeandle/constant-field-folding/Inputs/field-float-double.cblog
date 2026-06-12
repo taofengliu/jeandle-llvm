@@ -1,4 +1,4 @@
 GetConstantFieldInfo 0 32 = 6
-GetConstantFieldFloatBits 0 32 = -1082130432
+GetConstantFieldValue 0 32 = -1082130432
 GetConstantFieldInfo 0 40 = 7
-GetConstantFieldDoubleBits 0 40 = -4616189618054758400
+GetConstantFieldValue 0 40 = -4616189618054758400

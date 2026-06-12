@@ -1,2 +1,2 @@
 GetConstantFieldInfo 0 24 = 12
-GetConstantFieldOop 0 24 = -1
+GetConstantFieldValue 0 24 = -1

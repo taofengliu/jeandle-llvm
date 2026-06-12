@@ -31,6 +31,7 @@ enum class VMCallbackValueType : uint8_t {
   Uintptr, // uintptr_t
   Int,     // int
   Long,    // int64_t
+  String,  // const char* (NUL-terminated)
 };
 
 // =============================================================================
@@ -128,30 +129,15 @@ enum class VMCallbackValueType : uint8_t {
   def(IsEffectivelyFinal, bool, Bool,                                            \
       (uintptr_t a1), (a1),                                                      \
       (VMCallbackValueType::Uintptr), 1)                                         \
-  def(IsConstantField, bool, Bool,                                               \
-      (int a1, int a2), (a1, a2),                                                \
-      (VMCallbackValueType::Int, VMCallbackValueType::Int), 2)                   \
-  def(GetFieldBasicTypeByOop, int, Int,                                          \
-      (int a1, int a2), (a1, a2),                                                \
-      (VMCallbackValueType::Int, VMCallbackValueType::Int), 2)                   \
-  def(GetConstantFieldInt, int, Int,                                             \
-      (int a1, int a2), (a1, a2),                                                \
-      (VMCallbackValueType::Int, VMCallbackValueType::Int), 2)                   \
-  def(GetConstantFieldLong, int64_t, Long,                                       \
-      (int a1, int a2), (a1, a2),                                                \
-      (VMCallbackValueType::Int, VMCallbackValueType::Int), 2)                   \
-  def(GetConstantFieldFloatBits, int, Int,                                       \
-      (int a1, int a2), (a1, a2),                                                \
-      (VMCallbackValueType::Int, VMCallbackValueType::Int), 2)                   \
-  def(GetConstantFieldDoubleBits, int64_t, Long,                                 \
-      (int a1, int a2), (a1, a2),                                                \
-      (VMCallbackValueType::Int, VMCallbackValueType::Int), 2)                   \
-  def(GetConstantFieldOop, int, Int,                                             \
+  def(GetConstantFieldValue, int64_t, Long,                                      \
       (int a1, int a2), (a1, a2),                                                \
       (VMCallbackValueType::Int, VMCallbackValueType::Int), 2)                   \
   def(GetConstantFieldInfo, int, Int,                                            \
       (int a1, int a2), (a1, a2),                                                \
-      (VMCallbackValueType::Int, VMCallbackValueType::Int), 2)
+      (VMCallbackValueType::Int, VMCallbackValueType::Int), 2)                   \
+  def(GetOopHandleName, const char*, String,                                     \
+      (int a1), (a1),                                                            \
+      (VMCallbackValueType::Int), 1)
 
 // =============================================================================
 // VMCallbacks struct — generated from master list
@@ -178,22 +164,21 @@ enum class VMCallbackValueType : uint8_t {
 ///   IsInterface         — Returns true if the klass is an interface.
 ///   IsObjectKlass       — Returns true if the klass is java.lang.Object.
 ///   IsEffectivelyFinal  — Returns true if no subclass can exist at runtime.
-///   IsConstantField     — Returns true if oop id + byte offset is foldable.
-///   GetFieldBasicTypeByOop
-///                       — Returns the HotSpot BasicType value for a field.
-///   GetConstantFieldInt — Returns widened int value for boolean/byte/char/
-///                         short/int fields.
-///   GetConstantFieldLong
-///                       — Returns long value.
-///   GetConstantFieldFloatBits
-///                       — Returns raw int bits for float fields.
-///   GetConstantFieldDoubleBits
-///                       — Returns raw long bits for double fields.
-///   GetConstantFieldOop — Returns stable oop id for object/array field value,
-///                         or -1 for null.
+///   GetConstantFieldValue
+///                       — Returns the constant field value as int64_t.
+///                         For boolean/byte/char/short/int: the widened value.
+///                         For long: the long value.
+///                         For float: raw IEEE-754 bit pattern (low 32 bits).
+///                         For double: raw IEEE-754 bit pattern (full int64_t).
+///                         For object/array: the stable oop id, or -1 for null.
 ///   GetConstantFieldInfo
 ///                       — Combined query: returns -1 if the field is not
 ///                         foldable, or the HotSpot BasicType (>=0) if it is.
+///   GetOopHandleName
+///                       — Returns the descriptive oop handle name (e.g.
+///                         "oop_handle_Test_1") for a given oop id. The
+///                         returned pointer remains valid for the duration
+///                         of the compilation.
 struct VMCallbacks {
   ALL_JEANDLE_VM_CALLBACKS(DEF_VM_CALLBACK_FIELD)
 };
