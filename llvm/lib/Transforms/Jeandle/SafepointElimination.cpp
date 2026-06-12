@@ -14,11 +14,14 @@
 /// time-to-safepoint budget: a poll is only deleted when another poll keeps
 /// covering the loop or the loop's trip count is provably small.
 ///
-/// Current transform:
+/// Current transforms:
 ///   - Adjacent poll collapse: two polls back to back on a straight-line path
 ///     collapse to the later one, whose deopt state supersedes the earlier
 ///     one's at that program point. Mirrors C2's SafePointNode::Identity and
 ///     Graal's SafepointNode.simplify.
+///   - Keep-one dedup: when some poll dominates a loop's latch, every
+///     iteration passes it, so the loop's other polls are redundant. Mirrors
+///     C2's IdealLoopTree::remove_safepoints(keep_one=true).
 ///
 /// A poll tagged `!jeandle.poll_coverage` is one some transform designated as
 /// its loop's required coverage; it wins over the positional rule.
@@ -27,10 +30,14 @@
 
 #include "llvm/Transforms/Jeandle/SafepointElimination.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Jeandle/Metadata.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
 
@@ -98,6 +105,68 @@ bool collapseAdjacentPolls(BasicBlock &BB) {
   return Changed;
 }
 
+// Keep-one dedup, C2's remove_safepoints(keep_one=true). When some poll the
+// loop owns dominates the latch, every complete iteration passes it, so the
+// loop's other polls are redundant: keep the latch-closest dominating poll (a
+// coverage-marked one wins) and erase the rest. Without a dominating poll,
+// deleting any poll could leave an iteration path uncovered — delete nothing.
+//
+// Only polls in blocks the loop owns directly are considered: an inner loop's
+// polls are that loop's coverage and must not be counted on (or deleted) here,
+// because they may legitimately disappear later under the inner loop's own
+// trip-count proof.
+bool keepOneLoopPoll(Loop &L, LoopInfo &LI, DominatorTree &DT) {
+  BasicBlock *Latch = L.getLoopLatch();
+  if (!Latch)
+    return false;
+
+  SmallVector<CallInst *, 4> Polls;
+  for (BasicBlock *BB : L.blocks()) {
+    if (LI.getLoopFor(BB) != &L)
+      continue;
+    for (Instruction &I : *BB)
+      if (isSafepointPoll(I))
+        Polls.push_back(cast<CallInst>(&I));
+  }
+  if (Polls.size() < 2)
+    return false;
+
+  // Walk the dominator chain upward from the latch; every block on it
+  // dominates the latch, so the first poll found is the latch-closest
+  // dominating one. First pass restricts to coverage-marked polls.
+  CallInst *Keep = nullptr;
+  for (bool MarkedOnly : {true, false}) {
+    for (BasicBlock *BB = Latch; BB && L.contains(BB);) {
+      if (LI.getLoopFor(BB) == &L) {
+        for (Instruction &I : llvm::reverse(*BB)) {
+          if (isSafepointPoll(I) &&
+              (!MarkedOnly || hasCoverageMarker(I))) {
+            Keep = cast<CallInst>(&I);
+            break;
+          }
+        }
+        if (Keep)
+          break;
+      }
+      auto *IDom = DT.getNode(BB)->getIDom();
+      BB = IDom ? IDom->getBlock() : nullptr;
+    }
+    if (Keep)
+      break;
+  }
+  if (!Keep)
+    return false;
+
+  for (CallInst *P : Polls)
+    if (P != Keep)
+      P->eraseFromParent();
+
+  // The survivor is the loop's designated coverage from here on.
+  if (!hasCoverageMarker(*Keep))
+    Keep->setMetadata(PollCoverageMD, MDNode::get(Keep->getContext(), {}));
+  return true;
+}
+
 } // end anonymous namespace
 
 PreservedAnalyses SafepointElimination::run(Function &F,
@@ -114,6 +183,15 @@ PreservedAnalyses SafepointElimination::run(Function &F,
   bool Changed = false;
   for (BasicBlock &BB : F)
     Changed |= collapseAdjacentPolls(BB);
+
+  auto &LI = AM.getResult<LoopAnalysis>(F);
+  auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
+
+  // Innermost-first, so an inner loop settles its own coverage before any
+  // outer-loop decision looks at the nest.
+  SmallVector<Loop *, 8> Loops(LI.getLoopsInPreorder());
+  for (Loop *L : llvm::reverse(Loops))
+    Changed |= keepOneLoopPoll(*L, LI, DT);
 
   if (!Changed)
     return PreservedAnalyses::all();
