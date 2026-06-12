@@ -22,6 +22,10 @@
 ///   - Keep-one dedup: when some poll dominates a loop's latch, every
 ///     iteration passes it, so the loop's other polls are redundant. Mirrors
 ///     C2's IdealLoopTree::remove_safepoints(keep_one=true).
+///   - Short-loop deletion: an innermost loop whose trip count provably fits
+///     the chunk budget cannot keep a thread away from a safepoint for more
+///     than that many iterations, so its polls go entirely. Mirrors C2's
+///     short-loop collapse in OuterStripMinedLoopNode::adjust_strip_mined_loop.
 ///
 /// A poll tagged `!jeandle.poll_coverage` is one some transform designated as
 /// its loop's required coverage; it wins over the positional rule.
@@ -32,6 +36,8 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
@@ -47,6 +53,18 @@ static cl::opt<bool> EnableSafepointElim(
     "jeandle-enable-safepoint-elim", cl::init(true),
     cl::desc("Master switch for the SafepointElimination pass. Setting this "
              "to false makes the pass a no-op. Useful for A/B comparison."));
+
+// One knob, three meanings: the bare-deletion trip bound, the (future)
+// strip-mining chunk size, and therefore the system-wide bound on how many
+// iterations a thread can run between safepoint polls. C2's equivalent is
+// LoopStripMiningIter (default 1000).
+static cl::opt<uint64_t> SafepointChunkIters(
+    "jeandle-safepoint-chunk-iters", cl::init(1000),
+    cl::desc("Iteration budget between safepoint polls: polls are deleted "
+             "outright only in innermost loops whose SCEV max backedge-taken "
+             "count provably fits this bound."));
+
+uint64_t llvm::jeandle::getSafepointChunkIters() { return SafepointChunkIters; }
 
 namespace {
 
@@ -167,6 +185,37 @@ bool keepOneLoopPoll(Loop &L, LoopInfo &LI, DominatorTree &DT) {
   return true;
 }
 
+// Trip-count-based deletion. SCEV's constant max backedge-taken count is a
+// sound upper bound across every exit and wrap case, so when it fits the
+// chunk budget the loop cannot keep a thread away from its next safepoint
+// for more than the budget and its polls can go entirely.
+//
+// Innermost loops only: a short loop enclosing a poll-free short loop would
+// compound to budget^2 poll-free iterations and break the bound. Once the
+// inner loop dissolves (full unroll, deletion), the enclosing loop becomes
+// innermost and qualifies on a later run.
+bool deleteShortLoopPolls(Loop &L, ScalarEvolution &SE) {
+  if (!L.isInnermost())
+    return false;
+  const auto *MaxC =
+      dyn_cast<SCEVConstant>(SE.getConstantMaxBackedgeTakenCount(&L));
+  if (!MaxC || MaxC->getAPInt().ugt(SafepointChunkIters))
+    return false;
+
+  SmallVector<CallInst *, 4> Polls;
+  for (BasicBlock *BB : L.blocks())
+    for (Instruction &I : *BB)
+      if (isSafepointPoll(I))
+        Polls.push_back(cast<CallInst>(&I));
+  if (Polls.empty())
+    return false;
+
+  for (CallInst *P : Polls)
+    P->eraseFromParent();
+  SE.forgetLoop(&L);
+  return true;
+}
+
 } // end anonymous namespace
 
 PreservedAnalyses SafepointElimination::run(Function &F,
@@ -186,12 +235,15 @@ PreservedAnalyses SafepointElimination::run(Function &F,
 
   auto &LI = AM.getResult<LoopAnalysis>(F);
   auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
+  auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
 
   // Innermost-first, so an inner loop settles its own coverage before any
   // outer-loop decision looks at the nest.
   SmallVector<Loop *, 8> Loops(LI.getLoopsInPreorder());
-  for (Loop *L : llvm::reverse(Loops))
+  for (Loop *L : llvm::reverse(Loops)) {
     Changed |= keepOneLoopPoll(*L, LI, DT);
+    Changed |= deleteShortLoopPolls(*L, SE);
+  }
 
   if (!Changed)
     return PreservedAnalyses::all();

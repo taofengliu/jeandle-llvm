@@ -25,6 +25,12 @@ public:
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 };
 
+namespace jeandle {
+/// Iteration budget shared by the trip-count-based poll deletion and the
+/// safepoint coverage verifier (-jeandle-safepoint-chunk-iters).
+uint64_t getSafepointChunkIters();
+} // namespace jeandle
+
 } // namespace llvm
 
 #endif // LLVM_SAFEPOINT_ELIMINATION_H
