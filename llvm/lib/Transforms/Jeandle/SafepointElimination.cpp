@@ -66,23 +66,23 @@ static cl::opt<uint64_t> SafepointChunkIters(
 
 uint64_t llvm::jeandle::getSafepointChunkIters() { return SafepointChunkIters; }
 
+bool llvm::jeandle::isSafepointPoll(const Instruction &I) {
+  const auto *CI = dyn_cast<CallInst>(&I);
+  if (!CI || CI->isIndirectCall())
+    return false;
+  const Function *Callee = CI->getCalledFunction();
+  return Callee && Callee->getName() == "jeandle.safepoint_poll";
+}
+
 namespace {
 
-constexpr StringRef SafepointPollName = "jeandle.safepoint_poll";
+using jeandle::isSafepointPoll;
 
 // A poll carrying this metadata is the designated safepoint coverage of its
 // loop: the loop must retain at least one poll so tagged. The tag marks the
 // loop's coverage need, not the instruction's identity — clones inherit it
 // and any one of them may serve.
 constexpr StringRef PollCoverageMD = "jeandle.poll_coverage";
-
-bool isSafepointPoll(const Instruction &I) {
-  const auto *CI = dyn_cast<CallInst>(&I);
-  if (!CI || CI->isIndirectCall())
-    return false;
-  const Function *Callee = CI->getCalledFunction();
-  return Callee && Callee->getName() == SafepointPollName;
-}
 
 bool hasCoverageMarker(const Instruction &I) {
   return I.getMetadata(PollCoverageMD) != nullptr;

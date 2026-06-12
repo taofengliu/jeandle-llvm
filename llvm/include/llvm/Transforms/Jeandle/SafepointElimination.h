@@ -15,6 +15,8 @@
 
 namespace llvm {
 
+class Instruction;
+
 /// Removes redundant `jeandle.safepoint_poll` calls. Polls are created by the
 /// frontend only — each carries the deopt JVM state of its bci, which no LLVM
 /// pass can synthesize — so this pass deletes or relocates polls but never
@@ -26,6 +28,9 @@ public:
 };
 
 namespace jeandle {
+/// Matches a direct call to `jeandle.safepoint_poll`.
+bool isSafepointPoll(const Instruction &I);
+
 /// Iteration budget shared by the trip-count-based poll deletion and the
 /// safepoint coverage verifier (-jeandle-safepoint-chunk-iters).
 uint64_t getSafepointChunkIters();
