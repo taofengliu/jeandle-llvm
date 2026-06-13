@@ -103,8 +103,8 @@ void VMCallbackLogRecorder::recordIfNew(unsigned Kind,
     formatValue(PrevOS, It->second);
     formatValue(CurOS, Result);
     report_fatal_error("VMCallbackLog purity violation: " + Twine(Info.Name) +
-                       "(" + ArgStr + ") returned " + CurStr +
-                       ", previously " + PrevStr);
+                       "(" + ArgStr + ") returned " + CurStr + ", previously " +
+                       PrevStr);
   }
 }
 
@@ -195,8 +195,7 @@ static VMCallbacks RealCallbacks;
   static RetType record##Name Params {                                         \
     RetType Result = RealCallbacks.Name(JEANDLE_STRIP_PARENS Args);            \
     if (auto *R = VMCallbackLogRecorder::getActiveRecorder())                  \
-      R->recordIfNew(CK_##Name,                                                \
-                     encodeArgs(JEANDLE_STRIP_PARENS Args),                    \
+      R->recordIfNew(CK_##Name, encodeArgs(JEANDLE_STRIP_PARENS Args),         \
                      encodeVMCallbackValue(Result));                           \
     return Result;                                                             \
   }
@@ -282,7 +281,7 @@ static T fetchReplayedResult(unsigned Kind, ArrayRef<CallbackValue> Args,
 #define REPLAY_CALLBACK(Name, RetType, Params, Args)                           \
   static RetType replay##Name Params {                                         \
     return fetchReplayedResult<RetType>(                                       \
-        CK_##Name, encodeArgs(JEANDLE_STRIP_PARENS Args), #Name);             \
+        CK_##Name, encodeArgs(JEANDLE_STRIP_PARENS Args), #Name);              \
   }
 
 #define DEF_REPLAY_CB(Name, RetType, ResType, Params, Args, ArgTypes, NumArgs) \
@@ -312,7 +311,7 @@ static unsigned findCallbackKind(StringRef Name) {
 
 /// Parse a numeric token according to its expected value type.
 static std::optional<int64_t> parseNumericToken(StringRef Token,
-                                                 VMCallbackValueType VT) {
+                                                VMCallbackValueType VT) {
   switch (VT) {
   case VMCallbackValueType::Bool: {
     if (Token == "true")
@@ -426,16 +425,15 @@ static Error parseLogBuffer(
       for (unsigned I = 0; I < Info.ArgTypes.size(); ++I) {
         auto Parsed = parseArgToken(ArgPart, Pos, Info.ArgTypes[I]);
         if (!Parsed)
-          return createStringError(
-              "line %zu: invalid argument %u for '%s'", LineNum + 1,
-              I + 1, Info.Name);
+          return createStringError("line %zu: invalid argument %u for '%s'",
+                                   LineNum + 1, I + 1, Info.Name);
         Args.push_back(Parsed->first);
         Pos = Parsed->second;
       }
     } else if (Info.ArgTypes.size() != 0) {
       return createStringError(
-          "line %zu: callback '%s' expects %zu argument(s), got 0",
-          LineNum + 1, Info.Name, Info.ArgTypes.size());
+          "line %zu: callback '%s' expects %zu argument(s), got 0", LineNum + 1,
+          Info.Name, Info.ArgTypes.size());
     }
 
     // Parse the result.

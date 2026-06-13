@@ -106,7 +106,8 @@ struct FieldLoadMatch {
 
 // Recognize both naming conventions produced by the frontend / runtime:
 //   "oop_handle_<id>"           — alias form, used by chain folds here and
-//                                 registered by JDK via ensure_oop_handle_alias.
+//                                 registered by JDK via
+//                                 ensure_oop_handle_alias.
 //   "oop_handle_<klass>_<id>"   — descriptive form produced by the abstract
 //                                 interpreter in find_or_insert_oop.
 // Convention: whatever follows the LAST '_' is the decimal oop id. Any name
@@ -172,8 +173,9 @@ ConstOopLattice getLattice(Value *V,
 
 // Compute the lattice value for a forwarder instruction by taking the meet
 // of its operand lattice values.
-ConstOopLattice transferForwarder(Instruction &I,
-                                  const DenseMap<Value *, ConstOopLattice> &States) {
+ConstOopLattice
+transferForwarder(Instruction &I,
+                  const DenseMap<Value *, ConstOopLattice> &States) {
   if (auto *PN = dyn_cast<PHINode>(&I)) {
     ConstOopLattice Result = ConstOopLattice::top();
     for (Value *Inc : PN->incoming_values()) {
@@ -188,8 +190,7 @@ ConstOopLattice transferForwarder(Instruction &I,
     return getLattice(SI->getTrueValue(), States)
         .meet(getLattice(SI->getFalseValue(), States));
 
-  if (isa<BitCastInst>(&I) || isa<AddrSpaceCastInst>(&I) ||
-      isa<FreezeInst>(&I))
+  if (isa<BitCastInst>(&I) || isa<AddrSpaceCastInst>(&I) || isa<FreezeInst>(&I))
     return getLattice(I.getOperand(0), States);
 
   if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
@@ -277,8 +278,8 @@ DenseMap<Value *, int> computeConstOops(Function &F) {
   return Result;
 }
 
-std::optional<int>
-lookupConstOop(Value *V, const DenseMap<Value *, int> &ConstOops) {
+std::optional<int> lookupConstOop(Value *V,
+                                  const DenseMap<Value *, int> &ConstOops) {
   auto It = ConstOops.find(V);
   if (It == ConstOops.end())
     return std::nullopt;
@@ -322,8 +323,8 @@ matchFieldLoad(LoadInst *LI, const DenseMap<Value *, int> &ConstOops,
 }
 
 bool isSubIntBasicType(int BasicType) {
-  return BasicType == T_BOOLEAN || BasicType == T_BYTE ||
-         BasicType == T_CHAR || BasicType == T_SHORT;
+  return BasicType == T_BOOLEAN || BasicType == T_BYTE || BasicType == T_CHAR ||
+         BasicType == T_SHORT;
 }
 
 LoadInst *createConstOopLoad(Module &M, IRBuilder<> &Builder, int OopId) {
@@ -394,71 +395,71 @@ bool foldFieldLoad(Module &M, const jeandle::VMCallbacks &CB,
   IRBuilder<> Builder(LI);
 
   switch (BasicType) {
-    case T_BOOLEAN:
-    case T_BYTE:
-    case T_CHAR:
-    case T_SHORT:
-      return replaceSubIntLoad(LI, BasicType, static_cast<int>(RawValue));
+  case T_BOOLEAN:
+  case T_BYTE:
+  case T_CHAR:
+  case T_SHORT:
+    return replaceSubIntLoad(LI, BasicType, static_cast<int>(RawValue));
 
-    case T_INT: {
-      if (!LI->getType()->isIntegerTy(32))
-        return false;
-      auto *C = ConstantInt::get(LI->getType(), static_cast<int>(RawValue));
-      LI->replaceAllUsesWith(C);
-      LI->eraseFromParent();
-      return true;
-    }
-
-    case T_LONG: {
-      if (!LI->getType()->isIntegerTy(64))
-        return false;
-      auto *C = ConstantInt::get(LI->getType(), RawValue);
-      LI->replaceAllUsesWith(C);
-      LI->eraseFromParent();
-      return true;
-    }
-
-    case T_FLOAT: {
-      if (!LI->getType()->isFloatTy())
-        return false;
-      uint32_t RawBits = static_cast<uint32_t>(RawValue);
-      auto *C = ConstantFP::get(
-          LI->getType(), APFloat(APFloat::IEEEsingle(), APInt(32, RawBits)));
-      LI->replaceAllUsesWith(C);
-      LI->eraseFromParent();
-      return true;
-    }
-
-    case T_DOUBLE: {
-      if (!LI->getType()->isDoubleTy())
-        return false;
-      uint64_t RawBits = static_cast<uint64_t>(RawValue);
-      auto *C = ConstantFP::get(
-          LI->getType(), APFloat(APFloat::IEEEdouble(), APInt(64, RawBits)));
-      LI->replaceAllUsesWith(C);
-      LI->eraseFromParent();
-      return true;
-    }
-
-    case T_OBJECT:
-    case T_ARRAY: {
-      if (!isJavaOopType(LI->getType()))
-        return false;
-      int NewOopId = static_cast<int>(RawValue);
-      Value *NewValue = nullptr;
-      if (NewOopId < 0) {
-        NewValue = ConstantPointerNull::get(cast<PointerType>(LI->getType()));
-      } else {
-        NewValue = createConstOopLoad(M, Builder, NewOopId);
-        ++NumOopChains;
-      }
-      LI->replaceAllUsesWith(NewValue);
-      LI->eraseFromParent();
-      return true;
-    }
-
-    default:
+  case T_INT: {
+    if (!LI->getType()->isIntegerTy(32))
       return false;
+    auto *C = ConstantInt::get(LI->getType(), static_cast<int>(RawValue));
+    LI->replaceAllUsesWith(C);
+    LI->eraseFromParent();
+    return true;
+  }
+
+  case T_LONG: {
+    if (!LI->getType()->isIntegerTy(64))
+      return false;
+    auto *C = ConstantInt::get(LI->getType(), RawValue);
+    LI->replaceAllUsesWith(C);
+    LI->eraseFromParent();
+    return true;
+  }
+
+  case T_FLOAT: {
+    if (!LI->getType()->isFloatTy())
+      return false;
+    uint32_t RawBits = static_cast<uint32_t>(RawValue);
+    auto *C = ConstantFP::get(
+        LI->getType(), APFloat(APFloat::IEEEsingle(), APInt(32, RawBits)));
+    LI->replaceAllUsesWith(C);
+    LI->eraseFromParent();
+    return true;
+  }
+
+  case T_DOUBLE: {
+    if (!LI->getType()->isDoubleTy())
+      return false;
+    uint64_t RawBits = static_cast<uint64_t>(RawValue);
+    auto *C = ConstantFP::get(
+        LI->getType(), APFloat(APFloat::IEEEdouble(), APInt(64, RawBits)));
+    LI->replaceAllUsesWith(C);
+    LI->eraseFromParent();
+    return true;
+  }
+
+  case T_OBJECT:
+  case T_ARRAY: {
+    if (!isJavaOopType(LI->getType()))
+      return false;
+    int NewOopId = static_cast<int>(RawValue);
+    Value *NewValue = nullptr;
+    if (NewOopId < 0) {
+      NewValue = ConstantPointerNull::get(cast<PointerType>(LI->getType()));
+    } else {
+      NewValue = createConstOopLoad(M, Builder, NewOopId);
+      ++NumOopChains;
+    }
+    LI->replaceAllUsesWith(NewValue);
+    LI->eraseFromParent();
+    return true;
+  }
+
+  default:
+    return false;
   }
 }
 

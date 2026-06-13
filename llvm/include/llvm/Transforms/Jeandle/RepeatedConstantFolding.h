@@ -1,4 +1,5 @@
-//===- RepeatedConstantFolding.h - Iterate CFF with simplification -*- C++ -*-===//
+//===- RepeatedConstantFolding.h - Iterate CFF with simplification -*- C++
+//-*-===//
 //
 // Copyright (c) 2026, the Jeandle-LLVM Authors. All Rights Reserved.
 //
@@ -19,8 +20,7 @@ namespace llvm {
 // so that branches turned constant by a fold are eliminated before the next
 // fold round. This unlocks PHI nodes that the lattice in CFF would otherwise
 // pin to Bottom because of an incoming value on a since-dead path.
-class RepeatedConstantFolding
-    : public PassInfoMixin<RepeatedConstantFolding> {
+class RepeatedConstantFolding : public PassInfoMixin<RepeatedConstantFolding> {
 public:
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);
 };

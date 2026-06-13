@@ -37,9 +37,9 @@
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
 
-#include <string>
 #include <cstdint>
 #include <initializer_list>
+#include <string>
 
 namespace llvm::jeandle {
 
@@ -137,8 +137,8 @@ struct CallbackKeyDenseMapInfo {
     unsigned H = Key.Kind;
     for (const auto &A : Key.Args) {
       if (A.IsString)
-        H = hash_combine(
-            H, hash_combine_range(A.StrVal.begin(), A.StrVal.end()));
+        H = hash_combine(H,
+                         hash_combine_range(A.StrVal.begin(), A.StrVal.end()));
       else
         H = hash_combine(H, A.NumVal);
     }
@@ -191,8 +191,7 @@ private:
 
 /// Encode a C++ argument value into a CallbackValue for key construction.
 template <typename T> inline CallbackValue encodeVMCallbackValue(T V);
-template <>
-inline CallbackValue encodeVMCallbackValue<uintptr_t>(uintptr_t V) {
+template <> inline CallbackValue encodeVMCallbackValue<uintptr_t>(uintptr_t V) {
   return CallbackValue::fromNum(static_cast<int64_t>(V));
 }
 template <> inline CallbackValue encodeVMCallbackValue<int>(int V) {
@@ -221,7 +220,8 @@ inline uintptr_t decodeVMCallbackValue<uintptr_t>(const CallbackValue &V) {
 template <> inline int decodeVMCallbackValue<int>(const CallbackValue &V) {
   return static_cast<int>(V.NumVal);
 }
-template <> inline int64_t decodeVMCallbackValue<int64_t>(const CallbackValue &V) {
+template <>
+inline int64_t decodeVMCallbackValue<int64_t>(const CallbackValue &V) {
   return V.NumVal;
 }
 template <>
