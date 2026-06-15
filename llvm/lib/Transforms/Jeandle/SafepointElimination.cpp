@@ -165,8 +165,7 @@ bool keepOneLoopPoll(Loop &L, LoopInfo &LI, DominatorTree &DT) {
     for (BasicBlock *BB = Latch; BB && L.contains(BB);) {
       if (LI.getLoopFor(BB) == &L) {
         for (Instruction &I : llvm::reverse(*BB)) {
-          if (isSafepointPoll(I) &&
-              (!MarkedOnly || hasCoverageMarker(I))) {
+          if (isSafepointPoll(I) && (!MarkedOnly || hasCoverageMarker(I))) {
             Keep = cast<CallInst>(&I);
             break;
           }
