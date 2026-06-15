@@ -30,6 +30,7 @@
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/Jeandle/Attributes.h"
 #include "llvm/IR/Jeandle/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
@@ -63,6 +64,13 @@ PreservedAnalyses SafepointCoverageVerifier::run(Function &F,
                                                  FunctionAnalysisManager &AM) {
   if (!F.getParent()->getNamedMetadata(
           jeandle::Metadata::JavaMethodCompilation))
+    return PreservedAnalyses::all();
+
+  // Template runtime helpers (lower-phase attribute) have their own bounded
+  // loops that legitimately run without polls; they are not Java method bodies
+  // and the coverage invariant does not apply to them. SafepointElimination
+  // skips them for the same reason.
+  if (F.hasFnAttribute(jeandle::Attribute::LowerPhase))
     return PreservedAnalyses::all();
 
   auto &LI = AM.getResult<LoopAnalysis>(F);

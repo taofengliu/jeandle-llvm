@@ -44,6 +44,7 @@
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Jeandle/Attributes.h"
 #include "llvm/IR/Jeandle/Metadata.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
@@ -233,6 +234,14 @@ PreservedAnalyses SafepointElimination::run(Function &F,
   // named metadata mirrors the existing pattern in InsertGCBarriers.
   if (!F.getParent()->getNamedMetadata(
           jeandle::Metadata::JavaMethodCompilation))
+    return PreservedAnalyses::all();
+
+  // The compilation module also holds the template runtime helpers (instanceof
+  // slow path, array clear, ...), tagged with the lower-phase attribute. They
+  // are runtime stubs with their own bounded loops, not Java method bodies —
+  // skip them. This also avoids paying loop analyses on every helper per
+  // compile.
+  if (F.hasFnAttribute(jeandle::Attribute::LowerPhase))
     return PreservedAnalyses::all();
 
   bool Changed = false;
