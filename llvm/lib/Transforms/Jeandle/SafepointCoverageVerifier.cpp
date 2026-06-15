@@ -22,6 +22,8 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Jeandle/SafepointCoverageVerifier.h"
+#include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
@@ -64,6 +66,18 @@ PreservedAnalyses SafepointCoverageVerifier::run(Function &F,
     return PreservedAnalyses::all();
 
   auto &LI = AM.getResult<LoopAnalysis>(F);
+
+  // SafepointElimination skips functions with irreducible cycles (LoopInfo
+  // can't see those cycles, so neither it nor this check can reason about
+  // their coverage). Match that: certifying only the natural loops here would
+  // be a false assurance, so report the function as unverifiable instead.
+  ReversePostOrderTraversal<const Function *> RPOT(&F);
+  if (containsIrreducibleCFG<const BasicBlock *>(RPOT, LI)) {
+    errs() << "SafepointCoverageVerifier: function '" << F.getName()
+           << "' has an irreducible CFG; coverage not verified\n";
+    return PreservedAnalyses::all();
+  }
+
   auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
   auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
 

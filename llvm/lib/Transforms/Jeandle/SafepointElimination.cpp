@@ -33,8 +33,10 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/Transforms/Jeandle/SafepointElimination.h"
+#include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
@@ -194,6 +196,10 @@ bool keepOneLoopPoll(Loop &L, LoopInfo &LI, DominatorTree &DT) {
 // compound to budget^2 poll-free iterations and break the bound. Once the
 // inner loop dissolves (full unroll, deletion), the enclosing loop becomes
 // innermost and qualifies on a later run.
+//
+// This deletes coverage-marked polls too: a provable trip bound supersedes the
+// coverage need (the loop is short enough that no poll is required at all), so
+// the marker is not a shield here.
 bool deleteShortLoopPolls(Loop &L, ScalarEvolution &SE) {
   if (!L.isInnermost())
     return false;
@@ -234,15 +240,26 @@ PreservedAnalyses SafepointElimination::run(Function &F,
     Changed |= collapseAdjacentPolls(BB);
 
   auto &LI = AM.getResult<LoopAnalysis>(F);
-  auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
-  auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
 
-  // Innermost-first, so an inner loop settles its own coverage before any
-  // outer-loop decision looks at the nest.
-  SmallVector<Loop *, 8> Loops(LI.getLoopsInPreorder());
-  for (Loop *L : llvm::reverse(Loops)) {
-    Changed |= keepOneLoopPoll(*L, LI, DT);
-    Changed |= deleteShortLoopPolls(*L, SE);
+  // LoopInfo doesn't model irreducible cycles, so a natural loop's
+  // latch-dominating poll or trip-count bound says nothing about a thread
+  // spinning inside an irreducible sub-cycle: keep-one could delete that
+  // cycle's polls while keeping a poll the cycle never reaches, and short-loop
+  // deletion bounds only latch executions, not the cycle's internal spins.
+  // Skip the loop transforms for the whole function; the block-local collapse
+  // above is safe on any CFG.
+  ReversePostOrderTraversal<const Function *> RPOT(&F);
+  if (!containsIrreducibleCFG<const BasicBlock *>(RPOT, LI)) {
+    auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
+    auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
+
+    // Innermost-first, so an inner loop settles its own coverage before any
+    // outer-loop decision looks at the nest.
+    SmallVector<Loop *, 8> Loops(LI.getLoopsInPreorder());
+    for (Loop *L : llvm::reverse(Loops)) {
+      Changed |= keepOneLoopPoll(*L, LI, DT);
+      Changed |= deleteShortLoopPolls(*L, SE);
+    }
   }
 
   if (!Changed)
