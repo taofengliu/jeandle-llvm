@@ -34,11 +34,14 @@
 #include "llvm/IR/Jeandle/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Debug.h"
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Jeandle/SafepointElimination.h"
 
 using namespace llvm;
+
+#define DEBUG_TYPE "safepoint-elimination"
 
 static cl::opt<bool> PrintOnly(
     "jeandle-safepoint-coverage-print-only", cl::init(false),
@@ -91,8 +94,11 @@ PreservedAnalyses SafepointCoverageVerifier::run(Function &F,
 
   bool Broken = false;
   for (Loop *L : LI.getLoopsInPreorder()) {
-    if (isLoopCovered(*L, DT, SE))
+    if (isLoopCovered(*L, DT, SE)) {
+      LLVM_DEBUG(dbgs() << "  covered: loop " << L->getHeader()->getName()
+                        << " in " << F.getName() << "\n");
       continue;
+    }
     Broken = true;
     errs() << "SafepointCoverageVerifier: loop with header '"
            << L->getHeader()->getName() << "' in function '" << F.getName()

@@ -49,8 +49,11 @@
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/Debug.h"
 
 using namespace llvm;
+
+#define DEBUG_TYPE "safepoint-elimination"
 
 static cl::opt<bool> EnableSafepointElim(
     "jeandle-enable-safepoint-elim", cl::init(true),
@@ -112,6 +115,8 @@ bool collapseAdjacentPolls(BasicBlock &BB) {
         CallInst *Victim =
             (hasCoverageMarker(*Prev) && !hasCoverageMarker(*Cur)) ? Cur : Prev;
         CallInst *Survivor = Victim == Prev ? Cur : Prev;
+        LLVM_DEBUG(dbgs() << "  collapse: erased an adjacent poll in "
+                          << BB.getName() << "\n");
         Victim->eraseFromParent();
         Changed = true;
         Prev = Survivor;
@@ -178,6 +183,9 @@ bool keepOneLoopPoll(Loop &L, LoopInfo &LI, DominatorTree &DT) {
   if (!Keep)
     return false;
 
+  LLVM_DEBUG(dbgs() << "  keep-one: loop " << L.getHeader()->getName()
+                    << " kept the latch-dominating poll, erased "
+                    << (Polls.size() - 1) << " redundant\n");
   for (CallInst *P : Polls)
     if (P != Keep)
       P->eraseFromParent();
@@ -217,6 +225,9 @@ bool deleteShortLoopPolls(Loop &L, ScalarEvolution &SE) {
   if (Polls.empty())
     return false;
 
+  LLVM_DEBUG(dbgs() << "  short-loop: " << L.getHeader()->getName()
+                    << " max trip count fits the chunk budget, deleted "
+                    << Polls.size() << " poll(s)\n");
   for (CallInst *P : Polls)
     P->eraseFromParent();
   SE.forgetLoop(&L);
@@ -244,6 +255,8 @@ PreservedAnalyses SafepointElimination::run(Function &F,
   if (F.hasFnAttribute(jeandle::Attribute::LowerPhase))
     return PreservedAnalyses::all();
 
+  LLVM_DEBUG(dbgs() << "SafepointElimination: " << F.getName() << "\n");
+
   bool Changed = false;
   for (BasicBlock &BB : F)
     Changed |= collapseAdjacentPolls(BB);
@@ -258,7 +271,9 @@ PreservedAnalyses SafepointElimination::run(Function &F,
   // Skip the loop transforms for the whole function; the block-local collapse
   // above is safe on any CFG.
   ReversePostOrderTraversal<const Function *> RPOT(&F);
-  if (!containsIrreducibleCFG<const BasicBlock *>(RPOT, LI)) {
+  if (containsIrreducibleCFG<const BasicBlock *>(RPOT, LI)) {
+    LLVM_DEBUG(dbgs() << "  irreducible CFG; skipping loop transforms\n");
+  } else {
     auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
     auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
 
