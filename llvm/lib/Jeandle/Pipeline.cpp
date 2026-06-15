@@ -36,6 +36,7 @@ Pipeline::Pipeline(OptimizationLevel level, LLVMContext &Ctx)
   PM = buildJeandlePipeline(PB, level);
 }
 
+// TODO: The pass selection/ordering is not optimal. We need to improve it.
 ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
                                                  OptimizationLevel level) {
   ModulePassManager PM;
@@ -43,6 +44,7 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   PM.addPass(createModuleToFunctionPassAdaptor(InstSimplifyPass()));
   PM.addPass(createModuleToFunctionPassAdaptor(TypeCheckElimination()));
   PM.addPass(createModuleToFunctionPassAdaptor(RepeatedConstantFolding()));
+  PM.addPass(createModuleToFunctionPassAdaptor(TypeCheckElimination()));
   PM.addPass(createModuleToFunctionPassAdaptor(InsertGCBarriers()));
   PM.addPass(JavaOperationLower(1));
   PM.addPass(createModuleToFunctionPassAdaptor(TLSPointerRewrite()));

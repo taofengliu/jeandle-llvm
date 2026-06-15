@@ -45,6 +45,7 @@ namespace {
 
 using llvm::jeandle::HotspotBasicType;
 using llvm::jeandle::isJavaOopType;
+using llvm::jeandle::getOopHandleId;
 using llvm::jeandle::T_ARRAY;
 using llvm::jeandle::T_BOOLEAN;
 using llvm::jeandle::T_BYTE;
@@ -103,35 +104,6 @@ struct FieldLoadMatch {
   int OopId;
   int Offset;
 };
-
-// Recognize both naming conventions produced by the frontend / runtime:
-//   "oop_handle_<id>"           — alias form, used by chain folds here and
-//                                 registered by JDK via
-//                                 ensure_oop_handle_alias.
-//   "oop_handle_<klass>_<id>"   — descriptive form produced by the abstract
-//                                 interpreter in find_or_insert_oop.
-// Convention: whatever follows the LAST '_' is the decimal oop id. Any name
-// that does not end in a decimal segment is rejected.
-std::optional<int> parseOopHandleId(StringRef Name) {
-  if (!Name.starts_with("oop_handle_"))
-    return std::nullopt;
-
-  StringRef Rest = Name.substr(strlen("oop_handle_"));
-  size_t Pos = Rest.rfind('_');
-  StringRef IdText = Pos == StringRef::npos ? Rest : Rest.substr(Pos + 1);
-
-  int Id = 0;
-  if (IdText.empty() || IdText.getAsInteger(10, Id))
-    return std::nullopt;
-  return Id;
-}
-
-std::optional<int> getOopHandleId(Value *V) {
-  auto *GV = dyn_cast<GlobalVariable>(V->stripPointerCasts());
-  if (!GV)
-    return std::nullopt;
-  return parseOopHandleId(GV->getName());
-}
 
 // If `LI` is a load from an oop_handle_* global, return its id.
 std::optional<int> getOopHandleLoadId(LoadInst *LI) {

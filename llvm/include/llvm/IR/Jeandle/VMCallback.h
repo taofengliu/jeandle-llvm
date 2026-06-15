@@ -137,6 +137,9 @@ enum class VMCallbackValueType : uint8_t {
       (VMCallbackValueType::Int, VMCallbackValueType::Int), 2)                   \
   def(GetOopHandleName, const char*, String,                                     \
       (int a1), (a1),                                                            \
+      (VMCallbackValueType::Int), 1)                                             \
+  def(GetOopKlass, uintptr_t, Uintptr,                                           \
+      (int a1), (a1),                                                            \
       (VMCallbackValueType::Int), 1)
 
 // =============================================================================
@@ -179,6 +182,9 @@ enum class VMCallbackValueType : uint8_t {
 ///                         "oop_handle_Test_1") for a given oop id. The
 ///                         returned pointer remains valid for the duration
 ///                         of the compilation.
+///   GetOopKlass        — Returns the actual runtime klass pointer of the
+///                         constant oop with the given oop id, or 0 if it is
+///                         unavailable. Pure (id -> klass).
 struct VMCallbacks {
   ALL_JEANDLE_VM_CALLBACKS(DEF_VM_CALLBACK_FIELD)
 };
