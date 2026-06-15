@@ -12,8 +12,8 @@
 #define JEANDLE_UTILS_HPP
 
 #include "llvm/ADT/StringRef.h"
-#include "llvm/IR/Jeandle/Metadata.h"
 #include "llvm/IR/GlobalVariable.h"
+#include "llvm/IR/Jeandle/Metadata.h"
 #include "llvm/IR/Type.h"
 
 #include <optional>

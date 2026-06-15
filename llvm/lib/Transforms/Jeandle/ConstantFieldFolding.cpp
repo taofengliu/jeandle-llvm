@@ -43,9 +43,9 @@ STATISTIC(NumOopChains, "Number of oop chains followed");
 
 namespace {
 
+using llvm::jeandle::getOopHandleId;
 using llvm::jeandle::HotspotBasicType;
 using llvm::jeandle::isJavaOopType;
-using llvm::jeandle::getOopHandleId;
 using llvm::jeandle::T_ARRAY;
 using llvm::jeandle::T_BOOLEAN;
 using llvm::jeandle::T_BYTE;
