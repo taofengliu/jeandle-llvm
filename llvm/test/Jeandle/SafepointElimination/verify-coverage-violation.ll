@@ -1,9 +1,12 @@
 ; RUN: opt -passes='verify<jeandle-safepoint-coverage>' \
 ; RUN:   -jeandle-safepoint-coverage-print-only -S < %s 2>&1 | FileCheck %s
+; RUN: not --crash opt -passes='verify<jeandle-safepoint-coverage>' \
+; RUN:   -disable-output < %s 2>&1 | FileCheck %s --check-prefix=ABORT
 
 ; An unbounded loop with no poll at all violates the coverage invariant: a
-; thread inside it can never reach a safepoint. The verifier must report it
-; (print-only keeps opt alive so the report is observable).
+; thread inside it can never reach a safepoint. In print-only mode the verifier
+; reports and keeps opt alive; in the default mode it aborts the compile (the
+; acceptance-gate behavior).
 
 define void @naked_loop(i64 %n) gc "safepoint-in-loop-example" {
 entry:
@@ -22,3 +25,5 @@ exit:
 !java-method-compilation = !{}
 
 ; CHECK: SafepointCoverageVerifier: loop with header 'loop.header' in function 'naked_loop' has no dominating safepoint poll and no provable trip bound
+
+; ABORT: Jeandle safepoint coverage verification failed
