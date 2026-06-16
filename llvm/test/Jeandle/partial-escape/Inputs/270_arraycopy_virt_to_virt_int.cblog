@@ -1,4 +1,0 @@
-RequiresStrictLockOrder = 1
-# Two newarray sites, both int[].
-ElementBasicTypeOfArrayKlass 12345 = 4
-ElementBasicTypeOfArrayKlass 12345 = 4

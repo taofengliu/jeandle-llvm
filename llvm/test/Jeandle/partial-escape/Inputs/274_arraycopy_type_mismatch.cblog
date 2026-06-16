@@ -1,5 +1,0 @@
-RequiresStrictLockOrder = 1
-# src is byte[] (klass 11111, JBasicType::Byte=1).
-ElementBasicTypeOfArrayKlass 11111 = 1
-# dst is int[] (klass 12345, JBasicType::Int=4).
-ElementBasicTypeOfArrayKlass 12345 = 4
