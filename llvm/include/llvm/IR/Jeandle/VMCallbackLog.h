@@ -104,10 +104,6 @@ struct CallbackValue {
   }
 };
 
-} // namespace llvm::jeandle
-
-namespace llvm::jeandle {
-
 // =============================================================================
 // Callback key for map-based lookup
 // =============================================================================

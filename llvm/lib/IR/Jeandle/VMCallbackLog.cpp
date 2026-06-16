@@ -337,10 +337,10 @@ static std::optional<int64_t> parseNumericToken(StringRef Token,
     return static_cast<int64_t>(Val);
   }
   case VMCallbackValueType::Long: {
-    int64_t val;
-    if (Token.getAsInteger(0, val))
+    int64_t Val;
+    if (Token.getAsInteger(0, Val))
       return std::nullopt;
-    return val;
+    return Val;
   }
   case VMCallbackValueType::String:
     // String tokens are handled separately by parseArgToken.
