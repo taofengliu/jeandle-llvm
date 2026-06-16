@@ -44,8 +44,7 @@ exit:
 !java-method-compilation = !{}
 
 ; CHECK-LABEL: @helper(
-; CHECK:       loop:
-; CHECK-NEXT:    call hotspotcc void @jeandle.safepoint_poll()
+; CHECK:         call hotspotcc void @jeandle.safepoint_poll()
 ; CHECK-NEXT:    call hotspotcc void @jeandle.safepoint_poll()
 
 ; VERIFY-NOT: function 'helper'

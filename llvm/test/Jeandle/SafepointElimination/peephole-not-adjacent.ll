@@ -1,40 +1,25 @@
 ; RUN: opt -passes=safepoint-elimination -S < %s | FileCheck %s
 
-; The two polls are separated by a load — a real (non-transparent) instruction.
-; Both must stay; collapsing them would drop the deopt anchor covering the
-; load's program point.
+; Two polls separated by a load — a real (non-transparent) instruction. R3 must
+; not collapse them; the load's program point needs the deopt anchor between
+; the polls. Kept on a straight-line path (no loop) so that keep-one dedup,
+; which would legitimately drop one of two latch-dominating polls, doesn't mask
+; what R3 alone does.
 
 declare hotspotcc void @jeandle.safepoint_poll()
 
-define void @not_adjacent(i64 %n, ptr %a) gc "safepoint-in-loop-example" {
+define void @not_adjacent(ptr %a) gc "safepoint-in-loop-example" {
 entry:
-  %cmp = icmp sgt i64 %n, 0
-  br i1 %cmp, label %loop.header, label %exit
-
-loop.header:
-  %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.latch ]
-  %exit.cond = icmp slt i64 %iv, %n
-  br i1 %exit.cond, label %loop.body, label %exit
-
-loop.body:
   call hotspotcc void @jeandle.safepoint_poll()
   %v = load i32, ptr %a
   call hotspotcc void @jeandle.safepoint_poll()
-  br label %loop.latch
-
-loop.latch:
-  %iv.next = add nsw i64 %iv, 1
-  br label %loop.header
-
-exit:
   ret void
 }
 
 !java-method-compilation = !{}
 
 ; CHECK-LABEL: @not_adjacent(
-; CHECK:       loop.body:
-; CHECK-NEXT:    call hotspotcc void @jeandle.safepoint_poll()
+; CHECK:         call hotspotcc void @jeandle.safepoint_poll()
 ; CHECK-NEXT:    load i32, ptr %a
 ; CHECK-NEXT:    call hotspotcc void @jeandle.safepoint_poll()
-; CHECK-NEXT:    br label %loop.latch
+; CHECK-NEXT:    ret void
