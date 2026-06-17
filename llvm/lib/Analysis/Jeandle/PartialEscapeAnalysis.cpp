@@ -3488,6 +3488,15 @@ bool Analyzer::tier2Store(StoreInst *SI) {
     Eligible[*BaseID] = false;
     return true;
   }
+  if (VObj.isInstance()) {
+    const jeandle::VMConstants VMConsts =
+        jeandle::VMConstants::fromModule(*F.getParent());
+    if (*Offset < VMConsts.instanceBaseOffset()) {
+      // Header accesses (mark/klass) are VM metadata, not Java fields.
+      Eligible[*BaseID] = false;
+      return true;
+    }
+  }
 
   // TODO: Unsafe.put{Int,Long,Short}-into-byte-array decomposition.
   // Re-enable together with the jeandle-jdk frontend inliner for
@@ -3569,6 +3578,15 @@ void Analyzer::tier2Load(LoadInst *LI) {
   if (!Offset) {
     Eligible[*BaseID] = false;
     return;
+  }
+  if (VObj.isInstance()) {
+    const jeandle::VMConstants VMConsts =
+        jeandle::VMConstants::fromModule(*F.getParent());
+    if (*Offset < VMConsts.instanceBaseOffset()) {
+      // Header accesses (mark/klass) are VM metadata, not Java fields.
+      Eligible[*BaseID] = false;
+      return;
+    }
   }
 
   Type *LoadTy = LI->getType();

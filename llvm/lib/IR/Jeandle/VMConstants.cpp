@@ -112,6 +112,8 @@ VMConstants VMConstants::fromModule(const Module &M) {
     C.DefaultMarkWord = *V;
   if (auto V = readGlobalInt(M, "arrayOopDesc.length_offset_in_bytes"))
     C.ArrayLengthOffset = *V;
+  if (auto V = readGlobalInt(M, "instanceOopDesc.base_offset_in_bytes"))
+    C.InstanceBaseOffset = *V;
 
   for (unsigned I = 0; I < (unsigned)JBasicType::Count; ++I) {
     const char *N = jBasicTypeName(static_cast<JBasicType>(I));

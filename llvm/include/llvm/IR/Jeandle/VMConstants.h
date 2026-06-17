@@ -76,6 +76,11 @@ struct VMConstants {
   // arrayOopDesc layout.
   int64_t ArrayLengthOffset = 12;     // 12 with compressed klass; 16 without.
 
+  // instanceOopDesc layout.  The opt-only lit tests do not link the runtime
+  // VMConstants globals, so keep the fallback permissive; JVM compilations
+  // override this with the real first Java-field offset from HotSpot.
+  int64_t InstanceBaseOffset = 0;
+
   // Per-element-type base offsets. Indexed by JBasicType.
   int64_t ArrayBaseOffset[(unsigned)JBasicType::Count] = {
       /*Boolean*/16, /*Byte*/16, /*Char*/16, /*Short*/16,
@@ -98,6 +103,7 @@ struct VMConstants {
   int64_t klassOffset() const { return KlassOffset; }
   int64_t markWordOffset() const { return MarkWordOffset; }
   int64_t defaultMarkWord() const { return DefaultMarkWord; }
+  int64_t instanceBaseOffset() const { return InstanceBaseOffset; }
 
   // Returns the array base offset for an element type. Returns -1 if Ty is not
   // a recognised Jeandle element type.
