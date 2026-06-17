@@ -869,6 +869,7 @@ private:
   bool foldMonitorExit(CallBase *CB);
   bool foldArrayStoreCheck(CallBase *CB);
   bool foldCheckIfValueBased(CallBase *CB);
+  bool foldRegisterFinalizerIfNeeded(CallBase *CB);
   // Common helper for checkcast/check_instanceof: returns the folded constant
   // bool (true/false) if the relationship is statically known, or
   // std::nullopt otherwise.
@@ -2884,8 +2885,8 @@ void Analyzer::applyThreeTier(Instruction *I) {
     //
     // ----------------------------------------------------------------------
     // Wiring-point TODOs for the deferred virtualization handlers
-    // (ObjectClone, GetClass/load-hub, EnsureVirtualized, FinalFieldBarrier /
-    // RegisterFinalizer elide).
+    // (ObjectClone, GetClass/load-hub, EnsureVirtualized,
+    // FinalFieldBarrier elide).
     // ----------------------------------------------------------------------
     // The following PEA folds map to frontend constructs that the current
     // Jeandle frontend does NOT emit. The intrinsic-name inventory
@@ -2898,11 +2899,12 @@ void Analyzer::applyThreeTier(Instruction *I) {
     // ldiv, load_klass, lrem, monitorenter_*, monitorexit_*, new_instance,
     // newarray, personality, post_barrier, pre_barrier, safepoint_poll,
     // try_acquire_monitor_lock, try_release_monitor_lock. No `clone`,
-    // `get_class`, `final_field_barrier`, `register_finalizer`, or
-    // `ensure_virtualized` JavaOp exists, so the matchers below are
-    // intentionally absent from tier2JavaOpFold to avoid dead code. When the
-    // frontend grows the corresponding JavaOp, wire each fold here and add
-    // the isJeandle* predicate in PartialEscapeUtils.{h,cpp}.
+    // `get_class`, `final_field_barrier`, or `ensure_virtualized` JavaOp
+    // exists, so the matchers below are intentionally absent from
+    // tier2JavaOpFold to avoid dead code. Register-finalizer is modeled as
+    // `jeandle.register_finalizer_if_needed` and folded below. When the
+    // frontend grows the remaining JavaOps, wire each fold here and add the
+    // isJeandle* predicate in PartialEscapeUtils.{h,cpp}.
     //
     // ObjectClone — clone virtualizer that duplicates the receiver's VO
     // ObjectState when virtual, else stages per-field loads from the
@@ -2955,51 +2957,19 @@ void Analyzer::applyThreeTier(Instruction *I) {
     //     return true;
     //   Tests: 320-329 reserved.
     //
-    // FinalFieldBarrier / RegisterFinalizer elide — virtualize deletes the
-    // barrier / registration when the receiver is virtual (final-field
-    // publication and finalizer registration are meaningless on a
-    // not-yet-escaped object).
-    //   The frontend emits `SharedRuntime_register_finalizer` (a direct
-    //   runtime call wired in jeandleRuntimeRoutine.hpp:122-126), gated by
-    //   a runtime check on the receiver klass's JVM_ACC_HAS_FINALIZER bit in
-    //   jeandleAbstractInterpreter.cpp:3254-3283. The runtime check + call
-    //   together do not look like a single JavaOp call site we can pattern-
-    //   match here without recognising the surrounding ICmp / branch pair —
-    //   beyond what tier2JavaOpFold supports. There is also no analogue for
-    //   final-field barriers (no `jeandle.final_field_barrier`, no runtime
-    //   routine). Wiring becomes possible if the frontend consolidates the
-    //   register_finalizer site into a `jeandle.register_finalizer(oop)`
-    //   JavaOp that internalises the access-flags check.
-    //   Wiring sketch when both JavaOps land:
+    // FinalFieldBarrier elide -- virtualize deletes a final-field publication
+    // barrier when the receiver is virtual. No frontend producer exists yet
+    // (`jeandle.final_field_barrier` is not emitted), so this remains
+    // deferred. Register-finalizer is handled by
+    // foldRegisterFinalizerIfNeeded once the frontend emits the explicit
+    // `jeandle.register_finalizer_if_needed(oop)` JavaOp.
+    //   Wiring sketch when `jeandle.final_field_barrier` lands:
     //     if (isJeandleFinalFieldBarrier(CB)) {
     //       auto BaseID = jeandle::pea::resolveVirtualRef(CB->getArgOperand(0),
     //                                                     CurrentState,
     //                                                     Aliases, DL);
     //       if (!BaseID) return false;
-    //       emitReplaceCall(CB, UndefValue::get(CB->getType()), *BaseID);
-    //       return true;
-    //     }
-    //     if (isJeandleRegisterFinalizer(CB)) {
-    //       auto BaseID = jeandle::pea::resolveVirtualRef(CB->getArgOperand(0),
-    //                                                     CurrentState,
-    //                                                     Aliases, DL);
-    //       if (!BaseID) {
-    //         // Even on the escape path, drop the call if the receiver's
-    //         // Klass is statically known to lack a finalizer. New
-    //         // VMCallback required:
-    //         //   bool (*HasFinalizer)(uintptr_t klass);
-    //         uintptr_t K = jeandle::pea::extractKlassConstant(
-    //                            CB->getArgOperand(0));
-    //         const auto *VC = jeandle::getVMCallbacks();
-    //         if (K && VC && VC->HasFinalizer && !VC->HasFinalizer(K)) {
-    //           emitReplaceCall(CB, UndefValue::get(CB->getType()),
-    //                           jeandle::InvalidObjectID);
-    //           return true;
-    //         }
-    //         return false;
-    //       }
-    //       // Virtual receiver: drop unconditionally.
-    //       emitReplaceCall(CB, UndefValue::get(CB->getType()), *BaseID);
+    //       emitReplaceCall(CB, nullptr, *BaseID);
     //       return true;
     //     }
     //   Tests: 320-329 reserved.
@@ -3809,10 +3779,12 @@ void Analyzer::emitReplaceCall(CallBase *CB, Value *Replacement,
   E.SeqNo = Result.nextSeqNo();
   E.ObjID = ID;
   Result.addBlockEffect(std::move(E));
-  // Scalar-alias the call's value so downstream resolveVirtualRef queries
+  // Scalar-alias non-void call values so downstream resolveVirtualRef queries
   // (e.g. another JavaOp later in the same block whose operand is the call
-  // result) see through to the replacement constant.
-  Aliases.addScalarAlias(CB, Replacement);
+  // result) see through to the replacement constant. Void JavaOps can use a
+  // null Replacement to request deletion only.
+  if (Replacement)
+    Aliases.addScalarAlias(CB, Replacement);
 }
 
 std::optional<bool> Analyzer::evalSubtypeRelation(uintptr_t SubKlass,
@@ -4196,6 +4168,33 @@ bool Analyzer::foldCheckIfValueBased(CallBase *CB) {
 }
 
 
+bool Analyzer::foldRegisterFinalizerIfNeeded(CallBase *CB) {
+  // jeandle.register_finalizer_if_needed(oop) -> void.
+  //
+  // The JavaOp default lowering preserves HotSpot semantics by checking the
+  // receiver klass finalizer bit and calling SharedRuntime_register_finalizer
+  // only when needed. For a virtual receiver with an exact klass, PEA can
+  // answer the same query without forcing the object header to materialize.
+  if (CB->arg_size() < 1)
+    return false;
+  auto BaseID = jeandle::pea::resolveVirtualRef(CB->getArgOperand(0),
+                                                CurrentState, Aliases, DL);
+  if (!BaseID)
+    return false;
+  jeandle::VirtualObject &VObj = *Result.VirtualObjects[*BaseID];
+  if (VObj.Klass == 0)
+    return false;
+  const jeandle::VMCallbacks *VMCB = jeandle::getVMCallbacks();
+  if (!VMCB || !VMCB->HasFinalizer)
+    return false;
+  if (VMCB->HasFinalizer(VObj.Klass)) {
+    Eligible[*BaseID] = false;
+    return true;
+  }
+  emitReplaceCall(CB, nullptr, *BaseID);
+  return true;
+}
+
 bool Analyzer::tier2JavaOpFold(CallBase *CB) {
   using namespace jeandle::pea;
   if (isJeandleArrayLength(CB))       return foldArrayLength(CB);
@@ -4207,6 +4206,8 @@ bool Analyzer::tier2JavaOpFold(CallBase *CB) {
   if (isJeandleMonitorExit(CB))       return foldMonitorExit(CB);
   if (isJeandleArrayStoreCheck(CB))   return foldArrayStoreCheck(CB);
   if (isJeandleCheckIfValueBased(CB)) return foldCheckIfValueBased(CB);
+  if (isJeandleRegisterFinalizerIfNeeded(CB))
+    return foldRegisterFinalizerIfNeeded(CB);
   return false;
 }
 

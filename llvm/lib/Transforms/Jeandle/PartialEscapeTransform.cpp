@@ -706,14 +706,19 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
         break;
       }
       case jeandle::PEAResult::EffectKind::ReplaceCall: {
-        // JavaOp folded against a virtual receiver. The call site's result
-        // is replaced with a constant and the call is erased. Some folded
-        // JavaOps (monitorenter/exit, checkcast) feed `br i1` on their
-        // result; the constant-folded terminator is cleaned up below by
+        // JavaOp folded against a virtual receiver. Non-void call results are
+        // replaced with a constant and the call is erased. Void JavaOps use a
+        // null Replacement to request deletion only. Some folded JavaOps
+        // (monitorenter/exit, checkcast) feed `br i1` on their result; the
+        // constant-folded terminator is cleaned up below by
         // ConstantFoldTerminator after both Pass 1 and Pass 2 finish.
-        if (!E->Target || !E->Replacement)
+        if (!E->Target)
           break;
-        E->Target->replaceAllUsesWith(E->Replacement);
+        if (E->Replacement) {
+          E->Target->replaceAllUsesWith(E->Replacement);
+        } else if (!E->Target->use_empty()) {
+          break;
+        }
         // For InvokeInst we cannot simply erase — the unwind edge must be
         // dropped first. JavaOp folds emit `call` (not invoke) calls in
         // practice, so handle that common case; defensively skip invokes

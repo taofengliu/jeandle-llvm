@@ -50,6 +50,7 @@ bool isJeandleCheckIfValueBased(const CallBase *CB);
 bool isJeandleArrayStoreCheck(const CallBase *CB);
 bool isJeandleMonitorEnter(const CallBase *CB);
 bool isJeandleMonitorExit(const CallBase *CB);
+bool isJeandleRegisterFinalizerIfNeeded(const CallBase *CB);
 
 // Extract the Java element basic type from an array klass pointer that we
 // already have in hand (uintptr_t).  Currently a stub that returns

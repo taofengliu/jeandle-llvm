@@ -99,6 +99,10 @@ bool isJeandleMonitorExit(const CallBase *CB) {
          isJeandleCallNamed(CB, "jeandle.monitorexit_with_lightweight_lock");
 }
 
+bool isJeandleRegisterFinalizerIfNeeded(const CallBase *CB) {
+  return isJeandleCallNamed(CB, "jeandle.register_finalizer_if_needed");
+}
+
 // ===========================================================================
 // Type / klass helpers
 // ===========================================================================
