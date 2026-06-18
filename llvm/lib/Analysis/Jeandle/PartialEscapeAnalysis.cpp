@@ -4171,10 +4171,14 @@ bool Analyzer::foldCheckIfValueBased(CallBase *CB) {
 bool Analyzer::foldRegisterFinalizerIfNeeded(CallBase *CB) {
   // jeandle.register_finalizer_if_needed(oop) -> void.
   //
-  // The JavaOp default lowering preserves HotSpot semantics by checking the
+  // The JavaOp's default lowering preserves HotSpot semantics by checking the
   // receiver klass finalizer bit and calling SharedRuntime_register_finalizer
-  // only when needed. For a virtual receiver with an exact klass, PEA can
-  // answer the same query without forcing the object header to materialize.
+  // only when needed. Finalizability is resolved at the allocation site: tier1
+  // (new_instance handling) refuses to virtualize any instance whose exact
+  // klass has a finalizer, so such an object stays materialized and this call
+  // survives to be lowered normally. A virtual receiver reaching this fold is
+  // therefore non-finalizable by construction — delete the provably-no-op
+  // call without forcing the object header to materialize.
   if (CB->arg_size() < 1)
     return false;
   auto BaseID = jeandle::pea::resolveVirtualRef(CB->getArgOperand(0),
@@ -4187,10 +4191,14 @@ bool Analyzer::foldRegisterFinalizerIfNeeded(CallBase *CB) {
   const jeandle::VMCallbacks *VMCB = jeandle::getVMCallbacks();
   if (!VMCB || !VMCB->HasFinalizer)
     return false;
-  if (VMCB->HasFinalizer(VObj.Klass)) {
-    Eligible[*BaseID] = false;
-    return true;
-  }
+  // A virtual receiver can only reach here if tier1 virtualized its
+  // allocation, and tier1 (new_instance handling) refuses to virtualize any
+  // instance whose exact klass has a finalizer. So by construction the
+  // receiver is non-finalizable: the runtime check would always be false and
+  // SharedRuntime_register_finalizer would never fire. Assert that invariant,
+  // then delete the provably-no-op call so the allocation can be eliminated.
+  assert(!VMCB->HasFinalizer(VObj.Klass) &&
+         "tier1 must refuse finalizable klasses");
   emitReplaceCall(CB, nullptr, *BaseID);
   return true;
 }
