@@ -15,7 +15,7 @@
 ; runtime lock stack at sink(%a) is correctly [A, B].
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
@@ -27,14 +27,14 @@ entry:
             ptr inttoptr (i64 11111 to ptr), i32 16)
        to label %n1 unwind label %u
 n1:
-  %ea = call hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(
+  call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
                   ptr addrspace(1) %a, ptr %la)
   %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
             ptr inttoptr (i64 22222 to ptr), i32 16)
        to label %n2 unwind label %u
 n2:
   ; Virtual monitorenter on B — fires the pre-cascade of A.
-  %eb = call hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(
+  call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
                   ptr addrspace(1) %b, ptr %lb)
   ; Escape A first.
   call void @sink(ptr addrspace(1) %a)
@@ -51,9 +51,9 @@ u:
 ; into IR alongside A.
 ; CHECK-LABEL: define void @pre_cascade
 ; CHECK: %[[MATA:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
-; CHECK: call hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MATA]],
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MATA]],
 ; CHECK: %[[MATB:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
-; CHECK: call hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MATB]],
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MATB]],
 ; CHECK: call void @sink(ptr addrspace(1) %[[MATA]])
 ; CHECK: call void @sink(ptr addrspace(1) %[[MATB]])
 

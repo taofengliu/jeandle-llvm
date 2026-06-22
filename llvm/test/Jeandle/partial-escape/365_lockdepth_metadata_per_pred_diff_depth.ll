@@ -10,8 +10,8 @@
 ; materialise.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
-declare hotspotcc i1 @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1), ptr)
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
@@ -26,14 +26,14 @@ dispatch:
   br i1 %cond, label %t, label %e
 t:
   ; Then-arm: this enter is the only one on %o, so its bytecode depth is 0.
-  %et = call hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(
+  call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
                   ptr addrspace(1) %o, ptr %lock_t), !jeandle.lock_depth !{i32 0}
   br label %merge
 e:
   ; Else-arm: a hypothetical outer synchronized region in the Java source
   ; meant THIS enter would be at depth=1. Different call site, different
   ; depth.
-  %ee = call hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(
+  call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
                   ptr addrspace(1) %o, ptr %lock_e), !jeandle.lock_depth !{i32 1}
   br label %merge
 merge:
@@ -52,8 +52,8 @@ u:
 ; CHECK-DAG: %[[MATT:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 8765 to ptr), i32 16)
 ; CHECK-DAG: %[[MATE:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 8765 to ptr), i32 16)
 ; Both pred-side enter calls survive on per-pred materialised pointers.
-; CHECK-DAG: call hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) {{.*}}, ptr %lock_t)
-; CHECK-DAG: call hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) {{.*}}, ptr %lock_e)
+; CHECK-DAG: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) {{.*}}, ptr %lock_t)
+; CHECK-DAG: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) {{.*}}, ptr %lock_e)
 ; The merge block synthesises a phi over the two pred materialised pointers
 ; and the sink uses it.
 ; CHECK: phi ptr addrspace(1)

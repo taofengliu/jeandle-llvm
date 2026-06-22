@@ -25,7 +25,7 @@
 ; model or the LockState port becomes available.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc i1 @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
 declare i32 @__gxx_personality_v0(...)
 
 define void @critical_edge_lock_mismatch(i1 %c1, i1 %c2)
@@ -38,7 +38,7 @@ entry:
 branch:
   br i1 %c1, label %then, label %else
 then:
-  %en = call hotspotcc i1 @jeandle.monitorenter_with_thin_lock(
+  call hotspotcc void @jeandle.monitorenter_with_thin_lock(
               ptr addrspace(1) %o, ptr %lock)
   ; Critical edge: `then` has two successors, `merge` has two preds.
   br i1 %c2, label %merge, label %cold

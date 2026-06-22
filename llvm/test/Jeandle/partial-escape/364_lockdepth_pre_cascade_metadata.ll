@@ -15,8 +15,8 @@
 ; observable to materialise for, and its enter folds away.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
-declare hotspotcc i1 @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1), ptr)
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
@@ -32,17 +32,17 @@ na:
             ptr inttoptr (i64 27182 to ptr), i32 16)
        to label %nb unwind label %u
 nb:
-  %ea = call hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(
+  call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
                   ptr addrspace(1) %a, ptr %lock_a), !jeandle.lock_depth !{i32 0}
   ; The next enter is at depth=1; pre-cascade selects A (A.front=0 < 1).
-  %eb = call hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(
+  call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
                   ptr addrspace(1) %b, ptr %lock_b), !jeandle.lock_depth !{i32 1}
   ; A leaks; B is unused downstream so B has no sink, but its narrow
   ; cascade would also fire here if anything escapes B.
   call void @sink(ptr addrspace(1) %a)
-  %xb = call hotspotcc i1 @jeandle.monitorexit_with_lightweight_lock(
+  call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
                   ptr addrspace(1) %b, ptr %lock_b)
-  %xa = call hotspotcc i1 @jeandle.monitorexit_with_lightweight_lock(
+  call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
                   ptr addrspace(1) %a, ptr %lock_a)
   ret void
 u:
@@ -57,8 +57,8 @@ u:
 ; are A-only.
 ; CHECK-LABEL: define void @test_lockdepth_pre_cascade_metadata
 ; CHECK: %[[MATA:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 31415 to ptr), i32 16)
-; CHECK: call hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MATA]],
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MATA]],
 ; CHECK: call void @sink(ptr addrspace(1) %[[MATA]])
-; CHECK: call hotspotcc i1 @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1) %[[MATA]],
+; CHECK: call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1) %[[MATA]],
 
 !java-method-compilation = !{}

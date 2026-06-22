@@ -8,8 +8,8 @@
 ; allocation's normal-dest so it dominates both successors.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc i1 @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
-declare hotspotcc i1 @jeandle.monitorexit_with_thin_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorexit_with_thin_lock(ptr addrspace(1), ptr)
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
@@ -23,17 +23,17 @@ n:
   br i1 %c, label %escape, label %hot
 
 escape:
-  %e_ok = call hotspotcc i1 @jeandle.monitorenter_with_thin_lock(
+  call hotspotcc void @jeandle.monitorenter_with_thin_lock(
                   ptr addrspace(1) %o, ptr %lock)
   call void @sink(ptr addrspace(1) %o)
-  %x_ok = call hotspotcc i1 @jeandle.monitorexit_with_thin_lock(
+  call hotspotcc void @jeandle.monitorexit_with_thin_lock(
                   ptr addrspace(1) %o, ptr %lock)
   br label %merge
 
 hot:
-  %h_e = call hotspotcc i1 @jeandle.monitorenter_with_thin_lock(
+  call hotspotcc void @jeandle.monitorenter_with_thin_lock(
                   ptr addrspace(1) %o, ptr %lock)
-  %h_x = call hotspotcc i1 @jeandle.monitorexit_with_thin_lock(
+  call hotspotcc void @jeandle.monitorexit_with_thin_lock(
                   ptr addrspace(1) %o, ptr %lock)
   br label %merge
 
@@ -48,9 +48,9 @@ u:
 ; The escape branch retains the monitor calls on the materialized pointer.
 ; CHECK-LABEL: define void @test_partial_escape_with_lock
 ; CHECK: %[[MAT:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance
-; CHECK: call hotspotcc i1 @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %[[MAT]],
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %[[MAT]],
 ; CHECK: call void @sink(ptr addrspace(1) %[[MAT]])
-; CHECK: call hotspotcc i1 @jeandle.monitorexit_with_thin_lock(ptr addrspace(1) %[[MAT]],
+; CHECK: call hotspotcc void @jeandle.monitorexit_with_thin_lock(ptr addrspace(1) %[[MAT]],
 ; The hot branch should have no remaining monitor calls (both elided).
 ; CHECK-NOT: monitorenter
 ; CHECK-NOT: monitorexit

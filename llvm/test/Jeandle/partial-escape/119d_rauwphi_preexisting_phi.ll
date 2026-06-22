@@ -17,7 +17,7 @@
 ; itself dead-coded by the trivial-dead sweep).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc i1 @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
 declare i32 @__gxx_personality_v0(...)
 
 define void @rauwphi_safe(i1 %c) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
@@ -30,7 +30,7 @@ branch:
   br i1 %c, label %then, label %else
 then:
   ; lock — forces per-pred materialisation at the merge.
-  %en = call hotspotcc i1 @jeandle.monitorenter_with_thin_lock(
+  call hotspotcc void @jeandle.monitorenter_with_thin_lock(
               ptr addrspace(1) %o, ptr %lock)
   br label %merge
 else:

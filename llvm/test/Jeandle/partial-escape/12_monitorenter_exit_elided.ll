@@ -10,8 +10,8 @@
 ; single-block confinement rule for monitor folds.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc i1 @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
-declare hotspotcc i1 @jeandle.monitorexit_with_thin_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorexit_with_thin_lock(ptr addrspace(1), ptr)
 
 declare i32 @__gxx_personality_v0(...)
 
@@ -22,9 +22,9 @@ entry:
             ptr inttoptr (i64 12345 to ptr), i32 16)
        to label %n unwind label %u
 n:
-  %enter_ok = call hotspotcc i1 @jeandle.monitorenter_with_thin_lock(
+  call hotspotcc void @jeandle.monitorenter_with_thin_lock(
                   ptr addrspace(1) %o, ptr %lock)
-  %exit_ok  = call hotspotcc i1 @jeandle.monitorexit_with_thin_lock(
+  call hotspotcc void @jeandle.monitorexit_with_thin_lock(
                   ptr addrspace(1) %o, ptr %lock)
   ret void
 u:

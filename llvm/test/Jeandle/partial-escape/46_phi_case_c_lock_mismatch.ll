@@ -12,8 +12,8 @@
 ; the LLVM PHI also survives, merging the two materialized invokes.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc i1 @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
-declare hotspotcc i1 @jeandle.monitorexit_with_thin_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorexit_with_thin_lock(ptr addrspace(1), ptr)
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
@@ -28,7 +28,7 @@ left:
         to label %lcont unwind label %u
 lcont:
   ; Enter monitor on the left arm so left.LockCount == 1 at exit.
-  %enter = call hotspotcc i1 @jeandle.monitorenter_with_thin_lock(
+  call hotspotcc void @jeandle.monitorenter_with_thin_lock(
                 ptr addrspace(1) %o1, ptr %lock)
   br label %merge
 right:

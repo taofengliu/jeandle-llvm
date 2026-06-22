@@ -21,7 +21,7 @@
 ; enters on c2, no synthesized enters anywhere.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc i1 @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
@@ -37,13 +37,13 @@ switchblk:
 c0:
   br label %merge
 c1:
-  %e1 = call hotspotcc i1 @jeandle.monitorenter_with_thin_lock(
+  call hotspotcc void @jeandle.monitorenter_with_thin_lock(
               ptr addrspace(1) %o, ptr %lock)
   br label %merge
 c2:
-  %e2a = call hotspotcc i1 @jeandle.monitorenter_with_thin_lock(
+  call hotspotcc void @jeandle.monitorenter_with_thin_lock(
               ptr addrspace(1) %o, ptr %lock)
-  %e2b = call hotspotcc i1 @jeandle.monitorenter_with_thin_lock(
+  call hotspotcc void @jeandle.monitorenter_with_thin_lock(
               ptr addrspace(1) %o, ptr %lock)
   br label %merge
 merge:
@@ -57,17 +57,17 @@ u:
 ; CHECK-LABEL: define void @test_lock_mismatch_three_preds
 ; Walk the IR in RPO order. c0 (zero locks) materializes with no enter:
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
-; CHECK-NOT: call hotspotcc i1 @jeandle.monitorenter_with_thin_lock
+; CHECK-NOT: call hotspotcc void @jeandle.monitorenter_with_thin_lock
 ; c1 (one lock) materializes and un-elides one enter:
 ; CHECK: %[[MAT1:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
-; CHECK: call hotspotcc i1 @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %[[MAT1]],
-; CHECK-NOT: call hotspotcc i1 @jeandle.monitorenter_with_thin_lock
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %[[MAT1]],
+; CHECK-NOT: call hotspotcc void @jeandle.monitorenter_with_thin_lock
 ; c2 (two locks) materializes and un-elides two enters:
 ; CHECK: %[[MAT2:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
-; CHECK: call hotspotcc i1 @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %[[MAT2]],
-; CHECK: call hotspotcc i1 @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %[[MAT2]],
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %[[MAT2]],
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %[[MAT2]],
 ; No more enters or new-instance invokes after this.
-; CHECK-NOT: call hotspotcc i1 @jeandle.monitorenter_with_thin_lock
+; CHECK-NOT: call hotspotcc void @jeandle.monitorenter_with_thin_lock
 ; CHECK-NOT: invoke hotspotcc{{.*}}@jeandle.new_instance
 ; ptr addrspace(1) PHI at merge wires the three per-pred NewInvs, then
 ; sink consumes the PHI value.

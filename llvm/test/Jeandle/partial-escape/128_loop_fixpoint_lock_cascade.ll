@@ -5,8 +5,8 @@
 ; escape, the lock pair elides and the alloc disappears.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc i1 @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
-declare hotspotcc i1 @jeandle.monitorexit_with_thin_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorexit_with_thin_lock(ptr addrspace(1), ptr)
 declare void @use(i32)
 declare i32 @__gxx_personality_v0(...)
 
@@ -23,10 +23,10 @@ body:
             ptr inttoptr (i64 3333 to ptr), i32 16)
        to label %lk unwind label %u
 lk:
-  %en = call hotspotcc i1 @jeandle.monitorenter_with_thin_lock(
+  call hotspotcc void @jeandle.monitorenter_with_thin_lock(
               ptr addrspace(1) %o, ptr %lock)
   call void @use(i32 %i)
-  %ex = call hotspotcc i1 @jeandle.monitorexit_with_thin_lock(
+  call hotspotcc void @jeandle.monitorexit_with_thin_lock(
               ptr addrspace(1) %o, ptr %lock)
   %i1 = add i32 %i, 1
   br label %loop

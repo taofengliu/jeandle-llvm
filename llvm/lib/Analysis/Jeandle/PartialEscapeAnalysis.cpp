@@ -3992,8 +3992,10 @@ bool Analyzer::foldMonitorEnter(CallBase *CB) {
     if (OS.isVirtual())
       OS.addLock({CB, NewBytecodeDepth});
   }
-  Constant *True = ConstantInt::getTrue(CB->getType());
-  emitReplaceCall(CB, True, *BaseID);
+  // Monitor JavaOps return void (the fast/slow dispatch lives inside the
+  // JavaOp body, invisible to PEA), so there is no result to replace: emit a
+  // null Replacement and let the transform erase the (always unused) call.
+  emitReplaceCall(CB, nullptr, *BaseID);
   return true;
 }
 
@@ -4029,8 +4031,10 @@ bool Analyzer::foldMonitorExit(CallBase *CB) {
     if (OS.isVirtual() && OS.hasLocks())
       OS.removeLock();
   }
-  Constant *True = ConstantInt::getTrue(CB->getType());
-  emitReplaceCall(CB, True, *BaseID);
+  // Monitor JavaOps return void (the fast/slow dispatch lives inside the
+  // JavaOp body, invisible to PEA), so there is no result to replace: emit a
+  // null Replacement and let the transform erase the (always unused) call.
+  emitReplaceCall(CB, nullptr, *BaseID);
   return true;
 }
 

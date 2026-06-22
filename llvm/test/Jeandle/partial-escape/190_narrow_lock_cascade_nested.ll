@@ -9,8 +9,8 @@
 ; lock-stack ordering [A, B] at the materialization point.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
-declare hotspotcc i1 @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1), ptr)
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
@@ -26,15 +26,15 @@ na:
             ptr inttoptr (i64 22222 to ptr), i32 16)
        to label %nb unwind label %u
 nb:
-  %ea = call hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(
+  call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
                   ptr addrspace(1) %a, ptr %lock_a)
-  %eb = call hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(
+  call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
                   ptr addrspace(1) %b, ptr %lock_b)
   ; Inner B escapes.
   call void @sink(ptr addrspace(1) %b)
-  %xb = call hotspotcc i1 @jeandle.monitorexit_with_lightweight_lock(
+  call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
                   ptr addrspace(1) %b, ptr %lock_b)
-  %xa = call hotspotcc i1 @jeandle.monitorexit_with_lightweight_lock(
+  call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
                   ptr addrspace(1) %a, ptr %lock_a)
   ret void
 u:
@@ -46,10 +46,10 @@ u:
 ; CHECK-LABEL: define void @test_narrow_cascade_nested
 ; CHECK-DAG: %[[MATA:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
 ; CHECK-DAG: %[[MATB:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
-; CHECK: call hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MATA]],
-; CHECK: call hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MATB]],
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MATA]],
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MATB]],
 ; CHECK: call void @sink(ptr addrspace(1) %[[MATB]])
-; CHECK: call hotspotcc i1 @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1) %[[MATB]],
-; CHECK: call hotspotcc i1 @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1) %[[MATA]],
+; CHECK: call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1) %[[MATB]],
+; CHECK: call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1) %[[MATA]],
 
 !java-method-compilation = !{}

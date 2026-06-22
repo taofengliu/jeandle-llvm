@@ -16,7 +16,7 @@
 ; eliminated; downstream uses of %o resolve through the per-pred MatConts.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc i1 @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
 declare i32 @__gxx_personality_v0(...)
 
 define void @test_lock_mismatch_one_arm_locked(i1 %c) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
@@ -28,7 +28,7 @@ entry:
 branch:
   br i1 %c, label %then, label %else
 then:
-  %en = call hotspotcc i1 @jeandle.monitorenter_with_thin_lock(
+  call hotspotcc void @jeandle.monitorenter_with_thin_lock(
               ptr addrspace(1) %o, ptr %lock)
   br label %merge
 else:
@@ -50,7 +50,7 @@ u:
 ; surviving monitorenter on a per-pred NewInv, and (c) a second
 ; materialized invoke for the other pred.
 ; CHECK: %[[MAT1:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
-; CHECK: call hotspotcc i1 @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %[[MAT1]],
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %[[MAT1]],
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
 
 !java-method-compilation = !{}

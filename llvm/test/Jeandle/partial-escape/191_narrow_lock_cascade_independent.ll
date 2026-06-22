@@ -8,8 +8,8 @@
 ; min < this.max" doesn't accidentally pick up VOs with zero live locks.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
-declare hotspotcc i1 @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1), ptr)
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
@@ -26,15 +26,15 @@ na:
        to label %nb unwind label %u
 nb:
   ; First sync region: A, fully balanced.
-  %ea = call hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(
+  call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
                   ptr addrspace(1) %a, ptr %lock_a)
-  %xa = call hotspotcc i1 @jeandle.monitorexit_with_lightweight_lock(
+  call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
                   ptr addrspace(1) %a, ptr %lock_a)
   ; Second sync region: B, escapes inside.
-  %eb = call hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(
+  call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
                   ptr addrspace(1) %b, ptr %lock_b)
   call void @sink(ptr addrspace(1) %b)
-  %xb = call hotspotcc i1 @jeandle.monitorexit_with_lightweight_lock(
+  call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
                   ptr addrspace(1) %b, ptr %lock_b)
   ret void
 u:
@@ -45,9 +45,9 @@ u:
 ; B materializes (escapes); A stays virtual and folds away entirely.
 ; CHECK-LABEL: define void @test_narrow_cascade_independent
 ; CHECK: %[[MATB:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 44444 to ptr), i32 16)
-; CHECK: call hotspotcc i1 @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MATB]],
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MATB]],
 ; CHECK: call void @sink(ptr addrspace(1) %[[MATB]])
-; CHECK: call hotspotcc i1 @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1) %[[MATB]],
+; CHECK: call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1) %[[MATB]],
 ; A must NOT materialize, and none of its monitor calls or lock_a alloca
 ; uses should survive (lock_a may stay as a dead alloca, but no monitor
 ; call should reference it).

@@ -19,7 +19,7 @@
 ; enter to retarget, and the merge has no downstream use of B.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc i1 @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
 declare i32 @__gxx_personality_v0(...)
 
 define void @test_lock_mismatch_with_cascade(i1 %c) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
@@ -35,9 +35,9 @@ allocB:
 branch:
   br i1 %c, label %then, label %else
 then:
-  %enB = call hotspotcc i1 @jeandle.monitorenter_with_thin_lock(
+  call hotspotcc void @jeandle.monitorenter_with_thin_lock(
               ptr addrspace(1) %oB, ptr %lock)
-  %enA = call hotspotcc i1 @jeandle.monitorenter_with_thin_lock(
+  call hotspotcc void @jeandle.monitorenter_with_thin_lock(
               ptr addrspace(1) %oA, ptr %lock)
   br label %merge
 else:
@@ -60,13 +60,13 @@ u:
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
 ; Surviving un-elided enters: one for B, one for A, both in the same
 ; per-pred MatCont chain.
-; CHECK: call hotspotcc i1 @jeandle.monitorenter_with_thin_lock
-; CHECK: call hotspotcc i1 @jeandle.monitorenter_with_thin_lock
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock
 ; The else-pred materializes A only (no cascade for B because A has no
 ; live locks at else — the cascade rule needs HasLiveLocks). B at else stays
 ; virtual and is absorbed by the mixed-merge inherit-with-OrigAlloc path.
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
 ; No more enters past this point.
-; CHECK-NOT: call hotspotcc i1 @jeandle.monitorenter_with_thin_lock
+; CHECK-NOT: call hotspotcc void @jeandle.monitorenter_with_thin_lock
 
 !java-method-compilation = !{}
