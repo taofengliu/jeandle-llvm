@@ -1,8 +1,10 @@
 add_llvm_component_library(LLVMJeandleTransforms
+  ConstantFieldFolding.cpp
   InsertGCBarriers.cpp
   JavaOperationLower.cpp
   PartialEscapeIterative.cpp
   PartialEscapeTransform.cpp
+  RepeatedConstantFolding.cpp
   TLSPointerRewrite.cpp
   TypeCheckElimination.cpp
 
