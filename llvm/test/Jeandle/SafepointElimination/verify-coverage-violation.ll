@@ -1,11 +1,12 @@
 ; RUN: opt -passes='verify<jeandle-safepoint-coverage>' \
-; RUN:   -jeandle-safepoint-coverage-print-only -S < %s 2>&1 | FileCheck %s
+; RUN:   -jeandle-verify-safepoint-coverage=warn -S < %s 2>&1 | FileCheck %s
 ; RUN: not --crash opt -passes='verify<jeandle-safepoint-coverage>' \
-; RUN:   -disable-output < %s 2>&1 | FileCheck %s --check-prefix=ABORT
+; RUN:   -jeandle-verify-safepoint-coverage=fatal -disable-output < %s 2>&1 \
+; RUN:   | FileCheck %s --check-prefix=ABORT
 
 ; An unbounded loop with no poll at all violates the coverage invariant: a
-; thread inside it can never reach a safepoint. In print-only mode the verifier
-; reports and keeps opt alive; in the default mode it aborts the compile (the
+; thread inside it can never reach a safepoint. In warn mode the verifier
+; reports and keeps opt alive; in fatal mode it aborts the compile (the
 ; acceptance-gate behavior).
 
 define void @naked_loop(i64 %n) gc "safepoint-in-loop-example" {

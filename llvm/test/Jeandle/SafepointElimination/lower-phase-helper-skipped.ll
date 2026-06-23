@@ -1,6 +1,6 @@
 ; RUN: opt -passes=safepoint-elimination -S < %s | FileCheck %s
 ; RUN: opt -passes='verify<jeandle-safepoint-coverage>' \
-; RUN:   -jeandle-safepoint-coverage-print-only -disable-output < %s 2>&1 \
+; RUN:   -jeandle-verify-safepoint-coverage=warn -disable-output < %s 2>&1 \
 ; RUN:   | FileCheck %s --check-prefix=VERIFY
 
 ; The compilation module is the template module, so it carries runtime helper

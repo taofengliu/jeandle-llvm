@@ -43,9 +43,22 @@ using namespace llvm;
 
 #define DEBUG_TYPE "safepoint-elimination"
 
-static cl::opt<bool> PrintOnly(
-    "jeandle-safepoint-coverage-print-only", cl::init(false),
-    cl::desc("Report safepoint coverage violations without aborting."));
+using jeandle::SafepointCoverageCheck;
+
+static cl::opt<SafepointCoverageCheck> CoverageCheck(
+    "jeandle-verify-safepoint-coverage",
+    cl::values(clEnumValN(SafepointCoverageCheck::Off, "off",
+                          "Do not run the safepoint coverage verifier"),
+               clEnumValN(SafepointCoverageCheck::Warn, "warn",
+                          "Report all coverage violations without aborting"),
+               clEnumValN(SafepointCoverageCheck::Fatal, "fatal",
+                          "Abort the compile on any coverage violation")),
+    cl::init(SafepointCoverageCheck::Off),
+    cl::desc("Safepoint coverage verifier mode."));
+
+SafepointCoverageCheck llvm::jeandle::getSafepointCoverageCheck() {
+  return CoverageCheck;
+}
 
 static bool isLoopCovered(Loop &L, DominatorTree &DT, ScalarEvolution &SE) {
   BasicBlock *Latch = L.getLoopLatch();
@@ -65,6 +78,9 @@ static bool isLoopCovered(Loop &L, DominatorTree &DT, ScalarEvolution &SE) {
 
 PreservedAnalyses SafepointCoverageVerifier::run(Function &F,
                                                  FunctionAnalysisManager &AM) {
+  if (CoverageCheck == SafepointCoverageCheck::Off)
+    return PreservedAnalyses::all();
+
   if (!F.getParent()->getNamedMetadata(
           jeandle::Metadata::JavaMethodCompilation))
     return PreservedAnalyses::all();
@@ -106,7 +122,7 @@ PreservedAnalyses SafepointCoverageVerifier::run(Function &F,
               "bound\n";
   }
 
-  if (Broken && !PrintOnly)
+  if (Broken && CoverageCheck == SafepointCoverageCheck::Fatal)
     report_fatal_error("Jeandle safepoint coverage verification failed");
   return PreservedAnalyses::all();
 }

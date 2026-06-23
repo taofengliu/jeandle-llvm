@@ -1,5 +1,5 @@
-; RUN: opt -passes='safepoint-elimination,verify<jeandle-safepoint-coverage>' -S < %s 2>&1 \
-; RUN:   | FileCheck %s
+; RUN: opt -passes='safepoint-elimination,verify<jeandle-safepoint-coverage>' \
+; RUN:   -jeandle-verify-safepoint-coverage=fatal -S < %s 2>&1 | FileCheck %s
 
 ; Both loops satisfy the coverage invariant after elimination: the first keeps
 ; a dominating poll (parameter bound), the second loses its poll under the
