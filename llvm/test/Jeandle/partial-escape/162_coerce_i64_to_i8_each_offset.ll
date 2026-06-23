@@ -1,9 +1,11 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Store i64 into a virtual's slot at offset 8, then perform 8 separate
-; i8 loads, one at each byte offset 0..7 within the slot. The low byte
-; uses `trunc` only; the other seven use `lshr by 8*off` + `trunc`. All
-; sub-byte values are summed so each load's result is observed.
+; Store i64 into a virtual's slot at offset 8, then perform 8 separate i8 loads,
+; one at each byte offset 0..7 within the slot. Every one of these is a sub-slot
+; narrowing read (i64 -> i8). PEA no longer supports sub-slot / narrowing loads
+; (the lshr+trunc fold was removed) — the first such load bails to ineligible
+; and the object materializes: alloc, store, and loads survive intact, no
+; coercion synthesized.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 
@@ -49,19 +51,10 @@ unwind:
 }
 
 ; CHECK-LABEL: define i8 @test_coerce_i64_to_i8_each_offset()
-; CHECK-NOT: jeandle.new_instance
-; CHECK-NOT: store
-; CHECK-NOT: load atomic
-; Low byte: plain trunc, no lshr by 0.
-; CHECK: trunc i64 -81985529216486896 to i8
-; Other bytes: lshr + trunc at 8, 16, 24, 32, 40, 48, 56.
-; CHECK-DAG: lshr i64 -81985529216486896, 8
-; CHECK-DAG: lshr i64 -81985529216486896, 16
-; CHECK-DAG: lshr i64 -81985529216486896, 24
-; CHECK-DAG: lshr i64 -81985529216486896, 32
-; CHECK-DAG: lshr i64 -81985529216486896, 40
-; CHECK-DAG: lshr i64 -81985529216486896, 48
-; CHECK-DAG: lshr i64 -81985529216486896, 56
+; CHECK: jeandle.new_instance
+; CHECK: store atomic i64
+; CHECK: load atomic i8
+; CHECK-NOT: pea.coerce
 ; CHECK: ret i8
 
 !java-method-compilation = !{}

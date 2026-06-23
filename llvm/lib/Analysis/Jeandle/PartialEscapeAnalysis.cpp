@@ -50,7 +50,7 @@
 //     virtual ObjectID but the IDs DIFFER across incomings. synthesizeCaseC
 //     attempts to merge them into a single synthetic VirtualObject (cloned
 //     from the first per-pred VO). Compatibility requires identical Klass /
-//     kind / entry count / lock state across preds, plus an identity check
+//     kind / array dimensions / lock state across preds, plus an identity check
 //     (the PHI is the only external LLVM user of each per-pred alloc, and
 //     no other VO references the per-pred VOs via virtualRef). Per-entry
 //     field PHIs are emitted for offsets where the per-pred values
@@ -407,6 +407,11 @@ private:
   // Per-object field state: ObjectID -> (offset -> FieldValue). Decoupled from
   // ObjectState::Entries because field discovery is lazy and we don't want to
   // keep VirtualObject::Fields and ObjectState::Entries in lock step.
+  // Both VirtualObject::Fields and this map are path-dependent: they record
+  // only offsets that some store/load actually touched, never the declared
+  // field layout. An offset absent here means "Java default" (zero/null), not
+  // "field does not exist" — never treat the size of either as a structural
+  // invariant of the object's type (see synthesizeCaseC).
   DenseMap<jeandle::ObjectID, DenseMap<int64_t, jeandle::FieldValue>>
       FieldStates;
 
@@ -708,13 +713,10 @@ private:
   // ineligible in the latter case. InsertContext is the load whose DebugLoc
   // (if any) is propagated onto the synthesized cast.
   //
-  // WithinSlotByteOff is the byte offset of the load *within* the field-state
-  // slot that holds V (i.e. LoadOffsetFromAlloc - EntryOffsetFromAlloc). It is
-  // used for sub-bit-width integer loads: when EntryWidth > LoadWidth and
-  // both sides are integer-typed, an `lshr` (by WithinSlotByteOff*8) is
-  // emitted before a `trunc`. Little-endian byte order assumed (x86/aarch64).
-  Value *coerceToType(Value *V, Type *LoadTy, Instruction *InsertContext,
-                      int64_t WithinSlotByteOff = 0);
+  // Precondition: the load reads a WHOLE stored slot. The caller (tier2Load)
+  // bails to materialization for any sub-slot / partial-field read before
+  // calling, so this routine only handles same-slot type reinterprets.
+  Value *coerceToType(Value *V, Type *LoadTy, Instruction *InsertContext);
 
   // Why a materialization was emitted. Used to bump the
   // per-reason Statistic counter at the emission site. Cascade / Nested /
@@ -900,7 +902,44 @@ private:
 
   void commit();
   void dropEffectsFor(jeandle::ObjectID ID);
+
+  // Mark a VO ineligible, taking the TRANSITIVE closure over synthetic Case-C
+  // sources. A synthetic VO has no real backing allocation (AllocationCall is
+  // borrowed), so dropping it alone would let its per-pred sources still be
+  // eliminated, leaving the merge PHI's incomings as poison. Moreover a source
+  // can itself be synthetic (synthesizeCaseC does not reject synthetic per-pred
+  // inputs, and processBlockPhis resolves incomings through the function-wide
+  // alias map that exposes synthetic ObjectIDs — so Case C can nest), so the
+  // cascade must walk the whole synthetic-source DAG: every leaf real
+  // allocation under the dropped synthetic must survive in IR. The relation is
+  // acyclic (a source is created at an earlier merge than the synthetic that
+  // references it), so the worklist terminates; the visited set is pure cycle
+  // defense. The SyntheticPhi alias is reset for every synthetic in the tree so
+  // downstream resolveVirtualRef stops folding through it. Safe on non-synthetic
+  // VOs (degenerates to a plain Eligible[ID] = false). This is the single
+  // source of truth for the synthetic cascade; the mixed-merge bail and the two
+  // materialization paths call through here rather than re-implementing it.
+  void markIneligible(jeandle::ObjectID ID);
 };
+
+void Analyzer::markIneligible(jeandle::ObjectID ID) {
+  SmallVector<jeandle::ObjectID, 8> Worklist;
+  DenseSet<jeandle::ObjectID> Visited;
+  Worklist.push_back(ID);
+  while (!Worklist.empty()) {
+    jeandle::ObjectID Cur = Worklist.pop_back_val();
+    if (!Visited.insert(Cur).second)
+      continue;
+    Eligible[Cur] = false;
+    jeandle::VirtualObject &VObj = *Result.VirtualObjects[Cur];
+    if (VObj.IsSynthetic) {
+      if (VObj.SyntheticPhi)
+        Aliases.resetAlias(VObj.SyntheticPhi);
+      for (jeandle::ObjectID PID : VObj.SyntheticSourceIDs)
+        Worklist.push_back(PID);
+    }
+  }
+}
 
 void Analyzer::processBlock(BasicBlock *BB) {
   // Rebuild per-block state from the predecessor snapshots before we walk
@@ -1200,31 +1239,27 @@ PHINode *Analyzer::getOrCreateLoopFieldPhi(BasicBlock *BB, jeandle::ObjectID ID,
 
 // Type-coercion for tier2Load.
 //
-// Handles same-bit-width primitive↔primitive (BitCast), and sub-bit-width
-// integer loads of a wider integer-stored slot (`lshr` by within-slot byte
-// offset * 8, then `trunc`). Pointer↔primitive at the same slot is forbidden
-// because the slot's reference-vs-primitive nature must be stable, so a
-// ref cannot be re-read as a primitive (or vice-versa) without materializing.
-// Cross-addrspace pointer coercion is also bailed (rare, GC-risky).
+// Handles loads that read a WHOLE stored slot, possibly reinterpreting its
+// type: the trivial same-type return, a same-bit-width primitive↔primitive
+// BitCast (Float↔Int, Half↔i16, etc.), and pointer↔pointer passthrough.
 //
-// Widening loads (EntryWidth < LoadWidth) bail: would require multi-slot
-// read+concat which is not worth the complexity for sub-bit-width.
+// The caller, tier2Load, rejects sub-slot ("incomplete field") reads — a load
+// whose within-slot byte offset is nonzero — before reaching this routine,
+// forcing the object to materialize instead. Such partial-field reads are rare
+// in IR lowered from normal Java (they arise from Unsafe.get* / byte-array
+// repacking, which the frontend does not yet inline) and the extra
+// shift/trunc/concat machinery was not worth the complexity; see the TODO at
+// tier2Load's OverlapsNoncontained bail for the re-enablement plan. Widening
+// loads (EntryWidth < LoadWidth), narrower whole-slot loads (EntryWidth >
+// LoadWidth), and pointer↔primitive mismatches (stable-slot-kind invariant)
+// bail here.
 //
-// Sub-byte loads (load size not a whole multiple of 8 bits, e.g. i1/i7) bail.
-//
-// Endianness: this code is LITTLE-ENDIAN-specific (x86, aarch64). For a
-// big-endian target (e.g. RISC-V BE), the within-slot byte offset would need
-// to be flipped to `(EntryByteSize - LoadByteSize - WithinSlotByteOff)`.
-//
-// Unparented coercion instructions are registered in Result.OwnedInsts; the
-// transform's ReplaceLoad handler walks the operand chain and splices them
-// before the target load (so the lshr precedes the trunc, both before the
-// load).
+// The same-bit-width bitcast is registered (unparented) in Result.OwnedInsts;
+// the transform's ReplaceLoad handler splices it before the target load.
 Value *Analyzer::coerceToType(Value *V, Type *LoadTy,
-                              Instruction *InsertContext,
-                              int64_t WithinSlotByteOff) {
+                              Instruction *InsertContext) {
   Type *VTy = V->getType();
-  if (VTy == LoadTy && WithinSlotByteOff == 0)
+  if (VTy == LoadTy)
     return V;
   if (!VTy->isSized() || !LoadTy->isSized())
     return nullptr;
@@ -1235,12 +1270,12 @@ Value *Analyzer::coerceToType(Value *V, Type *LoadTy,
   if (VTy->isPointerTy() != LoadTy->isPointerTy())
     return nullptr;
 
-  // Pointer↔pointer: pointers don't truncate. Require exact same offset and
-  // matching address spaces. Same-AS same-bitwidth pointers are already
-  // type-identical under opaque pointers, so a true pointer coercion is rare;
-  // defend against the cross-AS case.
+  // Pointer↔pointer: pointers don't truncate. Require matching bit width and
+  // address spaces. Same-AS same-bitwidth pointers are already type-identical
+  // under opaque pointers, so a true pointer coercion is rare; defend against
+  // the cross-AS case.
   if (VTy->isPointerTy() && LoadTy->isPointerTy()) {
-    if (WithinSlotByteOff != 0 || VBits != LBits)
+    if (VBits != LBits)
       return nullptr;
     if (VTy->getPointerAddressSpace() != LoadTy->getPointerAddressSpace())
       return nullptr;
@@ -1255,7 +1290,7 @@ Value *Analyzer::coerceToType(Value *V, Type *LoadTy,
     return nullptr;
 
   // Same bit width → BitCast (Float↔Int, Half↔i16, etc.).
-  if (VBits == LBits && WithinSlotByteOff == 0) {
+  if (VBits == LBits) {
     if (!CastInst::isBitCastable(VTy, LoadTy))
       return nullptr;
     Instruction *Cast = CastInst::Create(Instruction::BitCast, V, LoadTy,
@@ -1267,40 +1302,12 @@ Value *Analyzer::coerceToType(Value *V, Type *LoadTy,
     return Cast;
   }
 
-  // Sub-bit-width: EntryWidth > LoadWidth, both integer-typed, byte-aligned within the
-  // slot. Emit `lshr V, WithinSlotByteOff*8` (omit if offset==0), then `trunc`
-  // to LoadTy.
-  if (VBits > LBits && VTy->isIntegerTy() && LoadTy->isIntegerTy()) {
-    if (WithinSlotByteOff < 0)
-      return nullptr;
-    uint64_t ShiftBits = static_cast<uint64_t>(WithinSlotByteOff) * 8ULL;
-    // The load must fit entirely within the slot's bytes.
-    if (ShiftBits + LBits > VBits)
-      return nullptr;
-
-    Value *Src = V;
-    if (ShiftBits != 0) {
-      Constant *ShAmt = ConstantInt::get(VTy, ShiftBits);
-      Instruction *Shr =
-          BinaryOperator::Create(Instruction::LShr, V, ShAmt, "pea.coerce.shr",
-                                 /*InsertBefore=*/nullptr);
-      if (InsertContext)
-        Shr->setDebugLoc(InsertContext->getDebugLoc());
-      Result.OwnedInsts.emplace_back(Shr);
-      Src = Shr;
-    }
-    Instruction *Trunc = CastInst::Create(Instruction::Trunc, Src, LoadTy,
-                                          "pea.coerce.trunc",
-                                          /*InsertBefore=*/nullptr);
-    if (InsertContext)
-      Trunc->setDebugLoc(InsertContext->getDebugLoc());
-    Result.OwnedInsts.emplace_back(Trunc);
-    return Trunc;
-  }
-
-  // EntryWidth < LoadWidth, or float/double mismatched with different widths,
-  // or any other unhandled cross-kind/cross-width: bail. The caller will mark
-  // the VO ineligible so the original alloc/store/load survive in IR.
+  // Anything else bails: a narrower whole-slot load (EntryWidth > LoadWidth),
+  // a widening load (EntryWidth < LoadWidth), and any other cross-width
+  // mismatch. The caller marks the VO ineligible so the original
+  // alloc/store/load survive in IR. (Sub-slot reads at a nonzero within-slot
+  // offset are rejected upstream in tier2Load; the `lshr`+`trunc` narrowing
+  // fold they once triggered here was intentionally removed.)
   return nullptr;
 }
 
@@ -1674,11 +1681,8 @@ void Analyzer::mergeStates(BasicBlock *BB) {
       // conservative bail.
       jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
       if (VObj.IsSynthetic) {
-        Eligible[ID] = false;
-        for (jeandle::ObjectID PID : VObj.SyntheticSourceIDs)
-          Eligible[PID] = false;
-        if (VObj.SyntheticPhi)
-          Aliases.resetAlias(VObj.SyntheticPhi);
+        // Cascade (transitive over nested synthetics) through markIneligible.
+        markIneligible(ID);
         continue;
       }
       if (!VObj.AllocationCall ||
@@ -2318,8 +2322,6 @@ bool Analyzer::synthesizeCaseC(
       if (VO.ArrayBaseOffset != Ref.ArrayBaseOffset)
         return false;
     }
-    if (VO.entryCount() != Ref.entryCount())
-      return false;
   }
 
   // Lock compatibility (locksEqual).
@@ -2596,6 +2598,32 @@ bool Analyzer::synthesizeCaseC(
   // guard in materializeAt prevents that. We keep the field non-null only
   // because some accessors don't tolerate null AllocationCall (no current
   // path reaches them for a synthetic VO).
+
+  // Rebuild the synthetic VO's Fields as the UNION of every per-pred VO's
+  // Fields. duplicate() only copied Ref's (pred-0's) Fields, but the merged
+  // FieldStates we build below spans the union of all preds' stored offsets.
+  // A later sub-slot / wider load against the merged object scans VObj.Fields
+  // to find the containing slot (tier2Load); if a FieldDesc that came only
+  // from a non-pred-0 path were missing, the scan would find nothing and the
+  // load would silently fold to the default zero instead of the merged value.
+  // getOrCreateFieldIndex is idempotent on exact matches (safe on the cached
+  // loop-header VO and for Ref's already-present fields) and returns -1 on an
+  // overlap/size conflict, which we treat as an incompatibility bail — exactly
+  // like the type-mismatch bails in the Plans loop below. We poison NewID
+  // before returning so the half-built VO is never observable; no PHI effects
+  // have been committed at this point.
+  {
+    jeandle::VirtualObject &MergedVO = *Result.VirtualObjects[NewID];
+    for (unsigned i = 0; i < N; ++i) {
+      const jeandle::VirtualObject &PVO = *Result.VirtualObjects[PerPredIDs[i]];
+      for (const auto &FD : PVO.Fields) {
+        if (MergedVO.getOrCreateFieldIndex(FD.Offset, FD.LLVMType) < 0) {
+          Eligible[NewID] = false;
+          return false;
+        }
+      }
+    }
+  }
 
   // Materialize inner virtuals if any per-pred entry is a VirtualRef. This
   // happens BEFORE we emit CreatePHI effects so the PHI inputs point at the
@@ -3437,14 +3465,14 @@ bool Analyzer::tier2Store(StoreInst *SI) {
         if (auto *CI = dyn_cast<ConstantInt>(Match->Index)) {
           int64_t Cidx = CI->getSExtValue();
           if (Cidx < 0 || static_cast<uint64_t>(Cidx) >= VObj.ArrayLength) {
-            Eligible[*BaseID] = false;
+            markIneligible(*BaseID);
             return true;
           }
           Offset = static_cast<int64_t>(VObj.ArrayBaseOffset) +
                    Cidx * static_cast<int64_t>(VObj.ArrayIndexScale);
         } else {
           // Symbolic index — materialize.
-          Eligible[*BaseID] = false;
+          markIneligible(*BaseID);
           return true;
         }
       }
@@ -3455,7 +3483,7 @@ bool Analyzer::tier2Store(StoreInst *SI) {
     Offset = jeandle::pea::resolveFieldOffset(Ptr, DL);
   if (!Offset) {
     // Non-constant offset access — punt on materialization.
-    Eligible[*BaseID] = false;
+    markIneligible(*BaseID);
     return true;
   }
   if (VObj.isInstance()) {
@@ -3463,7 +3491,7 @@ bool Analyzer::tier2Store(StoreInst *SI) {
         jeandle::VMConstants::fromModule(*F.getParent());
     if (*Offset < VMConsts.instanceBaseOffset()) {
       // Header accesses (mark/klass) are VM metadata, not Java fields.
-      Eligible[*BaseID] = false;
+      markIneligible(*BaseID);
       return true;
     }
   }
@@ -3477,7 +3505,7 @@ bool Analyzer::tier2Store(StoreInst *SI) {
   // actually use the returned index (FieldStates is keyed by raw offset), but
   // -1 means an overlap/size conflict that forces escape.
   if (VObj.getOrCreateFieldIndex(*Offset, Val->getType()) < 0) {
-    Eligible[*BaseID] = false;
+    markIneligible(*BaseID);
     return true;
   }
 
@@ -3530,13 +3558,13 @@ void Analyzer::tier2Load(LoadInst *LI) {
         if (auto *CI = dyn_cast<ConstantInt>(Match->Index)) {
           int64_t Cidx = CI->getSExtValue();
           if (Cidx < 0 || static_cast<uint64_t>(Cidx) >= VObj.ArrayLength) {
-            Eligible[*BaseID] = false;
+            markIneligible(*BaseID);
             return;
           }
           Offset = static_cast<int64_t>(VObj.ArrayBaseOffset) +
                    Cidx * static_cast<int64_t>(VObj.ArrayIndexScale);
         } else {
-          Eligible[*BaseID] = false;
+          markIneligible(*BaseID);
           return;
         }
       }
@@ -3546,7 +3574,7 @@ void Analyzer::tier2Load(LoadInst *LI) {
   if (!Offset)
     Offset = jeandle::pea::resolveFieldOffset(Ptr, DL);
   if (!Offset) {
-    Eligible[*BaseID] = false;
+    markIneligible(*BaseID);
     return;
   }
   if (VObj.isInstance()) {
@@ -3554,18 +3582,20 @@ void Analyzer::tier2Load(LoadInst *LI) {
         jeandle::VMConstants::fromModule(*F.getParent());
     if (*Offset < VMConsts.instanceBaseOffset()) {
       // Header accesses (mark/klass) are VM metadata, not Java fields.
-      Eligible[*BaseID] = false;
+      markIneligible(*BaseID);
       return;
     }
   }
 
   Type *LoadTy = LI->getType();
 
-  // Locate the FieldDesc whose recorded range contains the load. The
-  // load may be at a sub-offset / sub-width of a wider stored entry (e.g.
-  // store i64 at off 8, load i16 at off 12 → entry at off 8 with within-slot
-  // byte offset 4). If the load straddles slot boundaries (overlaps without
-  // being contained), we bail — that would need multi-slot read+concat.
+  // Locate the FieldDesc whose recorded range contains the load. We detect the
+  // relationship between the load and the stored slot so we can bail correctly:
+  // a load that straddles slot boundaries (overlaps without being contained)
+  // forces materialization here, and a load contained in a wider slot but at a
+  // nonzero within-slot offset is a sub-slot read bailed on below (see
+  // WithinSlotByteOff). Loads that exactly cover the slot, or read it at the
+  // same offset, proceed to coerceToType.
   uint64_t LoadBits = LoadTy->isSized() ? DL.getTypeSizeInBits(LoadTy) : 0;
   uint8_t LoadByteSize = static_cast<uint8_t>((LoadBits + 7) / 8);
   int64_t LoadEnd = *Offset + static_cast<int64_t>(LoadByteSize);
@@ -3592,10 +3622,17 @@ void Analyzer::tier2Load(LoadInst *LI) {
     // Re-enable together with the jeandle-jdk frontend inliner for
     // Unsafe.get* intrinsics. Until then any straddling load
     // conservatively forces materialization.
-    Eligible[*BaseID] = false;
+    markIneligible(*BaseID);
     return;
   }
 
+  // A nonzero within-slot offset means the load reads PART of a wider stored
+  // field (a sub-slot / "incomplete field" read). Such partial-field reads are
+  // not folded — the lshr+trunc narrowing was removed (see the TODO at the
+  // OverlapsNoncontained bail above for the re-enablement plan) — so we bail to
+  // materialization directly. The bail runs after the Unknown/default-value
+  // fold below, so a sub-slot read of a never-written field still folds to its
+  // default (zero for every primitive).
   int64_t WithinSlotByteOff = *Offset - EntryOffset;
 
   const jeandle::FieldValue *Existing = nullptr;
@@ -3621,16 +3658,23 @@ void Analyzer::tier2Load(LoadInst *LI) {
     return;
   }
 
+  // Sub-slot read of a non-Unknown field: a partial-field load is not folded
+  // (see WithinSlotByteOff above). Force the object to materialize so the
+  // original load survives in IR.
+  if (WithinSlotByteOff != 0) {
+    markIneligible(*BaseID);
+    return;
+  }
+
   if (Existing->isScalar()) {
     Value *V = Existing->getScalar();
-    // Coerce to LoadTy. Handles same-bit-width primitive↔primitive (bitcast)
-    // and sub-bit-width integer truncation (lshr+trunc at within-slot
-    // byte offset). Pointer↔primitive (or cross-AS pointer↔pointer, or a
-    // widening integer load) bails to ineligible per the stable-slot-kind
-    // and sub-bit-width policies.
-    Value *Coerced = coerceToType(V, LoadTy, LI, WithinSlotByteOff);
+    // Coerce to LoadTy: same-type passthrough or same-bit-width primitive↔
+    // primitive reinterpret (bitcast). Pointer↔primitive, cross-AS pointer
+    // pairs, and any cross-width mismatch (narrowing/widening) bail to
+    // ineligible per the stable-slot-kind and width policies.
+    Value *Coerced = coerceToType(V, LoadTy, LI);
     if (!Coerced) {
-      Eligible[*BaseID] = false;
+      markIneligible(*BaseID);
       return;
     }
     jeandle::PEAResult::Effect E;
@@ -3666,7 +3710,7 @@ void Analyzer::tier2Load(LoadInst *LI) {
       // will survive in IR, but we should not silently keep forwarding to
       // it for the outer because forwarding can mask a missing
       // materialization. Bail conservatively on the outer.
-      Eligible[*BaseID] = false;
+      markIneligible(*BaseID);
       return;
     }
 
@@ -3677,7 +3721,7 @@ void Analyzer::tier2Load(LoadInst *LI) {
       // for a VirtualRef field entry that was inherited alongside the
       // outer, but defend). Bail on the outer only; do not poison the
       // inner — it may be cleanly virtualizable on other paths.
-      Eligible[*BaseID] = false;
+      markIneligible(*BaseID);
       return;
     }
 
@@ -3694,19 +3738,19 @@ void Analyzer::tier2Load(LoadInst *LI) {
       Repl = InnerVO.AllocationCall;
     }
     if (!Repl) {
-      Eligible[*BaseID] = false;
+      markIneligible(*BaseID);
       return;
     }
 
     // Type-compatibility. For ordinary reference loads, both LoadTy and the
     // inner allocation are `ptr addrspace(1)` and coerceToType returns Repl
-    // unchanged. Cross-address-space or ptr↔primitive mismatch bails per
-    // the stable-slot-kind invariant; a nonzero WithinSlotByteOff also
-    // bails (partial pointer loads are not virtualizable). We don't poison
-    // InnerID because other paths may still be able to virtualize it.
-    Value *Coerced = coerceToType(Repl, LoadTy, LI, WithinSlotByteOff);
+    // unchanged. Cross-address-space or ptr↔primitive mismatch bails per the
+    // stable-slot-kind invariant. (Sub-slot pointer loads were already rejected
+    // by the WithinSlotByteOff bail above.) We don't poison InnerID because
+    // other paths may still be able to virtualize it.
+    Value *Coerced = coerceToType(Repl, LoadTy, LI);
     if (!Coerced) {
-      Eligible[*BaseID] = false;
+      markIneligible(*BaseID);
       return;
     }
 
@@ -3736,17 +3780,17 @@ void Analyzer::tier2Load(LoadInst *LI) {
     // to the materialized value, matching the Scalar handler.
     Value *V = Existing->getMaterialized();
     if (!V) {
-      Eligible[*BaseID] = false;
+      markIneligible(*BaseID);
       return;
     }
     // A materialized ref slot can only be loaded back as a pointer (and in
     // practice, since LLVM 17 uses opaque pointers, only as the same
-    // ptr-AS). coerceToType bails on ptr↔primitive (stable-slot-kind),
-    // cross-AS pointer pairs, and on any partial (within-slot) pointer
-    // load.
-    Value *Coerced = coerceToType(V, LoadTy, LI, WithinSlotByteOff);
+    // ptr-AS). coerceToType bails on ptr↔primitive (stable-slot-kind) and
+    // cross-AS pointer pairs. (Partial pointer loads were already rejected by
+    // the WithinSlotByteOff bail above.)
+    Value *Coerced = coerceToType(V, LoadTy, LI);
     if (!Coerced) {
-      Eligible[*BaseID] = false;
+      markIneligible(*BaseID);
       return;
     }
     jeandle::PEAResult::Effect E;
@@ -3762,7 +3806,7 @@ void Analyzer::tier2Load(LoadInst *LI) {
   }
 
   // Should be unreachable; FieldValue::Tag is a closed enum.
-  Eligible[*BaseID] = false;
+  markIneligible(*BaseID);
 }
 
 // ---------------------------------------------------------------------------
@@ -4010,7 +4054,7 @@ bool Analyzer::foldMonitorExit(CallBase *CB) {
   if (It == LockCounts.end() || It->second == 0) {
     // Unbalanced monitorexit (release without acquire on this virtual). Mark
     // the virtual ineligible and let the generic escape path keep the call.
-    Eligible[*BaseID] = false;
+    markIneligible(*BaseID);
     return false;
   }
   --It->second;
@@ -4160,7 +4204,7 @@ bool Analyzer::foldCheckIfValueBased(CallBase *CB) {
     // for it and the original allocation + check call stay in IR, where
     // the call ends up operating on the materialized pointer. Matches the
     // foldArrayStoreCheck "unknown value klass" conservative path.
-    Eligible[*BaseID] = false;
+    markIneligible(*BaseID);
     return true;
   }
   // Provably non-value-based: fold the check to false. The query against
@@ -4389,11 +4433,8 @@ void Analyzer::materializeAt(jeandle::ObjectID ID,
   //       consumers stop trying to fold through it.
   // The cascade-materialize path is deferred to a follow-on change.
   if (VObj.IsSynthetic) {
-    Eligible[ID] = false;
-    for (jeandle::ObjectID PID : VObj.SyntheticSourceIDs)
-      Eligible[PID] = false;
-    if (VObj.SyntheticPhi)
-      Aliases.resetAlias(VObj.SyntheticPhi);
+    // Cascade (transitive over nested synthetics) through markIneligible.
+    markIneligible(ID);
     // Mark Materialized so the idempotent guard at the top of subsequent
     // materializeAt calls short-circuits and we don't re-bail repeatedly.
     Materialized.insert(ID);
@@ -5020,11 +5061,8 @@ void Analyzer::materializeAtPredFromExitInfo(
   // (ensure-materialize each per-pred source + reuse the existing PHI as
   // the materialized pointer) is deferred.
   if (VObj.IsSynthetic) {
-    Eligible[ID] = false;
-    for (jeandle::ObjectID PID : VObj.SyntheticSourceIDs)
-      Eligible[PID] = false;
-    if (VObj.SyntheticPhi)
-      Aliases.resetAlias(VObj.SyntheticPhi);
+    // Cascade (transitive over nested synthetics) through markIneligible.
+    markIneligible(ID);
     // Insert into MatInPH so any subsequent call short-circuits at the top.
     MatInPH.insert(ID);
     return;

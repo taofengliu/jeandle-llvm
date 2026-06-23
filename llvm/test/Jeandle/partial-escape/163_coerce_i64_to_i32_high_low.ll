@@ -1,8 +1,10 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Store i64 into a virtual's slot at offset 8, then read both halves as
-; i32. Offset 8 (low half) -> plain `trunc`. Offset 12 (high half) ->
-; `lshr by 32` + `trunc`. Little-endian semantics.
+; Store i64 into a virtual's slot at offset 8, then read both halves as i32 —
+; both are sub-slot narrowing reads (i64 -> i32). PEA no longer supports
+; sub-slot / narrowing loads (the lshr+trunc fold was removed) — the loads bail
+; to ineligible and the object materializes: alloc, store, and loads survive
+; intact, no coercion synthesized.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 
@@ -32,11 +34,10 @@ unwind:
 }
 
 ; CHECK-LABEL: define i64 @test_coerce_i64_to_i32_halves()
-; CHECK-NOT: jeandle.new_instance
-; CHECK-NOT: store
-; CHECK-NOT: load atomic
-; CHECK-DAG: trunc i64 -81985529216486896 to i32
-; CHECK-DAG: lshr i64 -81985529216486896, 32
+; CHECK: jeandle.new_instance
+; CHECK: store atomic i64
+; CHECK: load atomic i32
+; CHECK-NOT: pea.coerce
 ; CHECK: ret i64
 
 !java-method-compilation = !{}

@@ -139,9 +139,13 @@ public:
   bool isBoxedPrimitive() const { return BoxedPrimitiveKind != 9; }
 
   // A "synthetic" VirtualObject is one created at a multi-pred merge by the analyzer's processBlockPhis when every incoming
-  // resolves to a DIFFERENT but COMPATIBLE virtual object (same Klass / kind
-  // / entry count / lock state, and the per-pred allocations have no other
-  // observable identity). There is no per-pred allocation backing this VO —
+  // resolves to a DIFFERENT but COMPATIBLE virtual object (same Klass / kind /
+  // array dimensions / lock state, and the per-pred allocations have no other
+  // observable identity). Compatibility deliberately does NOT compare a
+  // per-instance field count: Fields is lazily populated (only stored offsets,
+  // path-dependent), so its size is not a structural invariant. The synthetic
+  // VO's Fields is the UNION of all per-pred Fields. There is no per-pred
+  // allocation backing this VO —
   // AllocationCall is non-null (cloned from the first per-pred VO) but MUST
   // NOT be erased or used as a Materialize effect target. SyntheticSourceIDs
   // holds the per-pred VOs in PHI-incoming order; SyntheticPhi is the LLVM
@@ -182,8 +186,6 @@ public:
   std::optional<ArrayElementGEPMatch>
   matchArrayElementGEP(GetElementPtrInst *GEP,
                        const llvm::DataLayout &DL) const;
-
-  unsigned entryCount() const;
 
   static Type *getMaterializedType(LLVMContext &Ctx);
 

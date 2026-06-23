@@ -275,12 +275,6 @@ VirtualObject::matchArrayElementGEP(GetElementPtrInst *GEP,
   return std::nullopt;
 }
 
-unsigned VirtualObject::entryCount() const {
-  if (Kind == Instance)
-    return static_cast<unsigned>(Fields.size());
-  return ArrayLength;
-}
-
 Type *VirtualObject::getMaterializedType(LLVMContext &Ctx) {
   return PointerType::get(Ctx, jeandle::AddrSpace::JavaHeapAddrSpace);
 }

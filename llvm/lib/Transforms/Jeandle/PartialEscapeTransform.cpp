@@ -640,14 +640,14 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
             }
           }
         }
-        // The analyzer may have synthesized one or more unparented coercion
-        // instructions as the replacement: a `bitcast` for same-bit-width
-        // primitive↔primitive, or a `lshr`+`trunc` chain for narrowing
-        // primitive bit-widths on integer loads. Splice the chain in postorder
-        // so each operand is parented before its user; all land immediately
-        // before Target. Ownership transfers from PEAResult::OwnedInsts to the
-        // parent BasicBlock; the OwnedInsts destructor skips inserted
-        // instructions.
+        // The analyzer may have synthesized an unparented coercion instruction
+        // as the replacement: a `bitcast` for a same-bit-width primitive↔
+        // primitive reinterpret. (Sub-slot narrowing — a `lshr`+`trunc` chain —
+        // was removed; coerceToType no longer emits multi-instruction chains.)
+        // Splice it, and any still-unparented operand, in postorder so each
+        // operand is parented before its user; all land immediately before
+        // Target. Ownership transfers from PEAResult::OwnedInsts to the parent
+        // BasicBlock; the OwnedInsts destructor skips inserted instructions.
         //
         // A PHINode replacement is owned by a CreatePHI effect that
         // runs LATER in SeqNo order (drain-time reassignment). Splicing the
@@ -676,7 +676,17 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
               if (Top.NextOpIdx < Top.I->getNumOperands()) {
                 Value *Op = Top.I->getOperand(Top.NextOpIdx++);
                 if (auto *OpI = dyn_cast<Instruction>(Op)) {
-                  if (OpI->getParent() == nullptr &&
+                  // A PHINode operand is owned by its own CreatePHI effect,
+                  // which parents it at the merge-block head (and asserts it
+                  // is still unparented at that time). It must NOT be spliced
+                  // here: a PHI is illegal mid-block, and parenting it now
+                  // would crash the later CreatePHI handler. Treat it as a
+                  // leaf — a PHI dominates all non-PHI uses in its block, so
+                  // it is always available where the coercion chain lands.
+                  // This arises when a load against a Case-C synthetic VO folds
+                  // through a same-width reinterpret: the coercion (a bitcast)
+                  // wraps the merged field PHI.
+                  if (OpI->getParent() == nullptr && !isa<PHINode>(OpI) &&
                       Visited.insert(OpI).second) {
                     Frames.push_back({OpI, 0});
                   }

@@ -1,8 +1,10 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Store i32 into a virtual's slot at offset 8, load i16 at byte offset
-; 10 (within-slot byte offset 2). Little-endian semantics: emit
-; `lshr i32 V, 16` then `trunc i32 to i16` to extract the high half.
+; Store i32 into a virtual's slot at offset 8, load i16 at byte offset 10
+; (within-slot byte offset 2). This is a sub-slot read of a wider stored field.
+; PEA no longer supports sub-slot / narrowing loads (the lshr+trunc fold was
+; removed) — the load bails to ineligible and the object materializes: alloc,
+; store, and load survive intact, no coercion synthesized.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 
@@ -27,11 +29,10 @@ unwind:
 }
 
 ; CHECK-LABEL: define i16 @test_coerce_i32_to_i16_off2()
-; CHECK-NOT: jeandle.new_instance
-; CHECK-NOT: store
-; CHECK-NOT: load
-; CHECK: %[[S:.*]] = lshr i32 305419896, 16
-; CHECK: %[[T:.*]] = trunc i32 %[[S]] to i16
-; CHECK: ret i16 %[[T]]
+; CHECK: jeandle.new_instance
+; CHECK: store atomic i32
+; CHECK: load atomic i16
+; CHECK-NOT: pea.coerce
+; CHECK: ret i16
 
 !java-method-compilation = !{}
