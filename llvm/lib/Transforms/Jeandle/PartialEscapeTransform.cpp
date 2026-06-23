@@ -947,13 +947,10 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
   // conditional branch on the result becomes constant). Use
   // ConstantFoldTerminator to collapse those before the unreachable-block
   // sweep so the slow-path blocks of synchronized regions get cleaned up.
-  bool TermFolded = false;
   for (BasicBlock &BB : llvm::make_early_inc_range(F)) {
-    if (ConstantFoldTerminator(&BB, /*DeleteDeadConditions=*/true,
-                               /*TLI=*/nullptr, /*DTU=*/nullptr))
-      TermFolded = true;
+    ConstantFoldTerminator(&BB, /*DeleteDeadConditions=*/true,
+                           /*TLI=*/nullptr, /*DTU=*/nullptr);
   }
-  (void)TermFolded;
 
   // Sweep trivially-dead instructions that became unused after our rewrites
   // (e.g., GEPs derived from eliminated allocations whose only users were the

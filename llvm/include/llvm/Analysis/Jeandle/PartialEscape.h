@@ -98,8 +98,6 @@ public:
     }
   };
 
-  static constexpr int64_t ArrayLengthSlotOffset = -1;
-
 private:
   const ObjectID ID;
   ClassKind Kind;
@@ -116,27 +114,6 @@ public:
   uint32_t ArrayBaseOffset = 0;
 
   SmallVector<FieldDesc, 8> Fields;
-
-  bool IsSingleUsageAllocation = false;
-  bool IdentityHashObserved = false;
-
-  // PEA (boxed-primitive tagging): JBasicType index of the boxed
-  // primitive when this VirtualObject's Klass is one of the eight
-  // java.lang autobox wrapper classes (Boolean=0..Double=7); otherwise
-  // 9 (JBasicType::Count, the sentinel "not boxed"). Populated in
-  // tier1Allocate from the IsBoxed VMCallback (when registered) — kept at
-  // the sentinel for lit tests without a callback log, which leaves the
-  // boxed-virtual fold path inert. Used by the icmp eq fold
-  // to substitute structural value comparison for object-identity, and
-  // by synthesizeCaseC to drop the identity-bail when two
-  // boxed virtuals of the same primitive kind reach a merge.
-  //
-  // Held as a uint8_t to match the JBasicType enum's underlying type
-  // without dragging the VMConstants header into PartialEscape.h. The
-  // sentinel value 9 (JBasicType::Count) is the agreed "no boxing" code
-  // shared with VMCallback::IsBoxed; do not use 0 (which is Boolean).
-  uint8_t BoxedPrimitiveKind = 9; // JBasicType::Count sentinel
-  bool isBoxedPrimitive() const { return BoxedPrimitiveKind != 9; }
 
   // A "synthetic" VirtualObject is one created at a multi-pred merge by the analyzer's processBlockPhis when every incoming
   // resolves to a DIFFERENT but COMPATIBLE virtual object (same Klass / kind /
@@ -168,17 +145,14 @@ public:
   bool isInstance() const { return Kind == Instance; }
   bool isArray() const { return Kind == Array; }
 
-  int getFieldIndex(int64_t Offset, uint8_t ByteSize) const;
   int getOrCreateFieldIndex(int64_t Offset, Type *Ty);
-  int getArrayLengthFieldIndex() const;
-  int64_t arrayElementOffset(uint32_t Index) const;
 
   // Result of matching a GEP against the array's element-address pattern.
   // Index is the (possibly symbolic) Value* that names the Java-level
   // element index; ElementType is the per-element LLVM type. Callers must
-  // inspect Index: a ConstantInt yields a constant element index (use
-  // arrayElementOffset to recover the canonical byte offset); a symbolic
-  // index forces the caller to bail (materialize the array).
+  // inspect Index: a ConstantInt yields a constant element index (combine
+  // it with ArrayBaseOffset + scale for the canonical byte offset); a
+  // symbolic index forces the caller to bail (materialize the array).
   struct ArrayElementGEPMatch {
     llvm::Value *Index;
     llvm::Type *ElementType;
@@ -186,8 +160,6 @@ public:
   std::optional<ArrayElementGEPMatch>
   matchArrayElementGEP(GetElementPtrInst *GEP,
                        const llvm::DataLayout &DL) const;
-
-  static Type *getMaterializedType(LLVMContext &Ctx);
 
   std::unique_ptr<VirtualObject> duplicate() const;
 };
@@ -218,7 +190,6 @@ public:
   static FieldValue virtualRef(ObjectID ID, Type *RefTy);
   static FieldValue materializedRef(Value *Ptr);
 
-  Tag getTag() const { return T; }
   bool isUnknown() const { return T == Unknown; }
   bool isScalar() const { return T == Scalar; }
   bool isVirtualRef() const { return T == VirtualRef; }
@@ -229,12 +200,9 @@ public:
   Value *getMaterialized() const { assert(isMaterializedRef()); return U.V; }
   Type *getDeclaredType() const { return DeclaredType; }
 
-  void setDeclaredType(Type *Ty) { DeclaredType = Ty; }
-
   static Constant *defaultFor(Type *FieldType);
 
   bool shallowEquals(const FieldValue &O) const;
-  llvm::hash_code hash() const;
 };
 
 // ===========================================================================
@@ -264,7 +232,7 @@ private:
   Value *MaterializedValue = nullptr;
   // CopyOnWrite is logically a sharing annotation, not part of the object's
   // observable state, so it may be set on a const-borrowed ObjectState by
-  // PEABlockState::adoptObjectStates.
+  // PEABlockState's copy-on-write machinery (markAllSlotsShared).
   mutable bool CopyOnWrite = false;
 
 public:
@@ -294,25 +262,11 @@ public:
   bool isVirtual() const { return Kind == Virtual; }
   bool isMaterialized() const { return Kind == Materialized; }
 
-  ArrayRef<FieldValue> entries() const {
-    assert(isVirtual());
-    return Entries;
-  }
-  const FieldValue &getEntry(unsigned Idx) const {
-    assert(isVirtual());
-    return Entries[Idx];
-  }
-  unsigned getEntryCount() const {
-    assert(isVirtual());
-    return Entries.size();
-  }
   Value *getMaterializedValue() const {
     assert(isMaterialized() && MaterializedValue);
     return MaterializedValue;
   }
-  unsigned getLockCount() const { return Locks.size(); }
   bool hasLocks() const { return !Locks.empty(); }
-  ArrayRef<MonitorIdRef> getLocks() const { return Locks; }
   // Element-wise lock-stack comparison used by the depth-aware merge-time
   // stack-identity check (mergeStates) and the pre-cascade in
   // foldMonitorEnter. Compares both EnterCall AND BytecodeDepth when the
@@ -332,11 +286,6 @@ public:
     return true;
   }
 
-  void setEntry(unsigned Idx, FieldValue V) {
-    assert(isVirtual());
-    Entries[Idx] = V;
-  }
-
   void materialize(Value *Ptr) {
     assert(isVirtual());
     assert(Ptr);
@@ -349,11 +298,6 @@ public:
     // Clear defensively so any stale element does not survive into the
     // Materialized state and confuse a later equivalentTo / hash.
     Locks.clear();
-  }
-
-  void updateMaterializedValue(Value *NewPtr) {
-    assert(isMaterialized() && NewPtr);
-    MaterializedValue = NewPtr;
   }
 
   void addLock(MonitorIdRef M) {
@@ -376,8 +320,6 @@ public:
   bool isShared() const { return CopyOnWrite; }
 
   ObjectState clone() const;
-
-  llvm::hash_code hash() const;
 };
 
 // ===========================================================================
@@ -437,10 +379,6 @@ public:
     return ObjectStates ? static_cast<unsigned>(ObjectStates->size()) : 0u;
   }
 
-  void resetObjectStates(unsigned NumObjects);
-
-  void adoptObjectStates(const PEABlockState &Other);
-
   std::optional<ObjectID> resolveVirtualRef(Value *V,
                                             const AliasMap &Aliases) const;
 
@@ -449,7 +387,6 @@ public:
 
 private:
   SmallVector<std::optional<ObjectState>, 8> *getArrayForModification();
-  void ensureSize(unsigned Size);
 };
 
 // ===========================================================================
@@ -460,7 +397,6 @@ class AliasMap {
   DenseMap<Value *, ObjectID> VirtualAliases;
   DenseMap<Value *, Value *> ScalarAliases;
   DenseSet<Instruction *> HasVirtualInputs;
-  DenseSet<Instruction *> HasScalarReplacedInputs;
 
 public:
   void addVirtualAlias(Value *V, ObjectID ID);
@@ -473,9 +409,6 @@ public:
   bool hasVirtualInputs(Instruction *I) const {
     return HasVirtualInputs.count(I);
   }
-  bool hasScalarReplacedInputs(Instruction *I) const {
-    return HasScalarReplacedInputs.count(I);
-  }
 
   // Read-only view over the virtual alias map. Used to iterate every Value*
   // that represents a given ObjectID for the per-object eligibility cleanup
@@ -484,14 +417,10 @@ public:
     return VirtualAliases;
   }
 
-  Value *resolve(Value *V, const PEABlockState &State) const;
-
   void clear();
 
   AliasMap snapshot() const;
   void restore(const AliasMap &S);
-
-  void invalidate(Value *V);
 };
 
 // ===========================================================================

@@ -549,32 +549,16 @@ private:
   // or runs of the analyzer).
   DenseMap<CallBase *, jeandle::ObjectID> AllocSiteToVO;
 
-  // Loops for which the fixpoint did NOT converge AND the
-  // MATERIALIZE_ALL preheader-force-materialize fallback was applied. The
-  // safety net materializeBeforeLoops() skips these (their preheader's
-  // virtuals were already drained).
-  DenseSet<Loop *> PessimisticLoops;
-
-  // Loops whose body fixpoint successfully converged. The safety net
-  // materializeBeforeLoops() skips these too — virtuals that survived the
-  // fixpoint at the preheader were tracked across the back-edge by
-  // construction, and any in-body escape is already covered by the
-  // per-instruction materializeAt that triggered inside the body during
-  // the converged iteration. Forcing them to materialize at the preheader
-  // would defeat the whole point of the loop fixpoint for the alloc-before-loop-with-body-
-  // mutation pattern that today's behaviour cannot recover.
-  DenseSet<Loop *> ConvergedLoops;
-
-  // Every Loop* on which processLoop was invoked (including
-  // recursive sub-loop calls). The safety-net
+  // Every Loop* on which processLoop was invoked (including recursive
+  // sub-loop calls). The safety-net
   // materializePreheaderVirtualsForUnvisitedLoops() drains preheader
   // virtuals ONLY for loops absent from this set, i.e. truly unvisited
   // loops (an unreachable top-level loop the RPO walk skipped, or a
   // sub-loop whose containing top-level loop's processLoop bailed before
-  // recursing into it). An earlier gate used PessimisticLoops +
-  // ConvergedLoops, which conflated "processLoop visited and handled" with
-  // "processLoop never ran", missing the rare unvisited case where the
-  // preheader drain is the only sound source of materialisation.
+  // recursing into it). processLoop handles every loop it visits —
+  // whether the body fixpoint converged or fell into the MATERIALIZE_ALL
+  // fallback — by draining preheader virtuals itself, so the only loops
+  // that need this safety-net drain are those processLoop never ran on.
   DenseSet<Loop *> VisitedLoops;
 
   // Per-loop-header field-PHI cache. Keyed on (Header, ID, Offset). The
@@ -723,7 +707,6 @@ private:
   // Unknown are not surfaced as standalone counters — they roll into the
   // total `JeandlePEAMaterialized` only.
   enum class MatReason : uint8_t {
-    Unknown,
     Unhandled,   // unhandled escape-point instruction (generic
                  // "virtualize returned false" path).
     Merge,       // state merge: mixed virtual/materialized at a multi-pred
@@ -865,7 +848,6 @@ private:
   bool foldArrayLength(CallBase *CB);
   bool foldLoadKlass(CallBase *CB);
   bool foldCheckCast(CallBase *CB);
-  bool foldCheckInstanceOf(CallBase *CB);
   bool foldInstanceOf(CallBase *CB);
   bool foldMonitorEnter(CallBase *CB);
   bool foldMonitorExit(CallBase *CB);
@@ -2349,35 +2331,6 @@ bool Analyzer::synthesizeCaseC(
     }
   }
 
-  // Boxed-primitive fast path: when every per-pred VO is a same-kind boxed primitive
-  // wrapper (Boolean/Byte/.../Double), drop the identity check entirely.
-  // A boxed-primitive virtual has no identity, so Case-C-style merges of
-  // two boxed allocations are permitted regardless of external users —
-  // the merged virtual is treated as a structural value carrier, not an
-  // identity carrier. We key on the BoxedPrimitiveKind tag installed by
-  // tier1Allocate. Note: this gate is currently dormant in production
-  // because the JDK frontend does not yet lower autoboxing to
-  // `jeandle.new_instance + store`; the tag stays at the
-  // JBasicType::Count sentinel for non-boxed VOs so the path below
-  // remains the conservative default. Lit tests synthesize the boxed
-  // pattern by hand and rely on this fast-path.
-  bool AllBoxedSameKind = true;
-  {
-    jeandle::VirtualObject &Ref0 = *Result.VirtualObjects[PerPredIDs[0]];
-    if (!Ref0.isBoxedPrimitive())
-      AllBoxedSameKind = false;
-    else {
-      for (unsigned i = 1; i < N; ++i) {
-        jeandle::VirtualObject &VOi = *Result.VirtualObjects[PerPredIDs[i]];
-        if (!VOi.isBoxedPrimitive() ||
-            VOi.BoxedPrimitiveKind != Ref0.BoxedPrimitiveKind) {
-          AllBoxedSameKind = false;
-          break;
-        }
-      }
-    }
-  }
-
   // Early-bail if any incoming of Phi equals Phi itself (a
   // back-edge self-reference on a loop-header PHI). A self-loop incoming
   // means the per-pred VO this slot resolves to is one that we're about
@@ -2388,8 +2341,8 @@ bool Analyzer::synthesizeCaseC(
       return false;
   }
 
-  // Identity check (single-usage-allocation). Every non-boxed VO has
-  // identity. For each per-pred VO we require:
+  // Identity check (single-usage-allocation). Every VO has identity.
+  // For each per-pred VO we require:
   //   (a) the LLVM PHI is the only "external" user of the per-pred alloc.
   //       An "external" user is one that is neither (i) covered by a planned
   //       PEA effect for that ID (EliminateStore, ReplaceLoad, ReplaceCall,
@@ -2399,61 +2352,50 @@ bool Analyzer::synthesizeCaseC(
   //   (b) no OTHER VO at any pred references this VO via virtualRef in its
   //       FieldStates (otherwise materializing that other VO would also
   //       materialize this one and expose identity).
-  if (!AllBoxedSameKind) {
-    for (unsigned i = 0; i < N; ++i) {
-      jeandle::ObjectID PID = PerPredIDs[i];
-      jeandle::VirtualObject &PVO = *Result.VirtualObjects[PID];
-      CallBase *OrigAlloc = PVO.AllocationCall;
-      if (!OrigAlloc)
-        return false;
-      // Cheap-out — an alloc with only one use (the PHI itself)
-      // trivially satisfies the no-other-external-user requirement, so
-      // the expensive Effect-target collection below is unnecessary.
-      // hasNUsesOrMore(2) does an O(1) check against the use list.
-      bool MaybeOtherUsers = OrigAlloc->hasNUsesOrMore(2);
-      if (MaybeOtherUsers) {
-        DenseSet<Instruction *> InternalTargets;
-        for (auto &Kv : Result.BlockEffects) {
-          for (const auto &E : Kv.second) {
-            if (E.ObjID == PID && E.Target)
-              InternalTargets.insert(E.Target);
-          }
+  for (unsigned i = 0; i < N; ++i) {
+    jeandle::ObjectID PID = PerPredIDs[i];
+    jeandle::VirtualObject &PVO = *Result.VirtualObjects[PID];
+    CallBase *OrigAlloc = PVO.AllocationCall;
+    if (!OrigAlloc)
+      return false;
+    // Cheap-out — an alloc with only one use (the PHI itself)
+    // trivially satisfies the no-other-external-user requirement, so
+    // the expensive Effect-target collection below is unnecessary.
+    // hasNUsesOrMore(2) does an O(1) check against the use list.
+    bool MaybeOtherUsers = OrigAlloc->hasNUsesOrMore(2);
+    if (MaybeOtherUsers) {
+      DenseSet<Instruction *> InternalTargets;
+      for (auto &Kv : Result.BlockEffects) {
+        for (const auto &E : Kv.second) {
+          if (E.ObjID == PID && E.Target)
+            InternalTargets.insert(E.Target);
         }
-        for (User *U : OrigAlloc->users()) {
-          if (U == Phi)
-            continue;
-          auto *UI = dyn_cast<Instruction>(U);
-          if (!UI)
-            return false;
-          if (InternalTargets.count(UI))
-            continue;
-          auto AID = Aliases.getVirtualAlias(UI);
-          if (AID && *AID == PID)
-            continue;
-          // An unaccounted-for user — identity-bail.
+      }
+      for (User *U : OrigAlloc->users()) {
+        if (U == Phi)
+          continue;
+        auto *UI = dyn_cast<Instruction>(U);
+        if (!UI)
           return false;
-        }
+        if (InternalTargets.count(UI))
+          continue;
+        auto AID = Aliases.getVirtualAlias(UI);
+        if (AID && *AID == PID)
+          continue;
+        // An unaccounted-for user — identity-bail.
+        return false;
       }
-      // No other VO references PID through a virtualRef field entry.
-      // Cross-check both per-pred ExitInfos AND the analyzer's
-      // live FieldStates / CurrentState. A VO synthesized earlier in
-      // this same mergeStates iteration (e.g. a prior Case-C inner)
-      // may carry a VirtualRef(PID) entry that isn't yet reflected in
-      // any pred's ExitInfo — the analyzer's CurrentState is the only
-      // place it lives until snapshotExitState runs. Missing this
-      // check leaks identity through the in-flight synthesis.
-      for (auto *EI : ExitInfos) {
-        for (auto &Kv : EI->FieldStates) {
-          if (Kv.first == PID)
-            continue;
-          for (auto &Off : Kv.second) {
-            if (Off.second.isVirtualRef() &&
-                Off.second.getVirtualRef() == PID)
-              return false;
-          }
-        }
-      }
-      for (auto &Kv : FieldStates) {
+    }
+    // No other VO references PID through a virtualRef field entry.
+    // Cross-check both per-pred ExitInfos AND the analyzer's
+    // live FieldStates / CurrentState. A VO synthesized earlier in
+    // this same mergeStates iteration (e.g. a prior Case-C inner)
+    // may carry a VirtualRef(PID) entry that isn't yet reflected in
+    // any pred's ExitInfo — the analyzer's CurrentState is the only
+    // place it lives until snapshotExitState runs. Missing this
+    // check leaks identity through the in-flight synthesis.
+    for (auto *EI : ExitInfos) {
+      for (auto &Kv : EI->FieldStates) {
         if (Kv.first == PID)
           continue;
         for (auto &Off : Kv.second) {
@@ -2461,6 +2403,15 @@ bool Analyzer::synthesizeCaseC(
               Off.second.getVirtualRef() == PID)
             return false;
         }
+      }
+    }
+    for (auto &Kv : FieldStates) {
+      if (Kv.first == PID)
+        continue;
+      for (auto &Off : Kv.second) {
+        if (Off.second.isVirtualRef() &&
+            Off.second.getVirtualRef() == PID)
+          return false;
       }
     }
   }
@@ -2868,169 +2819,33 @@ void Analyzer::applyThreeTier(Instruction *I) {
         break;
       }
     }
-    // TODO: tier2ArrayCopy / tier2MemSet dispatch. Re-enable together with
-    // a jeandle-jdk frontend inliner that emits llvm.memcpy/memmove
-    // (System.arraycopy) or llvm.memset (Arrays.fill / user-array zero-init)
-    // before PEA runs. Today neither shape reaches PEA — see
-    // jeandle-llvm/llvm/lib/Jeandle/Pipeline.cpp; the only llvm.memset
-    // producer lives inside jeandle.new_instance's lower-phase=1 template,
-    // which is inlined after PEA.
-    // llvm.reachability_fence virtualize. Status: NOT WIRED — the upstream
-    // LLVM tree this Jeandle fork tracks does NOT define
-    // Intrinsic::reachability_fence (verified against
-    // build-debug/include/llvm/IR/IntrinsicEnums.inc) and the Jeandle
-    // frontend does not emit any analogue call (no caller of
-    // Reference.reachabilityFence currently lowers to a tracked intrinsic;
-    // jeandleAbstractInterpreter has no reachability-fence path). When LLVM
-    // adds the intrinsic (or Jeandle introduces `jeandle.reachability_fence`),
-    // add the matcher here BEFORE the JavaOp-fold and generic-escape paths.
+    // Deferred virtualization handlers — NOT WIRED because the current
+    // Jeandle frontend does not emit any of these shapes. Detailed wiring
+    // sketches (arg lists, effect kinds, test reservations) lived here and
+    // are preserved in the git history immediately preceding the PEA
+    // cleanup:
+    //   - tier2ArrayCopy / tier2MemSet — llvm.memcpy/memmove (System.arraycopy)
+    //     and llvm.memset (Arrays.fill). The only llvm.memset producer today
+    //     is inside jeandle.new_instance's lower-phase=1 template, inlined
+    //     AFTER PEA, so neither shape reaches PEA yet.
+    //   - llvm.reachability_fence — upstream LLVM this fork tracks does not
+    //     define Intrinsic::reachability_fence, and the frontend emits no
+    //     analogue.
+    //   - ObjectClone / Object.getClass / FinalFieldBarrier / EnsureVirtualized
+    //     — no jeandle.clone / get_class / final_field_barrier /
+    //     ensure_virtualized JavaOp exists in the frontend inventory.
     //
-    // Expected behaviour, paraphrased from a reference virtualize:
-    //   For each arg V of the fence:
-    //     - V is a constant or primitive          -> drop arg
-    //     - V is a non-virtual pointer            -> keep arg unchanged
-    //     - V resolves to a virtual ObjectID OID  -> visit OID once and
-    //         recursively process every entry of its VirtualObject's
-    //         ObjectState. Entries that are FieldValue::scalar(Value*) or
-    //         FieldValue::materializedRef(Value*) are non-virtual leaves and
-    //         become args of the rewritten fence; FieldValue::virtualRef(ID)
-    //         entries recurse; FieldValue::unknown contributes nothing
-    //         (default-zero field of a virtual, no live pointer to keep).
-    //   If after rewriting the arg list is EMPTY -> delete the fence (every
-    //   transitively-reachable leaf was primitive/constant; the fence has
-    //   nothing to keep alive).
-    //   If the arg list is non-empty but DIFFERENT from the original ->
-    //   replace the original call with a new call to llvm.reachability_fence
-    //   whose operands are the collected leaves.
-    //   If unchanged -> no-op (treat like lifetime_end above).
-    //
-    // The rewrite needs a new PEAResult::EffectKind (e.g. RewriteCallArgs)
-    // so the transform pass can swap the operand list at apply time; the
-    // analyzer-side helper that walks the VO entry tree is intentionally NOT
-    // pre-built here to avoid dead code in this fork (no production caller
-    // exists). Tests are deferred until the intrinsic / Jeandle named call
-    // lands.
-    //
-    // ----------------------------------------------------------------------
-    // Wiring-point TODOs for the deferred virtualization handlers
-    // (ObjectClone, GetClass/load-hub, EnsureVirtualized,
-    // FinalFieldBarrier elide).
-    // ----------------------------------------------------------------------
-    // The following PEA folds map to frontend constructs that the current
-    // Jeandle frontend does NOT emit. The intrinsic-name inventory
-    // (grep `jeandle\\.[a-z_]+` in jeandle-jdk/src/hotspot/share/jeandle/)
-    // contains: array_store_check, arraylength, card_table_barrier,
-    // check_if_value_based, check_inflated, check_instanceof,
+    // Current frontend JavaOp inventory (grep `jeandle.[a-z_]+` in
+    // jeandle-jdk/src/hotspot/share/jeandle/): array_store_check, arraylength,
+    // card_table_barrier, check_if_value_based, check_inflated, check_instanceof,
     // check_klass_subtype, check_klass_subtype_slow_path, checkcast,
     // clear_oop_in_lock_stack_top, current_thread, decrement_lock_count,
-    // get_stack_pointer, idiv, increment_lock_count, instanceof, irem,
-    // ldiv, load_klass, lrem, monitorenter_*, monitorexit_*, new_instance,
-    // newarray, personality, post_barrier, pre_barrier, safepoint_poll,
-    // try_acquire_monitor_lock, try_release_monitor_lock. No `clone`,
-    // `get_class`, `final_field_barrier`, or `ensure_virtualized` JavaOp
-    // exists, so the matchers below are intentionally absent from
-    // tier2JavaOpFold to avoid dead code. Register-finalizer is modeled as
-    // `jeandle.register_finalizer_if_needed` and folded below. When the
-    // frontend grows the remaining JavaOps, wire each fold here and add the
+    // get_stack_pointer, idiv, increment_lock_count, instanceof, irem, ldiv,
+    // load_klass, lrem, monitorenter_*, monitorexit_*, new_instance, newarray,
+    // personality, post_barrier, pre_barrier, safepoint_poll,
+    // try_acquire_monitor_lock, try_release_monitor_lock. When the frontend
+    // grows a new JavaOp, wire its fold in tier2JavaOpFold and add the
     // isJeandle* predicate in PartialEscapeUtils.{h,cpp}.
-    //
-    // ObjectClone — clone virtualizer that duplicates the receiver's VO
-    // ObjectState when virtual, else stages per-field loads from the
-    // materialized receiver.
-    //   Wiring sketch when `jeandle.clone(oop)` lands:
-    //     auto BaseID = jeandle::pea::resolveVirtualRef(CB->getArgOperand(0),
-    //                                                   CurrentState,
-    //                                                   Aliases, DL);
-    //     if (!BaseID) return false;          // receiver already escaped
-    //     auto &Src = *Result.VirtualObjects[*BaseID];
-    //     auto NewVO = Src.duplicate();       // already implemented; copies
-    //                                         // Klass, Fields, Array{Length,
-    //                                         // ElementType, IndexScale,
-    //                                         // BaseOffset}, IsSynthetic=false.
-    //     jeandle::ObjectID NID = registerVirtualObject(std::move(NewVO),
-    //                                                   /*alloc=*/CB);
-    //     CurrentState.addObject(NID,
-    //         CurrentState.getObjectState(*BaseID));    // copies FieldStates +
-    //                                                   // LockCount=0 reset.
-    //     Aliases.addVirtualAlias(CB, NID);
-    //     emitEliminateAllocation(CB, NID);   // clone call becomes the new
-    //                                         // alloc seed (same effect kind
-    //                                         // as tier1Allocate).
-    //   Tests: 320-329 reserved.
-    //
-    // Object.getClass / load-hub — get-class virtualize returns the
-    // java.lang.Class mirror constant when the receiver is a virtual with
-    // known Klass. Existing foldLoadKlass already covers the raw Klass*
-    // pointer case (see jeandle.load_klass dispatch above).
-    //   Wiring sketch when `jeandle.get_class(oop)` lands:
-    //     auto BaseID = jeandle::pea::resolveVirtualRef(CB->getArgOperand(0),
-    //                                                   CurrentState,
-    //                                                   Aliases, DL);
-    //     if (!BaseID) return false;
-    //     auto &VObj = *Result.VirtualObjects[*BaseID];
-    //     if (VObj.Klass == 0) return false;
-    //     // New VMCallback required:
-    //     //   uintptr_t (*JavaClassMirror)(uintptr_t klass);  // klass ->
-    //     //                                                  // Class oop addr
-    //     const auto *VC = jeandle::getVMCallbacks();
-    //     if (!VC || !VC->JavaClassMirror) return false;
-    //     uintptr_t Mirror = VC->JavaClassMirror(VObj.Klass);
-    //     if (Mirror == 0) return false;
-    //     LLVMContext &Ctx = F.getContext();
-    //     Type *PtrTy = PointerType::get(Ctx,
-    //                                     jeandle::AddrSpace::JavaHeapAddrSpace);
-    //     Constant *MirrorPtr = ConstantExpr::getIntToPtr(
-    //         ConstantInt::get(Type::getInt64Ty(Ctx), Mirror), PtrTy);
-    //     emitReplaceCall(CB, MirrorPtr, *BaseID);
-    //     return true;
-    //   Tests: 320-329 reserved.
-    //
-    // FinalFieldBarrier elide -- virtualize deletes a final-field publication
-    // barrier when the receiver is virtual. No frontend producer exists yet
-    // (`jeandle.final_field_barrier` is not emitted), so this remains
-    // deferred. Register-finalizer is handled by
-    // foldRegisterFinalizerIfNeeded once the frontend emits the explicit
-    // `jeandle.register_finalizer_if_needed(oop)` JavaOp.
-    //   Wiring sketch when `jeandle.final_field_barrier` lands:
-    //     if (isJeandleFinalFieldBarrier(CB)) {
-    //       auto BaseID = jeandle::pea::resolveVirtualRef(CB->getArgOperand(0),
-    //                                                     CurrentState,
-    //                                                     Aliases, DL);
-    //       if (!BaseID) return false;
-    //       emitReplaceCall(CB, nullptr, *BaseID);
-    //       return true;
-    //     }
-    //   Tests: 320-329 reserved.
-    //
-    // EnsureVirtualized — lets clients demand PEA succeed for a specific
-    // oop; on failure the compilation bails. The loop fixpoint's
-    // MATERIALIZE_ALL fallback is the "would-have-to-materialize" point
-    // and is now in place, so Phase 2 is technically actionable.
-    //   Status: DEFERRED. No frontend producer exists. There is no
-    //   `jeandle.ensure_virtualized` JavaOp and no other path that marks a
-    //   VirtualObject as must-stay-virtual. Adding the
-    //   `EnsureVirtualized` bit on VirtualObject + the
-    //   MATERIALIZE_ALL-time hard-bail check would be dead code in this
-    //   fork (the flag is never set, so the check never fires). This
-    //   matches the project rule "no dead code without a production
-    //   caller" already applied to the reachability_fence wiring above.
-    //   Wiring sketch when frontend producer lands:
-    //     Phase 1: add `bool EnsureVirtualized = false;` to VirtualObject
-    //              (PartialEscape.h §1.1, alongside MustPreserveLocks /
-    //              IdentityHashObserved); duplicate() copies it.
-    //     Phase 2: in processLoop's MATERIALIZE_ALL fallback, BEFORE
-    //              swapping CurrentMode to Mode::MaterializeAll, walk
-    //              every still-Eligible VO in CurrentState and if any has
-    //              EnsureVirtualized=true, abort PEA for this function
-    //              (clear Result.BlockEffects + Result.VirtualObjects,
-    //              skip commit, emit a debug diagnostic). The cleanest
-    //              integration point is a new PEAResult flag
-    //              (e.g. `bool Bailed = false;`) consulted at the top of
-    //              PartialEscapeTransform::apply.
-    //     Phase 3: frontend adds `jeandle.ensure_virtualized(oop)`. Match
-    //              it in tier2JavaOpFold: resolve receiver to a VO, set
-    //              EnsureVirtualized on that VO, replace the call with
-    //              undef (the node is purely advisory).
     //
     // §2.3.11/§2.3.12: equality compare against a virtual pointer folds.
     // Virtual objects are never null (by construction they track an in-flight
@@ -3051,129 +2866,6 @@ void Analyzer::applyThreeTier(Instruction *I) {
         bool Folded = false;
         bool EqResult = false;
         jeandle::ObjectID BaseID = jeandle::InvalidObjectID;
-        // Structural-equals fold for boxed primitive virtuals.
-        // When both operands resolve to DIFFERENT virtual IDs whose Klass
-        // is one of the eight java.lang autobox wrapper classes AND both
-        // wrap the same primitive kind AND neither carries any live
-        // monitor lock, replace the identity comparison with a value
-        // comparison over the boxed primitives (when both inputs are
-        // boxed virtuals of the same JavaKind, the identity check is
-        // semantically equivalent to comparing the unboxed values).
-        //
-        // PEA always creates a fresh virtual at each `jeandle.new_instance`
-        // (no box-cache lookup is modeled in the analyzer), so the
-        // identity-based path below would conservatively fold to false
-        // for two distinct boxed VOs even when they wrap equal primitive
-        // values — strictly weaker than what Java's
-        // `Integer.valueOf(x).equals(Integer.valueOf(y))` semantics
-        // imply. The structural fold restores precision; soundness
-        // follows from "two virtuals never escape into the box cache
-        // before fold time" (PEA materializes each VO into a fresh oop
-        // until Phase 5 lands, but the fold here runs BEFORE any
-        // materialization decision and the icmp's result is the only
-        // visible effect we replace).
-        //
-        // Lit tests that don't register an IsBoxed VMCallback leave
-        // BoxedPrimitiveKind at the JBasicType::Count sentinel and this
-        // path stays inert (the identity-based folds below still fire as
-        // before).
-        bool BoxedFolded = false;
-        if (V0 && V1 && *V0 != *V1) {
-          jeandle::VirtualObject &VO0 = *Result.VirtualObjects[*V0];
-          jeandle::VirtualObject &VO1 = *Result.VirtualObjects[*V1];
-          if (VO0.isBoxedPrimitive() &&
-              VO0.BoxedPrimitiveKind == VO1.BoxedPrimitiveKind &&
-              Eligible.lookup(*V0) && Eligible.lookup(*V1) &&
-              LockCounts.lookup(*V0) == 0 && LockCounts.lookup(*V1) == 0) {
-            jeandle::JBasicType Kind =
-                static_cast<jeandle::JBasicType>(VO0.BoxedPrimitiveKind);
-            Type *ValTy = jeandle::pea::llvmElementTypeFor(Kind,
-                                                            F.getContext());
-            if (ValTy) {
-              // Look up the boxed value from FieldStates: a boxed wrapper
-              // class has exactly one primitive instance field
-              // (Integer.value / Long.value / ...). We accept either the
-              // recorded scalar (when the constructor + store have been
-              // virtualized) or the default zero of the primitive type
-              // (when the value field was never explicitly stored — Java
-              // default semantics for an uninitialised primitive field).
-              auto getBoxedValue = [&](jeandle::ObjectID ID) -> Value * {
-                auto FIt = FieldStates.find(ID);
-                if (FIt != FieldStates.end()) {
-                  // Pick a scalar entry whose type matches the boxed
-                  // primitive. We do not assume a specific offset (HotSpot
-                  // sets java_lang_boxing_object::value_offset() at
-                  // VM-init time; without a VMCallback giving us that
-                  // value we instead key on type identity). Iterate the
-                  // map's recorded pairs deterministically by lowest
-                  // offset to avoid any DenseMap ordering nondeterminism
-                  // (we are about to issue a fold whose IR shape must be
-                  // stable across runs / replays).
-                  SmallVector<int64_t, 4> Offs;
-                  Offs.reserve(FIt->second.size());
-                  for (auto &Kv : FIt->second)
-                    Offs.push_back(Kv.first);
-                  llvm::sort(Offs);
-                  for (int64_t Off : Offs) {
-                    const jeandle::FieldValue &FV = FIt->second.lookup(Off);
-                    if (FV.isScalar() && FV.getScalar()->getType() == ValTy)
-                      return FV.getScalar();
-                  }
-                }
-                // No matching scalar found — default-zero per Java
-                // primitive-field initialisation.
-                return jeandle::FieldValue::defaultFor(ValTy);
-              };
-              Value *VA = getBoxedValue(*V0);
-              Value *VB = getBoxedValue(*V1);
-              if (VA && VB && VA->getType() == ValTy &&
-                  VB->getType() == ValTy) {
-                bool IsEqPred =
-                    (ICmp->getPredicate() == ICmpInst::ICMP_EQ);
-                Value *Repl = nullptr;
-                if (auto *CA = dyn_cast<Constant>(VA)) {
-                  if (auto *CB = dyn_cast<Constant>(VB)) {
-                    // Constant-fold the structural comparison.
-                    Repl = ConstantFoldCompareInstOperands(
-                        IsEqPred ? ICmpInst::ICMP_EQ : ICmpInst::ICMP_NE,
-                        CA, CB, DL);
-                  }
-                }
-                if (!Repl) {
-                  // Runtime structural compare: build an unparented ICmpInst
-                  // whose operands are the boxed primitive values, and let
-                  // the transform's ReplaceLoad handler splice it in just
-                  // before the original pointer ICmp. Mirrors the
-                  // coerceToType ownership pattern (see OwnedInsts in
-                  // PartialEscape.h).
-                  Repl = CmpInst::Create(
-                      Instruction::ICmp,
-                      IsEqPred ? ICmpInst::ICMP_EQ : ICmpInst::ICMP_NE,
-                      VA, VB, "pea.box.eq", /*InsertBefore=*/(Instruction *)nullptr);
-                  Repl->setName("pea.box.eq");
-                  if (ICmp->getDebugLoc())
-                    cast<Instruction>(Repl)->setDebugLoc(ICmp->getDebugLoc());
-                  Result.OwnedInsts.emplace_back(cast<Instruction>(Repl));
-                }
-                if (Repl) {
-                  jeandle::PEAResult::Effect E;
-                  E.Kind = jeandle::PEAResult::EffectKind::ReplaceLoad;
-                  E.Block = ICmp->getParent();
-                  E.Target = ICmp;
-                  E.Replacement = Repl;
-                  E.SeqNo = Result.nextSeqNo();
-                  E.ObjID = *V0;
-                  Result.addBlockEffect(std::move(E));
-                  if (auto *RC = dyn_cast<Constant>(Repl))
-                    Aliases.addScalarAlias(ICmp, RC);
-                  BoxedFolded = true;
-                }
-              }
-            }
-          }
-        }
-        if (BoxedFolded)
-          return;
         if (V0 && Op1IsNull) {
           Folded = true;
           EqResult = false;
@@ -3352,22 +3044,6 @@ void Analyzer::tier1Allocate(CallBase *CB) {
         jeandle::InvalidObjectID, jeandle::VirtualObject::Instance, CB);
     VO->Klass = Klass;
     VO->SizeInBytes = *Size;
-    // Tag this Instance VO with the boxed-primitive kind if
-    // its Klass is one of the eight java.lang autobox wrapper classes.
-    // The IsBoxed VMCallback returns the JBasicType integer of the boxed
-    // primitive (0..7) for boxed classes and 9 (JBasicType::Count) for
-    // everything else; we store the value verbatim so isBoxedPrimitive()
-    // is a single equality check. When the VMCallback isn't registered
-    // (lit tests without a cblog or callback wiring), the kind stays at
-    // the default 9 (Count) and the boxed-virtual fold paths stay inert.
-    if (const jeandle::VMCallbacks *VMCB = jeandle::getVMCallbacks()) {
-      if (VMCB->IsBoxed) {
-        int Kind = VMCB->IsBoxed(Klass);
-        if (Kind >= 0 &&
-            Kind < static_cast<int>(jeandle::JBasicType::Count))
-          VO->BoxedPrimitiveKind = static_cast<uint8_t>(Kind);
-      }
-    }
   } else {
     auto Length = jeandle::pea::extractArrayLength(CB);
     if (!Length)
@@ -3378,8 +3054,6 @@ void Analyzer::tier1Allocate(CallBase *CB) {
         jeandle::InvalidObjectID, jeandle::VirtualObject::Array, CB);
     VO->Klass = Klass;
     VO->ArrayLength = *Length;
-    // VO->ArrayLengthVal was a placeholder for symbolic-length
-    // arrays; never read by the analyzer or transform.
     // Populate per-element metadata so matchArrayElementGEP can match
     // typed-GEP / symbolic-byte-offset element accesses. If the VMCallback
     // is unregistered or cannot identify the element kind, leave
@@ -3902,11 +3576,6 @@ bool Analyzer::foldCheckCast(CallBase *CB) {
   return true;
 }
 
-bool Analyzer::foldCheckInstanceOf(CallBase *CB) {
-  // Same shape as foldCheckCast: (super_klass, oop) -> i1.
-  return foldCheckCast(CB);
-}
-
 bool Analyzer::foldInstanceOf(CallBase *CB) {
   if (CB->arg_size() < 2)
     return false;
@@ -4256,7 +3925,7 @@ bool Analyzer::tier2JavaOpFold(CallBase *CB) {
   if (isJeandleArrayLength(CB))       return foldArrayLength(CB);
   if (isJeandleLoadKlass(CB))         return foldLoadKlass(CB);
   if (isJeandleCheckCast(CB))         return foldCheckCast(CB);
-  if (isJeandleCheckInstanceOf(CB))   return foldCheckInstanceOf(CB);
+  if (isJeandleCheckInstanceOf(CB))   return foldCheckCast(CB);
   if (isJeandleInstanceOf(CB))        return foldInstanceOf(CB);
   if (isJeandleMonitorEnter(CB))      return foldMonitorEnter(CB);
   if (isJeandleMonitorExit(CB))       return foldMonitorExit(CB);
@@ -4377,8 +4046,6 @@ void Analyzer::bumpMaterializeStat(MatReason R) {
     break;
   case MatReason::PHI:
     ++JeandlePEAMaterializedPHI;
-    break;
-  case MatReason::Unknown:
     break;
   }
 }
@@ -4982,21 +4649,19 @@ void Analyzer::materializePreheaderVirtualsForUnvisitedLoops() {
     if (!PH) {
       // Loops without a unique preheader are drained in-place by
       // processLoop (it materialises every still-virtual VO at every
-      // forward header predecessor and marks the loop in PessimisticLoops
-      // so the VisitedLoops gate below short-circuits). This branch is
-      // a defense-in-depth no-op: the safety net cannot pick a single
-      // PH to drain at when none exists, so the only sound action here
-      // is to skip.
+      // forward header predecessor). This branch is a defense-in-depth
+      // no-op: the safety net cannot pick a single PH to drain at when
+      // none exists, so the only sound action here is to skip.
       continue;
     }
-    // Strict gate on VisitedLoops. Every loop processLoop
-    // touched — whether it converged (ConvergedLoops), fell into the
-    // pessimistic MATERIALIZE_ALL fallback (PessimisticLoops), or hit
-    // the overflow-recovery retry path — already had its
-    // preheader virtuals handled inside processLoop. The only loops
-    // that need this safety-net drain are those processLoop never
-    // visited (an unreachable top-level loop the RPO walk skipped, or
-    // a sub-loop whose outer recursion returned early on OverflowFlag).
+    // Strict gate on VisitedLoops. Every loop processLoop touched —
+    // whether the body fixpoint converged, fell into the pessimistic
+    // MATERIALIZE_ALL fallback, or hit the overflow-recovery retry path
+    // — already had its preheader virtuals handled inside processLoop.
+    // The only loops that need this safety-net drain are those
+    // processLoop never visited (an unreachable top-level loop the RPO
+    // walk skipped, or a sub-loop whose outer recursion returned early
+    // on OverflowFlag).
     if (VisitedLoops.count(L))
       continue;
     auto It = BlockExits.find(PH);
@@ -5635,10 +5300,6 @@ void Analyzer::processLoop(Loop *L) {
     // ineligibility sweep above doesn't touch them. The fixpoint we
     // can't run is irrelevant for such allocs because they don't cross
     // the back-edge.
-    //
-    // Mark L in PessimisticLoops so the safety-net materializeBeforeLoops()
-    // doesn't try to find a preheader to drain at.
-    PessimisticLoops.insert(L);
 
     // Collect forward (non-loop-back) predecessors of the header.
     llvm::SmallVector<BasicBlock *, 4> ForwardPreds;
@@ -5793,7 +5454,6 @@ void Analyzer::processLoop(Loop *L) {
   KnownAliveLoopEnds.clear();
 
   if (Converged) {
-    ConvergedLoops.insert(L);
     // Force-materialise at exits that flow into EH pads, so
     // exception handlers never see partially-materialised loop-internal
     // virtuals.
@@ -5826,9 +5486,7 @@ void Analyzer::processLoop(Loop *L) {
   for (BasicBlock *BB : LoopBlocks)
     BlockExits.erase(BB);
 
-  // Drain preheader virtuals at PH terminator. Marks the loop so the
-  // tail materializeBeforeLoops() sweep won't double-drain it.
-  PessimisticLoops.insert(L);
+  // Drain preheader virtuals at PH terminator.
   {
     auto It = BlockExits.find(Preheader);
     if (It != BlockExits.end()) {

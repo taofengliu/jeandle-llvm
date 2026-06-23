@@ -424,17 +424,8 @@ std::optional<int64_t> resolveFieldOffset(Value *Ptr, const DataLayout &DL) {
     const unsigned PtrBits =
         DL.getPointerSizeInBits(GEP->getPointerAddressSpace());
 
-    // Pattern 1: Jeandle-canonical i8-typed single-index GEP.
-    if (GEP->getNumIndices() == 1 &&
-        GEP->getSourceElementType()->isIntegerTy(8)) {
-      if (auto *CI = dyn_cast<ConstantInt>(GEP->getOperand(1))) {
-        APInt V = CI->getValue().sextOrTrunc(PtrBits);
-        return V.getSExtValue();
-      }
-      return std::nullopt;
-    }
-
-    // Patterns 2/3: arbitrary GEP with all-constant indices.
+    // Arbitrary GEP with all-constant indices. accumulateConstantOffset
+    // already covers the Jeandle-canonical i8 single-index form.
     APInt Acc(PtrBits, 0, /*isSigned=*/true);
     if (GEP->accumulateConstantOffset(DL, Acc))
       return Acc.getSExtValue();

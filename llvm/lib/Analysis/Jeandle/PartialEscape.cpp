@@ -53,17 +53,6 @@ static llvm::cl::opt<bool> JeandleTracePEA(
 // VirtualObject
 // ===========================================================================
 
-int VirtualObject::getFieldIndex(int64_t Offset, uint8_t ByteSize) const {
-  // Fields are kept sorted by Offset; do a binary search for an exact
-  // (Offset, ByteSize) match.
-  auto It = std::lower_bound(
-      Fields.begin(), Fields.end(), Offset,
-      [](const FieldDesc &F, int64_t Off) { return F.Offset < Off; });
-  if (It == Fields.end() || It->Offset != Offset || It->ByteSize != ByteSize)
-    return -1;
-  return static_cast<int>(It - Fields.begin());
-}
-
 int VirtualObject::getOrCreateFieldIndex(int64_t Offset, Type *Ty) {
   assert(Ty && "field type must be non-null");
   uint8_t ByteSize = 0;
@@ -107,19 +96,6 @@ int VirtualObject::getOrCreateFieldIndex(int64_t Offset, Type *Ty) {
   FieldDesc New{Offset, Ty, ByteSize, IsReference};
   auto NewIt = Fields.insert(It, New);
   return static_cast<int>(NewIt - Fields.begin());
-}
-
-int VirtualObject::getArrayLengthFieldIndex() const {
-  assert(Kind == Array);
-  return getFieldIndex(ArrayLengthSlotOffset, /*ByteSize=*/4);
-}
-
-int64_t VirtualObject::arrayElementOffset(uint32_t Index) const {
-  assert(Kind == Array);
-  if (Index >= ArrayLength)
-    return -1;
-  return static_cast<int64_t>(ArrayBaseOffset) +
-         static_cast<int64_t>(Index) * static_cast<int64_t>(ArrayIndexScale);
 }
 
 // Strip identity-preserving wrappers (freeze, bitcast, zext, sext) from an
@@ -275,10 +251,6 @@ VirtualObject::matchArrayElementGEP(GetElementPtrInst *GEP,
   return std::nullopt;
 }
 
-Type *VirtualObject::getMaterializedType(LLVMContext &Ctx) {
-  return PointerType::get(Ctx, jeandle::AddrSpace::JavaHeapAddrSpace);
-}
-
 std::unique_ptr<VirtualObject> VirtualObject::duplicate() const {
   // The clone is detached: ID is set to InvalidObjectID and the caller is
   // expected to register it via PEAResult::createVirtualObject to obtain a
@@ -292,13 +264,6 @@ std::unique_ptr<VirtualObject> VirtualObject::duplicate() const {
   Clone->ArrayIndexScale = ArrayIndexScale;
   Clone->ArrayBaseOffset = ArrayBaseOffset;
   Clone->Fields = Fields;
-  Clone->IsSingleUsageAllocation = false;
-  Clone->IdentityHashObserved = IdentityHashObserved;
-  // Carry the boxed-primitive tag across duplicate() so the synthetic
-  // Case-C VO produced by synthesizeCaseC inherits the boxed kind from its
-  // per-pred sources (we only enter the boxed-merge identity-bail-drop
-  // path when every per-pred VO carries the same BoxedPrimitiveKind).
-  Clone->BoxedPrimitiveKind = BoxedPrimitiveKind;
   // Synthetic-state fields are NOT copied — duplicate() is shared by the
   // generic VirtualObject clone path AND the Case C synthesis path; the
   // latter sets IsSynthetic/SyntheticSourceIDs/SyntheticPhi explicitly after
@@ -368,19 +333,6 @@ bool FieldValue::shallowEquals(const FieldValue &O) const {
   return false;
 }
 
-llvm::hash_code FieldValue::hash() const {
-  switch (T) {
-  case Unknown:
-    return llvm::hash_combine(static_cast<uint8_t>(T));
-  case Scalar:
-  case MaterializedRef:
-    return llvm::hash_combine(static_cast<uint8_t>(T), U.V);
-  case VirtualRef:
-    return llvm::hash_combine(static_cast<uint8_t>(T), U.Ref);
-  }
-  return llvm::hash_value(0);
-}
-
 // ===========================================================================
 // ObjectState
 // ===========================================================================
@@ -393,21 +345,6 @@ ObjectState ObjectState::clone() const {
   Copy.MaterializedValue = MaterializedValue;
   Copy.CopyOnWrite = false;
   return Copy;
-}
-
-llvm::hash_code ObjectState::hash() const {
-  llvm::hash_code H = llvm::hash_combine(static_cast<uint8_t>(Kind),
-                                          static_cast<unsigned>(Locks.size()));
-  // Fold each (EnterCall, BytecodeDepth) into the hash so two distinct lock
-  // stacks with the same size do not collide. Matches equivalentTo's compare.
-  for (const auto &L : Locks)
-    H = llvm::hash_combine(H, L.EnterCall, L.BytecodeDepth);
-  if (Kind == Materialized) {
-    return llvm::hash_combine(H, MaterializedValue);
-  }
-  for (const auto &E : Entries)
-    H = llvm::hash_combine(H, E.hash());
-  return H;
 }
 
 // ===========================================================================
@@ -535,12 +472,6 @@ PEABlockState::getArrayForModification() {
   return ObjectStates.get();
 }
 
-void PEABlockState::ensureSize(unsigned Size) {
-  auto *Arr = getArrayForModification();
-  if (Arr->size() < Size)
-    Arr->resize(Size);
-}
-
 void PEABlockState::addObject(ObjectID ID, ObjectState State) {
   assert(ID != InvalidObjectID);
   // Route the write through the helper-returned pointer so we never touch
@@ -588,47 +519,6 @@ ObjectState &PEABlockState::getObjectStateForModification(ObjectID ID) {
   return *Slot;
 }
 
-void PEABlockState::resetObjectStates(unsigned NumObjects) {
-  // Drop our hold on whatever backing vector we currently share; allocate a
-  // brand-new array + RefCount{1} that nobody else points at.
-  if (ArrayRefCount) {
-    assert(ArrayRefCount->Count >= 1 && "refcount underflow on reset");
-    --ArrayRefCount->Count;
-  }
-  ObjectStates =
-      std::make_shared<SmallVector<std::optional<ObjectState>, 8>>(NumObjects);
-  ArrayRefCount = std::make_shared<RefCount>();
-}
-
-void PEABlockState::adoptObjectStates(const PEABlockState &Other) {
-  // True shared_ptr handoff. No deep clone — we point at Other's backing
-  // vector AND Other's RefCount, then bump the count. On first share
-  // (Count was 1, becomes 2) mark every present ObjectState as
-  // CopyOnWrite so subsequent per-slot mutations on either side go through
-  // a slot clone rather than corrupting the peer's view.
-  if (!Other.ObjectStates) {
-    resetObjectStates(0);
-    return;
-  }
-  // Short-circuit if we already share with Other; the count is already
-  // accurate and there is no work to do.
-  if (ArrayRefCount == Other.ArrayRefCount)
-    return;
-  // Drop the ref we currently hold (typically the empty vector + Count{1}
-  // allocated by the default ctor that runs immediately before
-  // adoptObjectStates in the analyzer's per-block setup).
-  if (ArrayRefCount) {
-    assert(ArrayRefCount->Count >= 1 && "refcount underflow on adopt");
-    --ArrayRefCount->Count;
-  }
-  ObjectStates = Other.ObjectStates;
-  ArrayRefCount = Other.ArrayRefCount;
-  assert(ArrayRefCount && "Other had a backing vector but no RefCount?");
-  if (ArrayRefCount->Count == 1)
-    markAllSlotsShared(*ObjectStates);
-  ++ArrayRefCount->Count;
-}
-
 std::optional<ObjectID>
 PEABlockState::resolveVirtualRef(Value *V, const AliasMap &Aliases) const {
   // We need a DataLayout for the GEP-walking inside pea::resolveVirtualRef.
@@ -666,10 +556,6 @@ void AliasMap::addVirtualAlias(Value *V, ObjectID ID) {
 void AliasMap::addScalarAlias(Value *V, Value *Replacement) {
   assert(V && Replacement);
   ScalarAliases[V] = Replacement;
-  for (User *U : V->users()) {
-    if (auto *I = dyn_cast<Instruction>(U))
-      HasScalarReplacedInputs.insert(I);
-  }
 }
 
 void AliasMap::resetAlias(Value *V) {
@@ -689,43 +575,15 @@ Value *AliasMap::getScalarAlias(Value *V) const {
   return It == ScalarAliases.end() ? nullptr : It->second;
 }
 
-Value *AliasMap::resolve(Value *V, const PEABlockState &State) const {
-  if (!V)
-    return nullptr;
-  // Scalar replacement chain.
-  if (Value *S = getScalarAlias(V))
-    return S;
-  // Virtual alias: if the object is already materialized on this path, return
-  // the materialized pointer; otherwise return V unchanged (callers that
-  // care about the virtual identity must consult getVirtualAlias directly).
-  if (auto ID = getVirtualAlias(V)) {
-    if (const ObjectState *OS = State.getObjectStateOptional(*ID)) {
-      if (OS->isMaterialized())
-        return OS->getMaterializedValue();
-    }
-  }
-  return V;
-}
-
 void AliasMap::clear() {
   VirtualAliases.clear();
   ScalarAliases.clear();
   HasVirtualInputs.clear();
-  HasScalarReplacedInputs.clear();
 }
 
 AliasMap AliasMap::snapshot() const { return *this; }
 
 void AliasMap::restore(const AliasMap &S) { *this = S; }
-
-void AliasMap::invalidate(Value *V) {
-  VirtualAliases.erase(V);
-  ScalarAliases.erase(V);
-  if (auto *I = dyn_cast_or_null<Instruction>(V)) {
-    HasVirtualInputs.erase(I);
-    HasScalarReplacedInputs.erase(I);
-  }
-}
 
 // ===========================================================================
 // PEAResult
@@ -778,12 +636,6 @@ ObjectID PEAResult::createVirtualObject(std::unique_ptr<VirtualObject> VO) {
   Stamped->ArrayIndexScale = VO->ArrayIndexScale;
   Stamped->ArrayBaseOffset = VO->ArrayBaseOffset;
   Stamped->Fields = std::move(VO->Fields);
-  Stamped->IsSingleUsageAllocation = VO->IsSingleUsageAllocation;
-  Stamped->IdentityHashObserved = VO->IdentityHashObserved;
-  // Propagate the boxed-primitive tag installed by tier1Allocate (and
-  // inherited by the synthetic Case-C clone via duplicate()) into the
-  // re-stamped VO so downstream queries see the correct kind.
-  Stamped->BoxedPrimitiveKind = VO->BoxedPrimitiveKind;
   VirtualObjects.push_back(std::move(Stamped));
   return ID;
 }

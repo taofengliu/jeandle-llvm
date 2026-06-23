@@ -1,9 +1,0 @@
-# B10 test 263: Case C merge of two Integer (klass 9999) virtuals.
-# tier1Allocate fires twice for two Instance allocs, both Integer.
-RequiresStrictLockOrder = 1
-HasFinalizer 9999 = false
-CanVirtualize 9999 = true
-IsBoxed 9999 = 4
-HasFinalizer 9999 = false
-CanVirtualize 9999 = true
-IsBoxed 9999 = 4

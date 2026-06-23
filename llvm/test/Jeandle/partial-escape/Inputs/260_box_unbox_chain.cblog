@@ -1,6 +1,0 @@
-# B10 test 260: synthetic autobox + unbox chain on klass 9999 (Integer).
-# Single Instance alloc; tier1Allocate calls IsBoxed once.
-RequiresStrictLockOrder = 1
-HasFinalizer 9999 = false
-CanVirtualize 9999 = true
-IsBoxed 9999 = 4
