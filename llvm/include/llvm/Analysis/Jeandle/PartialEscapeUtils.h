@@ -52,32 +52,28 @@ bool isJeandleMonitorEnter(const CallBase *CB);
 bool isJeandleMonitorExit(const CallBase *CB);
 bool isJeandleRegisterFinalizerIfNeeded(const CallBase *CB);
 
-// Extract the Java element basic type from an array klass pointer that we
-// already have in hand (uintptr_t).  Currently a stub that returns
-// std::nullopt — a future hook into VMCallbacks will provide this.
+// Extract the Java element basic type from an array klass pointer.
+// TODO: returns std::nullopt when VMCallbacks are unavailable; pending
+// full VMCallbacks integration.
 std::optional<JBasicType> elementTypeForArrayKlass(uintptr_t ArrayKlass);
 
 // Map a JBasicType to its LLVM IR storage type for one element (e.g., Byte→i8,
 // Object→ptr addrspace(1)).  Returns nullptr if Kind == Count.
 Type *llvmElementTypeFor(JBasicType Kind, LLVMContext &Ctx);
 
-// Strip pointer-identity-preserving operations (bitcast, addrspacecast within
-// addrspace(1), freeze) and constant-offset GEPs, accumulating the constant
-// offset into *OutOffset.  Returns the root pointer.  Sets *NonConstant = true
-// if a non-constant GEP index was encountered (in which case the accumulated
-// offset is invalid).
-//
-// This is the structural helper that both resolveVirtualRef and
-// resolveFieldOffset use.
+// Strip pointer-identity-preserving operations (bitcast, addrspacecast
+// within addrspace(1), freeze) and constant-offset GEPs, accumulating the
+// constant offset into *OutOffset. Returns the root pointer. Sets
+// *NonConstant = true if a non-constant GEP index was encountered (then the
+// accumulated offset is invalid). Shared structural helper used by
+// resolveVirtualRef and resolveFieldOffset.
 Value *stripPointerCastsAndOffsets(Value *Ptr, const DataLayout &DL,
                                    int64_t *OutOffset, bool *NonConstant);
 
-// Resolve V to the ObjectID of the virtual object it names, in the current
-// State.  Returns std::nullopt if V does not resolve to a virtual object.
-// Algorithm cycle-safe via a small visited set.
-//
-// This is the canonical implementation; PEABlockState::resolveVirtualRef
-// delegates here.
+// Resolve V to the ObjectID of the virtual object it names in the current
+// State. Returns std::nullopt if V does not resolve to a virtual object.
+// Cycle-safe via a small visited set. Canonical implementation; the
+// PEABlockState::resolveVirtualRef overload delegates here.
 std::optional<ObjectID> resolveVirtualRef(Value *V,
                                           const PEABlockState &State,
                                           const AliasMap &Aliases,

@@ -8,10 +8,10 @@
 //
 //===----------------------------------------------------------------------===//
 //
-// Outer fixpoint. Runs the PartialEscapeAnalysis + PartialEscapeTransform
-// pair in a bounded loop, interleaving InstCombine + SimplifyCFG + ADCE
-// between rounds so that canonicalization can expose new scalar-replacement
-// opportunities for the next round.
+// Outer fixpoint. Runs PartialEscapeAnalysis + PartialEscapeTransform in a
+// bounded loop, interleaving canonicalization passes (ADCE + SimplifyCFG +
+// LoopSimplify + InstCombine) between rounds so new scalar-replacement
+// opportunities are exposed for the next round.
 //
 //===----------------------------------------------------------------------===//
 

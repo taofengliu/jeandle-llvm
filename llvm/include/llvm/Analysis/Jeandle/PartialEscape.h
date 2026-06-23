@@ -59,20 +59,14 @@ static constexpr ObjectID InvalidObjectID = ~0u;
 // ObjectState's live lock stack. EnterCall is the original
 // jeandle.monitorenter call site (the effects-side anchor used when
 // un-eliding the call on materialisation); BytecodeDepth is the
-// Java-bytecode-level monitor depth at the enter site, stable across
-// re-pushes within a loop fixpoint. When the JDK frontend supplies a
-// `!jeandle.lock_depth = !{i32 N}` metadata node on the call,
-// foldMonitorEnter uses that value. Lit tests that omit the metadata fall
-// back to the analyzer's monotonic NextLockEnterOrder proxy (so the depth is
-// then an Analyzer-run-monotonic identifier, NOT the true bytecode depth).
-// Cascade rules and merge-time stack-identity checks compare BytecodeDepth
-// instead of the Order proxy when the metadata is available. See also
-// LockEnter (private, PartialEscapeAnalysis.cpp), which mirrors this
-// struct for the analyzer-
-// side LiveLockEnters DenseMap and additionally carries the legacy Order
-// tag used by loop-fixpoint convergence checks (which must compare CallBase
-// identity ONLY because the Order is monotonically refreshed on every
-// re-push and so cannot be used for stable comparisons across iterations).
+// Java-bytecode-level monitor depth at the enter site, taken from the
+// `!jeandle.lock_depth` metadata when the JDK frontend supplies it, or
+// falling back to the analyzer's monotonic NextLockEnterOrder proxy in
+// lit tests that omit the metadata (then an Analyzer-run-monotonic id,
+// NOT the true bytecode depth). The analyzer-side mirror struct LockEnter
+// (PartialEscapeAnalysis.cpp) additionally carries an Order tag for
+// loop-fixpoint convergence checks, which compare CallBase identity only
+// since Order is refreshed on every re-push.
 struct MonitorIdRef {
   CallBase *EnterCall;
   uint32_t BytecodeDepth;
@@ -115,24 +109,21 @@ public:
 
   SmallVector<FieldDesc, 8> Fields;
 
-  // A "synthetic" VirtualObject is one created at a multi-pred merge by the analyzer's processBlockPhis when every incoming
-  // resolves to a DIFFERENT but COMPATIBLE virtual object (same Klass / kind /
-  // array dimensions / lock state, and the per-pred allocations have no other
-  // observable identity). Compatibility deliberately does NOT compare a
-  // per-instance field count: Fields is lazily populated (only stored offsets,
-  // path-dependent), so its size is not a structural invariant. The synthetic
-  // VO's Fields is the UNION of all per-pred Fields. There is no per-pred
-  // allocation backing this VO —
-  // AllocationCall is non-null (cloned from the first per-pred VO) but MUST
-  // NOT be erased or used as a Materialize effect target. SyntheticSourceIDs
-  // holds the per-pred VOs in PHI-incoming order; SyntheticPhi is the LLVM
-  // PHINode in the merge block that the new VO is aliased to. If the
-  // analyzer later attempts to materialize a synthetic VO (e.g. a downstream
-  // escape consumes the PHI), it conservatively marks both the synthetic VO
-  // AND every per-pred source VO ineligible so the original allocations and
-  // stores survive in IR — the cascade-materialize path (synthesized
-  // VirtualObject merged from per-pred sources, with materialization at
-  // each predecessor) is not implemented.
+  // A "synthetic" VirtualObject is created at a multi-pred merge by the
+  // analyzer's processBlockPhis when every incoming resolves to a DIFFERENT
+  // but COMPATIBLE virtual object (same Klass / kind / array dimensions /
+  // lock state, and the per-pred allocations have no other observable
+  // identity). Compatibility does NOT compare per-instance field count:
+  // Fields is lazily populated (path-dependent), so its size is not a
+  // structural invariant; the synthetic VO's Fields is the UNION of the
+  // per-pred Fields. There is no backing allocation — AllocationCall is
+  // non-null (cloned from the first per-pred VO) but MUST NOT be erased or
+  // used as a Materialize effect target. SyntheticSourceIDs holds the
+  // per-pred VOs in PHI-incoming order; SyntheticPhi is the merge-block
+  // PHINode the VO is aliased to. A later attempt to materialize a synthetic
+  // VO conservatively marks it and every per-pred source VO ineligible so
+  // the original allocations and stores survive.
+  // TODO(cascade-materialize): see PartialEscapeAnalysis.cpp materializeAt().
   bool IsSynthetic = false;
   SmallVector<ObjectID, 4> SyntheticSourceIDs;
   PHINode *SyntheticPhi = nullptr;
@@ -216,18 +207,15 @@ public:
 private:
   StateKind Kind = Virtual;
   SmallVector<FieldValue, 8> Entries;
-  // Per-VO live monitor stack. Each element is a MonitorIdRef
-  // identifying the (enter-call, bytecode-depth) pair pushed by a folded
-  // monitorenter on this VO whose matching monitorexit hasn't yet been seen
-  // on this path. The size is the count, and the additional EnterCall + BytecodeDepth fields are needed
-  // for (a) un-elision of the original calls on materialisation, (b) the
-  // narrow cascade rule (other.front().BytecodeDepth < this.back().
-  // BytecodeDepth), and (c) merge-time stack-identity comparisons. The
-  // analyzer keeps a parallel DenseMap (LiveLockEnters) for run-wide
-  // bookkeeping because the snapshot/restore plumbing for BlockExitData is
-  // keyed by ObjectID rather than per-VO ObjectState; this on-VO copy mirrors
-  // the per-VO truth for callers that already hold an ObjectState handle and
-  // is kept in lockstep with the DenseMap by foldMonitorEnter / foldMonitorExit.
+  // Per-VO live monitor stack: each element is a MonitorIdRef identifying
+  // the (enter-call, bytecode-depth) pair pushed by a folded monitorenter
+  // on this VO whose matching monitorexit hasn't yet been seen on this
+  // path. The EnterCall + BytecodeDepth fields are needed for un-elision
+  // of the original calls on materialisation, the narrow cascade rule, and
+  // merge-time stack-identity comparisons. The analyzer keeps a parallel
+  // LiveLockEnters DenseMap keyed by ObjectID; this on-VO copy mirrors the
+  // per-VO truth and is kept in lockstep by foldMonitorEnter /
+  // foldMonitorExit.
   SmallVector<MonitorIdRef, 2> Locks;
   Value *MaterializedValue = nullptr;
   // CopyOnWrite is logically a sharing annotation, not part of the object's
@@ -269,14 +257,12 @@ public:
   bool hasLocks() const { return !Locks.empty(); }
   // Element-wise lock-stack comparison used by the depth-aware merge-time
   // stack-identity check (mergeStates) and the pre-cascade in
-  // foldMonitorEnter. Compares both EnterCall AND BytecodeDepth when the
-  // JDK frontend supplies !jeandle.lock_depth metadata. When the metadata
-  // is absent (lit tests, JDK build that predates Phase-1 emission), the
-  // BytecodeDepth field holds the Analyzer's monotonic NextLockEnterOrder
-  // proxy; that proxy is stable for the duration of a single processBlock
-  // walk but is refreshed on every loop-fixpoint re-push, which is why the
-  // analyzer-side per-block snapshot identity (BlockExitData) intentionally
-  // compares only EnterCall — see blockExitInfoEquivalent for the rationale.
+  // foldMonitorEnter. Compares both EnterCall and BytecodeDepth. When
+  // !jeandle.lock_depth metadata is absent, BytecodeDepth holds the
+  // Analyzer's NextLockEnterOrder proxy, which is stable within a single
+  // processBlock walk but refreshed on every loop-fixpoint re-push — which
+  // is why the analyzer-side BlockExitData snapshot identity compares only
+  // EnterCall (see blockExitInfoEquivalent).
   bool locksEqual(const ObjectState &Other) const {
     if (Locks.size() != Other.Locks.size())
       return false;
@@ -328,17 +314,11 @@ public:
 
 class PEABlockState {
 public:
-  // Refcount object shared by every PEABlockState that holds the same
-  // ObjectStates backing vector.
-  // Count == 1 means we are the sole owner: mutations may happen in place.
-  // Count > 1 means the backing is shared with at least one other block
-  // state: any mutator must clone the vector first (drop our ref, point
-  // at a fresh shared_ptr<vector>, fresh RefCount{1}).
-  //
-  // Invariant: ObjectStates and ArrayRefCount are always cloned/shared in
-  // lockstep. If two PEABlockStates have the same shared_ptr<RefCount> they
-  // also have the same shared_ptr<SmallVector>, and vice versa. Every code
-  // path that touches one MUST touch the other.
+  // Refcount shared by every PEABlockState that holds the same ObjectStates
+  // vector: Count == 1 means sole owner (mutate in place); Count > 1 means
+  // shared (a mutator must clone first). ObjectStates and ArrayRefCount are
+  // always cloned/shared in lockstep — every code path that touches one MUST
+  // touch the other.
   struct RefCount {
     mutable unsigned Count = 1;
   };
@@ -461,11 +441,10 @@ public:
     uint32_t SeqNo = 0;
 
     Instruction *Target = nullptr;
-    // Tracked via WeakTrackingVH so that erasing the chosen insertion-point
-    // instruction (e.g. when a lower-SeqNo ReplaceLoad / ReplaceCall effect on
-    // the same instruction runs first within a block) auto-nulls the handle.
-    // applyMaterialize detects the null and recomputes a fresh safe IP at the
-    // head of the alloc's normal-dest block, avoiding a use-after-free in
+    // WeakTrackingVH so that erasing the insertion-point instruction (e.g. a
+    // lower-SeqNo effect on the same instruction running first within a block)
+    // auto-nulls the handle. applyMaterialize then recomputes a fresh IP at
+    // the head of the alloc's normal-dest block, avoiding a use-after-free in
     // splitBasicBlock.
     WeakTrackingVH InsertBefore;
 
@@ -476,12 +455,11 @@ public:
     SmallVector<Value *, 4> PHIIncomingValues;
     SmallVector<BasicBlock *, 4> PHIIncomingBlocks;
 
-    // The unparented PHINode created by the analyzer for a CreatePHI
-    // effect. The transform inserts it into Block and adds incomings using
-    // PHIIncomingValues / PHIIncomingBlocks. Ownership is held by
-    // PEAResult::OwnedPhis until the transform inserts it; once inserted,
-    // the parent BasicBlock owns it via its ilist, and the destructor
-    // skips it.
+    // The unparented PHINode created by the analyzer for a CreatePHI effect.
+    // The transform inserts it into Block and adds incomings from
+    // PHIIncomingValues / PHIIncomingBlocks. Owned by PEAResult::OwnedPhis
+    // until insertion; once inserted, the parent BasicBlock owns it via its
+    // ilist and the destructor skips it.
     PHINode *PhiInst = nullptr;
 
     // Per-offset field-value snapshot for Materialize effects.
@@ -493,22 +471,18 @@ public:
     // original allocation invoke.
     Instruction *DeoptBundleSource = nullptr;
 
-    // Materialize-effect flag: when true, the effect is one
-    // of multiple per-pred materializations for the same OrigAlloc. The
-    // transform must NOT do a global RAUW for this materialize because the
-    // first-wins RAUW would inject this pred's NewInv into uses on OTHER
-    // preds, breaking SSA. Pre-merge per-pred uses (un-elided enters) are
-    // rewired via ReplaceInput effects with MatPerBlock lookup; post-merge
-    // uses are rewired by the matching CreatePHI effect (RAUWOrigToPHI).
+    // Materialize-effect flag: true when this effect is one of multiple
+    // per-pred materializations for the same OrigAlloc. The transform must
+    // NOT do a global RAUW here — it would inject this pred's NewInv into
+    // uses on OTHER preds, breaking SSA. Pre-merge per-pred uses (un-elided
+    // enters) are rewired via ReplaceInput effects (MatPerBlock lookup);
+    // post-merge uses are rewired by the matching CreatePHI effect.
     bool IsPerPred = false;
 
-    // CreatePHI-effect flag: when true, after wiring the
-    // PHI's incomings (via MatPerBlock for per-pred placeholders), RAUW
-    // every remaining use of the VO's OrigAlloc onto the PHI. This handles
-    // the post-merge uses that the per-pred IsPerPred Materialize effects
-    // intentionally left untouched. Coupled with IsPerPred Materialize:
-    // applyMaterialize defers all OrigAlloc rewiring, and the CreatePHI
-    // here drives the final RAUW so post-merge users see the PHI.
+    // CreatePHI-effect flag: when true, after wiring the PHI's incomings,
+    // RAUW every remaining use of the VO's OrigAlloc onto the PHI. Handles
+    // the post-merge uses that the IsPerPred Materialize effects left
+    // untouched; the final RAUW drives them onto the PHI.
     bool RAUWOrigToPHI = false;
   };
 
@@ -527,43 +501,34 @@ public:
   SmallVector<WeakTrackingVH, 4> OwnedPhis;
 
   // Non-PHI Instructions created (unparented) by the analyzer for
-  // ReplaceLoad effects, e.g. a `bitcast` synthesized by `coerceToType` to
+  // ReplaceLoad effects (e.g. a `bitcast` synthesized by `coerceToType` to
   // bridge a same-bit-width type mismatch between a stored Scalar and the
-  // load's type. Same ownership/tracking rules as OwnedPhis: until the
-  // transform's ReplaceLoad handler splices the instruction in before its
-  // Target, the analyzer holds the unique owning reference; the destructor
-  // deletes any handle that is still non-null and unparented at PEAResult
-  // teardown. WeakTrackingVH guards against a UAF if the inserted coercion
-  // is later erased by the dead-code sweep.
+  // load's type). Same ownership rules as OwnedPhis: the transform splices
+  // the instruction in before its Target; the destructor deletes any
+  // handle still non-null and unparented at teardown. WeakTrackingVH guards
+  // against a UAF if the inserted coercion is later erased by the dead-code
+  // sweep.
   SmallVector<WeakTrackingVH, 4> OwnedInsts;
 
-  // PHI nodes synthesized by mergeStates at a LOOP HEADER block. Stored
-  // separately from OwnedPhis because they must SURVIVE rollback within the
-  // the loop-fixpoint iteration. The fixpoint may take up to 10 passes over
-  // the loop body; each pass re-runs mergeStates(Header) and would otherwise
-  // allocate a fresh PHI per (ID, offset) per iteration, ballooning
-  // OwnedPhis and (worse) producing fresh Value* pointers in FieldStates so
-  // the convergence check can never compare equal. The analyzer's
-  // LoopFieldPhiCache (keyed on (Header, ID, offset)) returns the same PHI
-  // across iterations; only the per-iteration CreatePHI Effect (in
-  // BlockEffects[Header]) is rebuilt — its PHIIncomingValues/Blocks list
-  // reflects whatever the LAST iteration's mergeStates computed. Ownership
-  // and lifecycle (delete-if-unparented at PEAResult teardown) are identical
-  // to OwnedPhis.
+  // PHI nodes synthesized by mergeStates at a LOOP HEADER block, stored
+  // separately from OwnedPhis because they must survive rollback within the
+  // loop-fixpoint iteration. Each iteration re-runs mergeStates(Header) and
+  // would otherwise allocate a fresh PHI per (ID, offset), producing fresh
+  // Value* pointers in FieldStates so the convergence check could never
+  // compare equal. The analyzer's LoopFieldPhiCache (keyed on
+  // (Header, ID, offset)) returns the same PHI across iterations; only the
+  // per-iteration CreatePHI Effect is rebuilt. Lifecycle is identical to
+  // OwnedPhis.
   SmallVector<WeakTrackingVH, 4> OwnedLoopFieldPhis;
 
-  // Parented LLVM PHIs the analyzer wants the transform to RAUW to
-  // poison + erase after the main Pass-2 EliminateAllocation sweep. Used
-  // for Case-B aliases on a virtual that ended up NeverEscapes: the PHI
-  // was registered as an alias for the VO so downstream loads/stores fold
-  // through the alias map, but the PHI itself is now dead in IR (every
-  // incoming was the VO's OrigAlloc, which Pass-2 just RAUW'd to poison).
-  // Without an explicit erase the PHI survives as
-  // `phi ptr addrspace(1) [poison, %a], [poison, %b]` until a downstream
-  // InstCombine canonicalisation reaps it; in single-shot PEA tests
-  // (no iterative wrapper) it survives forever. WeakTrackingVH so a
-  // parallel delete path (e.g. unreachable-block pruning) leaves a null
-  // handle that the transform safely skips.
+  // Parented LLVM PHIs the transform should RAUW to poison + erase after
+  // the main Pass-2 EliminateAllocation sweep. These are Case-B aliases on
+  // a virtual that ended up NeverEscapes: the PHI was registered as an
+  // alias so downstream loads/stores fold through the alias map, but the
+  // PHI itself is now dead (every incoming was the VO's OrigAlloc, which
+  // Pass-2 RAUW'd to poison). WeakTrackingVH so a parallel delete path
+  // (e.g. unreachable-block pruning) leaves a null handle the transform
+  // safely skips.
   SmallVector<WeakTrackingVH, 4> CaseBAliasedPhisToErase;
 
   PEAResult() = default;

@@ -6,73 +6,28 @@
 // Exceptions. See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Real partial-escape semantics. When a virtual object encounters an
-// instruction the analyzer can't fold (an "escape" point — generic call,
-// ret, store of the virtual into non-virtual memory, etc.) we record a
-// Materialize effect at that point. The transform pass re-emits a real
-// allocation immediately before the escape, replays the tracked field
-// stores, and RAUWs the original allocation's result with the new one. The
-// original allocation invoke is still erased via EliminateAllocation; the
-// virtually-folded stores/loads before the escape still apply.
+// Partial Escape Analysis. Tracks Java objects as addrspace(1) pointers that
+// are allocated at InvokeInst sites to jeandle.new_instance / jeandle.newarray
+// and have not yet escaped. On an escape point (generic call, ret, store into
+// non-virtual memory, ...) a Materialize effect is recorded; the transform
+// re-emits the allocation immediately before the escape, replays tracked field
+// stores, and RAUWs the original allocation. Effects partition into
+// non-CFG-kill (folded in place: ReplaceLoad, EliminateStore, ReplaceCall) and
+// CFG-kill (Materialize, CreatePHI), matching Graal's EffectList.isCfgKill().
 //
-// Multi-predecessor merge: every block's per-object exit state (Virtual /
-// Materialized, tracked field values, lock counts) is snapshotted into
-// BlockExits; at the top of every block we reconstruct the per-block state
-// either by inheriting from the unique pred's snapshot or by running
-// mergeStates() over all predecessors' snapshots. An object stays virtual
-// at BB's entry IFF every predecessor reports it Virtual, all predecessors
-// agree on the tracked field values at every offset, AND all predecessors
-// agree on the lock count. Any disagreement (mixed virtual / materialized,
-// missing on some path, field mismatch, lock mismatch) marks the object
-// ineligible — the commit() sweep drops every recorded effect for it and
-// the original IR survives unchanged.
+// Per-block exit state (virtual set, field values, lock counts) is snapshotted
+// into BlockExits; at each block header we inherit a single pred's snapshot or
+// run mergeStates() over all preds. An object stays virtual iff every pred is
+// Virtual and they agree on field values and lock counts; any disagreement
+// marks the object ineligible and commit() drops its effects.
 //
-// PHI handling. processBlockPhis classifies every explicit LLVM PHI of
-// a java-heap pointer at a multi-predecessor merge into one of three cases.
-// The classification depends on how the PHI's incoming values resolve
-// against the per-pred BlockExits virtual sets:
-//
-//   - Case A (mixed or fallback). At least one incoming is non-virtual,
-//     OR a Case C attempt bailed. For every virtual incoming the analyzer
-//     materializes the VO at that incoming's predecessor terminator; the
-//     PHI itself stays in IR as a real-pointer merge over the materialized
-//     allocations and the already-non-virtual incomings.
-//
-//   - Case B (uniform ID). Every incoming resolves to the SAME ObjectID
-//     AND the object is still virtual at merge entry. The PHI is registered
-//     as an alias for that ObjectID in AliasMap so downstream load/store
-//     handlers fold through it; no new VO and no materialization. If the
-//     underlying allocation is later eliminated by Pass 2, the PHI is dead
-//     (all incomings RAUW'd to poison) and is erased explicitly so the IR
-//     doesn't carry a `phi [poison, ..., poison]` artefact past PEA.
-//
-//   - Case C (compatible but distinct IDs). Every incoming carries a
-//     virtual ObjectID but the IDs DIFFER across incomings. synthesizeCaseC
-//     attempts to merge them into a single synthetic VirtualObject (cloned
-//     from the first per-pred VO). Compatibility requires identical Klass /
-//     kind / array dimensions / lock state across preds, plus an identity check
-//     (the PHI is the only external LLVM user of each per-pred alloc, and
-//     no other VO references the per-pred VOs via virtualRef). Per-entry
-//     field PHIs are emitted for offsets where the per-pred values
-//     disagree; agreeing entries fold to a single value. If the synthetic
-//     VO later requires materialization (e.g. a downstream escape consumes
-//     the PHI), it is conservatively dropped: both the synthetic VO and
-//     every per-pred source VO are marked ineligible so the original IR
-//     survives. The cascade-materialize path that keeps the PHI as
-//     the materialized pointer is deferred to a future task. On any
-//     compatibility / identity / per-entry-type failure the PHI falls
-//     through to Case A.
-//
-// Lock cascade: when materializing a virtual whose LockCount > 0, the
-// analyzer (1) drops the previously-recorded ReplaceCall(true) effects
-// targeting the unbalanced enter call sites, (2) emits ReplaceInput effects
-// retargeting each enter's first operand onto the materialized pointer, and
-// (3) clears the live stack. Matching exits downstream of the escape point
-// are not elided in the first place (foldMonitorExit on a materialized
-// object returns false) and survive in IR. Under
-// the runtime's RequiresStrictLockOrder VMCallback (overridable via the
-// JeandleAssumeStrictLockOrder cl::opt for tests), every other still-locked
-// virtual is also cascaded into materialization at the same insertion point.
+// At multi-pred merges, explicit LLVM PHIs of heap pointers are classified:
+// Case A (a non-virtual incoming or a Case-C bail) materializes each virtual
+// incoming at its pred; Case B (uniform ObjectID, still virtual) registers the
+// PHI as an alias; Case C (distinct but compatible IDs) synthesizes one VO
+// cloned from the first per-pred VO. A synthetic VO that later needs
+// materialization is dropped together with its per-pred sources (see
+// TODO(cascade-materialize) in materializeAt).
 //
 //===----------------------------------------------------------------------===//
 
@@ -155,14 +110,11 @@ static llvm::cl::opt<bool> JeandleDumpPEAStats(
     llvm::cl::desc("PEA: dump per-function NeverEscapes / PartiallyEscapes "
                    "/ AlwaysEscapes counts on errs() after analysis."));
 
-// Cascade other still-locked virtuals at materialization when the target
-// uses HotSpot's lightweight locking (LM_LIGHTWEIGHT requires strict lock
-// nesting on the runtime stack). The effective value is resolved per-run
-// by Analyzer::resolveStrictLockOrder(): an explicit command-line setting
-// (getNumOccurrences() > 0) wins for testing override, otherwise the
-// RequiresStrictLockOrder VMCallback is consulted. Final fallback (no
-// callback registered, no override) is true, matching JDK 21+ defaults
-// on x86_64.
+// Cascade other still-locked virtuals at materialization when the target uses
+// HotSpot's lightweight locking (LM_LIGHTWEIGHT requires strict lock nesting).
+// Resolved per-run by resolveStrictLockOrder(): explicit cl override wins,
+// otherwise the RequiresStrictLockOrder VMCallback is consulted; final
+// fallback is true (JDK 21+ x86_64 default).
 static llvm::cl::opt<bool> JeandleAssumeStrictLockOrder(
     "jeandle-assume-strict-lock-order", llvm::cl::init(true), llvm::cl::Hidden,
     llvm::cl::desc("PEA: testing override for whether the target VM requires "
@@ -170,41 +122,30 @@ static llvm::cl::opt<bool> JeandleAssumeStrictLockOrder(
                    "materialization). When unset, the value is queried from "
                    "the RequiresStrictLockOrder VM callback."));
 
-// Cap on array length for virtualization candidates. Promoted to a
-// hidden cl::opt so tests can override it without rebuilding; the default
-// is 128. A JVM-tunable surface (-XX:JeandleMaxEscapeAnalysisArrayLength=N)
-// can map onto this later without churn to the data structures.
+// Cap on array length for virtualization candidates (default 128). Hidden
+// cl::opt so tests can override without rebuilding.
 static llvm::cl::opt<unsigned> MaximumEscapeAnalysisArrayLength(
     "jeandle-pea-max-array-length", llvm::cl::init(128), llvm::cl::Hidden,
     llvm::cl::desc("PEA: cap on array length eligible for virtualization. "
                    "Larger arrays bypass PEA. Default 128."));
 
-// Testing-only knob — when true, every top-level processLoop entry
-// immediately switches to Mode::MaterializeAll for the duration of the
-// fixpoint, so the deferred end-of-block Materialize emission path is
-// exercised without having to construct a pathological non-converging
-// fixpoint in the IR. Default off; lit tests opt in via
-// -jeandle-pea-force-materialize-all=true. Not surfaced through any
-// VMCallback or runtime knob — purely a debug / test aid.
+// Testing-only knob: when true, every top-level processLoop entry switches to
+// Mode::MaterializeAll for the whole fixpoint, exercising the deferred
+// end-of-block Materialize emission path without constructing a pathological
+// non-converging fixpoint. Default off; not surfaced to the VM.
 static llvm::cl::opt<bool> JeandlePEAForceMaterializeAll(
     "jeandle-pea-force-materialize-all", llvm::cl::init(false), llvm::cl::Hidden,
     llvm::cl::desc("PEA: force every top-level processLoop into "
                    "Mode::MaterializeAll on entry. Testing aid for "
                    "virtualize-then-materialise coverage."));
 
-// Loop nesting DEPTH threshold for the 3-state mode machine. When a
-// top-level processLoop encounters a nest whose maximum loop depth exceeds
-// this value, the analyzer transiently enters Mode::StopNewInLoopNest for
-// the duration of that nest: tier1Allocate refuses to register NEW virtual
-// allocations inside the nest, but every other operation (already-virtual
-// merge / lock / load-fold / store-fold) continues unchanged. This bounds
-// the worst-case exponential cost of processing a very deep nest while
-// preserving virtualisation for objects allocated outside the nest.
-// Default 20.
-//
-// IMPORTANT: this is the DEPTH cutoff. Distinct from Analyzer::
-// kMaxLoopFixpointIters (10), which caps the number of BODY iterations
-// within a single processLoop fixpoint.
+// Loop nesting DEPTH threshold. When a top-level processLoop encounters a
+// nest whose maximum depth exceeds this value, the analyzer transiently
+// enters Mode::StopNewInLoopNest: tier1Allocate refuses NEW virtual
+// allocations inside the nest, but all other operations continue. Bounds the
+// worst-case cost of a deep nest while preserving virtualisation for objects
+// allocated outside it. Default 20. Distinct from kMaxLoopFixpointIters (10),
+// which caps BODY iterations within a single fixpoint.
 static llvm::cl::opt<unsigned> JeandlePEALoopCutoff(
     "jeandle-pea-loop-cutoff", llvm::cl::init(20), llvm::cl::Hidden,
     llvm::cl::desc("PEA: loop nesting depth threshold. When a nest's maximum "
@@ -236,28 +177,13 @@ AnalysisKey PartialEscapeAnalysis::Key;
 namespace {
 
 // A live (still-unbalanced) monitorenter on a virtual object.
-// The Call is the original jeandle.monitorenter call site (used by
-// materializeAt to undo the ReplaceCall elision). Two depth-style fields are
-// carried side-by-side:
-//   * Order is a per-Analyzer-run, strictly monotonically increasing tag
-//     assigned at every push to any LiveLockEnters stack. It is the legacy
-//     proxy for monitor lock-depth and is still consulted by
-//     blockExitInfoEquivalent comparisons of LiveLockEnters across
-//     loop-fixpoint iterations (where it is intentionally IGNORED —
-//     the fixpoint convergence check compares Call identity only because
-//     Order is monotonically refreshed on every re-push and would otherwise
-//     diverge forever).
-//   * BytecodeDepth is the Java-bytecode-level monitor depth at the enter
-//     site. When the JDK frontend supplies a `!jeandle.lock_depth`
-//     i32 metadata node on the call, foldMonitorEnter reads it and stores
-//     the value here. When the metadata is absent (lit tests, or a JDK
-//     build that predates Phase-1 emission), the field falls back to the
-//     Order value at push time — sound for the duration of a single
-//     processBlock walk but, like Order, unstable across loop-fixpoint
-//     iterations (so the fixpoint check continues to ignore both).
-// Cascade decisions (PEA narrow rule, pre-cascade, Phase-2 merge-time
-// stack-identity) compare BytecodeDepth when the metadata is supplied and
-// otherwise degrade to the existing Order proxy.
+//   * Call is the original jeandle.monitorenter call site (used by
+//     materializeAt to undo the ReplaceCall elision).
+//   * BytecodeDepth is the Java-bytecode monitor depth, read from the
+//     `!jeandle.lock_depth` metadata on the call when present; otherwise it
+//     falls back to a per-run-monotonic Order proxy. Both are unstable across
+//     loop-fixpoint iterations, so the convergence check compares Call only.
+// Cascade decisions and merge-time stack-identity compare BytecodeDepth.
 struct LockEnter {
   llvm::CallBase *Call;
   uint32_t Order;
@@ -502,22 +428,19 @@ private:
   // reverted before processLoop returns.
   Mode CurrentMode = Mode::Regular;
 
-  // 2-stage MATERIALIZE_ALL escalation tracking. Set true the
-  // first time a top-level processLoop escalates from Regular to
-  // MATERIALIZE_ALL. If the MATERIALIZE_ALL body pass STILL fails to
-  // converge, the second observation triggers a hard bail (unreachable in
-  // debug, return without commit in release). Cleared on every top-level
-  // processLoop entry to keep the bound per-nest.
+  // 2-stage MATERIALIZE_ALL escalation tracking. Set true the first time a
+  // top-level processLoop escalates from Regular to MATERIALIZE_ALL; if the
+  // MATERIALIZE_ALL body pass STILL fails to converge, the second
+  // observation triggers a hard bail (unreachable in debug, return without
+  // commit in release). Cleared on every top-level processLoop entry.
   bool TooManyIterationsSeen = false;
 
-  // Cross-recursion overflow signal. When a NESTED processLoop
-  // recursion enters MATERIALIZE_ALL mode and is about to materialise a
-  // VO whose AllocationCall is OUTSIDE the current loop (i.e. it belongs
-  // to an outer loop's preheader-virtual set), set this flag so the
-  // outer-most processLoop's body iteration breaks out to the
-  // MATERIALIZE_ALL escalation path. Cleared on every top-level
-  // processLoop entry. (Jeandle is C++ -fno-exceptions; a polled flag is
-  // equivalent since processLoop is the only consumer.)
+  // Cross-recursion overflow signal. When a NESTED processLoop recursion
+  // enters MATERIALIZE_ALL mode and is about to materialise a VO whose
+  // AllocationCall is OUTSIDE the current loop (belongs to an outer loop's
+  // preheader-virtual set), set this so the outer-most processLoop breaks out
+  // to the MATERIALIZE_ALL escalation path. Cleared on every top-level
+  // processLoop entry. (Jeandle is -fno-exceptions; a polled flag suffices.)
   bool OverflowFlag = false;
 
   // Currently-processed Loop (innermost). processLoop pushes /
@@ -538,15 +461,11 @@ private:
   DenseMap<BasicBlock *, SmallVector<jeandle::ObjectID, 4>>
       PendingMaterializeAllVOs;
 
-  // Stable allocation-site -> ObjectID cache. tier1Allocate consults
-  // this BEFORE creating a fresh VO so re-processing the same allocation
-  // call inside a loop fixpoint iteration reuses the original ID. Without
-  // this the convergence check (which compares FieldStates and Virtuals
-  // sets across iterations) would diverge forever — each iter would mint a
-  // fresh ID for the same body-local alloc. The invariant is that
-  // virtualizing the same allocation always yields the same ObjectID.
-  // This cache is monotonically grown (never cleared across iterations
-  // or runs of the analyzer).
+  // Stable allocation-site -> ObjectID cache. tier1Allocate consults this
+  // before creating a fresh VO so re-processing the same alloc inside a loop
+  // fixpoint iteration reuses the original ID (otherwise the convergence
+  // check, which compares FieldStates and Virtuals sets across iterations,
+  // would diverge forever). Monotonically grown; never cleared.
   DenseMap<CallBase *, jeandle::ObjectID> AllocSiteToVO;
 
   // Every Loop* on which processLoop was invoked (including recursive
@@ -838,12 +757,11 @@ private:
   // pointer (e.g. `store ptr %virt, ptr @G`).
   bool tier2Store(StoreInst *SI);
   void tier2Load(LoadInst *LI);
-  // TODO: tier2AtomicRMW / tier2CmpXchg — re-add with the jeandle-jdk
-  // Unsafe atomic intrinsic inliner.
-  // TODO: tier2ArrayCopy — re-add with System.arraycopy inliner
-  // (llvm.memcpy / llvm.memmove emission).
-  // TODO: tier2MemSet — re-add with a frontend producer of llvm.memset on
-  // user-visible arrays (e.g. Arrays.fill).
+  // TODO(unsafe-inliner): tier2AtomicRMW / tier2CmpXchg (re-add with the
+  // jeandle-jdk frontend inliner for Unsafe atomic intrinsics), tier2ArrayCopy
+  // (System.arraycopy → llvm.memcpy/memmove), tier2MemSet (Arrays.fill →
+  // llvm.memset). Until then these shapes fall through to conservative
+  // materialization.
   bool tier2JavaOpFold(CallBase *CB);
   bool foldArrayLength(CallBase *CB);
   bool foldLoadKlass(CallBase *CB);
@@ -888,19 +806,16 @@ private:
   // Mark a VO ineligible, taking the TRANSITIVE closure over synthetic Case-C
   // sources. A synthetic VO has no real backing allocation (AllocationCall is
   // borrowed), so dropping it alone would let its per-pred sources still be
-  // eliminated, leaving the merge PHI's incomings as poison. Moreover a source
-  // can itself be synthetic (synthesizeCaseC does not reject synthetic per-pred
-  // inputs, and processBlockPhis resolves incomings through the function-wide
-  // alias map that exposes synthetic ObjectIDs — so Case C can nest), so the
-  // cascade must walk the whole synthetic-source DAG: every leaf real
-  // allocation under the dropped synthetic must survive in IR. The relation is
-  // acyclic (a source is created at an earlier merge than the synthetic that
-  // references it), so the worklist terminates; the visited set is pure cycle
-  // defense. The SyntheticPhi alias is reset for every synthetic in the tree so
-  // downstream resolveVirtualRef stops folding through it. Safe on non-synthetic
-  // VOs (degenerates to a plain Eligible[ID] = false). This is the single
-  // source of truth for the synthetic cascade; the mixed-merge bail and the two
-  // materialization paths call through here rather than re-implementing it.
+  // eliminated, leaving the merge PHI's incomings as poison. A source can
+  // itself be synthetic (Case C can nest), so the cascade walks the whole
+  // synthetic-source DAG so every leaf real allocation survives in IR. The
+  // relation is acyclic (a source is created at an earlier merge than the
+  // synthetic referencing it), so the worklist terminates; the visited set is
+  // pure cycle defense. The SyntheticPhi alias is reset for every synthetic so
+  // downstream resolveVirtualRef stops folding through it. Safe on
+  // non-synthetic VOs (degenerates to Eligible[ID] = false). Single source of
+  // truth for the synthetic cascade; the mixed-merge bail and the two
+  // materialization paths call through here.
   void markIneligible(jeandle::ObjectID ID);
 };
 
@@ -1227,14 +1142,10 @@ PHINode *Analyzer::getOrCreateLoopFieldPhi(BasicBlock *BB, jeandle::ObjectID ID,
 //
 // The caller, tier2Load, rejects sub-slot ("incomplete field") reads — a load
 // whose within-slot byte offset is nonzero — before reaching this routine,
-// forcing the object to materialize instead. Such partial-field reads are rare
-// in IR lowered from normal Java (they arise from Unsafe.get* / byte-array
-// repacking, which the frontend does not yet inline) and the extra
-// shift/trunc/concat machinery was not worth the complexity; see the TODO at
-// tier2Load's OverlapsNoncontained bail for the re-enablement plan. Widening
-// loads (EntryWidth < LoadWidth), narrower whole-slot loads (EntryWidth >
-// LoadWidth), and pointer↔primitive mismatches (stable-slot-kind invariant)
-// bail here.
+// forcing the object to materialize instead. Widening loads (EntryWidth <
+// LoadWidth), narrower whole-slot loads (EntryWidth > LoadWidth), and
+// pointer↔primitive mismatches (stable-slot-kind invariant) bail here.
+// TODO(unsafe-inliner): see tier-2 dispatch.
 //
 // The same-bit-width bitcast is registered (unparented) in Result.OwnedInsts;
 // the transform's ReplaceLoad handler splices it before the target load.
@@ -1287,9 +1198,7 @@ Value *Analyzer::coerceToType(Value *V, Type *LoadTy,
   // Anything else bails: a narrower whole-slot load (EntryWidth > LoadWidth),
   // a widening load (EntryWidth < LoadWidth), and any other cross-width
   // mismatch. The caller marks the VO ineligible so the original
-  // alloc/store/load survive in IR. (Sub-slot reads at a nonzero within-slot
-  // offset are rejected upstream in tier2Load; the `lshr`+`trunc` narrowing
-  // fold they once triggered here was intentionally removed.)
+  // alloc/store/load survive in IR.
   return nullptr;
 }
 
@@ -1390,32 +1299,21 @@ void Analyzer::mergeStates(BasicBlock *BB) {
   SmallVector<jeandle::ObjectID, 8> IDs(Intersect.begin(), Intersect.end());
   llvm::sort(IDs); // deterministic order for ineligibility/marking effects.
 
-  // Iterative merge stabilization. A nested materialize
-  // triggered inside the per-field PHI synthesis path (when a per-pred slot
-  // resolves to a VirtualRef whose target must be materialized at that pred)
-  // can invalidate the per-VO decisions already made earlier in this loop:
-  // another VO processed before the materialize might have decided to stay
-  // virtual based on the inner's then-virtual state, but the inner is now
-  // materialized on at least one pred, which downstream affects field-PHI
-  // synthesis (type compatibility, value substitution) for any other VO whose
-  // field references the inner.
+  // Iterative merge stabilization. A nested materialize triggered inside
+  // per-field PHI synthesis (a per-pred slot resolves to a VirtualRef whose
+  // target must be materialized at that pred) can invalidate earlier per-VO
+  // decisions: a VO that stayed virtual based on the inner's then-virtual
+  // state is now affected once the inner is materialized on some pred.
   //
-  // To converge to a `do { ... } while (materialized)` merge fixpoint,
-  // we wrap the per-VO loop in a do-while that re-runs whenever any
-  // materializeAtPredFromExitInfo call inside the loop did real work (an
-  // Effect was emitted). State that's local to the merge — CurrentState,
-  // FieldStates, LockCounts, LiveLockEnters, Materialized, Aliases,
-  // OwnedPhis / OwnedInsts grown this iteration, and the merge BB's newly
-  // appended BlockEffects — is snapshotted before each iteration and
-  // restored on retry. State that captures the materialize side-effects —
-  // each pred's BlockExitInfo (now showing the inner as Materialized), the
-  // function-wide MaterializedAtPred dedup map, the per-pred BlockEffects
-  // entries for the Materialize effect, and the Eligible flags (which a
-  // legitimate materialize-bail may have flipped to false) — survives across
-  // retries. The progress measure is monotone: every retry-triggering
-  // materialize flips at least one (Pred, ID) entry from Virtual to
-  // Materialized in ExitInfo, so the per-VO problem strictly shrinks. The
-  // cap of 10 is purely a defensive safety net.
+  // The per-VO loop is wrapped in a do-while that re-runs whenever any
+  // materializeAtPredFromExitInfo call inside it emits an Effect. Merge-local
+  // state (CurrentState, FieldStates, LockCounts, LiveLockEnters,
+  // Materialized, Aliases, this iteration's OwnedPhis/OwnedInsts, and the
+  // merge BB's new BlockEffects) is snapshotted and restored on retry;
+  // materialize side-effects (per-pred ExitInfo flips, MaterializedAtPred,
+  // per-pred BlockEffects, Eligible flags) survive across retries. Progress is
+  // monotone — each retry flips at least one (Pred, ID) from Virtual to
+  // Materialized — so the cap of 10 is a defensive safety net only.
   struct MergeSnapshot {
     jeandle::PEABlockState CurrentState;
     DenseMap<jeandle::ObjectID, DenseMap<int64_t, jeandle::FieldValue>>
@@ -1658,9 +1556,8 @@ void Analyzer::mergeStates(BasicBlock *BB) {
       // not the real backing allocation. Synthetics that hit a downstream
       // mixed-state merge are detected here and dropped to ineligible, which
       // also propagates ineligibility to every per-pred source VO so the
-      // original allocations and stores survive in IR. Cascade-materialize
-      // is deferred to a follow-on task; the current code keeps the
-      // conservative bail.
+      // original allocations and stores survive in IR.
+      // TODO(cascade-materialize): see materializeAt().
       jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
       if (VObj.IsSynthetic) {
         // Cascade (transitive over nested synthetics) through markIneligible.
@@ -1669,13 +1566,11 @@ void Analyzer::mergeStates(BasicBlock *BB) {
       }
       if (!VObj.AllocationCall ||
           !DT.dominates(VObj.AllocationCall, BB)) {
-        // "Mixed-merge non-dominating alloc": the proper fix is
-        // per-pred materialize + merge-PHI. Until that lands, conservatively
-        // mark the VO ineligible so the alloc and per-pred stores survive
-        // unmodified in IR. Typed-array-element virtualization can
-        // legitimately reach this branch when an array alloc inside a loop
-        // body is tracked at the loop exit on every pred (the alloc
-        // dominates the loop body but not the post-loop merge).
+        // "Mixed-merge non-dominating alloc": conservatively mark the VO
+        // ineligible so the alloc and per-pred stores survive unmodified in
+        // IR. Typed-array-element virtualization can reach this when an array
+        // alloc inside a loop body is tracked at the loop exit on every pred
+        // (the alloc dominates the loop body but not the post-loop merge).
         Eligible[ID] = false;
         continue;
       }
@@ -1696,30 +1591,22 @@ void Analyzer::mergeStates(BasicBlock *BB) {
       }
     }
     if (!LocksMatch) {
-      // Lock-count cascade at merge. Handle a virtualCount==N +
-      // locksEqual==false merge by falling into the "materialize each
-      // virtual pred + build a materializedValuePhi" branch. Each per-pred
-      // materialise carries the PRED's OWN lock list, and the resulting
-      // alloc-commit emits exactly the pred's own monitorenter set —
-      // no synthesized enters are added on the lower-count side, so user
-      // semantics are preserved (the lower-count path keeps having fewer
-      // real enters than the higher-count one).
+      // Lock-count cascade at merge. A virtualCount==N + locksEqual==false
+      // merge falls into "materialize each virtual pred + build a
+      // materializedValuePhi". Each per-pred materialise carries the PRED's
+      // OWN lock list, so the alloc-commit emits exactly that pred's own
+      // monitorenter set — no synthesized enters are added on the lower-count
+      // side, preserving the original per-path lock counts.
       //
-      // Mechanism: for each pred whose VO is virtual, call
-      // materializeAtPredFromExitInfo so the pred's OWN elided enters
-      // (if any) get un-elided in place via ReplaceInput effects, and the
-      // alloc itself gets materialized at the pred's terminator. A
-      // zero-count pred has nothing to un-elide and just emits the
-      // Materialize effect. After the loop, every pred's ExitInfo has
-      // flipped to Materialized for ID; the outer retry (Changed=true)
-      // falls through to the AllMaterialized branch above which synthesizes
-      // the ptr addrspace(1) PHI.
-      //
-      // Per-pred order is deterministic (the SmallVector iteration is
-      // PredBBs's order, which is predecessors(BB) which is deterministic
-      // by IR layout). materializeAtPredFromExitInfo's own MatInPH dedup
-      // and Eligible bail handle the case where a cascade earlier in this
-      // loop already materialized ID at some pred.
+      // For each virtual pred, materializeAtPredFromExitInfo un-elides the
+      // pred's own enters via ReplaceInput effects and materializes the alloc
+      // at the pred's terminator (a zero-count pred just emits the Materialize
+      // effect). After the loop every pred's ExitInfo has flipped to
+      // Materialized for ID; the outer retry (Changed=true) falls through to
+      // the AllMaterialized branch above which synthesizes the ptr addrspace(1)
+      // PHI. Per-pred order is deterministic (predecessors(BB) order by IR
+      // layout); MatInPH dedup and Eligible bail handle a cascade that already
+      // materialized ID at an earlier pred.
       for (unsigned i = 0; i < Preds.size(); ++i) {
         if (!Eligible.lookup(ID))
           break;
@@ -1734,8 +1621,7 @@ void Analyzer::mergeStates(BasicBlock *BB) {
     }
     // When LockCounts agree we also require the live enter-stacks to be
     // identical so that any later materializeAt undoes a single, well-defined
-    // stack. An earlier implementation compared Call identity only and
-    // BAILED the VO on any mismatch.
+    // stack.
     //
     // Switch the per-element comparison to (Call, BytecodeDepth) when the
     // JDK frontend's depth metadata is present (otherwise the BytecodeDepth
@@ -2015,10 +1901,6 @@ void Analyzer::mergeStates(BasicBlock *BB) {
           // so a sibling successor of the pred (other-than-BB) that
           // later inherits from Preds[i] sees the materialized pointer
           // rather than a stale VirtualRef(InnerID).
-          // updateOtherStatesForMaterialized inside materializeAtPred-
-          // FromExitInfo already covers this for ALL sibling VOs,
-          // but the defensive write here doubles as a guard against
-          // any future refactor that removes the sibling sweep.
           Preds[i]->FieldStates[ID][Off] =
               jeandle::FieldValue::materializedRef(
                   InnerVO.AllocationCall);
@@ -2200,14 +2082,11 @@ void Analyzer::processBlockPhis(BasicBlock *BB) {
         // Register the PHI as an alias for the same ObjectID so downstream
         // load/store handlers in this block resolve through it.
         Aliases.addVirtualAlias(&Phi, *First);
-        // Also record the PHI on the per-VO Case-B alias list so
-        // commit() can hand the transform an erase request if the VO
-        // ends up NeverEscapes. The PHI's incomings will all be the
-        // VO's OrigAlloc (the analyzer never rewrites Case-B PHI
-        // operands), which Pass 2's EliminateAllocation RAUWs to poison;
-        // the PHI is then trivially dead and we erase it explicitly so
-        // the IR doesn't carry a `phi [poison, poison]` artefact past
-        // PEA.
+        // Also record the PHI on the per-VO Case-B alias list so commit() can
+        // erase it if the VO is NeverEscapes. The incomings are all the VO's
+        // OrigAlloc, which EliminateAllocation RAUWs to poison; the PHI is then
+        // dead and we erase it explicitly to avoid a `phi [poison, poison]`
+        // artefact past PEA.
         CaseBPhiAliases[*First].push_back(&Phi);
         continue;
       }
@@ -2425,15 +2304,12 @@ bool Analyzer::synthesizeCaseC(
     llvm::sort(Sorted);
     CacheKey.SourceIDs = std::move(Sorted);
   }
-  // Peek the cache for an already-synthesised VO at this loop header.
-  // We previously returned EARLY on a cache hit (just re-aliasing the PHI and
-  // re-adding an empty ObjectState), which left FieldStates[Cached] EMPTY on
-  // every iter >= 1 — any field load against the synthetic VO inside the loop
-  // body would then see "unknown" and force materialization. Instead, fall
-  // through into the full synthesize path, using `CachedExistingID` as the
-  // reused ObjectID; the PHI emission code below uses getOrCreateLoopFieldPhi
-  // so the per-offset PHI shells (and thus FieldStates' Value*) are stable
-  // across iterations.
+  // Peek the cache for an already-synthesised VO at this loop header. On a
+  // hit we fall through into the full synthesize path reusing CachedExistingID
+  // as the ObjectID (rather than returning early), so FieldStates[Cached] is
+  // repopulated each iteration; the PHI emission below uses
+  // getOrCreateLoopFieldPhi so per-offset PHI shells (and FieldStates' Value*)
+  // stay stable across iterations.
   bool IsLoopHeader = LI.isLoopHeader(BB);
   jeandle::ObjectID CachedExistingID = jeandle::InvalidObjectID;
   if (IsLoopHeader) {
@@ -2625,12 +2501,8 @@ bool Analyzer::synthesizeCaseC(
           Eligible[NewID] = false;
           return false;
         }
-        // Same defensive ExitInfo rewrite as the merge per-VO
-        // loop; see the matching comment in mergeStates. The per-pred
-        // sibling sweep inside materializeAtPredFromExitInfo already
-        // does this for ALL FieldStates entries; the explicit write
-        // here guards against future refactors and makes the post-
-        // condition local to this synthesise-Case-C call.
+        // Same defensive ExitInfo rewrite as the merge per-VO loop; see the
+        // matching comment in mergeStates.
         ExitInfos[i]->FieldStates[PerPredIDs[i]][P.Off] =
             jeandle::FieldValue::materializedRef(
                 Result.VirtualObjects[InnerID]->AllocationCall);
@@ -2728,10 +2600,8 @@ void Analyzer::applyThreeTier(Instruction *I) {
     return;
   }
 
-  // TODO: tier2AtomicRMW / tier2CmpXchg dispatch. Re-enable together with
-  // the jeandle-jdk frontend inliner for Unsafe atomic intrinsics. Until
-  // then any atomicrmw/cmpxchg falls through to the generic-escape path
-  // below, which materializes the virtual conservatively.
+  // TODO(unsafe-inliner): see tier-2 dispatch. atomicrmw/cmpxchg falls
+  // through to the generic-escape path below, materializing conservatively.
 
   // Other tier-2 / tier-3 consumers.
   if (Aliases.hasVirtualInputs(I)) {
@@ -2820,20 +2690,18 @@ void Analyzer::applyThreeTier(Instruction *I) {
       }
     }
     // Deferred virtualization handlers — NOT WIRED because the current
-    // Jeandle frontend does not emit any of these shapes. Detailed wiring
-    // sketches (arg lists, effect kinds, test reservations) lived here and
-    // are preserved in the git history immediately preceding the PEA
-    // cleanup:
-    //   - tier2ArrayCopy / tier2MemSet — llvm.memcpy/memmove (System.arraycopy)
-    //     and llvm.memset (Arrays.fill). The only llvm.memset producer today
-    //     is inside jeandle.new_instance's lower-phase=1 template, inlined
-    //     AFTER PEA, so neither shape reaches PEA yet.
-    //   - llvm.reachability_fence — upstream LLVM this fork tracks does not
-    //     define Intrinsic::reachability_fence, and the frontend emits no
-    //     analogue.
-    //   - ObjectClone / Object.getClass / FinalFieldBarrier / EnsureVirtualized
-    //     — no jeandle.clone / get_class / final_field_barrier /
-    //     ensure_virtualized JavaOp exists in the frontend inventory.
+    // Jeandle frontend does not emit any of these shapes:
+    //   - TODO: tier2ArrayCopy / tier2MemSet — llvm.memcpy/memmove
+    //     (System.arraycopy) and llvm.memset (Arrays.fill). The only
+    //     llvm.memset producer today is jeandle.new_instance's lower-phase=1
+    //     template, inlined AFTER PEA, so neither shape reaches PEA yet.
+    //   - TODO: llvm.reachability_fence — upstream LLVM this fork tracks
+    //     does not define Intrinsic::reachability_fence, and the frontend
+    //     emits no analogue.
+    //   - TODO: ObjectClone / Object.getClass / FinalFieldBarrier /
+    //     EnsureVirtualized — no jeandle.clone / get_class /
+    //     final_field_barrier / ensure_virtualized JavaOp exists in the
+    //     frontend inventory.
     //
     // Current frontend JavaOp inventory (grep `jeandle.[a-z_]+` in
     // jeandle-jdk/src/hotspot/share/jeandle/): array_store_check, arraylength,
@@ -2934,7 +2802,7 @@ void Analyzer::tier1Allocate(CallBase *CB) {
   // every other state intact — already-virtual objects (registered in a
   // shallower enclosing scope, or before the nest entry) continue to be
   // tracked and folded as usual.
-  // The EnsureVirtualized override is deferred.
+  // TODO: EnsureVirtualized override is deferred.
   if (CurrentMode == Mode::StopNewInLoopNest)
     return;
 
@@ -3170,9 +3038,8 @@ bool Analyzer::tier2Store(StoreInst *SI) {
     }
   }
 
-  // TODO: Unsafe.put{Int,Long,Short}-into-byte-array decomposition.
-  // Re-enable together with the jeandle-jdk frontend inliner for
-  // Unsafe.put* intrinsics.
+  // TODO(unsafe-inliner): see tier-2 dispatch.
+  // Unsafe.put{Int,Long,Short}-into-byte-array decomposition.
 
 
   // Type-overlap validation via VirtualObject::getOrCreateFieldIndex. We don't
@@ -3292,9 +3159,7 @@ void Analyzer::tier2Load(LoadInst *LI) {
     break;
   }
   if (OverlapsNoncontained) {
-    // TODO: Unsafe.get{Int,Long,Short}-from-byte-array reassembly.
-    // Re-enable together with the jeandle-jdk frontend inliner for
-    // Unsafe.get* intrinsics. Until then any straddling load
+    // TODO(unsafe-inliner): see tier-2 dispatch. Any straddling load
     // conservatively forces materialization.
     markIneligible(*BaseID);
     return;
@@ -3302,11 +3167,9 @@ void Analyzer::tier2Load(LoadInst *LI) {
 
   // A nonzero within-slot offset means the load reads PART of a wider stored
   // field (a sub-slot / "incomplete field" read). Such partial-field reads are
-  // not folded — the lshr+trunc narrowing was removed (see the TODO at the
-  // OverlapsNoncontained bail above for the re-enablement plan) — so we bail to
-  // materialization directly. The bail runs after the Unknown/default-value
-  // fold below, so a sub-slot read of a never-written field still folds to its
-  // default (zero for every primitive).
+  // not folded, so we bail to materialization. The bail runs after the
+  // Unknown/default-value fold below, so a sub-slot read of a never-written
+  // field still folds to its default (zero for every primitive).
   int64_t WithinSlotByteOff = *Offset - EntryOffset;
 
   const jeandle::FieldValue *Existing = nullptr;
@@ -3654,18 +3517,13 @@ bool Analyzer::foldMonitorEnter(CallBase *CB) {
     }
   }
 
-  // materializeVirtualLocksBefore pre-cascade. When we are
-  // about to virtualise a monitorenter on a NEW receiver ID while another VO
-  // already holds an OLDER (shallower-depth) elided lock, the runtime
-  // lock-stack ordering observable across later escape points would be
-  // silently reversed: the older VO would materialise alone at its escape
-  // point without its sibling's lock on the stack. We force every sibling
-  // holding a shallower-depth lock to materialise BEFORE the new virtual
-  // lock is added.
-  //
-  // Compares BytecodeDepth rather than the legacy Order proxy.
-  // When the metadata is absent on every call, BytecodeDepth == Order at
-  // push time, so the behaviour is identical to the earlier implementation.
+  // materializeVirtualLocksBefore pre-cascade. Before virtualising a
+  // monitorenter on a NEW receiver ID while another VO already holds an OLDER
+  // (shallower-depth) elided lock, force every such sibling to materialise
+  // BEFORE the new virtual lock is added — otherwise the runtime lock-stack
+  // ordering observable at a later escape point would be reversed (the older
+  // VO would materialise alone without its sibling's lock on the stack).
+  // Compares BytecodeDepth (the Order proxy when metadata is absent).
   if (StrictLockOrder) {
     SmallVector<jeandle::ObjectID, 4> ToPreCascade;
     for (auto &Kv : LiveLockEnters) {
@@ -3769,8 +3627,8 @@ bool Analyzer::foldArrayStoreCheck(CallBase *CB) {
 
   const jeandle::VMCallbacks *VMCB = jeandle::getVMCallbacks();
   if (!VMCB || !VMCB->ArrayElementKlass) {
-    // No VMCallback — match prior behaviour: leave the call alone; the array
-    // does not formally escape per §2.3.14.
+    // No VMCallback — leave the call alone; the array does not formally
+    // escape per §2.3.14.
     return true;
   }
   if (ArrayObj.Klass == 0)
@@ -3862,8 +3720,7 @@ bool Analyzer::foldCheckIfValueBased(CallBase *CB) {
   const jeandle::VMCallbacks *VMCB = jeandle::getVMCallbacks();
   if (!VMCB || !VMCB->IsValueBased) {
     // No callback registered (offline tests without a callback log). Bail
-    // conservatively so the virtual materializes; matches the prior
-    // pre-fold behaviour.
+    // conservatively so the virtual materializes.
     return false;
   }
   if (VMCB->IsValueBased(VObj.Klass)) {
@@ -4083,22 +3940,22 @@ void Analyzer::materializeAt(jeandle::ObjectID ID,
       OverflowFlag = true;
   }
 
-  // PHI Case C synthetic VOs cannot be materialized. There is no
-  // per-pred allocation to RAUW from — the new VO was conjured at the merge
-  // out of per-pred VOs whose allocations live in different blocks. The
-  // proper resolution (ensure-materialize each per-pred VO at its
-  // end-of-block and thread the per-pred materialized pointers through
-  // the existing PHI so it BECOMES the materialized pointer) is deferred;
-  // we take the simpler conservative path:
+  // PHI Case C synthetic VOs cannot be materialized: there is no per-pred
+  // allocation to RAUW from — the synthetic VO was conjured at the merge out
+  // of per-pred VOs whose allocations live in different blocks. Take the
+  // conservative path:
   //   (a) mark the synthetic VO ineligible, so dropEffectsFor strips the
-  //       per-entry field PHIs and the alias.
+  //       per-entry field PHIs and the alias;
   //   (b) mark every per-pred source VO ineligible too — their allocations
   //       must survive in IR so the existing PHI's incoming values resolve
-  //       to real pointers.
+  //       to real pointers;
   //   (c) unregister the PHI's virtual alias so any subsequent
   //       resolveVirtualRef on the PHI returns nullopt and downstream
   //       consumers stop trying to fold through it.
-  // The cascade-materialize path is deferred to a follow-on change.
+  // TODO(cascade-materialize): PHI Case-C synthetic virtual objects:
+  // per-pred source materialization + reuse of the existing PHI as the
+  // materialized pointer is not implemented; current code conservatively drops
+  // the synthetic and its per-pred sources to ineligible.
   if (VObj.IsSynthetic) {
     // Cascade (transitive over nested synthetics) through markIneligible.
     markIneligible(ID);
@@ -4117,45 +3974,26 @@ void Analyzer::materializeAt(jeandle::ObjectID ID,
   // before recursion so it doesn't re-enter the same ID.
   Materialized.insert(ID);
 
-  // Lock cascade on materialization. When the object has live locks at
-  // this point (LockCount > 0) AND the target's runtime requires strict
-  // lock nesting (HotSpot LM_LIGHTWEIGHT), some other still-locked virtuals
-  // must be materialized at the same insertion point so the runtime's
-  // monitor-stack ordering remains intact.
-  //
-  // Narrow cascade rule:
-  //   int lockDepth = obj.getMaximumLockDepth();
-  //   for (VirtualObject other : ...)
-  //     if (otherState.hasLocks() &&
-  //         otherState.getMinimumLockDepth() < lockDepth)
-  //       materialize(other, ...);
-  //
-  // We use the per-LockEnter Order tag as the lock-depth proxy: the
-  // OUTERMOST live lock on a VO is at
-  // LiveLockEnters[id].front().Order (min lock depth), and the INNERMOST
-  // is at LiveLockEnters[id].back().Order (max lock depth). The rule
-  // "other.min < this.max" thus selects exactly those VOs whose oldest
-  // still-held lock predates this VO's newest still-held lock — i.e., VOs
-  // that were locked BEFORE this VO's most recent enter. Materializing
-  // them ensures their monitorenters are emitted FIRST (before this VO's),
-  // so the real lock stack reproduces the original lexical order.
-  //
-  // VOs locked entirely AFTER this VO's max (other.min >= this.max) stay
-  // virtual: their monitorenter/exit pair is fully contained within our
-  // current scope and folds away cleanly without ever touching the real
-  // lock stack.
+  // Lock cascade on materialization. When the object has live locks at this
+  // point (LockCount > 0) and the runtime requires strict lock nesting
+  // (HotSpot LM_LIGHTWEIGHT), every other still-locked virtual whose oldest
+  // live lock predates this VO's newest live lock must be materialized at the
+  // same insertion point, so the runtime's monitor-stack ordering remains
+  // intact — matching Graal's narrow rule
+  //   if (other.getMinimumLockDepth() < this.getMaximumLockDepth())
+  //     materialize(other);
+  // LiveLockEnters[id].front() is the outermost (min) live lock and .back()
+  // is the innermost (max). VOs locked entirely after this VO's max stay
+  // virtual (their enter/exit pair is contained in scope and folds away).
   auto LCIt = LockCounts.find(ID);
   bool HasLiveLocks = (LCIt != LockCounts.end() && LCIt->second != 0);
   if (HasLiveLocks && StrictLockOrder) {
     auto ThisIt = LiveLockEnters.find(ID);
     assert(ThisIt != LiveLockEnters.end() && !ThisIt->second.empty() &&
            "LockCount > 0 implies a non-empty LiveLockEnters stack");
-    // Cascade by BytecodeDepth. When !jeandle.lock_depth metadata is
-    // present, this is the true bytecode monitor depth; otherwise
-    // BytecodeDepth carries the Order proxy value at push time, so
-    // behavior is bit-identical to the earlier implementation. This is
-    // the depth-aware narrow rule (getMinimumLockDepth /
-    // getMaximumLockDepth comparison).
+    // Cascade by BytecodeDepth (the Order proxy when !jeandle.lock_depth
+    // metadata is absent). This is the depth-aware narrow rule
+    // (getMinimumLockDepth / getMaximumLockDepth comparison).
     uint32_t ThisMaxDepth = ThisIt->second.back().BytecodeDepth;
     SmallVector<jeandle::ObjectID, 4> Cascade;
     for (auto &Kv : LiveLockEnters) {
@@ -4553,10 +4391,7 @@ void Analyzer::processLoopExit(Loop *L) {
   // stale OrigAlloc placeholders. The forced drain at the exit block
   // ensures every still-virtual VO has a real allocation by the time the
   // EH handler executes.
-  //
-  // Downstream "deopt-bundle" detection is deferred (Jeandle has no
-  // deopt machinery yet). Landingpad-block detection alone covers the
-  // immediate-EH path that motivated this code.
+  // TODO(jeandle-deopt): see PartialEscapeTransform.cpp applyMaterialize().
   SmallVector<BasicBlock *, 4> ExitingBBs;
   L->getExitingBlocks(ExitingBBs);
   for (BasicBlock *ExitingBB : ExitingBBs) {
@@ -4573,11 +4408,9 @@ void Analyzer::processLoopExit(Loop *L) {
       // and forcing a materialisation there would defeat virtualisation
       // for every loop-local alloc that happens to be the body of an
       // invoke (which is the canonical Jeandle shape — every alloc IS
-      // an invoke).
-      //
-      // Downstream "deopt-bundle" detection is deferred (Jeandle has
-      // no deopt). Only catchswitch / catchpad headers and landingpads
+      // an invoke). Only catchswitch / catchpad headers and landingpads
       // with at least one explicit clause qualify here.
+      // TODO(jeandle-deopt): see PartialEscapeTransform.cpp applyMaterialize().
       if (auto *CSI = dyn_cast<CatchSwitchInst>(&*Succ->getFirstNonPHIIt())) {
         (void)CSI;
         ExitsToEH = true;
@@ -4720,11 +4553,10 @@ void Analyzer::materializeAtPredFromExitInfo(
   // Case C has no backing per-pred allocation; its AllocationCall is shared
   // with one of the source VOs and using it as a Materialize target would
   // emit a re-allocation at PH that RAUWs the source alloc, breaking SSA
-  // dominance at the Case-C merge PHI. The conservative strategy is
-  // to drop the synthetic AND every per-pred source so the original
-  // allocations and stores survive in IR. The cascade-materialize path
-  // (ensure-materialize each per-pred source + reuse the existing PHI as
-  // the materialized pointer) is deferred.
+  // dominance at the Case-C merge PHI. The conservative strategy is to drop
+  // the synthetic AND every per-pred source so the original allocations and
+  // stores survive in IR.
+  // TODO(cascade-materialize): see materializeAt().
   if (VObj.IsSynthetic) {
     // Cascade (transitive over nested synthetics) through markIneligible.
     markIneligible(ID);
@@ -4764,21 +4596,17 @@ void Analyzer::materializeAtPredFromExitInfo(
       materializeAtPredFromExitInfo(OtherID, PH, ExitInfo, SkipGlobalRAUW);
   }
 
-  // Undo monitor-call elisions for ID when there are live locks. Reads the
-  // snapshot's LiveLockEnters (the unbalanced enter call sites along the
-  // path that produced ExitInfo). Mirrors materializeAt's logic.
-  //
-  // Two-phase emission (per-pred-safe):
-  //   Phase 1 (here): drop the ReplaceCall(true) elision so the original
-  //     enter calls survive the transform; clear the live lock state in both
+  // Undo monitor-call elisions for ID when there are live locks, reading the
+  // snapshot's LiveLockEnters. Two-phase emission (per-pred-safe):
+  //   Phase 1 (here): drop the ReplaceCall(true) elision so the original enter
+  //     calls survive the transform; clear the live lock state in both
   //     CurrentState and ExitInfo.
   //   Phase 2 (after Materialize emission below): emit a ReplaceInput effect
-  //     per surviving enter call, tagged with E.Block = PH so the transform
-  //     resolves the receiver via MatPerBlock[{PH, OrigAlloc}] (the PH's own
-  //     materialized invoke) rather than the global NewAllocFor (which
-  //     last-write-wins across per-pred materializations of the same
-  //     OrigAlloc, breaking SSA when multiple preds materialize the same VO
-  //     — the lock-mismatch case is the canonical example).
+  //     per surviving enter call, tagged E.Block = PH so the transform resolves
+  //     the receiver via MatPerBlock[{PH, OrigAlloc}] (the PH's own materialized
+  //     invoke) rather than the global NewAllocFor — which last-write-wins
+  //     across per-pred materializations of the same OrigAlloc, breaking SSA
+  //     when multiple preds materialize the same VO (the lock-mismatch case).
   SmallVector<LockEnter, 4> StackToUnElide;
   auto SIt = ExitInfo.LiveLockEnters.find(ID);
   if (HasLiveLocks && SIt != ExitInfo.LiveLockEnters.end() &&
@@ -4943,22 +4771,16 @@ void Analyzer::materializeAtPredFromExitInfo(
 // Real loop fixpoint
 // ===========================================================================
 //
-// Loop fixpoint:
-//
-//   * Iterate the loop body up to kMaxLoopFixpointIters times, each
-//     iteration starting from a clean rollback to the pre-loop snapshot.
-//   * The fixpoint variable is the per-block exit state of every block in
-//     the loop. mergeStates(Header) on iteration i+1 sees both the
-//     (unchanging) preheader BlockExitInfo and the iteration-i backedge
-//     BlockExitInfo, so field PHIs / lock-merge / virtuality decisions
-//     stabilise once the per-block exits stabilise.
-//   * Field PHIs synthesised at the loop header MUST be stable across
-//     iterations or the comparison-by-Value-pointer never agrees. That is
-//     the entire purpose of LoopFieldPhiCache / OwnedLoopFieldPhis.
-//   * On non-convergence, fall back to MATERIALIZE_ALL: rollback,
-//     materialize every preheader-live virtual, then process the body
-//     once in MATERIALIZE_ALL mode so any new allocations inside the
-//     body are also refused.
+// Iterate the loop body up to kMaxLoopFixpointIters times, each iteration
+// starting from a clean rollback to the pre-loop snapshot. The fixpoint
+// variable is the per-block exit state of every loop block: mergeStates(Header)
+// on iteration i+1 sees the preheader BlockExitInfo plus the iteration-i
+// backedge BlockExitInfo, so decisions stabilise once the per-block exits do.
+// Field PHIs at the loop header MUST be stable across iterations (same Value*)
+// for the convergence comparison — that is the purpose of LoopFieldPhiCache /
+// OwnedLoopFieldPhis. On non-convergence, fall back to MATERIALIZE_ALL:
+// rollback, materialize every preheader-live virtual, then process the body
+// once so any new body-internal allocations are also refused.
 
 // Equality on BlockExitData (the per-object base data). Two payloads are
 // equivalent iff every per-object dimension (still-virtual set, materialized
@@ -5182,27 +5004,20 @@ void Analyzer::restoreLoopSnapshot(
 
   // Roll back per-loop-block ledgers.
   //
-  // Back-edge propagation: we deliberately DO NOT roll back BlockExits
-  // for loop blocks. The next iteration's mergeStates(Header) reads each
-  // back-edge pred's BlockExits to learn the loop-internal contribution; if
-  // we wiped it here, mergeStates would only ever see the preheader (the
-  // back-edge pred is later in RPO than the header), the loop-header field
-  // PHI would never be synthesized, and the body's loop-carried state would
-  // be silently lost. Leaving the iter-N BlockExits in place feeds iter
-  // (N+1)'s header merge with the prior body exit; each block's
-  // snapshotExitState() at the end of processBlock then overwrites the
-  // stale entry with the iteration's fresh result, so by the end of iter
-  // (N+1) every loop block's BlockExits reflects the new iteration alone.
-  // The convergence check in processLoop compares iter (N+1)'s CurExits
-  // against iter N's LastExits, so a never-changing BlockExits will still
-  // converge after one extra iteration.
+  // BlockExits for loop blocks is deliberately NOT rolled back: the next
+  // iteration's mergeStates(Header) reads each back-edge pred's BlockExits to
+  // learn the loop-internal contribution (the back-edge pred is later in RPO
+  // than the header, so wiping it would leave mergeStates seeing only the
+  // preheader). snapshotExitState() at the end of each processBlock
+  // overwrites the stale entry with the iteration's fresh result, and the
+  // convergence check compares iter (N+1)'s CurExits against iter N's
+  // LastExits, so a never-changing BlockExits still converges after one extra
+  // iteration.
   //
-  // The other ledgers (BlockEffects, MaterializedAtPred) MUST be rolled
-  // back: they accumulate emitted-effect side-data, and leaving them would
-  // duplicate Materialize / CreatePHI / ReplaceLoad effects across
-  // iterations. The LoopFieldPhiCache (and Result.OwnedLoopFieldPhis)
-  // covers the "stable PHI Value*" need for iter-spanning structural
-  // equivalence on FieldStates.
+  // BlockEffects and MaterializedAtPred MUST be rolled back (they accumulate
+  // emitted-effect side-data; leaving them would duplicate effects across
+  // iterations). LoopFieldPhiCache / OwnedLoopFieldPhis cover the stable
+  // PHI Value* need for iter-spanning structural equivalence.
   for (BasicBlock *BB : LoopBlocks) {
     auto SF = S.SavedBlockEffects.find(BB);
     if (S.HadBlockEffects.count(BB))
@@ -5266,40 +5081,29 @@ void Analyzer::processLoop(Loop *L) {
     ~PopLoop() { A->CurrentProcessLoop = Saved; }
   } _pop{this, SavedProcessLoop};
   if (!Preheader) {
-    // Loop without a unique preheader. Jeandle now schedules
-    // LoopSimplifyPass before PEA, so natural loops on a reducible CFG
-    // always reach the fixpoint path above. We still land here for cases
-    // LoopSimplify cannot canonicalise — indirectbr-entered loops and
-    // (genuinely irreducible) cycles that LoopInfo nevertheless recognises
-    // as a natural loop with multiple entry edges.
+    // Loop without a unique preheader. Jeandle schedules LoopSimplifyPass
+    // before PEA, so natural reducible-CFG loops reach the fixpoint path
+    // above; we land here only for cases LoopSimplify cannot canonicalise —
+    // indirectbr-entered loops and genuinely irreducible cycles LoopInfo
+    // still recognises as a natural loop with multiple entry edges.
     //
-    // Strategy: a "materialize at every forward predecessor" option
-    // is not directly implementable in our effects model. Each
-    // Materialize effect emits one new invoke at its pred AND does a
-    // function-wide RAUW (PartialEscapeTransform.cpp's applyMaterialize
-    // Step 8). With N > 1 forward preds, the first apply RAUWs every
-    // user of OrigAlloc to NewInv_0, but the post-N-th pred's path needs
-    // NewInv_(N-1); without a synthesized PHI at the header to merge the
-    // per-pred NewInvs, the in-loop uses would observe a single NewInv
-    // that doesn't dominate them on all paths. The existing Case-A
-    // multi-pred materialise pattern works only because there is already
-    // an explicit PHI in IR whose incoming values MatPerBlock can patch.
+    // "Materialize at every forward predecessor" is not implementable in our
+    // effects model: each Materialize emits one new invoke at its pred AND a
+    // function-wide RAUW (applyMaterialize Step 8), so with N > 1 forward
+    // preds the in-loop uses would observe a single NewInv that doesn't
+    // dominate them on all paths (there is no synthesized header PHI to merge
+    // the per-pred NewInvs — the existing Case-A pattern works only because
+    // an explicit PHI already exists whose incoming values MatPerBlock patches).
     //
-    // The sound pessimistic action for irreducible regions is to MARK
-    // every VO still virtual at any
-    // forward predecessor INELIGIBLE. commit() drops every Effect for an
-    // ineligible VO and the original IR (alloc + stores + loads)
-    // survives unchanged — the loop body's pre-loop pointer is the
-    // original OrigAlloc on every entry edge, which trivially dominates
-    // the body and is therefore SSA-correct.
-    //
-    // Loop-local allocs (created inside the body, consumed within a
-    // single iteration) are still candidates: we walk the body once in
-    // REGULAR mode below. They were never virtual at any forward pred
-    // (the header's forward preds are outside L by definition), so the
-    // ineligibility sweep above doesn't touch them. The fixpoint we
-    // can't run is irrelevant for such allocs because they don't cross
-    // the back-edge.
+    // Sound fallback: mark every VO still virtual at any forward predecessor
+    // INELIGIBLE. commit() drops its effects and the original IR survives
+    // unchanged — the body's pre-loop pointer is the original OrigAlloc on
+    // every entry edge, which trivially dominates the body. Loop-local
+    // allocs (created and consumed within a single iteration) are still
+    // candidates: the body walk below runs once in REGULAR mode. They are
+    // never virtual at any forward pred (forward preds are outside L), so the
+    // sweep above doesn't touch them, and the missing fixpoint is irrelevant
+    // because they don't cross the back-edge.
 
     // Collect forward (non-loop-back) predecessors of the header.
     llvm::SmallVector<BasicBlock *, 4> ForwardPreds;
@@ -5311,12 +5115,9 @@ void Analyzer::processLoop(Loop *L) {
         ForwardPreds.push_back(P);
     }
 
-    // Bail every VO that is virtual at any forward pred — drop it back
-    // to the original IR. This is the irreducible-region bailout
-    // semantics.
-    // BlockExits[P] is populated by the outer RPO walk (forward preds
-    // dominate the loop entry in RPO order, so they've been processed
-    // by the time processLoop is invoked on L).
+    // Bail every VO that is virtual at any forward pred — drop it back to the
+    // original IR. BlockExits[P] is populated by the outer RPO walk (forward
+    // preds are processed before processLoop is invoked on L).
     for (BasicBlock *P : ForwardPreds) {
       auto It = BlockExits.find(P);
       if (It == BlockExits.end())
@@ -5327,13 +5128,9 @@ void Analyzer::processLoop(Loop *L) {
       }
     }
 
-    // Body walk in REGULAR mode (single pass — no fixpoint, since we have
-    // no way to verify convergence at a non-existent preheader). Loop-
-    // local allocs that don't outlive a single iteration (e.g. an alloc
-    // allocated in the body and consumed before the back-edge) are
-    // still virtualised — this preserves the earlier behaviour for
-    // nested loops where the inner loop has no preheader (a common
-    // shape under un-simplified IR).
+    // Body walk in REGULAR mode (single pass — no fixpoint, since there is
+    // no way to verify convergence at a non-existent preheader). Loop-local
+    // allocs that don't outlive a single iteration are still virtualised.
     //
     // Soundness for cross-back-edge allocs: explicit IR PHIs at the
     // header with a back-edge virtual incoming go through Case A /
