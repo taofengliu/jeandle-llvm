@@ -3,6 +3,9 @@
 ; A poll tagged !jeandle.poll_coverage is its loop's designated coverage and
 ; must survive adjacent collapse in both orderings: marked-then-plain would by
 ; the positional rule keep the plain (later) one, so the marker must override.
+; (The marker is pass-internal — set by a prior keep-one run or a future
+; strip-mine anchor, not emitted by the frontend; it is pre-set here only to
+; exercise the priority rule.)
 
 declare hotspotcc void @jeandle.safepoint_poll()
 

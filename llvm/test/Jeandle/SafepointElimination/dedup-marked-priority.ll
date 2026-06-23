@@ -1,7 +1,9 @@
 ; RUN: opt -passes=safepoint-elimination -S < %s | FileCheck %s
 
 ; A coverage-marked poll in the header wins over a latch-closer plain poll:
-; keep-one keeps the marked one and erases the plain.
+; keep-one keeps the marked one and erases the plain. (The marker is
+; pass-internal — set by a prior keep-one run or a future strip-mine anchor,
+; not emitted by the frontend; pre-set here only to exercise the priority.)
 
 declare hotspotcc void @jeandle.safepoint_poll()
 
