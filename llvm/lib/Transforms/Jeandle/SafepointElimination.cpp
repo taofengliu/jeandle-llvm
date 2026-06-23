@@ -100,11 +100,12 @@ bool isAdjacencyTransparent(const Instruction &I) {
   return I.isDebugOrPseudoInst() || I.isLifetimeStartOrEnd();
 }
 
-// Collapse runs of adjacent polls within a block, keeping the last one: the
-// earlier poll's deopt state belongs to an upstream program point that the
-// later poll's state supersedes (the converse — reusing an earlier state for
-// a later point — would be wrong). A coverage-marked poll survives over an
-// unmarked one regardless of position.
+// Collapse runs of adjacent polls within a block, keeping one. Two polls with
+// nothing observable between them are redundant; each carries its own
+// self-contained deopt state, so dropping either is safe (no state is merged
+// or moved). We keep the later by convention (as C2's SafePointNode::Identity
+// does), and the coverage-marked one if either is marked, regardless of
+// position.
 bool collapseAdjacentPolls(BasicBlock &BB) {
   bool Changed = false;
   CallInst *Prev = nullptr;
@@ -137,10 +138,14 @@ bool collapseAdjacentPolls(BasicBlock &BB) {
 // coverage-marked one wins) and erase the rest. Without a dominating poll,
 // deleting any poll could leave an iteration path uncovered — delete nothing.
 //
-// Only polls in blocks the loop owns directly are considered: an inner loop's
-// polls are that loop's coverage and must not be counted on (or deleted) here,
-// because they may legitimately disappear later under the inner loop's own
-// trip-count proof.
+// Only polls in blocks the loop owns directly are considered; a sub-loop's
+// poll is not taken as this loop's coverage even if it dominates the latch.
+// This is deliberate conservatism: relying on a poll this loop doesn't own
+// would leave the loop naked if a later transform (full unroll, LoopDeletion,
+// vectorization, the second-pass run) removes that sub-loop poll. Keeping each
+// loop self-covered also keeps the coverage invariant locally verifiable.
+// (Loops are processed innermost-first, so a sub-loop's polls are already
+// finalized here — the concern is downstream passes, not this one.)
 bool keepOneLoopPoll(Loop &L, LoopInfo &LI, DominatorTree &DT) {
   BasicBlock *Latch = L.getLoopLatch();
   if (!Latch)
