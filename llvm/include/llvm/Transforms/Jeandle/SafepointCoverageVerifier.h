@@ -27,9 +27,9 @@ public:
 };
 
 namespace jeandle {
-/// Mode of the safepoint coverage verifier (-jeandle-verify-safepoint-coverage):
-/// Off does not run it; Warn reports every violation but continues; Fatal
-/// aborts on the first violating function.
+/// Mode of the safepoint coverage verifier
+/// (-jeandle-verify-safepoint-coverage): Off does not run it; Warn reports
+/// every violation but continues; Fatal aborts on the first violating function.
 enum class SafepointCoverageCheck { Off, Warn, Fatal };
 SafepointCoverageCheck getSafepointCoverageCheck();
 } // namespace jeandle

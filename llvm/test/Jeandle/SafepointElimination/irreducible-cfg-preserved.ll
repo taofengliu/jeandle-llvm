@@ -1,5 +1,6 @@
 ; RUN: opt -passes=safepoint-elimination -S < %s | FileCheck %s
-; RUN: opt -passes='verify<jeandle-safepoint-coverage>' -S < %s 2>&1 \
+; RUN: opt -passes='verify<jeandle-safepoint-coverage>' \
+; RUN:   -jeandle-verify-safepoint-coverage=warn -S < %s 2>&1 \
 ; RUN:   | FileCheck %s --check-prefix=VERIFY
 
 ; A natural loop (header H, latch LT) encloses an irreducible two-entry cycle
