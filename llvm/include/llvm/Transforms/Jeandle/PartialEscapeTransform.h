@@ -1,4 +1,5 @@
-//===- PartialEscapeTransform.h - PEA (transform pass) ------------*- C++ -*-===//
+//===- PartialEscapeTransform.h - PEA (transform pass) ------------*- C++
+//-*-===//
 //
 // Copyright (c) 2026, the Jeandle-LLVM Authors. All Rights Reserved.
 //

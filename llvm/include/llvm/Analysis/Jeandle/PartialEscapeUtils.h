@@ -1,4 +1,5 @@
-//===- PartialEscapeUtils.h - PEA helpers ------------------------*- C++ -*-===//
+//===- PartialEscapeUtils.h - PEA helpers ------------------------*- C++
+//-*-===//
 //
 // Copyright (c) 2026, the Jeandle-LLVM Authors. All Rights Reserved.
 //
@@ -40,7 +41,7 @@ namespace llvm::jeandle::pea {
 bool isJeandleCallNamed(const CallBase *CB, StringRef Name);
 bool isJeandleNewInstance(const CallBase *CB);
 bool isJeandleNewArray(const CallBase *CB);
-bool isJeandleAllocation(const CallBase *CB);     // either of the above
+bool isJeandleAllocation(const CallBase *CB); // either of the above
 bool isJeandleArrayLength(const CallBase *CB);
 bool isJeandleLoadKlass(const CallBase *CB);
 bool isJeandleCheckCast(const CallBase *CB);
@@ -74,8 +75,7 @@ Value *stripPointerCastsAndOffsets(Value *Ptr, const DataLayout &DL,
 // State. Returns std::nullopt if V does not resolve to a virtual object.
 // Cycle-safe via a small visited set. Canonical implementation; the
 // PEABlockState::resolveVirtualRef overload delegates here.
-std::optional<ObjectID> resolveVirtualRef(Value *V,
-                                          const PEABlockState &State,
+std::optional<ObjectID> resolveVirtualRef(Value *V, const PEABlockState &State,
                                           const AliasMap &Aliases,
                                           const DataLayout &DL);
 

@@ -8,8 +8,9 @@
 //
 //===----------------------------------------------------------------------===//
 
-#include "llvm/Analysis/Jeandle/PartialEscapeAnalysis.h"
 #include "llvm/Jeandle/Pipeline.h"
+#include "llvm/Analysis/Jeandle/PartialEscapeAnalysis.h"
+#include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Jeandle/ConstantFieldFolding.h"
 #include "llvm/Transforms/Jeandle/InsertGCBarriers.h"
 #include "llvm/Transforms/Jeandle/JavaOperationLower.h"
@@ -18,7 +19,6 @@
 #include "llvm/Transforms/Jeandle/RepeatedConstantFolding.h"
 #include "llvm/Transforms/Jeandle/TLSPointerRewrite.h"
 #include "llvm/Transforms/Jeandle/TypeCheckElimination.h"
-#include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Scalar/ADCE.h"
 #include "llvm/Transforms/Scalar/InstSimplifyPass.h"
 #include "llvm/Transforms/Scalar/RewriteStatepointsForGC.h"

@@ -186,9 +186,18 @@ public:
   bool isVirtualRef() const { return T == VirtualRef; }
   bool isMaterializedRef() const { return T == MaterializedRef; }
 
-  Value *getScalar() const { assert(isScalar()); return U.V; }
-  ObjectID getVirtualRef() const { assert(isVirtualRef()); return U.Ref; }
-  Value *getMaterialized() const { assert(isMaterializedRef()); return U.V; }
+  Value *getScalar() const {
+    assert(isScalar());
+    return U.V;
+  }
+  ObjectID getVirtualRef() const {
+    assert(isVirtualRef());
+    return U.Ref;
+  }
+  Value *getMaterialized() const {
+    assert(isMaterializedRef());
+    return U.V;
+  }
   Type *getDeclaredType() const { return DeclaredType; }
 
   static Constant *defaultFor(Type *FieldType);

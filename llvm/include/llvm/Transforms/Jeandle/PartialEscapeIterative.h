@@ -1,4 +1,5 @@
-//===- PartialEscapeIterative.h - PEA outer fixpoint -------------*- C++ -*-===//
+//===- PartialEscapeIterative.h - PEA outer fixpoint -------------*- C++
+//-*-===//
 //
 // Copyright (c) 2026, the Jeandle-LLVM Authors. All Rights Reserved.
 //

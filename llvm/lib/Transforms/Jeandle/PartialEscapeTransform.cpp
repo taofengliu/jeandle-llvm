@@ -40,6 +40,8 @@
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/Jeandle/PartialEscape.h"
+#include "llvm/Analysis/Jeandle/PartialEscapeAnalysis.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -49,11 +51,9 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Jeandle/Attributes.h"
 #include "llvm/IR/Jeandle/Metadata.h"
-#include "llvm/Analysis/Jeandle/PartialEscape.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Analysis/Jeandle/PartialEscapeAnalysis.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
 
@@ -592,11 +592,11 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
         // Target. Ownership transfers from PEAResult::OwnedInsts to the parent
         // BasicBlock; OwnedInsts' destructor skips inserted instructions.
         //
-        // TODO(unsafe-inliner): see PartialEscapeAnalysis.cpp (tier-2 dispatch).
-        // A PHINode replacement is owned by a CreatePHI effect that runs LATER
-        // in SeqNo order. Splicing it here would parent it mid-block (illegal
-        // for a PHINode) and crash CreatePHI's "must be unparented" assert.
-        // Skip the splicing path for PHIs.
+        // TODO(unsafe-inliner): see PartialEscapeAnalysis.cpp (tier-2
+        // dispatch). A PHINode replacement is owned by a CreatePHI effect that
+        // runs LATER in SeqNo order. Splicing it here would parent it mid-block
+        // (illegal for a PHINode) and crash CreatePHI's "must be unparented"
+        // assert. Skip the splicing path for PHIs.
         if (auto *RI = dyn_cast<Instruction>(Repl); RI && !isa<PHINode>(RI)) {
           SmallVector<Instruction *, 4> Stack;
           SmallPtrSet<Instruction *, 4> Visited;

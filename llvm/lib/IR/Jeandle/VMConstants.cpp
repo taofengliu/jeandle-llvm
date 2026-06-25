@@ -1,4 +1,5 @@
-//===- VMConstants.cpp - Jeandle VM layout constants impl --------*- C++ -*-===//
+//===- VMConstants.cpp - Jeandle VM layout constants impl --------*- C++
+//-*-===//
 //
 // Copyright (c) 2026, the Jeandle-LLVM Authors. All Rights Reserved.
 //
@@ -37,12 +38,18 @@ JBasicType VMConstants::classifyType(Type *Ty) {
   }
   if (Ty->isIntegerTy()) {
     switch (Ty->getIntegerBitWidth()) {
-    case 1:  return JBasicType::Boolean;
-    case 8:  return JBasicType::Byte;
-    case 16: return JBasicType::Short;
-    case 32: return JBasicType::Int;
-    case 64: return JBasicType::Long;
-    default: return JBasicType::Count;
+    case 1:
+      return JBasicType::Boolean;
+    case 8:
+      return JBasicType::Byte;
+    case 16:
+      return JBasicType::Short;
+    case 32:
+      return JBasicType::Int;
+    case 64:
+      return JBasicType::Long;
+    default:
+      return JBasicType::Count;
     }
   }
   if (Ty->isFloatTy())
@@ -85,16 +92,26 @@ std::optional<bool> readGlobalBool(const Module &M, StringRef Name) {
 // template.ll declarations.
 const char *jBasicTypeName(JBasicType Kind) {
   switch (Kind) {
-  case JBasicType::Boolean: return "boolean";
-  case JBasicType::Byte:    return "byte";
-  case JBasicType::Char:    return "char";
-  case JBasicType::Short:   return "short";
-  case JBasicType::Int:     return "int";
-  case JBasicType::Long:    return "long";
-  case JBasicType::Float:   return "float";
-  case JBasicType::Double:  return "double";
-  case JBasicType::Object:  return "object";
-  case JBasicType::Count:   return nullptr;
+  case JBasicType::Boolean:
+    return "boolean";
+  case JBasicType::Byte:
+    return "byte";
+  case JBasicType::Char:
+    return "char";
+  case JBasicType::Short:
+    return "short";
+  case JBasicType::Int:
+    return "int";
+  case JBasicType::Long:
+    return "long";
+  case JBasicType::Float:
+    return "float";
+  case JBasicType::Double:
+    return "double";
+  case JBasicType::Object:
+    return "object";
+  case JBasicType::Count:
+    return nullptr;
   }
   return nullptr;
 }

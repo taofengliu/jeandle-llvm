@@ -24,6 +24,9 @@
 
 #include "llvm/Transforms/Jeandle/PartialEscapeIterative.h"
 
+#include "llvm/Analysis/Jeandle/PartialEscape.h"
+#include "llvm/Analysis/Jeandle/PartialEscapeAnalysis.h"
+#include "llvm/Analysis/Jeandle/PartialEscapeUtils.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
@@ -34,11 +37,8 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Analysis/Jeandle/PartialEscape.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
-#include "llvm/Analysis/Jeandle/PartialEscapeAnalysis.h"
 #include "llvm/Transforms/Jeandle/PartialEscapeTransform.h"
-#include "llvm/Analysis/Jeandle/PartialEscapeUtils.h"
 #include "llvm/Transforms/Scalar/ADCE.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/Transforms/Utils/LoopSimplify.h"
