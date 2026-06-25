@@ -1,4 +1,5 @@
-//===- PartialEscapeAnalysis.cpp - PEA (analysis pass) ---------------------===//
+//===- PartialEscapeAnalysis.cpp - PEA (analysis pass)
+//---------------------===//
 //
 // Copyright (c) 2026, the Jeandle-LLVM Authors. All Rights Reserved.
 //
@@ -38,6 +39,8 @@
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/ConstantFolding.h"
+#include "llvm/Analysis/Jeandle/PartialEscape.h"
+#include "llvm/Analysis/Jeandle/PartialEscapeUtils.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
@@ -50,13 +53,11 @@
 #include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Jeandle/JavaType.h"
 #include "llvm/IR/Jeandle/Metadata.h"
-#include "llvm/Analysis/Jeandle/PartialEscape.h"
-#include "llvm/IR/Metadata.h"
 #include "llvm/IR/Jeandle/VMCallback.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
-#include "llvm/Analysis/Jeandle/PartialEscapeUtils.h"
 
 #include <unordered_map>
 
@@ -70,12 +71,9 @@ using namespace llvm;
 // possible when a late dropEffectsFor() strips a Materialize that was
 // already counted (Eligible flipped after emission). Treated as a
 // diagnostic, not an audit.
-STATISTIC(JeandlePEAVirtualized,
-          "Number of virtual objects PEA created");
-STATISTIC(JeandlePEAEliminated,
-          "Number of allocations eliminated by PEA");
-STATISTIC(JeandlePEAMaterialized,
-          "Number of materializations emitted by PEA");
+STATISTIC(JeandlePEAVirtualized, "Number of virtual objects PEA created");
+STATISTIC(JeandlePEAEliminated, "Number of allocations eliminated by PEA");
+STATISTIC(JeandlePEAMaterialized, "Number of materializations emitted by PEA");
 STATISTIC(JeandlePEAMaterializedPHI,
           "Materializations triggered by PHI / Case-A merge");
 STATISTIC(JeandlePEAMaterializedMerge,
@@ -134,7 +132,8 @@ static llvm::cl::opt<unsigned> MaximumEscapeAnalysisArrayLength(
 // end-of-block Materialize emission path without constructing a pathological
 // non-converging fixpoint. Default off; not surfaced to the VM.
 static llvm::cl::opt<bool> JeandlePEAForceMaterializeAll(
-    "jeandle-pea-force-materialize-all", llvm::cl::init(false), llvm::cl::Hidden,
+    "jeandle-pea-force-materialize-all", llvm::cl::init(false),
+    llvm::cl::Hidden,
     llvm::cl::desc("PEA: force every top-level processLoop into "
                    "Mode::MaterializeAll on entry. Testing aid for "
                    "virtualize-then-materialise coverage."));
@@ -520,8 +519,7 @@ private:
   // that end up NeverEscapes, so EliminateAllocation isn't left with
   // a dead-but-still-parented `phi [poison, ..., poison]` survivor
   // in the IR.
-  DenseMap<jeandle::ObjectID, SmallVector<llvm::PHINode *, 2>>
-      CaseBPhiAliases;
+  DenseMap<jeandle::ObjectID, SmallVector<llvm::PHINode *, 2>> CaseBPhiAliases;
 
   // Monotonicity guard for per-loop fixpoint iterations. For the loop
   // currently being processed, this records every loop block that has had a
@@ -626,14 +624,14 @@ private:
   // Unknown are not surfaced as standalone counters — they roll into the
   // total `JeandlePEAMaterialized` only.
   enum class MatReason : uint8_t {
-    Unhandled,   // unhandled escape-point instruction (generic
-                 // "virtualize returned false" path).
-    Merge,       // state merge: mixed virtual/materialized at a multi-pred
-                 // entry, or lock-count cascade at merge.
-    LoopExit,    // force-drain at a loop preheader.
-    PHI,         // Case-A LLVM PHI fallback or Case-C synthetic-VO cascade.
-    Cascade,     // sibling-virtual cascade triggered by strict lock order.
-    Nested,      // recursive prerequisite materialization for an inner VO.
+    Unhandled, // unhandled escape-point instruction (generic
+               // "virtualize returned false" path).
+    Merge,     // state merge: mixed virtual/materialized at a multi-pred
+               // entry, or lock-count cascade at merge.
+    LoopExit,  // force-drain at a loop preheader.
+    PHI,       // Case-A LLVM PHI fallback or Case-C synthetic-VO cascade.
+    Cascade,   // sibling-virtual cascade triggered by strict lock order.
+    Nested,    // recursive prerequisite materialization for an inner VO.
   };
 
   // Loop-soundness helpers.
@@ -718,8 +716,7 @@ private:
     DenseMap<BasicBlock *, BlockExitInfo> SavedBlockExits;
     DenseMap<BasicBlock *, SmallVector<jeandle::PEAResult::Effect, 16>>
         SavedBlockEffects;
-    DenseMap<BasicBlock *, DenseSet<jeandle::ObjectID>>
-        SavedMaterializedAtPred;
+    DenseMap<BasicBlock *, DenseSet<jeandle::ObjectID>> SavedMaterializedAtPred;
     DenseSet<BasicBlock *> HadBlockExits;
     DenseSet<BasicBlock *> HadBlockEffects;
     DenseSet<BasicBlock *> HadMaterializedAtPred;
@@ -728,9 +725,9 @@ private:
   void takeLoopSnapshot(Loop *L,
                         const llvm::SmallPtrSetImpl<BasicBlock *> &LoopBlocks,
                         LoopSnapshot &S);
-  void restoreLoopSnapshot(
-      const llvm::SmallPtrSetImpl<BasicBlock *> &LoopBlocks,
-      const LoopSnapshot &S);
+  void
+  restoreLoopSnapshot(const llvm::SmallPtrSetImpl<BasicBlock *> &LoopBlocks,
+                      const LoopSnapshot &S);
 
   // Convergence: structural equivalence of two snapshots of (loop block ->
   // BlockExitInfo).
@@ -1070,8 +1067,8 @@ PHINode *Analyzer::createUnparentedPhi(Type *Ty, unsigned N,
 }
 
 PHINode *Analyzer::getOrCreateLoopFieldPhi(BasicBlock *BB, jeandle::ObjectID ID,
-                                            int64_t Offset, Type *Ty,
-                                            unsigned N, const Twine &Name) {
+                                           int64_t Offset, Type *Ty, unsigned N,
+                                           const Twine &Name) {
   // Outside a loop header, fall back to the legacy single-shot OwnedPhis path.
   if (!LoopHeaderSet.count(BB))
     return createUnparentedPhi(Ty, N, Name);
@@ -1085,8 +1082,8 @@ PHINode *Analyzer::getOrCreateLoopFieldPhi(BasicBlock *BB, jeandle::ObjectID ID,
   // and (defensively) avoids a stale-capacity surprise if the IR has more
   // preds than the analyzer thinks. BB->getNumPredecessors() observes ALL
   // preds even on first-pass analysis.
-  unsigned FullN = static_cast<unsigned>(
-      std::distance(pred_begin(BB), pred_end(BB)));
+  unsigned FullN =
+      static_cast<unsigned>(std::distance(pred_begin(BB), pred_end(BB)));
   if (FullN < N)
     FullN = N; // caller knows of more than IR shows; should not occur on
                // well-formed IR but cheap to honour.
@@ -1099,7 +1096,10 @@ PHINode *Analyzer::getOrCreateLoopFieldPhi(BasicBlock *BB, jeandle::ObjectID ID,
     // some other code path. The cache entry is plain PHINode*, so revalidate.
     bool Valid = false;
     for (auto &VH : Result.OwnedLoopFieldPhis) {
-      if (VH == Cached) { Valid = true; break; }
+      if (VH == Cached) {
+        Valid = true;
+        break;
+      }
     }
     // Tightened validity check. During analysis the PHI is an
     // unparented shell — the transform pass is responsible for inserting it
@@ -1120,8 +1120,8 @@ PHINode *Analyzer::getOrCreateLoopFieldPhi(BasicBlock *BB, jeandle::ObjectID ID,
       // a no-op in practice. It's spelled out anyway to keep the
       // post-condition explicit ("cache hit returns an empty shell").
       while (Cached->getNumIncomingValues() > 0)
-        Cached->removeIncomingValue(
-            Cached->getNumIncomingValues() - 1u, /*DeletePHIIfEmpty=*/false);
+        Cached->removeIncomingValue(Cached->getNumIncomingValues() - 1u,
+                                    /*DeletePHIIfEmpty=*/false);
       return Cached;
     }
     // Cache stale (rare): drop entry and fall through to recreate.
@@ -1159,7 +1159,8 @@ Value *Analyzer::coerceToType(Value *V, Type *LoadTy,
   uint64_t VBits = DL.getTypeSizeInBits(VTy);
   uint64_t LBits = DL.getTypeSizeInBits(LoadTy);
 
-  // Stable-slot-kind invariant: ref↔primitive at the same slot must materialize.
+  // Stable-slot-kind invariant: ref↔primitive at the same slot must
+  // materialize.
   if (VTy->isPointerTy() != LoadTy->isPointerTy())
     return nullptr;
 
@@ -1186,9 +1187,9 @@ Value *Analyzer::coerceToType(Value *V, Type *LoadTy,
   if (VBits == LBits) {
     if (!CastInst::isBitCastable(VTy, LoadTy))
       return nullptr;
-    Instruction *Cast = CastInst::Create(Instruction::BitCast, V, LoadTy,
-                                         "pea.coerce",
-                                         /*InsertBefore=*/nullptr);
+    Instruction *Cast =
+        CastInst::Create(Instruction::BitCast, V, LoadTy, "pea.coerce",
+                         /*InsertBefore=*/nullptr);
     if (InsertContext)
       Cast->setDebugLoc(InsertContext->getDebugLoc());
     Result.OwnedInsts.emplace_back(Cast);
@@ -1428,539 +1429,534 @@ void Analyzer::mergeStates(BasicBlock *BB) {
     Changed = false;
 
     for (jeandle::ObjectID ID : IDs) {
-    if (!Eligible.lookup(ID))
-      continue;
-
-    // Per-pred disposition.
-    bool AllVirtual = true;
-    bool AllMaterialized = true;
-    for (const auto *P : Preds) {
-      bool V = P->Virtuals.count(ID);
-      bool M = P->Materialized.count(ID);
-      if (!V)
-        AllVirtual = false;
-      if (!M)
-        AllMaterialized = false;
-    }
-
-    if (AllMaterialized) {
-      // Every incoming path already materialized the object — carry the
-      // materialized state forward at BB's entry. If the materialized pointer
-      // differs across preds, synthesize a ptr addrspace(1) PHI; otherwise
-      // reuse the unique pointer.
-      jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
-      Value *Unique = nullptr;
-      bool AllSame = true;
-      for (auto *P : Preds) {
-        auto It = P->MaterializedValues.find(ID);
-        Value *V = (It != P->MaterializedValues.end()) ? It->second
-                                                       : VObj.AllocationCall;
-        if (!Unique) {
-          Unique = V;
-        } else if (Unique != V) {
-          AllSame = false;
-          break;
-        }
-      }
-      // Per-pred materialize: when every pred's MaterializedValue is
-      // the OrigAlloc placeholder (the convention used by
-      // materializeAtPredFromExitInfo to signal "look me up via
-      // MatPerBlock"), each pred actually has its OWN NewInv that the
-      // transform resolves through MatPerBlock at apply time. The values
-      // are NOT truly unique — they only LOOK unique because they share
-      // the placeholder. Build a PHI so the CreatePHI handler can
-      // substitute the correct per-pred NewInv into each incoming, and
-      // downstream uses thread through the PHI rather than relying on the
-      // global RAUW (which is suppressed when IsPerPred=true).
-      bool IsPerPredPlaceholder = false;
-      if (AllSame && Preds.size() > 1 && Unique == VObj.AllocationCall) {
-        AllSame = false;
-        IsPerPredPlaceholder = true;
-      }
-      Value *MV = Unique;
-      if (!AllSame) {
-        Type *PtrTy =
-            PointerType::get(F.getContext(),
-                              jeandle::AddrSpace::JavaHeapAddrSpace);
-        // Loop-PHI cache: stable PHI across fixpoint iterations.
-        PHINode *Phi = getOrCreateLoopFieldPhi(
-            BB, ID, /*Offset=*/-1, PtrTy, Preds.size(),
-            "pea.materialized.phi");
-        jeandle::PEAResult::Effect PE;
-        PE.Kind = jeandle::PEAResult::EffectKind::CreatePHI;
-        PE.Block = BB;
-        // SeqNo is assigned at drain time (end of processBlock(BB))
-        // so the CreatePHI sorts strictly after any per-pred Materialize
-        // emitted during the same block walk. The placeholder 0 here is
-        // overwritten by drainPendingMergePhis.
-        PE.SeqNo = 0;
-        PE.ObjID = ID;
-        PE.PhiInst = Phi;
-        PE.PHIType = PtrTy;
-        // For the per-pred placeholder case, tell the transform to
-        // RAUW OrigAlloc onto the PHI after wiring, so post-merge users
-        // resolve through the PHI rather than referencing one of the
-        // per-pred NewInvs directly (the IsPerPred Materializes
-        // intentionally skip the global RAUW that would otherwise pick a
-        // single pred's NewInv and break SSA on other-pred paths).
-        PE.RAUWOrigToPHI = IsPerPredPlaceholder;
-        for (unsigned i = 0; i < Preds.size(); ++i) {
-          auto It = Preds[i]->MaterializedValues.find(ID);
-          Value *V = (It != Preds[i]->MaterializedValues.end())
-                         ? It->second
-                         : VObj.AllocationCall;
-          PE.PHIIncomingValues.push_back(V);
-          PE.PHIIncomingBlocks.push_back(PredBBs[i]);
-        }
-        PendingMergePhis[BB].push_back(std::move(PE));
-        MV = Phi;
-      }
-      jeandle::ObjectState OS(0);
-      OS.materialize(MV);
-      CurrentState.addObject(ID, std::move(OS));
-      Materialized.insert(ID);
-      continue;
-    }
-
-    if (!AllVirtual) {
-      // Mixed (virtual on some paths, materialized or missing on others).
-      // Short-circuit when the object isn't tracked on every pred (e.g.,
-      // an LLVM PHI mixing a virtual incoming from one branch and an
-      // unrelated pointer from another). The merge entry simply doesn't
-      // carry this ObjectID; processBlockPhis below picks up any LLVM PHI
-      // that references it and materializes the virtual incomings.
-      bool MissingOnSomePred = false;
-      for (auto *P : Preds) {
-        if (!P->Materialized.count(ID) && !P->Virtuals.count(ID)) {
-          MissingOnSomePred = true;
-          break;
-        }
-      }
-      if (MissingOnSomePred) {
+      if (!Eligible.lookup(ID))
         continue;
-      }
 
-      // True mixed virtual+materialized at a merge. Inherit Materialized at
-      // BB's entry using the OrigAlloc pointer as a placeholder. The transform
-      // RAUWs every IR use of OrigAlloc onto the live materialization invoke,
-      // so downstream uses of the virtual at the merge resolve correctly
-      // without a synthesized ptr addrspace(1) PHI here.
-      //
-      // "Mixed-merge non-dominating alloc" covers the case
-      // where OrigAlloc does NOT dominate BB. For a non-synthetic VO this is
-      // unreachable by construction: the only way ID can be tracked at every
-      // pred of BB is for OrigAlloc to flow into every pred via SSA, which by
-      // dominance requires OrigAlloc to dominate BB. Synthetic VOs (created
-      // by Case C at a different merge) escape this invariant — their
-      // AllocationCall is borrowed from one of the per-pred source VOs and is
-      // not the real backing allocation. Synthetics that hit a downstream
-      // mixed-state merge are detected here and dropped to ineligible, which
-      // also propagates ineligibility to every per-pred source VO so the
-      // original allocations and stores survive in IR.
-      // TODO(cascade-materialize): see materializeAt().
-      jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
-      if (VObj.IsSynthetic) {
-        // Cascade (transitive over nested synthetics) through markIneligible.
-        markIneligible(ID);
-        continue;
-      }
-      if (!VObj.AllocationCall ||
-          !DT.dominates(VObj.AllocationCall, BB)) {
-        // "Mixed-merge non-dominating alloc": conservatively mark the VO
-        // ineligible so the alloc and per-pred stores survive unmodified in
-        // IR. Typed-array-element virtualization can reach this when an array
-        // alloc inside a loop body is tracked at the loop exit on every pred
-        // (the alloc dominates the loop body but not the post-loop merge).
-        Eligible[ID] = false;
-        continue;
-      }
-      jeandle::ObjectState OS(0);
-      OS.materialize(VObj.AllocationCall);
-      CurrentState.addObject(ID, std::move(OS));
-      Materialized.insert(ID);
-      continue;
-    }
-
-    // All preds report Virtual: check lock counts.
-    unsigned RefLC = Preds[0]->LockCounts.lookup(ID);
-    bool LocksMatch = true;
-    for (const auto *P : Preds) {
-      if (P->LockCounts.lookup(ID) != RefLC) {
-        LocksMatch = false;
-        break;
-      }
-    }
-    if (!LocksMatch) {
-      // Lock-count cascade at merge. A virtualCount==N + locksEqual==false
-      // merge falls into "materialize each virtual pred + build a
-      // materializedValuePhi". Each per-pred materialise carries the PRED's
-      // OWN lock list, so the alloc-commit emits exactly that pred's own
-      // monitorenter set — no synthesized enters are added on the lower-count
-      // side, preserving the original per-path lock counts.
-      //
-      // For each virtual pred, materializeAtPredFromExitInfo un-elides the
-      // pred's own enters via ReplaceInput effects and materializes the alloc
-      // at the pred's terminator (a zero-count pred just emits the Materialize
-      // effect). After the loop every pred's ExitInfo has flipped to
-      // Materialized for ID; the outer retry (Changed=true) falls through to
-      // the AllMaterialized branch above which synthesizes the ptr addrspace(1)
-      // PHI. Per-pred order is deterministic (predecessors(BB) order by IR
-      // layout); MatInPH dedup and Eligible bail handle a cascade that already
-      // materialized ID at an earlier pred.
-      for (unsigned i = 0; i < Preds.size(); ++i) {
-        if (!Eligible.lookup(ID))
-          break;
-        uint32_t PreSeqNo = Result.NextSeqNo;
-        materializeAtPredFromExitInfo(ID, PredBBs[i], *Preds[i],
-                                       /*SkipGlobalRAUW=*/true,
-                                       MatReason::Merge);
-        if (Result.NextSeqNo != PreSeqNo)
-          Changed = true;
-      }
-      continue;
-    }
-    // When LockCounts agree we also require the live enter-stacks to be
-    // identical so that any later materializeAt undoes a single, well-defined
-    // stack.
-    //
-    // Switch the per-element comparison to (Call, BytecodeDepth) when the
-    // JDK frontend's depth metadata is present (otherwise the BytecodeDepth
-    // field carries the Order proxy value at push time, recovering exactly
-    // the Call-only check for lit tests / stale frontends). On mismatch,
-    // do NOT mark the VO ineligible: route to the same per-pred
-    // materialize path that the LockCounts-differ branch above uses.
-    if (RefLC != 0) {
-      const auto &RefStack = Preds[0]->LiveLockEnters.lookup(ID);
-      bool StacksMatch = true;
+      // Per-pred disposition.
+      bool AllVirtual = true;
+      bool AllMaterialized = true;
       for (const auto *P : Preds) {
-        const auto &S = P->LiveLockEnters.lookup(ID);
-        if (S.size() != RefStack.size()) {
-          StacksMatch = false;
-          break;
-        }
-        for (unsigned i = 0; i < S.size(); ++i) {
-          // Compare Call AND BytecodeDepth. Two paths that re-entered
-          // the SAME call site but at different bytecode-level depths (e.g.
-          // one path entered a wrapping outer synchronized block first) must
-          // be treated as distinct stacks, because un-elision at a downstream
-          // escape would emit the same set of ReplaceInput effects either way
-          // — but a proper per-pred cascade would have produced
-          // lock-correct IR.
-          if (S[i].Call != RefStack[i].Call ||
-              S[i].BytecodeDepth != RefStack[i].BytecodeDepth) {
-            StacksMatch = false;
+        bool V = P->Virtuals.count(ID);
+        bool M = P->Materialized.count(ID);
+        if (!V)
+          AllVirtual = false;
+        if (!M)
+          AllMaterialized = false;
+      }
+
+      if (AllMaterialized) {
+        // Every incoming path already materialized the object — carry the
+        // materialized state forward at BB's entry. If the materialized pointer
+        // differs across preds, synthesize a ptr addrspace(1) PHI; otherwise
+        // reuse the unique pointer.
+        jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
+        Value *Unique = nullptr;
+        bool AllSame = true;
+        for (auto *P : Preds) {
+          auto It = P->MaterializedValues.find(ID);
+          Value *V = (It != P->MaterializedValues.end()) ? It->second
+                                                         : VObj.AllocationCall;
+          if (!Unique) {
+            Unique = V;
+          } else if (Unique != V) {
+            AllSame = false;
             break;
           }
         }
-        if (!StacksMatch)
-          break;
+        // Per-pred materialize: when every pred's MaterializedValue is
+        // the OrigAlloc placeholder (the convention used by
+        // materializeAtPredFromExitInfo to signal "look me up via
+        // MatPerBlock"), each pred actually has its OWN NewInv that the
+        // transform resolves through MatPerBlock at apply time. The values
+        // are NOT truly unique — they only LOOK unique because they share
+        // the placeholder. Build a PHI so the CreatePHI handler can
+        // substitute the correct per-pred NewInv into each incoming, and
+        // downstream uses thread through the PHI rather than relying on the
+        // global RAUW (which is suppressed when IsPerPred=true).
+        bool IsPerPredPlaceholder = false;
+        if (AllSame && Preds.size() > 1 && Unique == VObj.AllocationCall) {
+          AllSame = false;
+          IsPerPredPlaceholder = true;
+        }
+        Value *MV = Unique;
+        if (!AllSame) {
+          Type *PtrTy = PointerType::get(F.getContext(),
+                                         jeandle::AddrSpace::JavaHeapAddrSpace);
+          // Loop-PHI cache: stable PHI across fixpoint iterations.
+          PHINode *Phi =
+              getOrCreateLoopFieldPhi(BB, ID, /*Offset=*/-1, PtrTy,
+                                      Preds.size(), "pea.materialized.phi");
+          jeandle::PEAResult::Effect PE;
+          PE.Kind = jeandle::PEAResult::EffectKind::CreatePHI;
+          PE.Block = BB;
+          // SeqNo is assigned at drain time (end of processBlock(BB))
+          // so the CreatePHI sorts strictly after any per-pred Materialize
+          // emitted during the same block walk. The placeholder 0 here is
+          // overwritten by drainPendingMergePhis.
+          PE.SeqNo = 0;
+          PE.ObjID = ID;
+          PE.PhiInst = Phi;
+          PE.PHIType = PtrTy;
+          // For the per-pred placeholder case, tell the transform to
+          // RAUW OrigAlloc onto the PHI after wiring, so post-merge users
+          // resolve through the PHI rather than referencing one of the
+          // per-pred NewInvs directly (the IsPerPred Materializes
+          // intentionally skip the global RAUW that would otherwise pick a
+          // single pred's NewInv and break SSA on other-pred paths).
+          PE.RAUWOrigToPHI = IsPerPredPlaceholder;
+          for (unsigned i = 0; i < Preds.size(); ++i) {
+            auto It = Preds[i]->MaterializedValues.find(ID);
+            Value *V = (It != Preds[i]->MaterializedValues.end())
+                           ? It->second
+                           : VObj.AllocationCall;
+            PE.PHIIncomingValues.push_back(V);
+            PE.PHIIncomingBlocks.push_back(PredBBs[i]);
+          }
+          PendingMergePhis[BB].push_back(std::move(PE));
+          MV = Phi;
+        }
+        jeandle::ObjectState OS(0);
+        OS.materialize(MV);
+        CurrentState.addObject(ID, std::move(OS));
+        Materialized.insert(ID);
+        continue;
       }
-      if (!StacksMatch) {
-        // Per-pred materialise each (still-virtual) pred for this
-        // VO instead of bailing. Mirrors the LockCounts-mismatch branch
-        // above. On the next iter (Changed=true) every pred has flipped
-        // ID to Materialized and the AllMaterialized branch at the top of
-        // the per-VO loop synthesizes the ptr addrspace(1) PHI.
+
+      if (!AllVirtual) {
+        // Mixed (virtual on some paths, materialized or missing on others).
+        // Short-circuit when the object isn't tracked on every pred (e.g.,
+        // an LLVM PHI mixing a virtual incoming from one branch and an
+        // unrelated pointer from another). The merge entry simply doesn't
+        // carry this ObjectID; processBlockPhis below picks up any LLVM PHI
+        // that references it and materializes the virtual incomings.
+        bool MissingOnSomePred = false;
+        for (auto *P : Preds) {
+          if (!P->Materialized.count(ID) && !P->Virtuals.count(ID)) {
+            MissingOnSomePred = true;
+            break;
+          }
+        }
+        if (MissingOnSomePred) {
+          continue;
+        }
+
+        // True mixed virtual+materialized at a merge. Inherit Materialized at
+        // BB's entry using the OrigAlloc pointer as a placeholder. The
+        // transform RAUWs every IR use of OrigAlloc onto the live
+        // materialization invoke, so downstream uses of the virtual at the
+        // merge resolve correctly without a synthesized ptr addrspace(1) PHI
+        // here.
+        //
+        // "Mixed-merge non-dominating alloc" covers the case
+        // where OrigAlloc does NOT dominate BB. For a non-synthetic VO this is
+        // unreachable by construction: the only way ID can be tracked at every
+        // pred of BB is for OrigAlloc to flow into every pred via SSA, which by
+        // dominance requires OrigAlloc to dominate BB. Synthetic VOs (created
+        // by Case C at a different merge) escape this invariant — their
+        // AllocationCall is borrowed from one of the per-pred source VOs and is
+        // not the real backing allocation. Synthetics that hit a downstream
+        // mixed-state merge are detected here and dropped to ineligible, which
+        // also propagates ineligibility to every per-pred source VO so the
+        // original allocations and stores survive in IR.
+        // TODO(cascade-materialize): see materializeAt().
+        jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
+        if (VObj.IsSynthetic) {
+          // Cascade (transitive over nested synthetics) through markIneligible.
+          markIneligible(ID);
+          continue;
+        }
+        if (!VObj.AllocationCall || !DT.dominates(VObj.AllocationCall, BB)) {
+          // "Mixed-merge non-dominating alloc": conservatively mark the VO
+          // ineligible so the alloc and per-pred stores survive unmodified in
+          // IR. Typed-array-element virtualization can reach this when an array
+          // alloc inside a loop body is tracked at the loop exit on every pred
+          // (the alloc dominates the loop body but not the post-loop merge).
+          Eligible[ID] = false;
+          continue;
+        }
+        jeandle::ObjectState OS(0);
+        OS.materialize(VObj.AllocationCall);
+        CurrentState.addObject(ID, std::move(OS));
+        Materialized.insert(ID);
+        continue;
+      }
+
+      // All preds report Virtual: check lock counts.
+      unsigned RefLC = Preds[0]->LockCounts.lookup(ID);
+      bool LocksMatch = true;
+      for (const auto *P : Preds) {
+        if (P->LockCounts.lookup(ID) != RefLC) {
+          LocksMatch = false;
+          break;
+        }
+      }
+      if (!LocksMatch) {
+        // Lock-count cascade at merge. A virtualCount==N + locksEqual==false
+        // merge falls into "materialize each virtual pred + build a
+        // materializedValuePhi". Each per-pred materialise carries the PRED's
+        // OWN lock list, so the alloc-commit emits exactly that pred's own
+        // monitorenter set — no synthesized enters are added on the lower-count
+        // side, preserving the original per-path lock counts.
+        //
+        // For each virtual pred, materializeAtPredFromExitInfo un-elides the
+        // pred's own enters via ReplaceInput effects and materializes the alloc
+        // at the pred's terminator (a zero-count pred just emits the
+        // Materialize effect). After the loop every pred's ExitInfo has flipped
+        // to Materialized for ID; the outer retry (Changed=true) falls through
+        // to the AllMaterialized branch above which synthesizes the ptr
+        // addrspace(1) PHI. Per-pred order is deterministic (predecessors(BB)
+        // order by IR layout); MatInPH dedup and Eligible bail handle a cascade
+        // that already materialized ID at an earlier pred.
         for (unsigned i = 0; i < Preds.size(); ++i) {
           if (!Eligible.lookup(ID))
             break;
           uint32_t PreSeqNo = Result.NextSeqNo;
           materializeAtPredFromExitInfo(ID, PredBBs[i], *Preds[i],
-                                         /*SkipGlobalRAUW=*/true,
-                                         MatReason::Merge);
+                                        /*SkipGlobalRAUW=*/true,
+                                        MatReason::Merge);
           if (Result.NextSeqNo != PreSeqNo)
             Changed = true;
         }
         continue;
       }
-    }
-
-    // Check field states at every tracked offset. Identical entries flow
-    // straight into Merged; disagreements trigger field-PHI synthesis.
-    DenseSet<int64_t> Offsets;
-    for (const auto *P : Preds) {
-      auto FIt = P->FieldStates.find(ID);
-      if (FIt == P->FieldStates.end())
-        continue;
-      for (auto &Kv : FIt->second)
-        Offsets.insert(Kv.first);
-    }
-    SmallVector<int64_t, 8> SortedOffsets(Offsets.begin(), Offsets.end());
-    llvm::sort(SortedOffsets); // determinism
-    bool BailObject = false;
-    DenseMap<int64_t, jeandle::FieldValue> Merged;
-    // Snapshot of newly-emitted CreatePHI effects for this object's fields;
-    // committed to Result only if every offset succeeds.
-    SmallVector<jeandle::PEAResult::Effect, 4> PendingPhiEffects;
-    for (int64_t Off : SortedOffsets) {
-      // Per-offset bail. When a single offset cannot be merged
-      // (incompatible non-integer types, no safe coercion), DROP just
-      // that offset from the merged FieldStates rather than marking the
-      // entire VO ineligible. Downstream loads from a missing offset
-      // see Unknown — tier2Load forces materialization at the load
-      // site, which is the conservative-but-sound outcome. Other
-      // offsets keep their virtual state. The whole-VO BailObject path
-      // remains for unrecoverable conditions (type discovery returned
-      // null, LocalBail on inner materialise of an ineligible VO, etc.).
-      bool BailOffset = false;
-      jeandle::FieldValue Ref = jeandle::FieldValue::unknown();
-      bool HaveRef = false;
-      bool Disagrees = false;
-      for (const auto *P : Preds) {
-        jeandle::FieldValue FV = jeandle::FieldValue::unknown();
-        auto FIt = P->FieldStates.find(ID);
-        if (FIt != P->FieldStates.end()) {
-          auto OIt = FIt->second.find(Off);
-          if (OIt != FIt->second.end())
-            FV = OIt->second;
+      // When LockCounts agree we also require the live enter-stacks to be
+      // identical so that any later materializeAt undoes a single, well-defined
+      // stack.
+      //
+      // Switch the per-element comparison to (Call, BytecodeDepth) when the
+      // JDK frontend's depth metadata is present (otherwise the BytecodeDepth
+      // field carries the Order proxy value at push time, recovering exactly
+      // the Call-only check for lit tests / stale frontends). On mismatch,
+      // do NOT mark the VO ineligible: route to the same per-pred
+      // materialize path that the LockCounts-differ branch above uses.
+      if (RefLC != 0) {
+        const auto &RefStack = Preds[0]->LiveLockEnters.lookup(ID);
+        bool StacksMatch = true;
+        for (const auto *P : Preds) {
+          const auto &S = P->LiveLockEnters.lookup(ID);
+          if (S.size() != RefStack.size()) {
+            StacksMatch = false;
+            break;
+          }
+          for (unsigned i = 0; i < S.size(); ++i) {
+            // Compare Call AND BytecodeDepth. Two paths that re-entered
+            // the SAME call site but at different bytecode-level depths (e.g.
+            // one path entered a wrapping outer synchronized block first) must
+            // be treated as distinct stacks, because un-elision at a downstream
+            // escape would emit the same set of ReplaceInput effects either way
+            // — but a proper per-pred cascade would have produced
+            // lock-correct IR.
+            if (S[i].Call != RefStack[i].Call ||
+                S[i].BytecodeDepth != RefStack[i].BytecodeDepth) {
+              StacksMatch = false;
+              break;
+            }
+          }
+          if (!StacksMatch)
+            break;
         }
-        if (!HaveRef) {
-          Ref = FV;
-          HaveRef = true;
-        } else if (!Ref.shallowEquals(FV)) {
-          Disagrees = true;
-          break;
+        if (!StacksMatch) {
+          // Per-pred materialise each (still-virtual) pred for this
+          // VO instead of bailing. Mirrors the LockCounts-mismatch branch
+          // above. On the next iter (Changed=true) every pred has flipped
+          // ID to Materialized and the AllMaterialized branch at the top of
+          // the per-VO loop synthesizes the ptr addrspace(1) PHI.
+          for (unsigned i = 0; i < Preds.size(); ++i) {
+            if (!Eligible.lookup(ID))
+              break;
+            uint32_t PreSeqNo = Result.NextSeqNo;
+            materializeAtPredFromExitInfo(ID, PredBBs[i], *Preds[i],
+                                          /*SkipGlobalRAUW=*/true,
+                                          MatReason::Merge);
+            if (Result.NextSeqNo != PreSeqNo)
+              Changed = true;
+          }
+          continue;
         }
       }
-      if (!Disagrees) {
-        if (!Ref.isUnknown())
-          Merged[Off] = Ref;
-        continue;
-      }
 
-      // Field disagreement at Off — attempt field-PHI synthesis. Decide
-      // the merged PHI type. Compatibility rule: every non-unknown
-      // entry's declared type must be identical, OR every non-unknown
-      // entry must be a pointer in the Java heap addrspace (in which
-      // case the PHI is ptr addrspace(1) and ref/scalar are
-      // interchangeable). Additionally allows integer-width
-      // promotion: if every non-unknown entry is an integer in the
-      // same addrspace (none = primitive), promote the PHI type to the
-      // widest integer and zext narrower entries.
-      Type *PhiType = nullptr;
-      bool AllPointer = true;
-      bool AllInteger = true;
-      unsigned WidestIntBits = 0;
+      // Check field states at every tracked offset. Identical entries flow
+      // straight into Merged; disagreements trigger field-PHI synthesis.
+      DenseSet<int64_t> Offsets;
       for (const auto *P : Preds) {
         auto FIt = P->FieldStates.find(ID);
         if (FIt == P->FieldStates.end())
           continue;
-        auto OIt = FIt->second.find(Off);
-        if (OIt == FIt->second.end())
-          continue;
-        const jeandle::FieldValue &FV = OIt->second;
-        if (FV.isUnknown())
-          continue;
-        Type *T = nullptr;
-        if (FV.isScalar())
-          T = FV.getScalar()->getType();
-        else
-          T = FV.getDeclaredType();
-        if (!T) {
-          BailObject = true;
-          break;
-        }
-        if (!T->isPointerTy() ||
-            T->getPointerAddressSpace() !=
-                jeandle::AddrSpace::JavaHeapAddrSpace)
-          AllPointer = false;
-        if (T->isIntegerTy()) {
-          unsigned B = T->getIntegerBitWidth();
-          if (B > WidestIntBits)
-            WidestIntBits = B;
-        } else {
-          AllInteger = false;
-        }
-        if (!PhiType) {
-          PhiType = T;
-        } else if (PhiType != T) {
-          // Heap-pointer promotion is the existing rule.
-          bool BothJavaHeapPtr =
-              PhiType->isPointerTy() && T->isPointerTy() &&
-              PhiType->getPointerAddressSpace() ==
-                  jeandle::AddrSpace::JavaHeapAddrSpace &&
-              T->getPointerAddressSpace() ==
-                  jeandle::AddrSpace::JavaHeapAddrSpace;
-          // Integer-widening promotion: both integers, possibly
-          // different widths — defer PhiType selection to the widest
-          // and emit zext on narrower per-pred inputs in the value
-          // computation pass below.
-          bool BothInteger = PhiType->isIntegerTy() && T->isIntegerTy();
-          if (!BothJavaHeapPtr && !BothInteger) {
-            BailOffset = true;
+        for (auto &Kv : FIt->second)
+          Offsets.insert(Kv.first);
+      }
+      SmallVector<int64_t, 8> SortedOffsets(Offsets.begin(), Offsets.end());
+      llvm::sort(SortedOffsets); // determinism
+      bool BailObject = false;
+      DenseMap<int64_t, jeandle::FieldValue> Merged;
+      // Snapshot of newly-emitted CreatePHI effects for this object's fields;
+      // committed to Result only if every offset succeeds.
+      SmallVector<jeandle::PEAResult::Effect, 4> PendingPhiEffects;
+      for (int64_t Off : SortedOffsets) {
+        // Per-offset bail. When a single offset cannot be merged
+        // (incompatible non-integer types, no safe coercion), DROP just
+        // that offset from the merged FieldStates rather than marking the
+        // entire VO ineligible. Downstream loads from a missing offset
+        // see Unknown — tier2Load forces materialization at the load
+        // site, which is the conservative-but-sound outcome. Other
+        // offsets keep their virtual state. The whole-VO BailObject path
+        // remains for unrecoverable conditions (type discovery returned
+        // null, LocalBail on inner materialise of an ineligible VO, etc.).
+        bool BailOffset = false;
+        jeandle::FieldValue Ref = jeandle::FieldValue::unknown();
+        bool HaveRef = false;
+        bool Disagrees = false;
+        for (const auto *P : Preds) {
+          jeandle::FieldValue FV = jeandle::FieldValue::unknown();
+          auto FIt = P->FieldStates.find(ID);
+          if (FIt != P->FieldStates.end()) {
+            auto OIt = FIt->second.find(Off);
+            if (OIt != FIt->second.end())
+              FV = OIt->second;
+          }
+          if (!HaveRef) {
+            Ref = FV;
+            HaveRef = true;
+          } else if (!Ref.shallowEquals(FV)) {
+            Disagrees = true;
             break;
           }
-          // For integer case, leave PhiType as the LARGER type (we'll
-          // re-pick from WidestIntBits below).
         }
-      }
-      if (BailObject)
-        break;
-      if (BailOffset) {
-        // Drop this offset and keep going.
-        continue;
-      }
-      if (!PhiType) {
-        // Should be unreachable — a disagreement implies at least two
-        // distinct non-unknown entries.
-        continue;
-      }
-      if (AllPointer) {
-        PhiType = PointerType::get(F.getContext(),
-                                    jeandle::AddrSpace::JavaHeapAddrSpace);
-      } else if (AllInteger && WidestIntBits != 0) {
-        // Select the widest integer type as the PHI type and
-        // emit zext on narrower per-pred values below.
-        PhiType = IntegerType::get(F.getContext(), WidestIntBits);
-      }
+        if (!Disagrees) {
+          if (!Ref.isUnknown())
+            Merged[Off] = Ref;
+          continue;
+        }
 
-      // Compute per-pred input value.
-      SmallVector<Value *, 4> InValues;
-      InValues.reserve(Preds.size());
-      bool LocalBail = false;
-      for (unsigned i = 0; i < Preds.size(); ++i) {
-        jeandle::FieldValue FV = jeandle::FieldValue::unknown();
-        auto FIt = Preds[i]->FieldStates.find(ID);
-        if (FIt != Preds[i]->FieldStates.end()) {
+        // Field disagreement at Off — attempt field-PHI synthesis. Decide
+        // the merged PHI type. Compatibility rule: every non-unknown
+        // entry's declared type must be identical, OR every non-unknown
+        // entry must be a pointer in the Java heap addrspace (in which
+        // case the PHI is ptr addrspace(1) and ref/scalar are
+        // interchangeable). Additionally allows integer-width
+        // promotion: if every non-unknown entry is an integer in the
+        // same addrspace (none = primitive), promote the PHI type to the
+        // widest integer and zext narrower entries.
+        Type *PhiType = nullptr;
+        bool AllPointer = true;
+        bool AllInteger = true;
+        unsigned WidestIntBits = 0;
+        for (const auto *P : Preds) {
+          auto FIt = P->FieldStates.find(ID);
+          if (FIt == P->FieldStates.end())
+            continue;
           auto OIt = FIt->second.find(Off);
-          if (OIt != FIt->second.end())
-            FV = OIt->second;
+          if (OIt == FIt->second.end())
+            continue;
+          const jeandle::FieldValue &FV = OIt->second;
+          if (FV.isUnknown())
+            continue;
+          Type *T = nullptr;
+          if (FV.isScalar())
+            T = FV.getScalar()->getType();
+          else
+            T = FV.getDeclaredType();
+          if (!T) {
+            BailObject = true;
+            break;
+          }
+          if (!T->isPointerTy() || T->getPointerAddressSpace() !=
+                                       jeandle::AddrSpace::JavaHeapAddrSpace)
+            AllPointer = false;
+          if (T->isIntegerTy()) {
+            unsigned B = T->getIntegerBitWidth();
+            if (B > WidestIntBits)
+              WidestIntBits = B;
+          } else {
+            AllInteger = false;
+          }
+          if (!PhiType) {
+            PhiType = T;
+          } else if (PhiType != T) {
+            // Heap-pointer promotion is the existing rule.
+            bool BothJavaHeapPtr = PhiType->isPointerTy() && T->isPointerTy() &&
+                                   PhiType->getPointerAddressSpace() ==
+                                       jeandle::AddrSpace::JavaHeapAddrSpace &&
+                                   T->getPointerAddressSpace() ==
+                                       jeandle::AddrSpace::JavaHeapAddrSpace;
+            // Integer-widening promotion: both integers, possibly
+            // different widths — defer PhiType selection to the widest
+            // and emit zext on narrower per-pred inputs in the value
+            // computation pass below.
+            bool BothInteger = PhiType->isIntegerTy() && T->isIntegerTy();
+            if (!BothJavaHeapPtr && !BothInteger) {
+              BailOffset = true;
+              break;
+            }
+            // For integer case, leave PhiType as the LARGER type (we'll
+            // re-pick from WidestIntBits below).
+          }
         }
-        Value *In = nullptr;
-        if (FV.isUnknown()) {
-          In = jeandle::FieldValue::defaultFor(PhiType);
-        } else if (FV.isScalar()) {
-          Value *V = FV.getScalar();
-          if (V->getType() != PhiType) {
-            // Integer-widen via zext if both are integers AND
-            // V is strictly narrower than PhiType. Other mismatches
-            // (scalar at pointer slot, etc.) still LocalBail.
-            if (V->getType()->isIntegerTy() && PhiType->isIntegerTy() &&
-                V->getType()->getIntegerBitWidth() <
-                    PhiType->getIntegerBitWidth()) {
-              // Constant zext folds; non-constant zext synthesised
-              // as an unparented OwnedInst the transform splices in
-              // before each pred's terminator. Constants are the
-              // overwhelming common case (loop-invariant 0/1 stores)
-              // so we cover that path here and skip non-const for
-              // now (would need a per-pred CreatePHI shim, more
-              // plumbing than currently warranted).
-              if (auto *CI = dyn_cast<ConstantInt>(V)) {
-                In = ConstantInt::get(PhiType,
-                                       CI->getValue().zext(
-                                           PhiType->getIntegerBitWidth()));
+        if (BailObject)
+          break;
+        if (BailOffset) {
+          // Drop this offset and keep going.
+          continue;
+        }
+        if (!PhiType) {
+          // Should be unreachable — a disagreement implies at least two
+          // distinct non-unknown entries.
+          continue;
+        }
+        if (AllPointer) {
+          PhiType = PointerType::get(F.getContext(),
+                                     jeandle::AddrSpace::JavaHeapAddrSpace);
+        } else if (AllInteger && WidestIntBits != 0) {
+          // Select the widest integer type as the PHI type and
+          // emit zext on narrower per-pred values below.
+          PhiType = IntegerType::get(F.getContext(), WidestIntBits);
+        }
+
+        // Compute per-pred input value.
+        SmallVector<Value *, 4> InValues;
+        InValues.reserve(Preds.size());
+        bool LocalBail = false;
+        for (unsigned i = 0; i < Preds.size(); ++i) {
+          jeandle::FieldValue FV = jeandle::FieldValue::unknown();
+          auto FIt = Preds[i]->FieldStates.find(ID);
+          if (FIt != Preds[i]->FieldStates.end()) {
+            auto OIt = FIt->second.find(Off);
+            if (OIt != FIt->second.end())
+              FV = OIt->second;
+          }
+          Value *In = nullptr;
+          if (FV.isUnknown()) {
+            In = jeandle::FieldValue::defaultFor(PhiType);
+          } else if (FV.isScalar()) {
+            Value *V = FV.getScalar();
+            if (V->getType() != PhiType) {
+              // Integer-widen via zext if both are integers AND
+              // V is strictly narrower than PhiType. Other mismatches
+              // (scalar at pointer slot, etc.) still LocalBail.
+              if (V->getType()->isIntegerTy() && PhiType->isIntegerTy() &&
+                  V->getType()->getIntegerBitWidth() <
+                      PhiType->getIntegerBitWidth()) {
+                // Constant zext folds; non-constant zext synthesised
+                // as an unparented OwnedInst the transform splices in
+                // before each pred's terminator. Constants are the
+                // overwhelming common case (loop-invariant 0/1 stores)
+                // so we cover that path here and skip non-const for
+                // now (would need a per-pred CreatePHI shim, more
+                // plumbing than currently warranted).
+                if (auto *CI = dyn_cast<ConstantInt>(V)) {
+                  In = ConstantInt::get(
+                      PhiType,
+                      CI->getValue().zext(PhiType->getIntegerBitWidth()));
+                } else {
+                  LocalBail = true;
+                  break;
+                }
               } else {
+                // Scalar with a non-matching primitive type at a pointer
+                // slot, or non-integer width mismatch, or a value-wider-
+                // than-PhiType (would be unsound to truncate).
                 LocalBail = true;
                 break;
               }
             } else {
-              // Scalar with a non-matching primitive type at a pointer
-              // slot, or non-integer width mismatch, or a value-wider-
-              // than-PhiType (would be unsound to truncate).
+              In = V;
+            }
+          } else if (FV.isMaterializedRef()) {
+            if (!PhiType->isPointerTy()) {
               LocalBail = true;
               break;
             }
+            In = FV.getMaterialized();
+          } else if (FV.isVirtualRef()) {
+            if (!PhiType->isPointerTy()) {
+              LocalBail = true;
+              break;
+            }
+            jeandle::ObjectID InnerID = FV.getVirtualRef();
+            // Materialize the inner object at this pred's terminator. After
+            // this, the field's effective input value is OrigAlloc(inner) —
+            // the transform's MatPerBlock substitutes it with NewInv at apply.
+            //
+            // Track whether this call emitted any Effects (i.e. did real
+            // work, vs short-circuiting on MaterializedAtPred dedup or on a
+            // synthetic-VO bail that already happened). The SeqNo delta is a
+            // robust proxy: every Effect appended bumps NextSeqNo, and no
+            // other code path in materializeAtPredFromExitInfo bumps it.
+            uint32_t PreSeqNo = Result.NextSeqNo;
+            materializeAtPredFromExitInfo(InnerID, PredBBs[i], *Preds[i],
+                                          /*SkipGlobalRAUW=*/false,
+                                          MatReason::PHI);
+            if (Result.NextSeqNo != PreSeqNo)
+              Changed = true;
+            if (!Eligible.lookup(InnerID)) {
+              LocalBail = true;
+              break;
+            }
+            jeandle::VirtualObject &InnerVO = *Result.VirtualObjects[InnerID];
+            // Defensively rewrite this pred's outer-VO FieldStates
+            // entry for the just-materialized inner to MaterializedRef
+            // so a sibling successor of the pred (other-than-BB) that
+            // later inherits from Preds[i] sees the materialized pointer
+            // rather than a stale VirtualRef(InnerID).
+            Preds[i]->FieldStates[ID][Off] =
+                jeandle::FieldValue::materializedRef(InnerVO.AllocationCall);
+            In = InnerVO.AllocationCall;
           } else {
-            In = V;
-          }
-        } else if (FV.isMaterializedRef()) {
-          if (!PhiType->isPointerTy()) {
             LocalBail = true;
             break;
           }
-          In = FV.getMaterialized();
-        } else if (FV.isVirtualRef()) {
-          if (!PhiType->isPointerTy()) {
-            LocalBail = true;
-            break;
-          }
-          jeandle::ObjectID InnerID = FV.getVirtualRef();
-          // Materialize the inner object at this pred's terminator. After
-          // this, the field's effective input value is OrigAlloc(inner) —
-          // the transform's MatPerBlock substitutes it with NewInv at apply.
-          //
-          // Track whether this call emitted any Effects (i.e. did real
-          // work, vs short-circuiting on MaterializedAtPred dedup or on a
-          // synthetic-VO bail that already happened). The SeqNo delta is a
-          // robust proxy: every Effect appended bumps NextSeqNo, and no
-          // other code path in materializeAtPredFromExitInfo bumps it.
-          uint32_t PreSeqNo = Result.NextSeqNo;
-          materializeAtPredFromExitInfo(InnerID, PredBBs[i], *Preds[i],
-                                        /*SkipGlobalRAUW=*/false,
-                                        MatReason::PHI);
-          if (Result.NextSeqNo != PreSeqNo)
-            Changed = true;
-          if (!Eligible.lookup(InnerID)) {
-            LocalBail = true;
-            break;
-          }
-          jeandle::VirtualObject &InnerVO =
-              *Result.VirtualObjects[InnerID];
-          // Defensively rewrite this pred's outer-VO FieldStates
-          // entry for the just-materialized inner to MaterializedRef
-          // so a sibling successor of the pred (other-than-BB) that
-          // later inherits from Preds[i] sees the materialized pointer
-          // rather than a stale VirtualRef(InnerID).
-          Preds[i]->FieldStates[ID][Off] =
-              jeandle::FieldValue::materializedRef(
-                  InnerVO.AllocationCall);
-          In = InnerVO.AllocationCall;
-        } else {
-          LocalBail = true;
-          break;
+          InValues.push_back(In);
         }
-        InValues.push_back(In);
+        if (LocalBail) {
+          // Per-offset bail. Drop this offset, keep going.
+          continue;
+        }
+
+        // Loop-PHI cache: stable PHI across fixpoint iterations.
+        PHINode *Phi = getOrCreateLoopFieldPhi(BB, ID, Off, PhiType,
+                                               Preds.size(), "pea.field.phi");
+        jeandle::PEAResult::Effect PE;
+        PE.Kind = jeandle::PEAResult::EffectKind::CreatePHI;
+        PE.Block = BB;
+        // SeqNo assigned at drain time; see PendingMergePhis comment.
+        PE.SeqNo = 0;
+        PE.ObjID = ID;
+        PE.PhiInst = Phi;
+        PE.PHIType = PhiType;
+        for (unsigned i = 0; i < Preds.size(); ++i) {
+          PE.PHIIncomingValues.push_back(InValues[i]);
+          PE.PHIIncomingBlocks.push_back(PredBBs[i]);
+        }
+        PendingPhiEffects.push_back(std::move(PE));
+
+        if (PhiType->isPointerTy())
+          Merged[Off] = jeandle::FieldValue::materializedRef(Phi);
+        else
+          Merged[Off] = jeandle::FieldValue::scalar(Phi);
       }
-      if (LocalBail) {
-        // Per-offset bail. Drop this offset, keep going.
+      if (BailObject) {
+        Eligible[ID] = false;
         continue;
       }
 
-      // Loop-PHI cache: stable PHI across fixpoint iterations.
-      PHINode *Phi = getOrCreateLoopFieldPhi(BB, ID, Off, PhiType,
-                                              Preds.size(), "pea.field.phi");
-      jeandle::PEAResult::Effect PE;
-      PE.Kind = jeandle::PEAResult::EffectKind::CreatePHI;
-      PE.Block = BB;
-      // SeqNo assigned at drain time; see PendingMergePhis comment.
-      PE.SeqNo = 0;
-      PE.ObjID = ID;
-      PE.PhiInst = Phi;
-      PE.PHIType = PhiType;
-      for (unsigned i = 0; i < Preds.size(); ++i) {
-        PE.PHIIncomingValues.push_back(InValues[i]);
-        PE.PHIIncomingBlocks.push_back(PredBBs[i]);
+      // Defer pending field-PHI effects to PendingMergePhis so the
+      // drain at end of processBlock(BB) reassigns their SeqNos AFTER any
+      // per-pred Materialize emitted during the block walk.
+      for (auto &PE : PendingPhiEffects)
+        PendingMergePhis[BB].push_back(std::move(PE));
+
+      // Case B: object stays virtual at BB entry with the merged field state.
+      CurrentState.addObject(ID, jeandle::ObjectState(/*numEntries=*/0));
+      if (!Merged.empty())
+        FieldStates[ID] = std::move(Merged);
+      if (RefLC != 0) {
+        LockCounts[ID] = RefLC;
+        // The merged live stack is identical to (any) pred's stack, since the
+        // StacksMatch check above succeeded.
+        const auto &RefStack = Preds[0]->LiveLockEnters.lookup(ID);
+        if (!RefStack.empty())
+          LiveLockEnters[ID] = RefStack;
       }
-      PendingPhiEffects.push_back(std::move(PE));
-
-      if (PhiType->isPointerTy())
-        Merged[Off] = jeandle::FieldValue::materializedRef(Phi);
-      else
-        Merged[Off] = jeandle::FieldValue::scalar(Phi);
-    }
-    if (BailObject) {
-      Eligible[ID] = false;
-      continue;
-    }
-
-    // Defer pending field-PHI effects to PendingMergePhis so the
-    // drain at end of processBlock(BB) reassigns their SeqNos AFTER any
-    // per-pred Materialize emitted during the block walk.
-    for (auto &PE : PendingPhiEffects)
-      PendingMergePhis[BB].push_back(std::move(PE));
-
-    // Case B: object stays virtual at BB entry with the merged field state.
-    CurrentState.addObject(ID, jeandle::ObjectState(/*numEntries=*/0));
-    if (!Merged.empty())
-      FieldStates[ID] = std::move(Merged);
-    if (RefLC != 0) {
-      LockCounts[ID] = RefLC;
-      // The merged live stack is identical to (any) pred's stack, since the
-      // StacksMatch check above succeeded.
-      const auto &RefStack = Preds[0]->LiveLockEnters.lookup(ID);
-      if (!RefStack.empty())
-        LiveLockEnters[ID] = RefStack;
-    }
     }
 
     // Run the PHI loop INSIDE the merge do-while. Case-A fallback
@@ -2192,8 +2188,7 @@ bool Analyzer::synthesizeCaseC(
       return false;
   }
   if (RefLC != 0) {
-    const auto &RefStack =
-        ExitInfos[0]->LiveLockEnters.lookup(PerPredIDs[0]);
+    const auto &RefStack = ExitInfos[0]->LiveLockEnters.lookup(PerPredIDs[0]);
     for (unsigned i = 1; i < N; ++i) {
       const auto &S = ExitInfos[i]->LiveLockEnters.lookup(PerPredIDs[i]);
       if (S.size() != RefStack.size())
@@ -2278,8 +2273,7 @@ bool Analyzer::synthesizeCaseC(
         if (Kv.first == PID)
           continue;
         for (auto &Off : Kv.second) {
-          if (Off.second.isVirtualRef() &&
-              Off.second.getVirtualRef() == PID)
+          if (Off.second.isVirtualRef() && Off.second.getVirtualRef() == PID)
             return false;
         }
       }
@@ -2288,8 +2282,7 @@ bool Analyzer::synthesizeCaseC(
       if (Kv.first == PID)
         continue;
       for (auto &Off : Kv.second) {
-        if (Off.second.isVirtualRef() &&
-            Off.second.getVirtualRef() == PID)
+        if (Off.second.isVirtualRef() && Off.second.getVirtualRef() == PID)
           return false;
       }
     }
@@ -2300,7 +2293,7 @@ bool Analyzer::synthesizeCaseC(
   CacheKey.Block = BB;
   {
     SmallVector<jeandle::ObjectID, 4> Sorted(PerPredIDs.begin(),
-                                              PerPredIDs.end());
+                                             PerPredIDs.end());
     llvm::sort(Sorted);
     CacheKey.SourceIDs = std::move(Sorted);
   }
@@ -2365,28 +2358,27 @@ bool Analyzer::synthesizeCaseC(
       P.PerPredFVs[i] = FV;
       if (FV.isUnknown())
         continue;
-      Type *T = FV.isScalar() ? FV.getScalar()->getType() : FV.getDeclaredType();
+      Type *T =
+          FV.isScalar() ? FV.getScalar()->getType() : FV.getDeclaredType();
       if (!T)
         return false;
       if (!T->isPointerTy() ||
-          T->getPointerAddressSpace() !=
-              jeandle::AddrSpace::JavaHeapAddrSpace)
+          T->getPointerAddressSpace() != jeandle::AddrSpace::JavaHeapAddrSpace)
         AllPointer = false;
       if (!PhiType)
         PhiType = T;
-      else if (PhiType != T &&
-               !(PhiType->isPointerTy() && T->isPointerTy() &&
-                 PhiType->getPointerAddressSpace() ==
-                     jeandle::AddrSpace::JavaHeapAddrSpace &&
-                 T->getPointerAddressSpace() ==
-                     jeandle::AddrSpace::JavaHeapAddrSpace))
+      else if (PhiType != T && !(PhiType->isPointerTy() && T->isPointerTy() &&
+                                 PhiType->getPointerAddressSpace() ==
+                                     jeandle::AddrSpace::JavaHeapAddrSpace &&
+                                 T->getPointerAddressSpace() ==
+                                     jeandle::AddrSpace::JavaHeapAddrSpace))
         return false;
     }
     if (!PhiType)
       continue; // every pred has this slot unknown — nothing to record.
     if (AllPointer)
       PhiType = PointerType::get(F.getContext(),
-                                  jeandle::AddrSpace::JavaHeapAddrSpace);
+                                 jeandle::AddrSpace::JavaHeapAddrSpace);
     P.PhiType = PhiType;
     // Detect AllSame across preds (shallowEquals comparison).
     jeandle::FieldValue First = P.PerPredFVs[0];
@@ -2495,8 +2487,7 @@ bool Analyzer::synthesizeCaseC(
         }
         jeandle::ObjectID InnerID = FV.getVirtualRef();
         materializeAtPredFromExitInfo(InnerID, Preds[i], *ExitInfos[i],
-                                      /*SkipGlobalRAUW=*/false,
-                                      MatReason::PHI);
+                                      /*SkipGlobalRAUW=*/false, MatReason::PHI);
         if (!Eligible.lookup(InnerID)) {
           Eligible[NewID] = false;
           return false;
@@ -2550,8 +2541,7 @@ bool Analyzer::synthesizeCaseC(
     FieldStates[NewID] = std::move(Merged);
   if (RefLC != 0) {
     LockCounts[NewID] = RefLC;
-    const auto &RefStack =
-        ExitInfos[0]->LiveLockEnters.lookup(PerPredIDs[0]);
+    const auto &RefStack = ExitInfos[0]->LiveLockEnters.lookup(PerPredIDs[0]);
     if (!RefStack.empty())
       LiveLockEnters[NewID] = RefStack;
   }
@@ -2614,8 +2604,7 @@ void Analyzer::applyThreeTier(Instruction *I) {
     // falls through to materializeAllVirtualOperands, matching the Case-A
     // PHI handling for ambiguous merges.
     if (isa<GetElementPtrInst>(I) || isa<BitCastInst>(I) ||
-        isa<AddrSpaceCastInst>(I) || isa<FreezeInst>(I) ||
-        isa<SelectInst>(I)) {
+        isa<AddrSpaceCastInst>(I) || isa<FreezeInst>(I) || isa<SelectInst>(I)) {
       propagatePointerAlias(I);
       return;
     }
@@ -2675,9 +2664,8 @@ void Analyzer::applyThreeTier(Instruction *I) {
       case Intrinsic::launder_invariant_group:
       case Intrinsic::strip_invariant_group: {
         Value *Arg = II->getArgOperand(0);
-        if (auto BaseID =
-                jeandle::pea::resolveVirtualRef(Arg, CurrentState,
-                                                Aliases, DL)) {
+        if (auto BaseID = jeandle::pea::resolveVirtualRef(Arg, CurrentState,
+                                                          Aliases, DL)) {
           Aliases.addVirtualAlias(II, *BaseID);
           return;
         }
@@ -2705,15 +2693,15 @@ void Analyzer::applyThreeTier(Instruction *I) {
     //
     // Current frontend JavaOp inventory (grep `jeandle.[a-z_]+` in
     // jeandle-jdk/src/hotspot/share/jeandle/): array_store_check, arraylength,
-    // card_table_barrier, check_if_value_based, check_inflated, check_instanceof,
-    // check_klass_subtype, check_klass_subtype_slow_path, checkcast,
-    // clear_oop_in_lock_stack_top, current_thread, decrement_lock_count,
-    // get_stack_pointer, idiv, increment_lock_count, instanceof, irem, ldiv,
-    // load_klass, lrem, monitorenter_*, monitorexit_*, new_instance, newarray,
-    // personality, post_barrier, pre_barrier, safepoint_poll,
-    // try_acquire_monitor_lock, try_release_monitor_lock. When the frontend
-    // grows a new JavaOp, wire its fold in tier2JavaOpFold and add the
-    // isJeandle* predicate in PartialEscapeUtils.{h,cpp}.
+    // card_table_barrier, check_if_value_based, check_inflated,
+    // check_instanceof, check_klass_subtype, check_klass_subtype_slow_path,
+    // checkcast, clear_oop_in_lock_stack_top, current_thread,
+    // decrement_lock_count, get_stack_pointer, idiv, increment_lock_count,
+    // instanceof, irem, ldiv, load_klass, lrem, monitorenter_*, monitorexit_*,
+    // new_instance, newarray, personality, post_barrier, pre_barrier,
+    // safepoint_poll, try_acquire_monitor_lock, try_release_monitor_lock. When
+    // the frontend grows a new JavaOp, wire its fold in tier2JavaOpFold and add
+    // the isJeandle* predicate in PartialEscapeUtils.{h,cpp}.
     //
     // §2.3.11/§2.3.12: equality compare against a virtual pointer folds.
     // Virtual objects are never null (by construction they track an in-flight
@@ -2725,10 +2713,10 @@ void Analyzer::applyThreeTier(Instruction *I) {
       if (ICmp->isEquality()) {
         Value *Op0 = ICmp->getOperand(0);
         Value *Op1 = ICmp->getOperand(1);
-        auto V0 = jeandle::pea::resolveVirtualRef(Op0, CurrentState, Aliases,
-                                                  DL);
-        auto V1 = jeandle::pea::resolveVirtualRef(Op1, CurrentState, Aliases,
-                                                  DL);
+        auto V0 =
+            jeandle::pea::resolveVirtualRef(Op0, CurrentState, Aliases, DL);
+        auto V1 =
+            jeandle::pea::resolveVirtualRef(Op1, CurrentState, Aliases, DL);
         bool Op0IsNull = isa<ConstantPointerNull>(Op0);
         bool Op1IsNull = isa<ConstantPointerNull>(Op1);
         bool Folded = false;
@@ -2759,8 +2747,7 @@ void Analyzer::applyThreeTier(Instruction *I) {
         if (Folded) {
           bool IsEq = (ICmp->getPredicate() == ICmpInst::ICMP_EQ);
           bool FinalResult = IsEq ? EqResult : !EqResult;
-          Constant *C = ConstantInt::get(ICmp->getType(),
-                                         FinalResult ? 1 : 0);
+          Constant *C = ConstantInt::get(ICmp->getType(), FinalResult ? 1 : 0);
           // Reuse ReplaceLoad: its handler does generic Instruction RAUW +
           // erase, which is exactly what we need here.
           jeandle::PEAResult::Effect E;
@@ -2815,8 +2802,7 @@ void Analyzer::tier1Allocate(CallBase *CB) {
   // immediately ensure-materialized before the next fixed node. The
   // end-of-block emission is the practical compromise: intra-block folds
   // work, end-of-block emission is dominance-safe.
-  const bool VirtualiseThenMaterialise =
-      (CurrentMode == Mode::MaterializeAll);
+  const bool VirtualiseThenMaterialise = (CurrentMode == Mode::MaterializeAll);
 
   // Stable VO-per-allocation-site cache. Re-processing the same alloc
   // inside a loop fixpoint iteration must produce the same ObjectID so the
@@ -2878,7 +2864,8 @@ void Analyzer::tier1Allocate(CallBase *CB) {
 
   const bool IsInstance = jeandle::pea::isJeandleNewInstance(CB);
   const bool IsArray = jeandle::pea::isJeandleNewArray(CB);
-  assert((IsInstance ^ IsArray) && "allocation must be either instance or array");
+  assert((IsInstance ^ IsArray) &&
+         "allocation must be either instance or array");
 
   // Refuse to virtualize identity-sensitive allocations.
   // HasFinalizer: classes that override finalize() require HotSpot's
@@ -2937,14 +2924,13 @@ void Analyzer::tier1Allocate(CallBase *CB) {
       // compile-time defaults declared on `struct VMConstants`.
       const jeandle::VMConstants VMConsts =
           jeandle::VMConstants::fromModule(*F.getParent());
-      Type *ElemTy =
-          jeandle::pea::llvmElementTypeFor(*Kind, F.getContext());
+      Type *ElemTy = jeandle::pea::llvmElementTypeFor(*Kind, F.getContext());
       if (ElemTy) {
         VO->ArrayElementType = ElemTy;
-        VO->ArrayBaseOffset = static_cast<uint32_t>(
-            VMConsts.arrayBaseOffsetFor(*Kind));
-        VO->ArrayIndexScale = static_cast<uint32_t>(
-            VMConsts.elementSizeFor(*Kind));
+        VO->ArrayBaseOffset =
+            static_cast<uint32_t>(VMConsts.arrayBaseOffsetFor(*Kind));
+        VO->ArrayIndexScale =
+            static_cast<uint32_t>(VMConsts.elementSizeFor(*Kind));
       }
     }
   }
@@ -3040,7 +3026,6 @@ bool Analyzer::tier2Store(StoreInst *SI) {
 
   // TODO(unsafe-inliner): see tier-2 dispatch.
   // Unsafe.put{Int,Long,Short}-into-byte-array decomposition.
-
 
   // Type-overlap validation via VirtualObject::getOrCreateFieldIndex. We don't
   // actually use the returned index (FieldStates is keyed by raw offset), but
@@ -3555,8 +3540,9 @@ bool Analyzer::foldMonitorEnter(CallBase *CB) {
   LiveLockEnters[*BaseID].push_back({CB, MyOrder, NewBytecodeDepth});
   // Keep the per-VO ObjectState::Locks mirror in lockstep with the analyzer-
   // side DenseMap. ObjectState::Locks does not carry the Order proxy —
-  // structural ObjectState equivalence (used by merge-time identicalObjectStates and
-  // the PEABlockState::equivalentTo path) compares Call+BytecodeDepth only.
+  // structural ObjectState equivalence (used by merge-time
+  // identicalObjectStates and the PEABlockState::equivalentTo path) compares
+  // Call+BytecodeDepth only.
   if (CurrentState.hasObjectState(*BaseID)) {
     jeandle::ObjectState &OS =
         CurrentState.getObjectStateForModification(*BaseID);
@@ -3646,8 +3632,8 @@ bool Analyzer::foldArrayStoreCheck(CallBase *CB) {
   // Object[] element: compare the value's klass against the element klass.
   Value *Val = CB->getArgOperand(0);
   uintptr_t ValueKlass = 0;
-  if (auto ValueID = jeandle::pea::resolveVirtualRef(Val, CurrentState,
-                                                    Aliases, DL)) {
+  if (auto ValueID =
+          jeandle::pea::resolveVirtualRef(Val, CurrentState, Aliases, DL)) {
     // Virtual values carry an exact, concrete klass.
     ValueKlass = Result.VirtualObjects[*ValueID]->Klass;
   } else {
@@ -3741,7 +3727,6 @@ bool Analyzer::foldCheckIfValueBased(CallBase *CB) {
   return true;
 }
 
-
 bool Analyzer::foldRegisterFinalizerIfNeeded(CallBase *CB) {
   // jeandle.register_finalizer_if_needed(oop) -> void.
   //
@@ -3779,15 +3764,24 @@ bool Analyzer::foldRegisterFinalizerIfNeeded(CallBase *CB) {
 
 bool Analyzer::tier2JavaOpFold(CallBase *CB) {
   using namespace jeandle::pea;
-  if (isJeandleArrayLength(CB))       return foldArrayLength(CB);
-  if (isJeandleLoadKlass(CB))         return foldLoadKlass(CB);
-  if (isJeandleCheckCast(CB))         return foldCheckCast(CB);
-  if (isJeandleCheckInstanceOf(CB))   return foldCheckCast(CB);
-  if (isJeandleInstanceOf(CB))        return foldInstanceOf(CB);
-  if (isJeandleMonitorEnter(CB))      return foldMonitorEnter(CB);
-  if (isJeandleMonitorExit(CB))       return foldMonitorExit(CB);
-  if (isJeandleArrayStoreCheck(CB))   return foldArrayStoreCheck(CB);
-  if (isJeandleCheckIfValueBased(CB)) return foldCheckIfValueBased(CB);
+  if (isJeandleArrayLength(CB))
+    return foldArrayLength(CB);
+  if (isJeandleLoadKlass(CB))
+    return foldLoadKlass(CB);
+  if (isJeandleCheckCast(CB))
+    return foldCheckCast(CB);
+  if (isJeandleCheckInstanceOf(CB))
+    return foldCheckCast(CB);
+  if (isJeandleInstanceOf(CB))
+    return foldInstanceOf(CB);
+  if (isJeandleMonitorEnter(CB))
+    return foldMonitorEnter(CB);
+  if (isJeandleMonitorExit(CB))
+    return foldMonitorExit(CB);
+  if (isJeandleArrayStoreCheck(CB))
+    return foldArrayStoreCheck(CB);
+  if (isJeandleCheckIfValueBased(CB))
+    return foldCheckIfValueBased(CB);
   if (isJeandleRegisterFinalizerIfNeeded(CB))
     return foldRegisterFinalizerIfNeeded(CB);
   return false;
@@ -3798,8 +3792,7 @@ void Analyzer::propagatePointerAlias(Instruction *I) {
   // operand carries a virtual alias. Forward the alias to the result.
   if (Aliases.getVirtualAlias(I))
     return;
-  auto BaseID =
-      jeandle::pea::resolveVirtualRef(I, CurrentState, Aliases, DL);
+  auto BaseID = jeandle::pea::resolveVirtualRef(I, CurrentState, Aliases, DL);
   if (!BaseID) {
     // Couldn't resolve — the underlying chain may have already escaped.
     materializeAllVirtualOperands(I);
@@ -3907,8 +3900,7 @@ void Analyzer::bumpMaterializeStat(MatReason R) {
   }
 }
 
-void Analyzer::materializeAt(jeandle::ObjectID ID,
-                             Instruction *InsertBefore,
+void Analyzer::materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
                              MatReason Reason) {
   if (Materialized.count(ID))
     return; // idempotent — first escape wins; also breaks nested-cycles.
@@ -4036,12 +4028,12 @@ void Analyzer::materializeAt(jeandle::ObjectID ID,
     for (auto &Kv : Result.BlockEffects) {
       auto &Effects = Kv.second;
       Effects.erase(
-          std::remove_if(Effects.begin(), Effects.end(),
-                         [&](const jeandle::PEAResult::Effect &E) {
-                           return E.Kind ==
-                                      jeandle::PEAResult::EffectKind::ReplaceCall &&
-                                  ToUndo.count(E.Target);
-                         }),
+          std::remove_if(
+              Effects.begin(), Effects.end(),
+              [&](const jeandle::PEAResult::Effect &E) {
+                return E.Kind == jeandle::PEAResult::EffectKind::ReplaceCall &&
+                       ToUndo.count(E.Target);
+              }),
           Effects.end());
     }
 
@@ -4235,17 +4227,17 @@ void Analyzer::dropEffectsFor(jeandle::ObjectID ID) {
   bool DroppedAllocation = false;
   for (auto &Kv : Result.BlockEffects) {
     auto &Effects = Kv.second;
-    Effects.erase(
-        std::remove_if(Effects.begin(), Effects.end(),
-                       [&](const jeandle::PEAResult::Effect &E) {
-                         if (E.ObjID != ID)
-                           return false;
-                         if (E.Kind ==
-                             jeandle::PEAResult::EffectKind::EliminateAllocation)
-                           DroppedAllocation = true;
-                         return true;
-                       }),
-        Effects.end());
+    Effects.erase(std::remove_if(
+                      Effects.begin(), Effects.end(),
+                      [&](const jeandle::PEAResult::Effect &E) {
+                        if (E.ObjID != ID)
+                          return false;
+                        if (E.Kind ==
+                            jeandle::PEAResult::EffectKind::EliminateAllocation)
+                          DroppedAllocation = true;
+                        return true;
+                      }),
+                  Effects.end());
   }
   if (DroppedAllocation) {
     --Result.VirtualizationDelta;
@@ -4434,7 +4426,7 @@ void Analyzer::processLoopExit(Loop *L) {
       continue;
     BlockExitInfo &Exit = It->second;
     SmallVector<jeandle::ObjectID, 4> Vs(Exit.Virtuals.begin(),
-                                          Exit.Virtuals.end());
+                                         Exit.Virtuals.end());
     llvm::sort(Vs);
     for (jeandle::ObjectID ID : Vs) {
       if (!Eligible.lookup(ID))
@@ -4462,7 +4454,7 @@ void Analyzer::processStateBeforeLoopOnOverflow(Loop *L) {
     return;
   BlockExitInfo &PHExit = It->second;
   SmallVector<jeandle::ObjectID, 4> Vs(PHExit.Virtuals.begin(),
-                                        PHExit.Virtuals.end());
+                                       PHExit.Virtuals.end());
   llvm::sort(Vs);
   for (jeandle::ObjectID ID : Vs) {
     if (!Eligible.lookup(ID))
@@ -4505,7 +4497,7 @@ void Analyzer::materializePreheaderVirtualsForUnvisitedLoops() {
     // Snapshot+sort the virtual IDs to materialize. Sorting by ObjectID gives
     // deterministic effect ordering across runs.
     SmallVector<jeandle::ObjectID, 4> Vs(PHExit.Virtuals.begin(),
-                                          PHExit.Virtuals.end());
+                                         PHExit.Virtuals.end());
     llvm::sort(Vs);
     for (jeandle::ObjectID ID : Vs) {
       if (!Eligible.lookup(ID))
@@ -4522,17 +4514,19 @@ void Analyzer::materializePreheaderVirtualsForUnvisitedLoops() {
 // map dedups (and breaks cycles between) recursive nested-virtual
 // materializations within a single PH and across multiple call sites
 // (e.g. a mixed-state merge and a loop-preheader sweep at the same PH).
-void Analyzer::materializeAtPredFromExitInfo(
-    jeandle::ObjectID ID, BasicBlock *PH, BlockExitData &ExitInfo,
-    bool SkipGlobalRAUW, MatReason Reason) {
+void Analyzer::materializeAtPredFromExitInfo(jeandle::ObjectID ID,
+                                             BasicBlock *PH,
+                                             BlockExitData &ExitInfo,
+                                             bool SkipGlobalRAUW,
+                                             MatReason Reason) {
   auto &MatInPH = MaterializedAtPred[PH];
   if (MatInPH.count(ID))
     return;
   if (!Eligible.lookup(ID))
     return;
   // Same dead-block guard as materializeAt. CurrentState is the
-  // active per-block state; if the dead-edge sweep marked it Dead, every materialise
-  // emitted from this point would pin IR onto an unreachable path.
+  // active per-block state; if the dead-edge sweep marked it Dead, every
+  // materialise emitted from this point would pin IR onto an unreachable path.
   if (CurrentState.isDead())
     return;
 
@@ -4576,8 +4570,7 @@ void Analyzer::materializeAtPredFromExitInfo(
   bool HasLiveLocks = (LCIt != ExitInfo.LockCounts.end() && LCIt->second != 0);
   if (HasLiveLocks && StrictLockOrder) {
     auto ThisIt = ExitInfo.LiveLockEnters.find(ID);
-    assert(ThisIt != ExitInfo.LiveLockEnters.end() &&
-           !ThisIt->second.empty() &&
+    assert(ThisIt != ExitInfo.LiveLockEnters.end() && !ThisIt->second.empty() &&
            "LockCount > 0 implies a non-empty LiveLockEnters stack");
     // Cascade by BytecodeDepth. See the matching comment in
     // materializeAt above for the rationale.
@@ -4603,10 +4596,11 @@ void Analyzer::materializeAtPredFromExitInfo(
   //     CurrentState and ExitInfo.
   //   Phase 2 (after Materialize emission below): emit a ReplaceInput effect
   //     per surviving enter call, tagged E.Block = PH so the transform resolves
-  //     the receiver via MatPerBlock[{PH, OrigAlloc}] (the PH's own materialized
-  //     invoke) rather than the global NewAllocFor — which last-write-wins
-  //     across per-pred materializations of the same OrigAlloc, breaking SSA
-  //     when multiple preds materialize the same VO (the lock-mismatch case).
+  //     the receiver via MatPerBlock[{PH, OrigAlloc}] (the PH's own
+  //     materialized invoke) rather than the global NewAllocFor — which
+  //     last-write-wins across per-pred materializations of the same OrigAlloc,
+  //     breaking SSA when multiple preds materialize the same VO (the
+  //     lock-mismatch case).
   SmallVector<LockEnter, 4> StackToUnElide;
   auto SIt = ExitInfo.LiveLockEnters.find(ID);
   if (HasLiveLocks && SIt != ExitInfo.LiveLockEnters.end() &&
@@ -4618,12 +4612,12 @@ void Analyzer::materializeAtPredFromExitInfo(
     for (auto &Kv : Result.BlockEffects) {
       auto &Effects = Kv.second;
       Effects.erase(
-          std::remove_if(Effects.begin(), Effects.end(),
-                         [&](const jeandle::PEAResult::Effect &E) {
-                           return E.Kind ==
-                                      jeandle::PEAResult::EffectKind::ReplaceCall &&
-                                  ToUndo.count(E.Target);
-                         }),
+          std::remove_if(
+              Effects.begin(), Effects.end(),
+              [&](const jeandle::PEAResult::Effect &E) {
+                return E.Kind == jeandle::PEAResult::EffectKind::ReplaceCall &&
+                       ToUndo.count(E.Target);
+              }),
           Effects.end());
     }
     // Clear locks and stack in both the live state (for commit()) and the
@@ -4849,8 +4843,8 @@ bool Analyzer::exitDataEquivalent(const BlockExitData &A,
 
 // Equality on BlockExitInfo. Compares the per-object base data AND the
 // state-split fields (TerminatorInvoke / UnwindDest / UnwindEdgeKilled /
-// optional UnwindData snapshot). The exception-edge fields participate in the loop
-// fixpoint convergence check so that a state-split appearing or
+// optional UnwindData snapshot). The exception-edge fields participate in the
+// loop fixpoint convergence check so that a state-split appearing or
 // disappearing across iterations is correctly observed as a change.
 bool Analyzer::blockExitInfoEquivalent(const BlockExitInfo &A,
                                        const BlockExitInfo &B) {
@@ -5093,7 +5087,8 @@ void Analyzer::processLoop(Loop *L) {
     // preds the in-loop uses would observe a single NewInv that doesn't
     // dominate them on all paths (there is no synthesized header PHI to merge
     // the per-pred NewInvs — the existing Case-A pattern works only because
-    // an explicit PHI already exists whose incoming values MatPerBlock patches).
+    // an explicit PHI already exists whose incoming values MatPerBlock
+    // patches).
     //
     // Sound fallback: mark every VO still virtual at any forward predecessor
     // INELIGIBLE. commit() drops its effects and the original IR survives
@@ -5263,8 +5258,7 @@ void Analyzer::processLoop(Loop *L) {
   }
 
   LLVM_DEBUG(dbgs() << "PEA: loop @ " << Header->getName()
-                    << " failed to converge after "
-                    << kMaxLoopFixpointIters
+                    << " failed to converge after " << kMaxLoopFixpointIters
                     << " iters; falling back to MATERIALIZE_ALL\n");
 
   // Non-convergence: rollback and use the pessimistic preheader force-
@@ -5288,7 +5282,7 @@ void Analyzer::processLoop(Loop *L) {
     auto It = BlockExits.find(Preheader);
     if (It != BlockExits.end()) {
       SmallVector<jeandle::ObjectID, 4> Vs(It->second.Virtuals.begin(),
-                                            It->second.Virtuals.end());
+                                           It->second.Virtuals.end());
       llvm::sort(Vs);
       for (jeandle::ObjectID ID : Vs) {
         if (!Eligible.lookup(ID))

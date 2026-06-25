@@ -121,14 +121,22 @@ std::optional<JBasicType> elementTypeForArrayKlass(uintptr_t ArrayKlass) {
 
 Type *llvmElementTypeFor(JBasicType Kind, LLVMContext &Ctx) {
   switch (Kind) {
-  case JBasicType::Boolean: return Type::getInt1Ty(Ctx);
-  case JBasicType::Byte:    return Type::getInt8Ty(Ctx);
-  case JBasicType::Char:    return Type::getInt16Ty(Ctx);
-  case JBasicType::Short:   return Type::getInt16Ty(Ctx);
-  case JBasicType::Int:     return Type::getInt32Ty(Ctx);
-  case JBasicType::Long:    return Type::getInt64Ty(Ctx);
-  case JBasicType::Float:   return Type::getFloatTy(Ctx);
-  case JBasicType::Double:  return Type::getDoubleTy(Ctx);
+  case JBasicType::Boolean:
+    return Type::getInt1Ty(Ctx);
+  case JBasicType::Byte:
+    return Type::getInt8Ty(Ctx);
+  case JBasicType::Char:
+    return Type::getInt16Ty(Ctx);
+  case JBasicType::Short:
+    return Type::getInt16Ty(Ctx);
+  case JBasicType::Int:
+    return Type::getInt32Ty(Ctx);
+  case JBasicType::Long:
+    return Type::getInt64Ty(Ctx);
+  case JBasicType::Float:
+    return Type::getFloatTy(Ctx);
+  case JBasicType::Double:
+    return Type::getDoubleTy(Ctx);
   case JBasicType::Object:
     return PointerType::get(Ctx, jeandle::AddrSpace::JavaHeapAddrSpace);
   case JBasicType::Count:
@@ -240,7 +248,10 @@ struct StackGuard {
   StackGuard(DenseSet<Value *> &S, Value *Val) : Set(S), V(Val) {
     Inserted = Set.insert(V).second;
   }
-  ~StackGuard() { if (Inserted) Set.erase(V); }
+  ~StackGuard() {
+    if (Inserted)
+      Set.erase(V);
+  }
 };
 } // namespace
 
@@ -293,13 +304,13 @@ resolveVirtualRefImpl(Value *V, const PEABlockState &State,
 
   // (5) BitCast.
   if (auto *BC = dyn_cast<BitCastOperator>(V))
-    return resolveVirtualRefImpl(BC->getOperand(0), State, Aliases, DL,
-                                 Visited, Depth + 1);
+    return resolveVirtualRefImpl(BC->getOperand(0), State, Aliases, DL, Visited,
+                                 Depth + 1);
 
   // (6) Freeze.
   if (auto *FI = dyn_cast<FreezeInst>(V))
-    return resolveVirtualRefImpl(FI->getOperand(0), State, Aliases, DL,
-                                 Visited, Depth + 1);
+    return resolveVirtualRefImpl(FI->getOperand(0), State, Aliases, DL, Visited,
+                                 Depth + 1);
 
   // (7) IntToPtr(PtrToInt(x)) round-trip with matching widths is a legal
   // laundering pattern; tagged-pointer encodings (with masking/shifting) must
@@ -363,8 +374,8 @@ resolveVirtualRefImpl(Value *V, const PEABlockState &State,
       // the whole PHI denote that virtual.
       if (isa<PoisonValue>(In))
         continue;
-      auto Sub = resolveVirtualRefImpl(In, State, Aliases, DL, Visited,
-                                       Depth + 1);
+      auto Sub =
+          resolveVirtualRefImpl(In, State, Aliases, DL, Visited, Depth + 1);
       if (!Sub)
         return std::nullopt;
       if (First) {
@@ -404,8 +415,7 @@ resolveVirtualRefImpl(Value *V, const PEABlockState &State,
   return std::nullopt;
 }
 
-std::optional<ObjectID> resolveVirtualRef(Value *V,
-                                          const PEABlockState &State,
+std::optional<ObjectID> resolveVirtualRef(Value *V, const PEABlockState &State,
                                           const AliasMap &Aliases,
                                           const DataLayout &DL) {
   DenseSet<Value *> Visited;

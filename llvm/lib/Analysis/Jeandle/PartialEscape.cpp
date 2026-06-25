@@ -12,6 +12,7 @@
 #include "llvm/Analysis/Jeandle/PartialEscape.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/Analysis/Jeandle/PartialEscapeUtils.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/Argument.h"
 #include "llvm/IR/Constants.h"
@@ -30,7 +31,6 @@
 #include "llvm/Support/Debug.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
-#include "llvm/Analysis/Jeandle/PartialEscapeUtils.h"
 
 #include <algorithm>
 
@@ -171,16 +171,16 @@ static Value *matchAddBasePlusScaledIndex(Value *ByteOff,
   if (isPowerOf2_64(Scale)) {
     unsigned LogScale = Log2_64(Scale);
     ConstantInt *ShAmt = nullptr;
-    if (match(ScaledIdx, m_Shl(m_Value(Idx), m_ConstantInt(ShAmt))) &&
-        ShAmt && ShAmt->getZExtValue() == LogScale)
+    if (match(ScaledIdx, m_Shl(m_Value(Idx), m_ConstantInt(ShAmt))) && ShAmt &&
+        ShAmt->getZExtValue() == LogScale)
       return peelIndexWrappers(Idx);
   }
   ConstantInt *MulCI = nullptr;
-  if (match(ScaledIdx, m_Mul(m_Value(Idx), m_ConstantInt(MulCI))) &&
-      MulCI && (uint64_t)MulCI->getSExtValue() == Scale)
+  if (match(ScaledIdx, m_Mul(m_Value(Idx), m_ConstantInt(MulCI))) && MulCI &&
+      (uint64_t)MulCI->getSExtValue() == Scale)
     return peelIndexWrappers(Idx);
-  if (match(ScaledIdx, m_Mul(m_ConstantInt(MulCI), m_Value(Idx))) &&
-      MulCI && (uint64_t)MulCI->getSExtValue() == Scale)
+  if (match(ScaledIdx, m_Mul(m_ConstantInt(MulCI), m_Value(Idx))) && MulCI &&
+      (uint64_t)MulCI->getSExtValue() == Scale)
     return peelIndexWrappers(Idx);
   return nullptr;
 }
@@ -205,8 +205,8 @@ VirtualObject::matchArrayElementGEP(GetElementPtrInst *GEP,
       GEPOp->getNumIndices() == 1) {
     int64_t BaseOff = 0;
     bool NonConst = false;
-    (void)jeandle::pea::stripPointerCastsAndOffsets(
-        GEPOp->getPointerOperand(), DL, &BaseOff, &NonConst);
+    (void)jeandle::pea::stripPointerCastsAndOffsets(GEPOp->getPointerOperand(),
+                                                    DL, &BaseOff, &NonConst);
     if (!NonConst && BaseOff == static_cast<int64_t>(ArrayBaseOffset))
       return ArrayElementGEPMatch{peelIndexWrappers(GEPOp->getOperand(1)),
                                   ArrayElementType};
@@ -222,8 +222,8 @@ VirtualObject::matchArrayElementGEP(GetElementPtrInst *GEP,
       GEPOp->getNumIndices() == 1) {
     int64_t BaseOff = 0;
     bool NonConst = false;
-    (void)jeandle::pea::stripPointerCastsAndOffsets(
-        GEPOp->getPointerOperand(), DL, &BaseOff, &NonConst);
+    (void)jeandle::pea::stripPointerCastsAndOffsets(GEPOp->getPointerOperand(),
+                                                    DL, &BaseOff, &NonConst);
     if (NonConst || BaseOff != 0)
       return std::nullopt;
 
@@ -238,8 +238,7 @@ VirtualObject::matchArrayElementGEP(GetElementPtrInst *GEP,
       int64_t Cidx = Adj / static_cast<int64_t>(ArrayIndexScale);
       if (Cidx < 0 || static_cast<uint64_t>(Cidx) >= ArrayLength)
         return std::nullopt;
-      Constant *CIdx =
-          ConstantInt::get(CI->getType(), Cidx, /*isSigned=*/true);
+      Constant *CIdx = ConstantInt::get(CI->getType(), Cidx, /*isSigned=*/true);
       return ArrayElementGEPMatch{CIdx, ArrayElementType};
     }
 
@@ -289,7 +288,8 @@ FieldValue FieldValue::scalar(Value *V) {
 FieldValue FieldValue::virtualRef(ObjectID ID, Type *RefTy) {
   assert(ID != InvalidObjectID);
   assert(RefTy && RefTy->isPointerTy() &&
-         RefTy->getPointerAddressSpace() == jeandle::AddrSpace::JavaHeapAddrSpace &&
+         RefTy->getPointerAddressSpace() ==
+             jeandle::AddrSpace::JavaHeapAddrSpace &&
          "virtualRef DeclaredType must be ptr addrspace(1)");
   FieldValue F;
   F.T = VirtualRef;
@@ -363,8 +363,8 @@ markAllSlotsShared(const SmallVector<std::optional<ObjectState>, 8> &Arr) {
 }
 
 PEABlockState::PEABlockState()
-    : ObjectStates(std::make_shared<
-                   SmallVector<std::optional<ObjectState>, 8>>()),
+    : ObjectStates(
+          std::make_shared<SmallVector<std::optional<ObjectState>, 8>>()),
       ArrayRefCount(std::make_shared<RefCount>()) {}
 
 PEABlockState::PEABlockState(const PEABlockState &Other)
@@ -651,13 +651,20 @@ void PEAResult::addBlockEffect(Effect E) {
   if (JeandleTracePEA) {
     auto effectKindName = [](EffectKind K) -> const char * {
       switch (K) {
-      case EffectKind::ReplaceLoad: return "ReplaceLoad";
-      case EffectKind::ReplaceCall: return "ReplaceCall";
-      case EffectKind::ReplaceInput: return "ReplaceInput";
-      case EffectKind::EliminateStore: return "EliminateStore";
-      case EffectKind::EliminateAllocation: return "EliminateAllocation";
-      case EffectKind::Materialize: return "Materialize";
-      case EffectKind::CreatePHI: return "CreatePHI";
+      case EffectKind::ReplaceLoad:
+        return "ReplaceLoad";
+      case EffectKind::ReplaceCall:
+        return "ReplaceCall";
+      case EffectKind::ReplaceInput:
+        return "ReplaceInput";
+      case EffectKind::EliminateStore:
+        return "EliminateStore";
+      case EffectKind::EliminateAllocation:
+        return "EliminateAllocation";
+      case EffectKind::Materialize:
+        return "Materialize";
+      case EffectKind::CreatePHI:
+        return "CreatePHI";
       }
       return "Unknown";
     };
