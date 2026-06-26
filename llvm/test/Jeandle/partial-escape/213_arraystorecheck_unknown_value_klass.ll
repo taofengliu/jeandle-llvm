@@ -6,14 +6,14 @@
 ; foldArrayStoreCheck bails conservatively: mark the array ineligible so
 ; the alloc and the surviving array_store_check both stay in IR.
 
-declare hotspotcc ptr addrspace(1) @jeandle.newarray(ptr, i32)
+declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32)
 declare hotspotcc i1 @jeandle.array_store_check(ptr addrspace(1), ptr addrspace(1))
 
 declare i32 @__gxx_personality_v0(...)
 
 define i1 @test_storecheck_unknown(ptr addrspace(1) %v) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
-  %arr = invoke hotspotcc ptr addrspace(1) @jeandle.newarray(
+  %arr = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
             ptr inttoptr (i64 8888 to ptr), i32 4)
          to label %n unwind label %u
 n:
@@ -26,7 +26,7 @@ u:
 }
 
 ; CHECK-LABEL: define i1 @test_storecheck_unknown
-; CHECK: jeandle.newarray
+; CHECK: jeandle.new_array
 ; CHECK: jeandle.array_store_check
 
 !java-method-compilation = !{}

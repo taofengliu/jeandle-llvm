@@ -21,19 +21,19 @@
 ;     THEN the array escapes via @sink. The length call still folds, but
 ;     the alloc must be materialized at the escape point.
 
-declare hotspotcc ptr addrspace(1) @jeandle.newarray(ptr, i32)
-declare hotspotcc i32 @jeandle.array_length(ptr addrspace(1) readonly)
+declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32)
+declare hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) readonly)
 declare void @use(i32)
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
 define void @test_length_then_eliminate() gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
-  %arr = invoke hotspotcc ptr addrspace(1) @jeandle.newarray(
+  %arr = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
             ptr inttoptr (i64 12345 to ptr), i32 4)
          to label %n unwind label %u
 n:
-  %len = call hotspotcc i32 @jeandle.array_length(ptr addrspace(1) %arr)
+  %len = call hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) %arr)
   call void @use(i32 %len)
   ret void
 u:
@@ -42,17 +42,17 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_length_then_eliminate
-; CHECK-NOT: jeandle.newarray
-; CHECK-NOT: jeandle.array_length
+; CHECK-NOT: jeandle.new_array
+; CHECK-NOT: jeandle.arraylength
 ; CHECK: call void @use(i32 4)
 
 define void @test_length_then_escape() gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
-  %arr = invoke hotspotcc ptr addrspace(1) @jeandle.newarray(
+  %arr = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
             ptr inttoptr (i64 12345 to ptr), i32 4)
          to label %n unwind label %u
 n:
-  %len = call hotspotcc i32 @jeandle.array_length(ptr addrspace(1) %arr)
+  %len = call hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) %arr)
   call void @use(i32 %len)
   call void @sink(ptr addrspace(1) %arr)
   ret void
@@ -66,8 +66,8 @@ u:
 ; of the alloc's normal-dest block, which is the recovery target after the
 ; original SafeIP instruction was folded away by ReplaceLoad).
 ; CHECK-LABEL: define void @test_length_then_escape
-; CHECK-NOT: jeandle.array_length
-; CHECK: invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.newarray
+; CHECK-NOT: jeandle.arraylength
+; CHECK: invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_array
 ; CHECK: call void @use(i32 4)
 ; CHECK: call void @sink
 

@@ -4,13 +4,13 @@
 ; ConstantInt. peelIndexWrappers strips the zext, so the underlying
 ; ConstantInt is recovered as the canonical element index.
 
-declare hotspotcc ptr addrspace(1) @jeandle.newarray(ptr, i32)
+declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32)
 
 declare i32 @__gxx_personality_v0(...)
 
 define i32 @test_zext_index() gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
-  %arr = invoke hotspotcc ptr addrspace(1) @jeandle.newarray(
+  %arr = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
             ptr inttoptr (i64 12345 to ptr), i32 4)
          to label %n unwind label %u
 n:
@@ -27,7 +27,7 @@ u:
 }
 
 ; CHECK-LABEL: define i32 @test_zext_index
-; CHECK-NOT: jeandle.newarray
+; CHECK-NOT: jeandle.new_array
 ; CHECK-NOT: store
 ; CHECK-NOT: load
 ; CHECK: ret i32 42

@@ -16,13 +16,13 @@
 ; crash and not silently produce wrong code.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc ptr addrspace(1) @jeandle.newarray(ptr, i32)
+declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32)
 declare void @sink_p0(ptr)
 declare i32 @__gxx_personality_v0(...)
 
 define void @test_virtualref_on_load_type_mismatch() gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
-  %inner = invoke hotspotcc ptr addrspace(1) @jeandle.newarray(
+  %inner = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
               ptr inttoptr (i64 12345 to ptr), i32 4)
            to label %nA unwind label %u1
 nA:

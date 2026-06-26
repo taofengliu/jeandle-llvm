@@ -11,7 +11,7 @@
 ; Byte-offset element access (no VM callback log needed: the typed-GEP matcher
 ; is inert without ArrayElementType, so accesses resolve via constant offsets).
 
-declare hotspotcc ptr addrspace(1) @jeandle.newarray(ptr, i32)
+declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32)
 declare void @use(i32)
 declare i32 @__gxx_personality_v0(...)
 
@@ -20,7 +20,7 @@ define void @test_casec_array_merge(i1 %c)
 entry:
   br i1 %c, label %left, label %right
 left:
-  %a1 = invoke hotspotcc ptr addrspace(1) @jeandle.newarray(
+  %a1 = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
             ptr inttoptr (i64 12345 to ptr), i32 4)
         to label %lstore unwind label %u
 lstore:
@@ -28,7 +28,7 @@ lstore:
   store atomic i32 7, ptr addrspace(1) %l unordered, align 4
   br label %merge
 right:
-  %a2 = invoke hotspotcc ptr addrspace(1) @jeandle.newarray(
+  %a2 = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
             ptr inttoptr (i64 12345 to ptr), i32 4)
         to label %rstore unwind label %u
 rstore:
@@ -50,7 +50,7 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_casec_array_merge
-; CHECK-NOT: jeandle.newarray
+; CHECK-NOT: jeandle.new_array
 ; CHECK-NOT: store atomic
 ; CHECK-NOT: load atomic
 ; CHECK-DAG: phi i32 [ 7, %{{.*}} ], [ 0, %{{.*}} ]

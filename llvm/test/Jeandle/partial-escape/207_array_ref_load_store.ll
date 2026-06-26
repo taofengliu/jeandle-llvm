@@ -5,13 +5,13 @@
 ; defaults to compressed-oop size (4 bytes), so element[1] sits at byte
 ; offset 20 etc.
 
-declare hotspotcc ptr addrspace(1) @jeandle.newarray(ptr, i32)
+declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32)
 
 declare i32 @__gxx_personality_v0(...)
 
 define ptr addrspace(1) @test_obj_array(ptr addrspace(1) %v) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
-  %arr = invoke hotspotcc ptr addrspace(1) @jeandle.newarray(
+  %arr = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
             ptr inttoptr (i64 22222 to ptr), i32 4)
          to label %n unwind label %u
 n:
@@ -26,7 +26,7 @@ u:
 }
 
 ; CHECK-LABEL: define ptr addrspace(1) @test_obj_array
-; CHECK-NOT: jeandle.newarray
+; CHECK-NOT: jeandle.new_array
 ; CHECK-NOT: store
 ; CHECK-NOT: load
 ; CHECK: ret ptr addrspace(1) %v

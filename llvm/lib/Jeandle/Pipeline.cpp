@@ -76,7 +76,7 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   //   Jeandle runs PEA at exactly ONE position. The slot is BEFORE
   //   JavaOperationLower(0), InstSimplify, TypeCheckElimination, and the
   //   standard O2 pipeline. Every downstream pass either (a) leaves the
-  //   named alloc intrinsics `jeandle.new_instance` / `jeandle.newarray`
+  //   named alloc intrinsics `jeandle.new_instance` / `jeandle.new_array`
   //   untouched (both carry `"lower-phase"="1"`, while JavaOperationLower(0)
   //   only inlines phase-0 helpers like load_klass/instanceof/arraylength/
   //   idiv), or (b) preserves addrspace(1) pointer types. The intrinsics

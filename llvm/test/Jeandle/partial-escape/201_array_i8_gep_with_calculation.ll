@@ -7,14 +7,14 @@
 ; forces the array to materialize so that
 ; both accesses execute against a real array pointer.
 
-declare hotspotcc ptr addrspace(1) @jeandle.newarray(ptr, i32)
+declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32)
 declare void @sink(i32)
 
 declare i32 @__gxx_personality_v0(...)
 
 define void @test_i8_calc_symbolic(i64 %idx) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
-  %arr = invoke hotspotcc ptr addrspace(1) @jeandle.newarray(
+  %arr = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
             ptr inttoptr (i64 12345 to ptr), i32 4)
          to label %n unwind label %u
 n:
@@ -33,7 +33,7 @@ u:
 ; The matcher saw the array-element shape with a symbolic index and bailed,
 ; so the alloc, the store, and the load all survive.
 ; CHECK-LABEL: define void @test_i8_calc_symbolic
-; CHECK: jeandle.newarray
+; CHECK: jeandle.new_array
 ; CHECK: store atomic i32 77
 ; CHECK: load atomic i32
 

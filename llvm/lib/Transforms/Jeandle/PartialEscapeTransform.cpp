@@ -133,7 +133,7 @@ static BasicBlock *findOrSynthesizeUnwindDest(Function &F,
 // operands.
 //
 // The materialized invoke is structurally identical to a frontend allocation
-// site (hotspotcc `jeandle.new_instance` / `jeandle.newarray`, addrspace(1)
+// site (hotspotcc `jeandle.new_instance` / `jeandle.new_array`, addrspace(1)
 // return, exception edge), so the downstream GC-statepoint pipeline
 // (PEA → InsertGCBarriers → ... → RewriteStatepointsForGC) wraps it
 // uniformly with gc.statepoint/gc.result/gc.relocate; splitBasicBlock is
@@ -175,7 +175,7 @@ static void applyMaterialize(Function &F, const jeandle::PEAResult &Result,
 
   // Step 1: pick the allocation function.
   const char *FnName =
-      VObj.isInstance() ? "jeandle.new_instance" : "jeandle.newarray";
+      VObj.isInstance() ? "jeandle.new_instance" : "jeandle.new_array";
   Function *AllocFn = M->getFunction(FnName);
   assert(AllocFn && "alloc function not declared in module");
 

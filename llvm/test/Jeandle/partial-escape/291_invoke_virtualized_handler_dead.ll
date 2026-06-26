@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Exception edge state splitting — when an invoke is virtualized
-; away by tier2JavaOpFold (e.g. jeandle.array_length on a virtual array
+; away by tier2JavaOpFold (e.g. jeandle.arraylength on a virtual array
 ; folds to a compile-time constant), the analyzer emits a ReplaceCall
 ; effect on the InvokeInst. The transform rewrites that invoke as an
 ; unconditional branch to the normal dest, dropping the unwind edge.
@@ -20,14 +20,14 @@
 ; and VO_A's allocation is cleanly eliminated.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc ptr addrspace(1) @jeandle.newarray(ptr, i32)
-declare hotspotcc i32 @jeandle.array_length(ptr addrspace(1) readonly)
+declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32)
+declare hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) readonly)
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
 define i32 @test_291() gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
-  %arr = invoke hotspotcc ptr addrspace(1) @jeandle.newarray(
+  %arr = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
             ptr inttoptr (i64 12345 to ptr), i32 7)
          to label %n unwind label %u_arr
 n:
@@ -39,7 +39,7 @@ n2:
   ; compile-time constant 7, emitting a ReplaceCall effect on the invoke.
   ; The transform replaces the invoke with `br label %normal`, which
   ; drops the unwind edge into %handler.
-  %len = invoke hotspotcc i32 @jeandle.array_length(ptr addrspace(1) %arr)
+  %len = invoke hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) %arr)
               to label %normal unwind label %handler
 normal:
   ret i32 %len
@@ -65,9 +65,9 @@ u_a:
 ; - VO_A   (klass 54321) — only used inside the now-dead handler.
 ; - The array_length call/invoke folds to the constant 7.
 ; CHECK-LABEL: define i32 @test_291
-; CHECK-NOT: jeandle.newarray
+; CHECK-NOT: jeandle.new_array
 ; CHECK-NOT: jeandle.new_instance(ptr inttoptr (i64 54321 to ptr), i32 16)
-; CHECK-NOT: jeandle.array_length
+; CHECK-NOT: jeandle.arraylength
 ; CHECK: ret i32 7
 
 !java-method-compilation = !{}

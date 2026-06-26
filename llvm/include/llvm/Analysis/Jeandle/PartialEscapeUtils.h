@@ -96,7 +96,7 @@ uintptr_t extractAllocationKlass(const CallBase *AllocCB);
 // std::nullopt if non-constant.
 std::optional<uint32_t> extractInstanceSize(const CallBase *NewInstance);
 
-// Returns the constant length operand of jeandle.newarray.
+// Returns the constant length operand of jeandle.new_array.
 // std::nullopt if non-constant.
 std::optional<uint32_t> extractArrayLength(const CallBase *NewArray);
 

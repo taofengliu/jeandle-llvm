@@ -3,13 +3,13 @@
 ; byte[] virtual — typed-element GEPs at constant byte indices with
 ; scale 1, so the element address is `getelementptr i8, %arr_base, idx`.
 
-declare hotspotcc ptr addrspace(1) @jeandle.newarray(ptr, i32)
+declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32)
 
 declare i32 @__gxx_personality_v0(...)
 
 define i8 @test_byte_array() gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
-  %arr = invoke hotspotcc ptr addrspace(1) @jeandle.newarray(
+  %arr = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
             ptr inttoptr (i64 33333 to ptr), i32 4)
          to label %n unwind label %u
 n:
@@ -26,7 +26,7 @@ u:
 }
 
 ; CHECK-LABEL: define i8 @test_byte_array
-; CHECK-NOT: jeandle.newarray
+; CHECK-NOT: jeandle.new_array
 ; CHECK-NOT: store
 ; CHECK-NOT: load
 ; CHECK: ret i8 99

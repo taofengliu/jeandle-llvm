@@ -52,7 +52,7 @@ bool isJeandleNewInstance(const CallBase *CB) {
 }
 
 bool isJeandleNewArray(const CallBase *CB) {
-  return isJeandleCallNamed(CB, "jeandle.newarray");
+  return isJeandleCallNamed(CB, "jeandle.new_array");
 }
 
 bool isJeandleAllocation(const CallBase *CB) {
@@ -60,7 +60,7 @@ bool isJeandleAllocation(const CallBase *CB) {
 }
 
 bool isJeandleArrayLength(const CallBase *CB) {
-  return isJeandleCallNamed(CB, "jeandle.array_length");
+  return isJeandleCallNamed(CB, "jeandle.arraylength");
 }
 
 bool isJeandleLoadKlass(const CallBase *CB) {
@@ -68,7 +68,7 @@ bool isJeandleLoadKlass(const CallBase *CB) {
 }
 
 bool isJeandleCheckCast(const CallBase *CB) {
-  return isJeandleCallNamed(CB, "jeandle.check_cast");
+  return isJeandleCallNamed(CB, "jeandle.checkcast");
 }
 
 bool isJeandleInstanceOf(const CallBase *CB) {
@@ -479,7 +479,7 @@ bool isJavaHeapPointer(const Value *V) {
 uintptr_t extractAllocationKlass(const CallBase *AllocCB) {
   if (!AllocCB || AllocCB->arg_size() == 0)
     return 0;
-  // Both jeandle.new_instance and jeandle.newarray take the klass pointer as
+  // Both jeandle.new_instance and jeandle.new_array take the klass pointer as
   // their first operand.
   return jeandle::extractKlassConstant(
       const_cast<Value *>(AllocCB->getArgOperand(0)));

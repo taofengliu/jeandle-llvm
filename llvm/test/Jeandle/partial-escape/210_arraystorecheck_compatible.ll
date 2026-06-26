@@ -8,7 +8,7 @@
 ; allocations are otherwise unused, so the alloc, the value alloc and
 ; the check call all disappear.
 
-declare hotspotcc ptr addrspace(1) @jeandle.newarray(ptr, i32)
+declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32)
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc i1 @jeandle.array_store_check(ptr addrspace(1), ptr addrspace(1))
 
@@ -16,7 +16,7 @@ declare i32 @__gxx_personality_v0(...)
 
 define i1 @test_storecheck_compat() gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
-  %arr = invoke hotspotcc ptr addrspace(1) @jeandle.newarray(
+  %arr = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
             ptr inttoptr (i64 8888 to ptr), i32 4)
          to label %n1 unwind label %u
 n1:
@@ -33,7 +33,7 @@ u:
 }
 
 ; CHECK-LABEL: define i1 @test_storecheck_compat
-; CHECK-NOT: jeandle.newarray
+; CHECK-NOT: jeandle.new_array
 ; CHECK-NOT: jeandle.new_instance
 ; CHECK-NOT: jeandle.array_store_check
 ; CHECK: ret i1 true

@@ -4,18 +4,18 @@
 ;
 ; A.f(@8) = B, B.f(@8) = C; loading A.f yields B (still virtual via the
 ; alias install), loading that's f yields C (still virtual), and a
-; jeandle.array_length on the third-level load folds to C's compile-time
+; jeandle.arraylength on the third-level load folds to C's compile-time
 ; length. Nothing escapes; all three allocations and both field stores
 ; disappear.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc ptr addrspace(1) @jeandle.newarray(ptr, i32)
-declare hotspotcc i32 @jeandle.array_length(ptr addrspace(1) readonly)
+declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32)
+declare hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) readonly)
 declare i32 @__gxx_personality_v0(...)
 
 define i32 @test_virtualref_on_load_chained() gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
-  %c = invoke hotspotcc ptr addrspace(1) @jeandle.newarray(
+  %c = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
             ptr inttoptr (i64 11111 to ptr), i32 9)
        to label %nC unwind label %u1
 nC:
@@ -34,7 +34,7 @@ nA:
   %loadedB = load atomic ptr addrspace(1), ptr addrspace(1) %slotA unordered, align 8
   %slotBfromA = getelementptr inbounds i8, ptr addrspace(1) %loadedB, i64 8
   %loadedC = load atomic ptr addrspace(1), ptr addrspace(1) %slotBfromA unordered, align 8
-  %len = call hotspotcc i32 @jeandle.array_length(ptr addrspace(1) %loadedC)
+  %len = call hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) %loadedC)
   ret i32 %len
 u1:
   %lp1 = landingpad i64 cleanup
@@ -49,8 +49,8 @@ u3:
 
 ; CHECK-LABEL: define i32 @test_virtualref_on_load_chained
 ; CHECK-NOT: jeandle.new_instance
-; CHECK-NOT: jeandle.newarray
-; CHECK-NOT: jeandle.array_length
+; CHECK-NOT: jeandle.new_array
+; CHECK-NOT: jeandle.arraylength
 ; CHECK-NOT: store atomic
 ; CHECK-NOT: load atomic
 ; CHECK: ret i32 9
