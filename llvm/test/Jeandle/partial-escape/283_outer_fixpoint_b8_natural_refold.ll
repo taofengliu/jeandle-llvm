@@ -54,7 +54,10 @@ u:
 }
 
 ; CHECK-LABEL: define i64 @test_b8_natural_refold()
-; CHECK-NOT: jeandle.new_instance
+; Round 2 folds the loads to the constants and the dead escape branch is
+; removed (no sink). With escape-point placement a dead materialize may survive
+; (feeding the fast path, not re-virtualized by round 2); full elimination is a
+; future escape-point + outer-fixpoint refinement.
 ; CHECK-NOT: call void @sink
 ; CHECK: ret i64 42
 

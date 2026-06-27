@@ -36,10 +36,13 @@ u:
 ; is replayed at the top of the materialization continuation block, then the
 ; sink and return consume the new invoke.
 ; CHECK-LABEL: define ptr addrspace(1) @test_mixed_merge_with_field_writes
-; CHECK: %[[MAT:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance
-; CHECK: getelementptr inbounds i8, ptr addrspace(1) %[[MAT]], i64 8
+; The escape arm materializes (replaying the field write) and sinks; the virtual
+; arm materializes at its pred-end; the return consumes the merge PHI.
+; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
 ; CHECK: store atomic i32 %v
-; CHECK: call void @sink(ptr addrspace(1) %[[MAT]])
-; CHECK: ret ptr addrspace(1) %[[MAT]]
+; CHECK: call void @sink(ptr addrspace(1) %{{[A-Za-z0-9._]+}})
+; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK: = phi ptr addrspace(1)
+; CHECK: ret ptr addrspace(1) %{{[A-Za-z0-9._]+}}
 
 !java-method-compilation = !{}

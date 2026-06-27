@@ -50,22 +50,16 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_lock_mismatch_with_cascade
-; The then-pred materializes BOTH B (cascade) and A (direct), then
-; MatCont chain replays both surviving enters with the right per-pred
-; receivers. Klasses are 11111 for A and 22222 for B; the cascade order
-; (B before A in the new IR layout because B's narrow-cascade rule fires
-; first during A's materializeAtPredFromExitInfo call) puts klass 22222
-; first.
+; then-pred: B (22222, the locked one) materializes first and re-emits its
+; surviving monitorenter; then A (11111) materializes and re-emits its enter.
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
-; Surviving un-elided enters: one for B, one for A, both in the same
-; per-pred MatCont chain.
 ; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock
-; The else-pred materializes A only (no cascade for B because A has no
-; live locks at else — the cascade rule needs HasLiveLocks). B at else stays
-; virtual and is absorbed by the mixed-merge inherit-with-OrigAlloc path.
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock
+; else-pred: A (11111) and B (22222) per-pred materialize via the merge
+; collapse (no locks on this arm, so no surviving enters to re-emit).
+; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
+; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
 ; No more enters past this point.
 ; CHECK-NOT: call hotspotcc void @jeandle.monitorenter_with_thin_lock
 

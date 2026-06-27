@@ -2,13 +2,13 @@
 
 ; PEA: alloc + store + load (folded to the stored constant) + use of
 ; the load + escape. The load fold survives the escape: %v becomes the
-; constant 99 (so use_int gets a constant), and the object is materialized
-; as an InvokeInst (block-split) hoisted back to the original allocation
-; point — the analyzer chooses the alloc's normal-dest start as the safe
-; insertion point so the new invoke dominates every existing use of the
-; original allocation (soundness against in-block forward references). The
-; field store is replayed on the normal-dest of the materialization invoke,
-; ahead of the load-fold consumer and the eventual sink call.
+; constant 99 (so use_int gets a constant, consumed before the escape), and
+; the object is materialized at the ESCAPE POINT (the @sink call) — Graal's
+; materializeBefore=node — so the new invoke sits just before the sink. The
+; field store is replayed at the top of the materialization continuation,
+; ahead of the sink. (Escape-point placement: OrigAlloc uses are resolved
+; per-point by the transform, so the materialize need not dominate earlier
+; in-block references.)
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use_int(i32)
@@ -33,10 +33,10 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_load_then_escape
+; CHECK: call void @use_int(i32 99)
 ; CHECK: %[[MAT:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
 ; CHECK-NEXT: to label %{{.*}} unwind label %{{.*}}
 ; CHECK: store atomic i32 99, ptr addrspace(1) %{{.*}} unordered, align {{[0-9]+}}
-; CHECK: call void @use_int(i32 99)
 ; CHECK: call void @sink(ptr addrspace(1) %[[MAT]])
 
 !java-method-compilation = !{}

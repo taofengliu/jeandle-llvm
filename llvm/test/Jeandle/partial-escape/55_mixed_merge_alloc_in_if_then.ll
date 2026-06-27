@@ -36,8 +36,11 @@ u:
 ; dominates the merge so we don't need a per-pred PHI), and the @sink and
 ; %ret must consume it.
 ; CHECK-LABEL: define ptr addrspace(1) @test_alloc_in_entry_mixed_merge
-; CHECK: %[[MAT:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance
-; CHECK: call void @sink(ptr addrspace(1) %[[MAT]])
-; CHECK: ret ptr addrspace(1) %[[MAT]]
+; Per-arm materialize + materializedValuePhi (the collapse).
+; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK: call void @sink(ptr addrspace(1) %{{[A-Za-z0-9._]+}})
+; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK: = phi ptr addrspace(1)
+; CHECK: ret ptr addrspace(1) %{{[A-Za-z0-9._]+}}
 
 !java-method-compilation = !{}

@@ -61,14 +61,14 @@ u:
   resume i64 %lp
 }
 
-; The length call folds to 4 (independent of the later escape). The array
-; itself is materialized at the alloc-site SafeIP (i.e. hoisted to the head
-; of the alloc's normal-dest block, which is the recovery target after the
-; original SafeIP instruction was folded away by ReplaceLoad).
+; The length call folds to 4 (independent of the later escape). The array is
+; materialized at the escape point (the @sink call); the folded length use
+; precedes it. (The former dominating-hoist placement put the materialize
+; before the length use; escape-point placement puts it at the sink.)
 ; CHECK-LABEL: define void @test_length_then_escape
 ; CHECK-NOT: jeandle.arraylength
-; CHECK: invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_array
 ; CHECK: call void @use(i32 4)
+; CHECK: invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_array
 ; CHECK: call void @sink
 
 !java-method-compilation = !{}

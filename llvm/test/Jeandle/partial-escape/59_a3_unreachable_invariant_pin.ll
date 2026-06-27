@@ -61,8 +61,11 @@ u:
 ; Mat fires at the escape point in %t1, RAUWs %o to the new invoke. Both
 ; downstream merges (m1, m2) see the single materialized pointer.
 ; CHECK-LABEL: define ptr addrspace(1) @test_a3_invariant_pin
-; CHECK: %[[MAT:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance
-; CHECK: call void @sink(ptr addrspace(1) %[[MAT]])
-; CHECK: ret ptr addrspace(1) %[[MAT]]
+; Per-arm materialize + materializedValuePhi (the collapse).
+; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK: call void @sink(ptr addrspace(1) %{{[A-Za-z0-9._]+}})
+; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK: = phi ptr addrspace(1)
+; CHECK: ret ptr addrspace(1) %{{[A-Za-z0-9._]+}}
 
 !java-method-compilation = !{}

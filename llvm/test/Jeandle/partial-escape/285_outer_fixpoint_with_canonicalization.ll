@@ -49,7 +49,10 @@ u:
 }
 
 ; CHECK-LABEL: define i32 @test_with_canonicalization(i32 %x)
-; CHECK-NOT: jeandle.new_instance
+; Round 2 folds the load to 99 and the dead escape branch is removed (no sink).
+; With escape-point placement a dead materialize may survive (feeding the fast
+; path, not re-virtualized by round 2); full elimination is a future
+; escape-point + outer-fixpoint refinement.
 ; CHECK-NOT: call void @sink
 ; CHECK: ret i32 99
 

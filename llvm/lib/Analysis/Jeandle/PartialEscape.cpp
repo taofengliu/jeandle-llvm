@@ -47,7 +47,7 @@ static llvm::cl::opt<bool> JeandleTracePEA(
     llvm::cl::desc("PEA: emit a one-line dbgs() trace on every major "
                    "effect emission (EliminateAllocation / Materialize / "
                    "ReplaceCall / ReplaceLoad / EliminateStore / "
-                   "CreatePHI / ReplaceInput)."));
+                   "CreatePHI)."));
 
 // ===========================================================================
 // VirtualObject
@@ -619,6 +619,14 @@ PEAResult::~PEAResult() {
           delete Phi;
     }
   }
+  // Per-pred materialization placeholders (never inserted by the transform).
+  for (WeakTrackingVH &VH : OwnedMatPlaceholders) {
+    if (Value *V = VH) {
+      if (auto *I = dyn_cast<Instruction>(V))
+        if (!I->getParent())
+          I->deleteValue();
+    }
+  }
 }
 
 ObjectID PEAResult::createVirtualObject(std::unique_ptr<VirtualObject> VO) {
@@ -640,45 +648,52 @@ ObjectID PEAResult::createVirtualObject(std::unique_ptr<VirtualObject> VO) {
   return ID;
 }
 
-void PEAResult::addBlockEffect(Effect E) {
-  assert(E.Block);
+void PEAResult::addBlockEffect(std::unique_ptr<Effect> E) {
+  assert(E->Block);
   // Per-effect trace (gated on -jeandle-trace-pea, off by default).
   // Centralised here so every emission site routes through a single trace
-  // call. The trace identifies the effect kind, the owning ObjectID (when
-  // set), the block
-  // label, and a short Target/Replacement summary so a `2>&1 | grep PEA:`
-  // sweep is enough to follow the analyser's decisions.
+  // call; Effect::dump prints the kind, owning ObjectID (when set), block
+  // label, and Target summary so a `2>&1 | grep PEA:` sweep is enough to
+  // follow the analyser's decisions.
   if (JeandleTracePEA) {
-    auto effectKindName = [](EffectKind K) -> const char * {
-      switch (K) {
-      case EffectKind::ReplaceLoad:
-        return "ReplaceLoad";
-      case EffectKind::ReplaceCall:
-        return "ReplaceCall";
-      case EffectKind::ReplaceInput:
-        return "ReplaceInput";
-      case EffectKind::EliminateStore:
-        return "EliminateStore";
-      case EffectKind::EliminateAllocation:
-        return "EliminateAllocation";
-      case EffectKind::Materialize:
-        return "Materialize";
-      case EffectKind::CreatePHI:
-        return "CreatePHI";
-      }
-      return "Unknown";
-    };
-    llvm::dbgs() << "PEA: " << effectKindName(E.Kind);
-    if (E.ObjID != InvalidObjectID)
-      llvm::dbgs() << " [VO=" << static_cast<unsigned>(E.ObjID) << "]";
-    if (E.Block && E.Block->hasName())
-      llvm::dbgs() << " block=%" << E.Block->getName();
-    if (E.Target)
-      llvm::dbgs() << " target=" << *E.Target;
+    E->dump(llvm::dbgs());
     llvm::dbgs() << "\n";
   }
-  BlockEffects[E.Block].push_back(std::move(E));
+  BasicBlock *BB = E->Block;
+  BlockEffects[BB].add(std::move(E));
 }
+
+void Effect::dump(raw_ostream &OS) const {
+  OS << "PEA: ";
+  switch (getKind()) {
+  case Kind::ReplaceLoad:
+    OS << "ReplaceLoad";
+    break;
+  case Kind::ReplaceCall:
+    OS << "ReplaceCall";
+    break;
+  case Kind::EliminateStore:
+    OS << "EliminateStore";
+    break;
+  case Kind::EliminateAllocation:
+    OS << "EliminateAllocation";
+    break;
+  case Kind::Materialize:
+    OS << "Materialize";
+    break;
+  case Kind::CreatePHI:
+    OS << "CreatePHI";
+    break;
+  }
+  if (ObjID != InvalidObjectID)
+    OS << " [VO=" << static_cast<unsigned>(ObjID) << "]";
+  if (Block && Block->hasName())
+    OS << " block=%" << Block->getName();
+  if (Instruction *T = getTarget())
+    OS << " target=" << *T;
+}
+
+void MaterializeEffect::setInsertBefore(Instruction *I) { InsertBefore = I; }
 
 bool PEAResult::hasOptimizationOpportunity() const {
   return VirtualizationDelta > 0 || AllocationDelta != 0 ||

@@ -55,19 +55,17 @@ u:
 
 ; Both A and B must be materialized: B because it escaped; A because the
 ; narrow cascade rule cascades the OUTER (still-virtual) lock when the
-; INNER object is materialized.
+; INNER object is materialized. Each materialize point re-emits its surviving
+; monitorenter (Graal: synthetic enter at the CommitAllocationNode), sorted
+; ascending by lock depth — outer A (lock_a, depth 0) before inner B (lock_b,
+; depth 1). The original monitorexits survive at their source locations.
 ; CHECK-LABEL: define void @test_strict_lock_cascade
-; CHECK-DAG: %[[MATA:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
-; CHECK-DAG: %[[MATB:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 67890 to ptr), i32 16)
-; A's enter on materialized A.
+; CHECK: %[[MATA:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
 ; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MATA]],
-; B's enter on materialized B.
+; CHECK: %[[MATB:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 67890 to ptr), i32 16)
 ; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MATB]],
-; Sink on materialized B.
 ; CHECK: call void @sink(ptr addrspace(1) %[[MATB]])
-; B's exit on materialized B.
 ; CHECK: call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1) %[[MATB]],
-; A's exit on materialized A.
 ; CHECK: call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1) %[[MATA]],
 
 !java-method-compilation = !{}

@@ -6,32 +6,39 @@
 // Exceptions. See https://llvm.org/LICENSE.txt for license information.
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
-// Consume the PEAResult from PartialEscapeAnalysis and apply effects in two
-// ordered passes.
+// Consume the PEAResult from PartialEscapeAnalysis and apply its effects in
+// two ordered passes driven by Effect::isCfgKill() (Jeandle's analog of
+// Graal's EffectList.apply(graph, obsoleteNodes, cfgKills)).
 //
-//   Pass 1 (non-CFG-kill effects): ReplaceLoad, ReplaceCall, ReplaceInput,
-//   EliminateStore, Materialize, CreatePHI — applied per-block in RPO,
-//   sorted by SeqNo.
+//   Pass 1 (non-cfgKill): ReplaceLoad, ReplaceCall, EliminateStore,
+//   Materialize, CreatePHI — applied per-block in RPO via EffectList::apply,
+//   which sorts by SeqNo and dispatches each effect's apply() through
+//   TransformContext.
 //
-//   Pass 2 (CFG-kill effects): EliminateAllocation — rewrites an invoke alloc
-//   into an unconditional branch to the normal dest (dropping the unwind
-//   edge), or plain-erases a call alloc.
+//   Pass 2 (cfgKill): EliminateAllocation — rewrites an invoke alloc into an
+//   unconditional branch to the normal dest (dropping the unwind edge), or
+//   plain-erases a call alloc. isCfgKill() is true ONLY for this effect
+//   (matching Graal's deleteNode(WithExceptionNode)/killIfBranch).
 //
+// Between the passes a point-sensitive resolution sub-pass rewrites each
+// surviving original-allocation use to the materialize NewInv / merge PHI
+// that dominates it (Jeandle's analog of Graal's per-point `aliases` map).
 // After both passes: ConstantFoldTerminator, a trivially-dead sweep, and
 // EliminateUnreachableBlocks.
 //
-// At each escape point the Materialize handler emits a new Hotspot_JIT
-// InvokeInst, replays tracked field stores, and RAUWs the original alloc's
-// result onto the new pointer; Pass 2 then erases the now-dead original.
-// The invoke reuses the original alloc's unwind dest when the original was
-// itself an invoke, else synthesizes a minimal landingpad+resume block, and
-// tags the return with java-klass, java-klass-exact, and nonnull.
+// At each escape point MaterializeEffect::apply emits a new Hotspot_JIT
+// InvokeInst, replays tracked field stores, and re-emits surviving
+// monitorenters; EliminateAllocation in Pass 2 then erases the now-dead
+// original. The invoke reuses the original alloc's unwind dest when the
+// original was itself an invoke, else synthesizes a minimal landingpad+resume
+// block, and tags the return with java-klass, java-klass-exact, and nonnull.
 //
-// Lock cascade: when an object escapes with locks held, the analyzer drops
-// the ReplaceCall(true) elisions of the unbalanced monitorenter sites and
-// emits ReplaceInput effects pointing those calls' first operand at the
-// materialized pointer (resolved via NewAllocFor / MatPerBlock). Matching
-// downstream exits survive in IR with operands RAUW'd onto the new invoke.
+// Lock cascade: when an object escapes with locks held, the lock model DELETES
+// the folded monitorenters and captures the surviving unbalanced enters into
+// MaterializeEffect::Locks (sorted ascending by bytecode depth), re-emitting
+// them right after the new allocation (Graal: synthetic MonitorEnterNodes at
+// the CommitAllocationNode). Matching downstream exits survive in IR with
+// operands RAUW'd onto the new invoke.
 //
 //===----------------------------------------------------------------------===//
 
@@ -45,6 +52,7 @@
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DerivedTypes.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstrTypes.h"
@@ -119,18 +127,19 @@ static BasicBlock *findOrSynthesizeUnwindDest(Function &F,
 }
 
 // Emit the materialization sequence for a single Materialize effect: split the
-// containing block at Effect.InsertBefore so the new materialization is the
-// terminator, emit a hotspotcc InvokeInst, replay tracked field stores at the
-// top of the normal-dest block, and RAUW the original allocation onto the new
-// invoke. The same OrigAlloc may be materialized multiple times (mixed-state
-// merge synthesizing a per-pred materialization on each virtual incoming):
-// record each (analyzer-recorded-pred-block, OrigAlloc) → NewInv in
-// MatPerBlock (CreatePHI picks the right per-incoming NewInv) and Origin →
-// MatCont in BlockRename (so the PHI's incoming-block names the post-split
-// merge-pred). Lock cascade: when the object had live locks, the analyzer's
-// matching ReplaceInput effects run later in Pass 1 (after NewAllocFor /
-// MatPerBlock are seeded here), and the RAUW below auto-updates monitor call
-// operands.
+// containing block at the MaterializeEffect's InsertBefore so the new
+// materialization is the terminator, emit a hotspotcc InvokeInst, replay
+// tracked field stores at the top of the normal-dest block, and record the
+// materialization (OrigAlloc → NewInv) in Defs for the resolution sub-pass
+// (OrigAlloc is no longer RAUW'd inline). The same OrigAlloc may be
+// materialized multiple times (mixed-state merge synthesizing a per-pred
+// materialization on each virtual incoming): record each (analyzer-recorded-
+// pred-block, OrigAlloc) → NewInv in MatPerBlock (CreatePHI picks the right
+// per-incoming NewInv) and Origin → MatCont in BlockRename (so the PHI's
+// incoming-block names the post-split merge-pred). Lock cascade: the surviving
+// unbalanced enters were captured by the analyzer into the MaterializeEffect's
+// Locks (sorted ascending by bytecode depth) and are re-emitted right after
+// the field stores here.
 //
 // The materialized invoke is structurally identical to a frontend allocation
 // site (hotspotcc `jeandle.new_instance` / `jeandle.new_array`, addrspace(1)
@@ -140,11 +149,12 @@ static BasicBlock *findOrSynthesizeUnwindDest(Function &F,
 // SSA-preserving and the materialized pointer dominates every use in MatCont.
 // See `partial-escape/310_full_pipeline_statepoint.ll`.
 static void applyMaterialize(Function &F, const jeandle::PEAResult &Result,
-                             const jeandle::PEAResult::Effect &E,
+                             const jeandle::MaterializeEffect &E,
                              DenseMap<Value *, Value *> &NewAllocFor,
                              DenseMap<std::pair<BasicBlock *, Value *>, Value *>
                                  &MatPerBlock,
-                             DenseMap<BasicBlock *, BasicBlock *> &BlockRename) {
+                             DenseMap<BasicBlock *, BasicBlock *> &BlockRename,
+                             DenseMap<Value *, SmallVector<Value *, 4>> &Defs) {
   assert(E.ObjID != jeandle::InvalidObjectID);
   assert(E.Target && "Materialize effect must carry the original allocation");
 
@@ -300,67 +310,320 @@ static void applyMaterialize(Function &F, const jeandle::PEAResult &Result,
     S->setAtomic(AtomicOrdering::Unordered);
   }
 
-  // Record this materialization in NewAllocFor BEFORE the RAUW so any later
-  // applyMaterialize can rewrite a recorded MaterializedRef referencing
-  // OrigAlloc to the live NewInv.
+  // Re-emit surviving monitorenters at the materialize point (Graal analog:
+  // synthetic MonitorEnterNodes attached to the CommitAllocationNode during
+  // lowering, sorted ascending by lock depth). The analyzer deleted the
+  // original enters and captured each here as a self-contained MaterializedLock
+  // (callee + non-receiver args + bytecode depth). Clone each with the freshly
+  // materialized pointer as receiver, after the field stores (object fully
+  // initialized before the lock is acquired) and before the escape instruction.
+  // Mechanism note (#13): Graal lowers a fresh MonitorEnterNode carrying the
+  // original MonitorId; Jeandle clones the original callee + BasicLock args,
+  // receiver = NewInv — behaviorally equivalent, the LLVM-IR form of the same
+  // lock acquisition at the materialize point.
+  for (const jeandle::MaterializedLock &ML : E.Locks) {
+    if (!ML.Callee)
+      continue;
+    SmallVector<Value *, 4> Args;
+    Args.push_back(NewInv);
+    for (Value *A : ML.NonReceiverArgs)
+      Args.push_back(A);
+    CallInst *Enter = SB.CreateCall(ML.Callee, Args);
+    Enter->setCallingConv(CallingConv::Hotspot_JIT);
+  }
+
+  // Record this materialization in NewAllocFor so any later applyMaterialize
+  // can rewrite a recorded MaterializedRef referencing OrigAlloc to the live
+  // NewInv (field-store replay of a nested virtual).
   NewAllocFor[OrigAlloc] = NewInv;
   // Per-pred mapping for CreatePHI to pick the right NewInv per incoming.
   // Also record the block split so the PHI's incoming-block resolves to the
   // post-split MatCont.
   MatPerBlock[{AnalyzerRecordedPred, OrigAlloc}] = NewInv;
+  // Per-pred-distinct placeholder resolution (Graal: a distinct
+  // AllocatedObjectNode per materialize). When the analyzer carried a per-pred
+  // placeholder Value* (one per (pred, ObjectID)), record the mapping under
+  // that placeholder so CreatePHI incomings and any inherited materialized
+  // value resolve to THIS pred's own NewInv — never the global last-write-wins
+  // NewAllocFor[OrigAlloc]. The placeholder is never inserted into IR; it is
+  // only ever looked up here.
+  if (E.PerPredPlaceholder) {
+    MatPerBlock[{AnalyzerRecordedPred, E.PerPredPlaceholder}] = NewInv;
+    NewAllocFor[E.PerPredPlaceholder] = NewInv;
+  }
   BlockRename[Origin] = MatCont;
 
-  // Step 8: RAUW the original allocation so every existing IR user of the
-  // virtual pointer snaps to the new materialized pointer. The original alloc
-  // becomes use-empty and is erased by Pass 2 (EliminateAllocation).
-  //
-  // IsPerPred: when multiple per-pred materializations of the same OrigAlloc
-  // coexist, a global RAUW would substitute one pred's NewInv on every path,
-  // which is SSA-invalid. Skip the global RAUW for per-pred materializes;
-  // per-pred pre-merge uses are rewired via matching ReplaceInput effects
-  // (MatPerBlock lookup) and post-merge uses via matching CreatePHI
-  // (RAUWOrigToPHI). The original alloc still becomes use-empty by end of
-  // Pass 1.
-  //
-  // TODO(jeandle-deopt): PEA is intentionally deopt-agnostic: it drops
-  // operand bundles at materialization sites rather than maintaining a
-  // materialized deopt bundle; a future deopt refactor should repopulate
-  // them. Concretely, before the global RAUW we scrub OrigAlloc out of any
-  // existing "deopt" operand bundle on a CallBase: letting the RAUW
-  // propagate OrigAlloc -> NewInv into another sink CB's deopt bundle would
-  // let a sibling Materialize for the same OrigAlloc copy that bundle and
-  // hold NewInv from a non-dominating block. Replacing those operands with a
-  // typed null keeps the bundle structurally intact for a future repopulate
-  // while making the slot verifier-legal.
-  if (!E.IsPerPred && !OrigAlloc->use_empty()) {
-    Value *NullVO = ConstantPointerNull::get(
-        cast<PointerType>(OrigAlloc->getType()));
-    for (Use &U : llvm::make_early_inc_range(OrigAlloc->uses())) {
-      auto *CB = dyn_cast<CallBase>(U.getUser());
-      if (!CB)
-        continue;
-      unsigned OpIdx = U.getOperandNo();
-      if (!CB->isBundleOperand(OpIdx))
-        continue;
-      if (CB->getOperandBundleForOperand(OpIdx).isDeoptOperandBundle())
-        U.set(NullVO);
-    }
-  }
-  if (!E.IsPerPred && !OrigAlloc->use_empty())
-    OrigAlloc->replaceAllUsesWith(NewInv);
+  // Record this NewInv as a definition point of OrigAlloc. OrigAlloc is no
+  // longer RAUW'd inline — the point-sensitive resolution sub-pass (run after
+  // Pass 1, once the CFG is stable and a fresh DominatorTree is available)
+  // rewrites each surviving OrigAlloc use to the unique dominating def (this
+  // NewInv, a sibling per-pred NewInv, or a merge PHI). This mirrors Graal's
+  // per-point alias resolution (getAlias/getAliasAndResolve) and is what makes
+  // escape-point (non-dominating) materialization SSA-sound. Deopt-bundle
+  // operands are scrubbed to a typed null in the sub-pass (PEA stays
+  // deopt-agnostic; see resolveMaterializedUses).
+  Defs[OrigAlloc].push_back(NewInv);
 }
 
-static void collectSortedEffects(
-    const SmallVectorImpl<jeandle::PEAResult::Effect> &Effects,
-    SmallVectorImpl<const jeandle::PEAResult::Effect *> &Out) {
-  Out.clear();
-  Out.reserve(Effects.size());
-  for (const auto &E : Effects)
-    Out.push_back(&E);
-  llvm::sort(Out, [](const jeandle::PEAResult::Effect *A,
-                    const jeandle::PEAResult::Effect *B) {
+// Bundles the Function, the analysis result, and the shared per-apply maps so
+// each Effect subclass's apply() is self-contained (Jeandle's adaptation of
+// Graal's `apply(StructuredGraph graph, ArrayList<Node> obsoleteNodes)` — LLVM
+// mutates a Function, not a StructuredGraph, and carries the alias/def maps the
+// analysis could not populate because it cannot mutate IR).
+struct jeandle::TransformContext {
+  Function &F;
+  jeandle::PEAResult &Result;
+  DenseMap<Value *, Value *> &NewAllocFor;
+  DenseMap<std::pair<BasicBlock *, Value *>, Value *> &MatPerBlock;
+  DenseMap<BasicBlock *, BasicBlock *> &BlockRename;
+  DenseMap<Value *, SmallVector<Value *, 4>> &Defs;
+  bool &Changed;
+};
+
+void jeandle::ReplaceLoadEffect::apply(jeandle::TransformContext &Ctx) {
+  if (!Target || !Replacement)
+    return;
+  Value *Repl = Replacement;
+  // When the replacement's stamp is wider than the original, a Pi node would
+  // normally be injected. LLVM has no per-Value stamp at this layer — the
+  // closest analogue is the load-only metadata the original load may have
+  // carried. Transfer those (only when both sides are LoadInsts and the
+  // Replacement is missing the kind) so downstream LLVM passes do not lose the
+  // narrower-than-default knowledge after RAUW.
+  if (auto *TargetLoad = dyn_cast<LoadInst>(Target)) {
+    if (auto *ReplLoad = dyn_cast<LoadInst>(Repl)) {
+      static constexpr unsigned PreservableKinds[] = {
+          LLVMContext::MD_nonnull,
+          LLVMContext::MD_dereferenceable,
+          LLVMContext::MD_dereferenceable_or_null,
+          LLVMContext::MD_align,
+          LLVMContext::MD_invariant_load,
+          LLVMContext::MD_noundef,
+      };
+      for (unsigned K : PreservableKinds) {
+        if (ReplLoad->getMetadata(K))
+          continue; // already at least as precise; do not overwrite.
+        if (MDNode *MD = TargetLoad->getMetadata(K))
+          ReplLoad->setMetadata(K, MD);
+      }
+    }
+  }
+  // The analyzer may have synthesized an unparented coercion instruction as the
+  // replacement (a same-bit-width `bitcast` reinterpretation). Splice it, and
+  // any still-unparented operand, in postorder so each operand is parented
+  // before its user; all land immediately before Target. A PHINode replacement
+  // is owned by a CreatePHI effect that runs LATER in SeqNo order, so it is
+  // treated as a leaf here (splicing it mid-block is illegal).
+  if (auto *RI = dyn_cast<Instruction>(Repl); RI && !isa<PHINode>(RI)) {
+    SmallVector<Instruction *, 4> Stack;
+    SmallPtrSet<Instruction *, 4> Visited;
+    if (RI->getParent() == nullptr && Visited.insert(RI).second)
+      Stack.push_back(RI);
+    SmallVector<Instruction *, 4> PostOrder;
+    struct Frame {
+      Instruction *I;
+      unsigned NextOpIdx;
+    };
+    SmallVector<Frame, 4> Frames;
+    if (!Stack.empty()) {
+      Frames.push_back({Stack.back(), 0});
+      while (!Frames.empty()) {
+        Frame &Top = Frames.back();
+        if (Top.NextOpIdx < Top.I->getNumOperands()) {
+          Value *Op = Top.I->getOperand(Top.NextOpIdx++);
+          if (auto *OpI = dyn_cast<Instruction>(Op)) {
+            if (OpI->getParent() == nullptr && !isa<PHINode>(OpI) &&
+                Visited.insert(OpI).second) {
+              Frames.push_back({OpI, 0});
+            }
+          }
+        } else {
+          PostOrder.push_back(Top.I);
+          Frames.pop_back();
+        }
+      }
+    }
+    for (Instruction *I : PostOrder) {
+      if (I->getParent() == nullptr)
+        I->insertBefore(Target->getIterator());
+    }
+    // Defensive: if the coercion's operand happens to be an OrigAlloc that's
+    // been materialized, redirect through NewAllocFor.
+    auto It2 = Ctx.NewAllocFor.find(RI);
+    if (It2 != Ctx.NewAllocFor.end())
+      Repl = It2->second;
+  }
+  if (!Target->use_empty())
+    Target->replaceAllUsesWith(Repl);
+  Target->eraseFromParent();
+  Ctx.Changed = true;
+}
+
+void jeandle::ReplaceCallEffect::apply(jeandle::TransformContext &Ctx) {
+  // JavaOp folded against a virtual receiver: non-void results are replaced
+  // with a constant and the call erased; void JavaOps use a null Replacement to
+  // request deletion only. Folded results that feed `br i1` leave constant
+  // terminators cleaned up by ConstantFoldTerminator in run().
+  if (!Target)
+    return;
+  if (Replacement) {
+    Target->replaceAllUsesWith(Replacement);
+  } else if (!Target->use_empty()) {
+    return;
+  }
+  // For InvokeInst we cannot simply erase — the unwind edge must be dropped
+  // first. JavaOp folds emit `call` (not invoke) calls in practice; defensively
+  // handle invokes.
+  if (auto *II = dyn_cast<InvokeInst>(Target)) {
+    BasicBlock *Normal = II->getNormalDest();
+    BasicBlock *Unwind = II->getUnwindDest();
+    BasicBlock *Parent = II->getParent();
+    Unwind->removePredecessor(Parent, /*KeepOneInputPHIs=*/true);
+    BranchInst::Create(Normal, Parent);
+    II->eraseFromParent();
+  } else {
+    Target->eraseFromParent();
+  }
+  Ctx.Changed = true;
+}
+
+void jeandle::EliminateStoreEffect::apply(jeandle::TransformContext &Ctx) {
+  if (!Target)
+    return;
+  Target->eraseFromParent();
+  Ctx.Changed = true;
+}
+
+void jeandle::EliminateAllocationEffect::apply(jeandle::TransformContext &Ctx) {
+  if (eraseAllocation(Target))
+    Ctx.Changed = true;
+}
+
+void jeandle::MaterializeEffect::apply(jeandle::TransformContext &Ctx) {
+  // Emit the materialization sequence. The original allocation's uses are
+  // resolved later by the point-sensitive resolution sub-pass (not RAUW'd
+  // inline); the allocation itself is erased by EliminateAllocation in Pass 2.
+  applyMaterialize(Ctx.F, Ctx.Result, *this, Ctx.NewAllocFor, Ctx.MatPerBlock,
+                   Ctx.BlockRename, Ctx.Defs);
+  Ctx.Changed = true;
+}
+
+void jeandle::CreatePHIEffect::apply(jeandle::TransformContext &Ctx) {
+  // Insert the unparented PHI created by the analyzer at the head of the merge
+  // block (after any existing PHIs), and wire up its incoming values. For each
+  // incoming (V, Pred): walk BlockRename to the live merge-pred; if V refers to
+  // an OrigAlloc materialized at this (Pred, V), use the per-pred NewInv from
+  // MatPerBlock, else fall back to NewAllocFor.
+  PHINode *Phi = PhiInst;
+  assert(Phi && "CreatePHI effect requires a PhiInst");
+  assert(Phi->getParent() == nullptr &&
+         "CreatePHI's PhiInst must be unparented at apply time");
+  BasicBlock *MergeBB = Block;
+  Phi->insertBefore(MergeBB->getFirstInsertionPt());
+  assert(PHIIncomingValues.size() == PHIIncomingBlocks.size());
+  for (unsigned I = 0; I < PHIIncomingValues.size(); ++I) {
+    Value *V = PHIIncomingValues[I];
+    BasicBlock *Pred = PHIIncomingBlocks[I];
+    if (auto *VI = dyn_cast<Instruction>(V)) {
+      auto It = Ctx.MatPerBlock.find({Pred, VI});
+      if (It != Ctx.MatPerBlock.end()) {
+        V = It->second;
+      } else {
+        auto It2 = Ctx.NewAllocFor.find(VI);
+        if (It2 != Ctx.NewAllocFor.end())
+          V = It2->second;
+      }
+    }
+    // Resolve the live pred BB through BlockRename.
+    BasicBlock *LivePred = Pred;
+    while (true) {
+      auto It = Ctx.BlockRename.find(LivePred);
+      if (It == Ctx.BlockRename.end())
+        break;
+      LivePred = It->second;
+    }
+    Phi->addIncoming(V, LivePred);
+  }
+  // Register the freshly built PHI as a definition point of OrigAlloc so the
+  // point-sensitive resolution sub-pass rewrites post-merge OrigAlloc uses onto
+  // it (the dominance check restricts the rewrite to uses the PHI dominates).
+  if (RAUWOrigToPHI && ObjID != jeandle::InvalidObjectID) {
+    jeandle::VirtualObject &VObj = *Ctx.Result.VirtualObjects[ObjID];
+    if (VObj.AllocationCall)
+      Ctx.Defs[VObj.AllocationCall].push_back(Phi);
+  }
+  Ctx.Changed = true;
+}
+
+// Apply every effect where isCfgKill()==CfgKills, in SeqNo order (Jeandle's
+// substitute for Graal's list-order — see Effect::SeqNo). Pass 1 calls this
+// with CfgKills=false (every effect except EliminateAllocation); Pass 2 with
+// CfgKills=true (EliminateAllocation only).
+void jeandle::EffectList::apply(jeandle::TransformContext &Ctx, bool CfgKills) {
+  SmallVector<jeandle::Effect *, 16> Order;
+  Order.reserve(Effects.size());
+  for (auto &E : Effects)
+    Order.push_back(E.get());
+  llvm::sort(Order, [](const jeandle::Effect *A, const jeandle::Effect *B) {
     return A->SeqNo < B->SeqNo;
   });
+  for (jeandle::Effect *E : Order)
+    if (E->isCfgKill() == CfgKills)
+      E->apply(Ctx);
+}
+
+// Point-sensitive resolution of original-allocation uses — Jeandle's analog of
+// Graal's per-point alias resolution (the `aliases` map / getAlias /
+// getAliasAndResolve, which Graal maintains because it REPLACES the allocation
+// node with a VirtualObjectNode during analysis). LLVM's Analysis/Transform
+// split forbids mutating IR during analysis, so OrigAlloc persists as a real
+// invoke until here; this pass makes its ROLE Graal-equivalent by resolving
+// every surviving use to the def that dominates it, then Pass 2 erases the
+// now-use-less allocation.
+//
+// Run AFTER Pass 1 (which has placed every materialize NewInv and merge PHI and
+// settled the CFG via block splits), so a freshly-computed DominatorTree is
+// valid. For each OrigAlloc use: pick the unique def in Defs[OrigAlloc] that
+// dominates it. PEA guarantees uniqueness per use-path — an arm's NewInv
+// dominates only that arm's pre-merge uses; a merge PHI dominates only
+// post-merge uses (no single arm dominates a real multi-pred merge). Deopt-
+// bundle operands are scrubbed to a typed null (PEA stays deopt-agnostic).
+static void resolveMaterializedUses(
+    Function &F, DenseMap<Value *, SmallVector<Value *, 4>> &Defs) {
+  if (Defs.empty())
+    return;
+  DominatorTree DT(F);
+
+  for (auto &Kv : Defs) {
+    Value *OrigAlloc = Kv.first;
+    const SmallVector<Value *, 4> &DefList = Kv.second;
+    if (OrigAlloc->use_empty())
+      continue;
+    Value *NullVO =
+        ConstantPointerNull::get(cast<PointerType>(OrigAlloc->getType()));
+    for (Use &U : llvm::make_early_inc_range(OrigAlloc->uses())) {
+      // Find the unique dominating definition.
+      Value *Dom = nullptr;
+      for (Value *Def : DefList)
+        if (DT.dominates(Def, U)) {
+          Dom = Def;
+          break;
+        }
+      if (!Dom)
+        continue; // no dominating def; leave for Pass 2's poison RAUW.
+      // Scrub deopt-bundle operands to a typed null rather than threading a
+      // (possibly non-dominating) NewInv/PHI into a sibling's deopt bundle.
+      if (auto *CB = dyn_cast<CallBase>(U.getUser())) {
+        unsigned OpIdx = U.getOperandNo();
+        if (CB->isBundleOperand(OpIdx) &&
+            CB->getOperandBundleForOperand(OpIdx).isDeoptOperandBundle()) {
+          U.set(NullVO);
+          continue;
+        }
+      }
+      U.set(Dom);
+    }
+  }
 }
 
 PreservedAnalyses
@@ -392,6 +655,10 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
   // the analyzer-recorded PHI incoming block (which named the original pred
   // pre-split) to the live merge-pred (post-split MatCont chain).
   DenseMap<BasicBlock *, BasicBlock *> BlockRename;
+  // Per-OrigAlloc definition points (every materialize NewInv + every merge
+  // PHI) populated during Pass 1. Consumed by resolveMaterializedUses after
+  // Pass 1 to rewrite each surviving OrigAlloc use to its dominating def.
+  DenseMap<Value *, SmallVector<Value *, 4>> Defs;
 
   // -------------------------------------------------------------------------
   // PRE-PASS: split critical edges before per-pred materialisation.
@@ -402,9 +669,9 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
   // for each IsPerPred Materialize on a PH with >1 successor, split the
   // PH→S edge where S is the merge that requested the per-pred mat (S has
   // >1 pred and BlockEffects[S] has a CreatePHI naming PH), then re-aim the
-  // per-pred Materialize / ReplaceInput effects onto the new edge-block PH'
-  // and seed BlockRename[PH] = PH' so CreatePHI's BlockRename-chain walk
-  // routes the analyzer-recorded PH incoming through PH' to MatCont.
+  // per-pred Materialize effects onto the new edge-block PH' and seed
+  // BlockRename[PH] = PH' so CreatePHI's BlockRename-chain walk routes the
+  // analyzer-recorded PH incoming through PH' to MatCont.
   {
     struct EdgeKey {
       BasicBlock *PH;
@@ -414,8 +681,8 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
     DenseSet<std::pair<BasicBlock *, BasicBlock *>> SeenEdges;
     for (const auto &KvOut : Result.BlockEffects) {
       for (const auto &E : KvOut.second) {
-        if (E.Kind != jeandle::PEAResult::EffectKind::Materialize ||
-            !E.IsPerPred)
+        const auto *M = dyn_cast<jeandle::MaterializeEffect>(&E);
+        if (!M || !M->IsPerPred)
           continue;
         BasicBlock *PH = E.Block;
         if (!PH)
@@ -423,24 +690,12 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
         Instruction *Term = PH->getTerminator();
         if (!Term || Term->getNumSuccessors() <= 1)
           continue;
-        // Skip the critical-edge split when PH carries any ReplaceInput effect
-        // (un-elided monitorenter): that call site sits in PH and references
-        // the materialised pointer via MatPerBlock[{PH, OrigAlloc}]. Moving
-        // the Materialize to PH' would leave it without an SSA-dominating
-        // receiver definition.
-        // TODO(oom-on-split): the OOM-on-other-path issue remains open here
-        // pending a richer un-elide model (per-pred monitorenter snapshot at
-        // PH') or a LockState port.
-        bool HasReplaceInputInPH = false;
-        for (const auto &E2 : KvOut.second) {
-          if (E2.Kind == jeandle::PEAResult::EffectKind::ReplaceInput &&
-              E2.Block == PH) {
-            HasReplaceInputInPH = true;
-            break;
-          }
-        }
-        if (HasReplaceInputInPH)
-          continue;
+        // The critical-edge split is now unconditional: the lock model deletes
+        // the original monitorenter and re-emits it at the materialize point, so
+        // there is no un-elided enter sitting in PH that would lose its
+        // dominating receiver if the Materialize moved to a new edge block. (The
+        // former HasReplaceInputInPH skip — and its open OOM-on-other-path TODO
+        // — is gone as a consequence of the Graal-aligned lock model.)
         for (unsigned i = 0, n = Term->getNumSuccessors(); i < n; ++i) {
           BasicBlock *S = Term->getSuccessor(i);
           if (S->hasNPredecessors(1))
@@ -452,9 +707,10 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
             continue;
           bool MatchingPhi = false;
           for (const auto &PE : SIt->second) {
-            if (PE.Kind != jeandle::PEAResult::EffectKind::CreatePHI)
+            const auto *CPE = dyn_cast<jeandle::CreatePHIEffect>(&PE);
+            if (!CPE)
               continue;
-            for (BasicBlock *IB : PE.PHIIncomingBlocks) {
+            for (BasicBlock *IB : CPE->PHIIncomingBlocks) {
               if (IB == PH) {
                 MatchingPhi = true;
                 break;
@@ -487,10 +743,11 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
       // MatCont.
       BlockRename[K.PH] = NewBB;
     }
-    // Re-aim per-pred Materialize and PH-keyed ReplaceInput effects from
-    // their original PH bucket onto the new edge-block. Also move the
-    // BlockEffects entry so the RPO walk applies the effects at the
-    // correct block boundary.
+    // Re-aim per-pred Materialize effects from their original PH bucket onto
+    // the new edge-block. Also move the BlockEffects entry so the RPO walk
+    // applies the effects at the correct block boundary. The Stay effects
+    // remain in the Old bucket; each Move effect is spliced out, re-aimed via
+    // the MaterializeEffect setters, and added to the New bucket.
     if (!PHRename.empty()) {
       for (const auto &KvOut : PHRename) {
         BasicBlock *Old = KvOut.first;
@@ -498,29 +755,21 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
         auto It = Result.BlockEffects.find(Old);
         if (It == Result.BlockEffects.end())
           continue;
-        SmallVector<jeandle::PEAResult::Effect, 4> Stay;
-        SmallVector<jeandle::PEAResult::Effect, 4> Move;
-        for (auto &E : It->second) {
-          bool MoveIt = false;
-          if (E.Kind == jeandle::PEAResult::EffectKind::Materialize &&
-              E.IsPerPred && E.Block == Old) {
-            MoveIt = true;
-          } else if (E.Kind == jeandle::PEAResult::EffectKind::ReplaceInput &&
-                     E.Block == Old) {
-            MoveIt = true;
-          }
-          if (MoveIt) {
-            E.Block = New;
-            if (E.Kind == jeandle::PEAResult::EffectKind::Materialize)
-              E.InsertBefore = &*New->getFirstNonPHIOrDbg();
-            Move.emplace_back(std::move(E));
+        jeandle::EffectList &Src = It->second;
+        jeandle::EffectList Move;
+        size_t I = 0;
+        while (I < Src.size()) {
+          jeandle::Effect &E = Src[I];
+          auto *M = dyn_cast<jeandle::MaterializeEffect>(&E);
+          if (M && M->IsPerPred && E.Block == Old) {
+            M->setBlock(New);
+            M->setInsertBefore(&*New->getFirstNonPHIOrDbg());
+            Move.add(Src.spliceOut(I));
           } else {
-            Stay.emplace_back(std::move(E));
+            ++I;
           }
         }
-        It->second = std::move(Stay);
-        for (auto &E : Move)
-          Result.BlockEffects[New].emplace_back(std::move(E));
+        Result.BlockEffects[New].addAll(Move);
       }
     }
   }
@@ -530,303 +779,44 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
   ReversePostOrderTraversal<Function *> RPOT(&F);
 
   // -------------------------------------------------------------------------
-  // Pass 1: non-CFG-kill effects (ReplaceLoad, ReplaceCall, ReplaceInput,
-  // EliminateStore, Materialize, CreatePHI)
+  // Pass 1: non-cfgKill effects (ReplaceLoad, ReplaceCall, EliminateStore,
+  // Materialize, CreatePHI) — applied per-block in RPO via EffectList::apply,
+  // which sorts by SeqNo and dispatches each effect's apply() through
+  // TransformContext (Jeandle's analog of Graal's
+  // apply(graph, obsoleteNodes, cfgKills=false)). isCfgKill() partitions the
+  // two passes; EliminateAllocation is the only cfgKill, so it is skipped here.
   // -------------------------------------------------------------------------
+  jeandle::TransformContext Ctx{F, Result,        NewAllocFor,
+                                MatPerBlock, BlockRename,   Defs,
+                                Changed};
   for (BasicBlock *BB : RPOT) {
     auto It = Result.BlockEffects.find(BB);
     if (It == Result.BlockEffects.end())
       continue;
-
-    SmallVector<const jeandle::PEAResult::Effect *, 8> Sorted;
-    collectSortedEffects(It->second, Sorted);
-
-    for (const auto *E : Sorted) {
-      switch (E->Kind) {
-      case jeandle::PEAResult::EffectKind::ReplaceLoad: {
-        if (!E->Target || !E->Replacement)
-          break;
-        Instruction *Target = E->Target;
-        Value *Repl = E->Replacement;
-        // When the replacement's stamp is wider than the original, a Pi
-        // node would normally be injected. LLVM has no per-Value stamp at
-        // this layer — the closest analogue is the load-only metadata
-        // (`!nonnull`, `!dereferenceable`,
-        // `!dereferenceable_or_null`, `!align`, `!invariant.load`,
-        // `!noundef`) the original load may have carried. Transfer those
-        // (only when both sides are LoadInsts and the Replacement is
-        // missing the kind) so downstream LLVM passes do not lose the
-        // narrower-than-default knowledge after RAUW.
-        //
-        // Skipped intentionally:
-        //  * `!range`: not monotonic — a value that's range-narrowed via
-        //    the original load is not guaranteed to satisfy the same range
-        //    when sourced from a freshly stored Scalar. Conservative skip.
-        //  * Non-load Replacement (Constant, binop, bitcast, struct):
-        //    load-only metadata does not apply.
-        //  * Non-load Target (atomicrmw / cmpxchg / icmp folded via
-        //    ReplaceLoad's generic RAUW handler): no load metadata on the
-        //    source.
-        if (auto *TargetLoad = dyn_cast<LoadInst>(Target)) {
-          if (auto *ReplLoad = dyn_cast<LoadInst>(Repl)) {
-            static constexpr unsigned PreservableKinds[] = {
-                LLVMContext::MD_nonnull,
-                LLVMContext::MD_dereferenceable,
-                LLVMContext::MD_dereferenceable_or_null,
-                LLVMContext::MD_align,
-                LLVMContext::MD_invariant_load,
-                LLVMContext::MD_noundef,
-            };
-            for (unsigned K : PreservableKinds) {
-              if (ReplLoad->getMetadata(K))
-                continue; // already at least as precise; do not overwrite.
-              if (MDNode *MD = TargetLoad->getMetadata(K))
-                ReplLoad->setMetadata(K, MD);
-            }
-          }
-        }
-        // The analyzer may have synthesized an unparented coercion instruction
-        // as the replacement (a same-bit-width `bitcast` reinterpretation).
-        // Splice it, and any still-unparented operand, in postorder so each
-        // operand is parented before its user; all land immediately before
-        // Target. Ownership transfers from PEAResult::OwnedInsts to the parent
-        // BasicBlock; OwnedInsts' destructor skips inserted instructions.
-        //
-        // TODO(unsafe-inliner): see PartialEscapeAnalysis.cpp (tier-2
-        // dispatch). A PHINode replacement is owned by a CreatePHI effect that
-        // runs LATER in SeqNo order. Splicing it here would parent it mid-block
-        // (illegal for a PHINode) and crash CreatePHI's "must be unparented"
-        // assert. Skip the splicing path for PHIs.
-        if (auto *RI = dyn_cast<Instruction>(Repl); RI && !isa<PHINode>(RI)) {
-          SmallVector<Instruction *, 4> Stack;
-          SmallPtrSet<Instruction *, 4> Visited;
-          if (RI->getParent() == nullptr && Visited.insert(RI).second)
-            Stack.push_back(RI);
-          // Iterative postorder splice: mark on first visit, splice on second.
-          SmallVector<Instruction *, 4> PostOrder;
-          // Use a small worklist that tracks (node, visited-children).
-          struct Frame {
-            Instruction *I;
-            unsigned NextOpIdx;
-          };
-          SmallVector<Frame, 4> Frames;
-          if (!Stack.empty()) {
-            Frames.push_back({Stack.back(), 0});
-            while (!Frames.empty()) {
-              Frame &Top = Frames.back();
-              if (Top.NextOpIdx < Top.I->getNumOperands()) {
-                Value *Op = Top.I->getOperand(Top.NextOpIdx++);
-                if (auto *OpI = dyn_cast<Instruction>(Op)) {
-                  // A PHINode operand is owned by its own CreatePHI effect,
-                  // which parents it at the merge-block head. Treat it as a
-                  // leaf here: it is illegal mid-block, and parenting it now
-                  // would crash the later CreatePHI handler. (A PHI dominates
-                  // all non-PHI uses in its block, so it's always available.)
-                  if (OpI->getParent() == nullptr && !isa<PHINode>(OpI) &&
-                      Visited.insert(OpI).second) {
-                    Frames.push_back({OpI, 0});
-                  }
-                }
-              } else {
-                PostOrder.push_back(Top.I);
-                Frames.pop_back();
-              }
-            }
-          }
-          for (Instruction *I : PostOrder) {
-            if (I->getParent() == nullptr)
-              I->insertBefore(Target->getIterator());
-          }
-          // Defensive: if the coercion's operand happens to be an OrigAlloc
-          // that's been materialized, redirect through NewAllocFor. Coercion
-          // operands are stored Scalars (typed primitives), so this branch
-          // is normally inert; mirrors the pattern in other handlers.
-          auto It2 = NewAllocFor.find(RI);
-          if (It2 != NewAllocFor.end())
-            Repl = It2->second;
-        }
-        if (!Target->use_empty())
-          Target->replaceAllUsesWith(Repl);
-        Target->eraseFromParent();
-        Changed = true;
-        break;
-      }
-      case jeandle::PEAResult::EffectKind::ReplaceCall: {
-        // JavaOp folded against a virtual receiver: non-void results are
-        // replaced with a constant and the call erased; void JavaOps use a
-        // null Replacement to request deletion only. Folded results that feed
-        // `br i1` (monitorenter/exit, checkcast) leave constant terminators
-        // cleaned up by ConstantFoldTerminator below.
-        if (!E->Target)
-          break;
-        if (E->Replacement) {
-          E->Target->replaceAllUsesWith(E->Replacement);
-        } else if (!E->Target->use_empty()) {
-          break;
-        }
-        // For InvokeInst we cannot simply erase — the unwind edge must be
-        // dropped first. JavaOp folds emit `call` (not invoke) calls in
-        // practice, so handle that common case; defensively skip invokes
-        // (no JavaOp test currently uses invoke for a fold target).
-        if (auto *II = dyn_cast<InvokeInst>(E->Target)) {
-          BasicBlock *Normal = II->getNormalDest();
-          BasicBlock *Unwind = II->getUnwindDest();
-          BasicBlock *Parent = II->getParent();
-          Unwind->removePredecessor(Parent, /*KeepOneInputPHIs=*/true);
-          BranchInst::Create(Normal, Parent);
-          II->eraseFromParent();
-        } else {
-          E->Target->eraseFromParent();
-        }
-        Changed = true;
-        break;
-      }
-      case jeandle::PEAResult::EffectKind::EliminateStore: {
-        if (!E->Target)
-          break;
-        E->Target->eraseFromParent();
-        Changed = true;
-        break;
-      }
-      case jeandle::PEAResult::EffectKind::Materialize: {
-        // Emit the materialization sequence and RAUW the original allocation
-        // onto the new CallInst. The original allocation itself is erased
-        // later by EliminateAllocation in Pass 2.
-        applyMaterialize(F, Result, *E, NewAllocFor, MatPerBlock, BlockRename);
-        Changed = true;
-        break;
-      }
-      case jeandle::PEAResult::EffectKind::CreatePHI: {
-        // Insert the unparented PHI created by the analyzer at the head
-        // of the merge block (after any existing PHIs), and wire up its
-        // incoming values. For each incoming (V, Pred):
-        //   * Walk BlockRename forward to the live merge-pred (post-split
-        //     MatCont chain).
-        //   * If V refers to an OrigAlloc that's been materialized at this
-        //     specific (Pred, V), use the per-pred NewInv from MatPerBlock.
-        //     Otherwise fall back to NewAllocFor for the single-mat path.
-        PHINode *Phi = E->PhiInst;
-        assert(Phi && "CreatePHI effect requires a PhiInst");
-        assert(Phi->getParent() == nullptr &&
-               "CreatePHI's PhiInst must be unparented at apply time");
-        BasicBlock *MergeBB = E->Block;
-        Phi->insertBefore(MergeBB->getFirstInsertionPt());
-        assert(E->PHIIncomingValues.size() == E->PHIIncomingBlocks.size());
-        for (unsigned I = 0; I < E->PHIIncomingValues.size(); ++I) {
-          Value *V = E->PHIIncomingValues[I];
-          BasicBlock *Pred = E->PHIIncomingBlocks[I];
-          if (auto *VI = dyn_cast<Instruction>(V)) {
-            auto It = MatPerBlock.find({Pred, VI});
-            if (It != MatPerBlock.end()) {
-              V = It->second;
-            } else {
-              auto It2 = NewAllocFor.find(VI);
-              if (It2 != NewAllocFor.end())
-                V = It2->second;
-            }
-          }
-          // Resolve the live pred BB through BlockRename.
-          BasicBlock *LivePred = Pred;
-          while (true) {
-            auto It = BlockRename.find(LivePred);
-            if (It == BlockRename.end())
-              break;
-            LivePred = It->second;
-          }
-          Phi->addIncoming(V, LivePred);
-        }
-        // For the AllMaterialized + per-pred placeholder case, the matching
-        // per-pred Materialize effects skipped their global RAUW, so
-        // post-merge users of OrigAlloc still reference the original invoke.
-        // RAUW them to the freshly built PHI here so downstream uses thread
-        // through the per-pred PHI. Pre-merge per-pred uses were already
-        // retargeted to per-pred NewInvs by the earlier ReplaceInput effects.
-        //
-        // GUARDED RAUW — a blanket replaceAllUsesWith would also rewrite PHI
-        // users in blocks MergeBB does not dominate, producing a non-dominating
-        // SSA use rejected by the verifier. The new PHI dominates MergeBB and
-        // its dom-tree subtree but not MergeBB's predecessors. Strategy:
-        //   * Non-PHI users: rewrite unconditionally (post-merge by
-        //     construction — the analyzer only sets RAUWOrigToPHI for the
-        //     AllMaterialized + per-pred placeholder case).
-        //   * PHINode users: rewrite only the PEA-inserted Phi itself
-        //     (self-incoming no-op skip). Other PHI users (e.g. a frontend
-        //     Case-B alias PHI in MergeBB or a successor) are left alone;
-        //     EliminateAllocation's poison RAUW dead-codes them.
-        if (E->RAUWOrigToPHI && E->ObjID != jeandle::InvalidObjectID) {
-          jeandle::VirtualObject &VObj = *Result.VirtualObjects[E->ObjID];
-          if (VObj.AllocationCall && !VObj.AllocationCall->use_empty()) {
-            SmallVector<Use *, 8> WorkList;
-            for (Use &U : VObj.AllocationCall->uses())
-              WorkList.push_back(&U);
-            for (Use *U : WorkList) {
-              User *Usr = U->getUser();
-              if (auto *PN = dyn_cast<PHINode>(Usr)) {
-                if (PN == Phi)
-                  continue; // our own PHI's incomings were set above.
-                if (PN->getParent() != Phi->getParent())
-                  continue; // SSA-unsafe across non-dominating blocks.
-              }
-              U->set(Phi);
-            }
-          }
-        }
-        Changed = true;
-        break;
-      }
-      case jeandle::PEAResult::EffectKind::ReplaceInput: {
-        // Emitted for monitorenter/monitorexit sites whose elision was undone
-        // because the object escapes with locks held. Replacement is OrigAlloc;
-        // resolve to the live materialized invoke. Resolution priority:
-        //   1. MatPerBlock[{E.Block, OrigAlloc}] — pred-specific NewInv. Needed
-        //      when multiple per-pred materializations of the same OrigAlloc
-        //      coexist (NewAllocFor only retains the last NewInv).
-        //   2. NewAllocFor[OrigAlloc] — single-materialize fallback.
-        if (!E->Target || !E->Replacement)
-          break;
-        Value *Replacement = E->Replacement;
-        if (auto *RI = dyn_cast<Instruction>(Replacement)) {
-          if (E->Block) {
-            auto It = MatPerBlock.find({E->Block, RI});
-            if (It != MatPerBlock.end()) {
-              Replacement = It->second;
-            } else {
-              auto It2 = NewAllocFor.find(RI);
-              if (It2 != NewAllocFor.end())
-                Replacement = It2->second;
-            }
-          } else {
-            auto It2 = NewAllocFor.find(RI);
-            if (It2 != NewAllocFor.end())
-              Replacement = It2->second;
-          }
-        }
-        E->Target->setOperand(E->InputIndex, Replacement);
-        Changed = true;
-        break;
-      }
-      default:
-        // EliminateAllocation is handled in Pass 2.
-        break;
-      }
-    }
+    It->second.apply(Ctx, /*CfgKills=*/false);
   }
 
   // -------------------------------------------------------------------------
-  // Pass 2: CFG-kill effects (EliminateAllocation).
+  // Resolution sub-pass: rewrite each surviving OrigAlloc use to its dominating
+  // materialize NewInv / merge PHI (Jeandle's analog of Graal's point-sensitive
+  // alias resolution). Runs after Pass 1 has settled the CFG; before Pass 2 so
+  // the allocation becomes use-empty before EliminateAllocation erases it.
+  // -------------------------------------------------------------------------
+  if (!Defs.empty()) {
+    resolveMaterializedUses(F, Defs);
+    Changed = true;
+  }
+
+  // -------------------------------------------------------------------------
+  // Pass 2: cfgKill effects (EliminateAllocation only) — same dispatch with
+  // CfgKills=true. Runs after the resolution sub-pass so each allocation is
+  // use-empty before it is erased.
   // -------------------------------------------------------------------------
   for (BasicBlock *BB : RPOT) {
     auto It = Result.BlockEffects.find(BB);
     if (It == Result.BlockEffects.end())
       continue;
-
-    SmallVector<const jeandle::PEAResult::Effect *, 8> Sorted;
-    collectSortedEffects(It->second, Sorted);
-
-    for (const auto *E : Sorted) {
-      if (E->Kind == jeandle::PEAResult::EffectKind::EliminateAllocation)
-        Changed |= eraseAllocation(E->Target);
-    }
+    It->second.apply(Ctx, /*CfgKills=*/true);
   }
 
   // Erase parented Case-B alias PHIs that the analyzer flagged

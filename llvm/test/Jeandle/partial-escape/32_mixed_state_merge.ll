@@ -1,15 +1,10 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA mixed-state merge: branch %left escapes the object via a sink call,
-; the other branch keeps it virtual until the merge. The analyzer inherits
-; Materialized at the merge using the OrigAlloc placeholder. The transform's
-; safe-IP-hoisted materializeAt produces a single materialized invoke that
-; dominates the merge; downstream uses snap to it via RAUW.
-;
-; A more aggressive design — per-pred materialization + a synthesized
-; ptr addrspace(1) PHI at the merge — would require a DT-aware fix-up to
-; redirect downstream uses through the PHI. That's deferred to a future task.
-; This test only asserts that the merge no longer bails to ineligible.
+; PEA mixed-state merge (Graal's per-pred+PHI else-branch): branch %left
+; escapes the object via a sink call, the other branch keeps it virtual until
+; the merge. The escape arm materializes at the escape point; the virtual arm
+; is materialized at its predecessor-end; a materializedValuePhi at the merge
+; reconciles them, and downstream uses (the return) consume the PHI.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -36,8 +31,10 @@ u:
 }
 
 ; CHECK-LABEL: define ptr addrspace(1) @test_mixed_merge
-; CHECK: %[[MAT:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance
-; CHECK: call void @sink(ptr addrspace(1) %[[MAT]])
-; CHECK: ret ptr addrspace(1) %[[MAT]]
+; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK: call void @sink(ptr addrspace(1) %{{[A-Za-z0-9._]+}})
+; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK: = phi ptr addrspace(1)
+; CHECK: ret ptr addrspace(1) %{{[A-Za-z0-9._]+}}
 
 !java-method-compilation = !{}

@@ -35,10 +35,12 @@ u:
 }
 
 ; CHECK-LABEL: define ptr addrspace(1) @test_both_arms_escape
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
+; Each arm escapes and materializes at its own sink; the merge builds a PHI.
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
 ; CHECK: call void @sink1
+; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
 ; CHECK: call void @sink2
+; CHECK: = phi ptr addrspace(1)
 ; CHECK: ret ptr addrspace(1)
 
 !java-method-compilation = !{}
