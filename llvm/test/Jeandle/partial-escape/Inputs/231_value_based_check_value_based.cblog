@@ -4,7 +4,7 @@
 # so the runtime DiagnoseSyncOnValueBasedClasses warning fires on a real
 # oop.
 RequiresStrictLockOrder = 1
-# tier1Allocate(7777) calls IsBoxed (B10). Klass 7777 is not an autobox
+# processAllocation(7777) calls IsBoxed (B10). Klass 7777 is not an autobox
 # wrapper, so the callback returns JBasicType::Count (9).
 HasFinalizer 7777 = false
 CanVirtualize 7777 = true

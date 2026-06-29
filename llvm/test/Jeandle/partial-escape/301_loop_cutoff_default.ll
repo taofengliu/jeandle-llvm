@@ -9,7 +9,7 @@
 ; on the materialised invoke).
 ;
 ; With -jeandle-pea-loop-cutoff=2, the same nest crosses the threshold,
-; StopNew kicks in, tier1Allocate refuses the depth-3 alloc, and the
+; StopNew kicks in, processAllocation refuses the depth-3 alloc, and the
 ; ORIGINAL invoke (with its original SSA name) survives unchanged. Use
 ; the @sink to anchor a CHECK that distinguishes the two paths.
 

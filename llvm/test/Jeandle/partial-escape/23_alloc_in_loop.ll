@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; PEA: the allocation lives inside a loop body and escapes via @sink on
-; every iteration. tier1Allocate virtualizes loop-body allocs; the @sink
+; every iteration. processAllocation virtualizes loop-body allocs; the @sink
 ; call forces materialization at the alloc's SafeIP (still inside the loop).
 ; The IR therefore still contains a
 ; jeandle.new_instance invoke per iteration — just rewritten through the

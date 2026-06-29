@@ -19,7 +19,7 @@
 ;               is rewritten to a branch by Pass 2).
 ;
 ;  * @t_always: one VO with a store at a runtime (non-constant) byte offset.
-;               tier2Store's resolveFieldOffset returns nullopt and flips
+;               processStore's resolveFieldOffset returns nullopt and flips
 ;               Eligible to false; commit() drops the effects and stamps
 ;               AlwaysEscapes.
 

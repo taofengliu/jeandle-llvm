@@ -45,7 +45,7 @@ u:
 ; After LoopSimplify canonicalises the entry to the loop, the loop
 ; fixpoint takes over and folds the alloc + field store/load.
 ; @use receives %i directly (the in-body store-load forwards through
-; tier2Load on the virtual field).
+; processLoad on the virtual field).
 ; CHECK-LABEL: define void @test_c6_after_loopsimplify
 ; CHECK-NOT: jeandle.new_instance
 ; CHECK-NOT: store atomic

@@ -10,7 +10,7 @@
 ; This is the "no compile-time klass evidence" conservative path: PEA leaves
 ; the call alone and the runtime decides at execution time.
 ;
-; Note: per tier1Allocate, the VObj.Klass == 0 case is unreachable today
+; Note: per processAllocation, the VObj.Klass == 0 case is unreachable today
 ; (the analyzer refuses to register a virtual when the alloc's klass operand
 ; isn't a compile-time constant), so a non-virtual operand is the
 ; representative test for the "klass unknown" fold path.

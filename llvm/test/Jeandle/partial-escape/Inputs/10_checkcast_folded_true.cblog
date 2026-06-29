@@ -2,7 +2,7 @@
 # This test has no locks, so the answer doesn't affect the IR — but the
 # replay log must still account for the call.
 RequiresStrictLockOrder = 1
-# B10: tier1Allocate queries IsBoxed for each Instance allocation. Klass
+# B10: processAllocation queries IsBoxed for each Instance allocation. Klass
 # 5 is not one of the eight java.lang autobox wrapper classes, so the
 # callback returns JBasicType::Count (9). The fold paths below stay on
 # the conservative non-boxed path.

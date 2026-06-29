@@ -2,9 +2,9 @@
 # is provably incompatible with 4444. evalSubtypeRelation paths through
 # IsSubtype then areKlassesIncompatible (IsSubtype + IsInterface).
 RequiresStrictLockOrder = 1
-# tier1Allocate(8888 — newarray) calls ElementBasicTypeOfArrayKlass.
+# processAllocation(8888 — newarray) calls ElementBasicTypeOfArrayKlass.
 ElementBasicTypeOfArrayKlass 8888 = 8
-# tier1Allocate(7777 — new_instance) calls IsBoxed (B10). Klass 7777 is
+# processAllocation(7777 — new_instance) calls IsBoxed (B10). Klass 7777 is
 # not an autobox wrapper, so the callback returns JBasicType::Count (9).
 HasFinalizer 7777 = false
 CanVirtualize 7777 = true

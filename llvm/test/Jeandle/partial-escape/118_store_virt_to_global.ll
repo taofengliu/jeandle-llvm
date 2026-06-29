@@ -1,9 +1,9 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Value-side virtual leak in tier2Store.
+; Value-side virtual leak in processStore.
 ; `store ptr %virt, ptr @G` where %virt is a virtual allocation but @G is a
-; non-virtual global. tier2Store returns false on a non-virtual pointer;
-; applyThreeTier falls through to materializeAllVirtualOperands and escapes
+; non-virtual global. processStore returns false on a non-virtual pointer;
+; processInstruction falls through to materializeAllVirtualOperands and escapes
 ; the value side, so %virt is materialized at the store and the global
 ; receives the live materialized pointer. Without this, EliminateAllocation
 ; would RAUW %virt to PoisonValue and the surviving store would write

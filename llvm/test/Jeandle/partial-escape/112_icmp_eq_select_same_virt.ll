@@ -5,7 +5,7 @@
 ; processBlockPhis Case B only handled PHINodes, not Selects, so the
 ; Select consumed virtual operands and forced materialization.
 ;
-; Now: applyThreeTier dispatches SelectInst into propagatePointerAlias,
+; Now: processInstruction dispatches SelectInst into propagatePointerAlias,
 ; which uses resolveVirtualRefImpl's Select case to verify that both arms
 ; resolve to the same ObjectID and then aliases the Select to that
 ; virtual. The icmp eq downstream resolves both operands to the same

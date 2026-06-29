@@ -7,7 +7,7 @@
 ; (InstCombine folds the load+icmp, SimplifyCFG drops the now-dead escape
 ; arm, ADCE/the dead-code sweep cleans up), the analyzer's RPO walk in
 ; round 2 sees the freshly materialized invoke as a brand-new allocation
-; site — tier1Allocate recognises it, the residual field stores are picked
+; site — processAllocation recognises it, the residual field stores are picked
 ; up naturally as virtual-field writes, and the alloc is re-virtualized
 ; and eliminated.
 ;

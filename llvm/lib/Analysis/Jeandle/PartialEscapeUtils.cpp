@@ -211,7 +211,7 @@ Value *stripPointerCastsAndOffsets(Value *Ptr, const DataLayout &DL,
 // detection the recursion is already bounded by the IR structure, but a hard
 // depth cap prevents pathological diamond DAGs from causing exponential
 // expansion through repeated PHI/Select operands.
-static constexpr unsigned kResolveVirtualRefMaxDepth = 8;
+static constexpr unsigned ResolveVirtualRefMaxDepth = 8;
 
 static std::optional<ObjectID>
 resolveVirtualRefImpl(Value *V, const PEABlockState &State,
@@ -261,7 +261,7 @@ resolveVirtualRefImpl(Value *V, const PEABlockState &State,
                       DenseSet<Value *> &Visited, unsigned Depth) {
   if (!V)
     return std::nullopt;
-  if (Depth > kResolveVirtualRefMaxDepth)
+  if (Depth > ResolveVirtualRefMaxDepth)
     return std::nullopt;
   // Cycle detection: if V is already on the resolution stack we're in a
   // self-reference (e.g. phi referencing itself) — bail.

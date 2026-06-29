@@ -3,7 +3,7 @@
 ; Mode::StopNewInLoopNest. With -jeandle-pea-loop-cutoff=2, a 3-deep
 ; nest has max depth = 3 which exceeds the threshold, so processLoop
 ; (called at top-level on the outer loop) transiently enters
-; Mode::StopNewInLoopNest. In that mode, tier1Allocate refuses to register
+; Mode::StopNewInLoopNest. In that mode, processAllocation refuses to register
 ; NEW allocations inside the nest — but every other operation continues
 ; unchanged.
 ;

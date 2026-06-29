@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/385_alloc_with_finalizer_bails.cblog %s | FileCheck %s
 
-; HasFinalizer VMCallback. tier1Allocate refuses to virtualize
+; HasFinalizer VMCallback. processAllocation refuses to virtualize
 ; an Instance allocation whose Klass has a finalizer because HotSpot
 ; must run the original allocation site so InstanceKlass's finalizer
 ; registration fires; eliding the alloc would skip that registration
@@ -31,7 +31,7 @@ u:
 }
 
 ; The new_instance survives because HasFinalizer(6666) returned true and
-; tier1Allocate refused to register a virtual object. The original
+; processAllocation refused to register a virtual object. The original
 ; check_if_value_based call also survives (no fold without a virtual).
 ; CHECK-LABEL: define i1 @test_finalizer_bails
 ; CHECK: invoke{{.*}}@jeandle.new_instance{{.*}}i64 6666

@@ -87,8 +87,8 @@ struct MonitorIdRef {
 // point. Graal analog: a synthetic MonitorEnterNode created at the
 // CommitAllocationNode during lowering (DefaultJavaLoweringProvider
 // finishAllocatedObjects), sorted ascending by lock depth. Jeandle captures
-// this from the original enter call at ANALYSIS time because the new lock
-// model DELETES the original enter from IR — the transform cannot depend on
+// this from the original enter call at ANALYSIS time because the lock model
+// DELETES the original enter from IR — the transform cannot depend on
 // the original call's lifetime. Callee is the jeandle.monitorenter_*
 // function; NonReceiverArgs are operands 1..N (e.g. the BasicLock); the
 // receiver (operand 0) is the freshly materialized pointer by construction.
@@ -317,17 +317,21 @@ public:
     return true;
   }
 
-  void materialize(Value *Ptr) {
+  // Graal analog: ObjectState.escape(ValueNode materialized). This is the
+  // pure virtual->materialized STATE FLIP only — it does NOT emit a
+  // Materialize effect or build an allocation invoke (that is the caller's
+  // job, e.g. materializeAt / ensureMaterialized). Named `escape` after Graal
+  // to avoid colliding with the real-materialization method family below.
+  void escape(Value *Ptr) {
     assert(isVirtual());
     assert(Ptr);
     Kind = Materialized;
     MaterializedValue = Ptr;
     Entries.clear();
-    // A materialized object has no virtual lock state — every
-    // outstanding monitorenter must have been un-elided by the caller
-    // (materializeAt's lock un-elide block) before flipping the state.
-    // Clear defensively so any stale element does not survive into the
-    // Materialized state and confuse a later equivalentTo / hash.
+    // A materialized object has no virtual lock state — any outstanding
+    // monitorenters are captured for re-emit by the caller before flipping
+    // the state. Clear defensively so any stale element does not survive
+    // into the Materialized state and confuse a later equivalentTo / hash.
     Locks.clear();
   }
 

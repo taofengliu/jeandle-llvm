@@ -2,7 +2,7 @@
 
 ; PEA: a loop body allocates a small object, stores the loop counter into
 ; a field, immediately reads it back, and consumes the value via @use. The
-; object never escapes the iteration. tier1Allocate virtualizes loop-body
+; object never escapes the iteration. processAllocation virtualizes loop-body
 ; allocs; the store/load are folded
 ; (load returns the stored counter scalar); nothing forces materialization.
 ; The allocation invoke must be gone from the loop body.

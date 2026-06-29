@@ -130,9 +130,9 @@ static BasicBlock *findOrSynthesizeUnwindDest(Function &F,
 // containing block at the MaterializeEffect's InsertBefore so the new
 // materialization is the terminator, emit a hotspotcc InvokeInst, replay
 // tracked field stores at the top of the normal-dest block, and record the
-// materialization (OrigAlloc → NewInv) in Defs for the resolution sub-pass
-// (OrigAlloc is no longer RAUW'd inline). The same OrigAlloc may be
-// materialized multiple times (mixed-state merge synthesizing a per-pred
+// materialization (OrigAlloc → NewInv) in Defs for the point-sensitive
+// resolution sub-pass (OrigAlloc is not RAUW'd inline). The same OrigAlloc may
+// be materialized multiple times (mixed-state merge synthesizing a per-pred
 // materialization on each virtual incoming): record each (analyzer-recorded-
 // pred-block, OrigAlloc) → NewInv in MatPerBlock (CreatePHI picks the right
 // per-incoming NewInv) and Origin → MatCont in BlockRename (so the PHI's
@@ -211,8 +211,8 @@ static void applyMaterialize(Function &F, const jeandle::PEAResult &Result,
   // Step 5: collect operand bundles from the recorded source (escape-point
   // CallBase or original allocation). Drop "deopt": copying it would plant
   // OrigAlloc into NewInv's own bundle (the source CB's deopt slot for the VO
-  // holds OrigAlloc), which the step-8 RAUW would rewrite to NewInv — a
-  // self-reference the verifier rejects.
+  // holds OrigAlloc), which the resolution sub-pass would rewrite to NewInv —
+  // a self-reference the verifier rejects.
   // TODO(jeandle-deopt): see applyMaterialize().
   // Preserve every non-deopt bundle (funclet, gc-transition, cfguardtarget,
   // ptrauth, kcfi, ...). The funclet-bundle synthesis below handles the
@@ -353,8 +353,8 @@ static void applyMaterialize(Function &F, const jeandle::PEAResult &Result,
   }
   BlockRename[Origin] = MatCont;
 
-  // Record this NewInv as a definition point of OrigAlloc. OrigAlloc is no
-  // longer RAUW'd inline — the point-sensitive resolution sub-pass (run after
+  // Record this NewInv as a definition point of OrigAlloc. OrigAlloc is not
+  // RAUW'd inline — the point-sensitive resolution sub-pass (run after
   // Pass 1, once the CFG is stable and a fresh DominatorTree is available)
   // rewrites each surviving OrigAlloc use to the unique dominating def (this
   // NewInv, a sibling per-pred NewInv, or a merge PHI). This mirrors Graal's
@@ -690,12 +690,10 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
         Instruction *Term = PH->getTerminator();
         if (!Term || Term->getNumSuccessors() <= 1)
           continue;
-        // The critical-edge split is now unconditional: the lock model deletes
-        // the original monitorenter and re-emits it at the materialize point, so
-        // there is no un-elided enter sitting in PH that would lose its
-        // dominating receiver if the Materialize moved to a new edge block. (The
-        // former HasReplaceInputInPH skip — and its open OOM-on-other-path TODO
-        // — is gone as a consequence of the Graal-aligned lock model.)
+        // The critical-edge split is unconditional: the lock model deletes the
+        // original monitorenter and re-emits it at the materialize point, so no
+        // surviving enter sits in PH that would lose its dominating receiver if
+        // the Materialize moved to a new edge block.
         for (unsigned i = 0, n = Term->getNumSuccessors(); i < n; ++i) {
           BasicBlock *S = Term->getSuccessor(i);
           if (S->hasNPredecessors(1))

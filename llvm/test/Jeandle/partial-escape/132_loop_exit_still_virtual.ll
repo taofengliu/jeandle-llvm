@@ -4,7 +4,7 @@
 ; loop body mutates a field, reads it back, and feeds the read scalar to
 ; @use. After the loop, the post-loop block reads the same field and
 ; consumes that scalar too. Both reads must fold to the just-stored value
-; via tier2Load.
+; via processLoad.
 ;
 ; This exercises the "for each VO still virtual at the loop exit's
 ; snapshot, the FieldStates must be visible to the outer block" branch.

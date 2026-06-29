@@ -17,7 +17,7 @@
 // count AND both analyser deltas (VirtualizationDelta, AllocationDelta) are
 // stable AND the previous round's canonicalization did not mutate IR. The
 // round cap is configured by `-jeandle-pea-iterations` (hard-capped at
-// kHardIterationCap). Determinism holds because each round builds a fresh
+// HardIterationCap). Determinism holds because each round builds a fresh
 // PEAResult via FAM.invalidate, so no analyser state crosses rounds.
 //
 //===----------------------------------------------------------------------===//
@@ -53,7 +53,7 @@ using namespace llvm;
 // explicitly are unaffected; the convergence break in `run()` makes round 2
 // a no-op when round 1 already reached fixed point, so the cost on simple
 // functions is one extra `countJeandleAllocations` walk + early exit. The
-// hard cap is kHardIterationCap (16).
+// hard cap is HardIterationCap (16).
 static cl::opt<unsigned> JeandlePEAIterations(
     "jeandle-pea-iterations", cl::init(2), cl::Hidden,
     cl::desc("PEA: maximum number of analyze+transform+canonicalize rounds "
@@ -70,7 +70,7 @@ static cl::opt<std::string> JeandleDumpPEAIR(
              "the given substring. Empty (the default) disables the dump."));
 
 // Hard upper bound guarding against non-converging inputs.
-static constexpr unsigned kHardIterationCap = 16;
+static constexpr unsigned HardIterationCap = 16;
 
 // Count `jeandle.new_instance` / `jeandle.new_array` CallBases in F — the
 // "allocations remaining" signal for convergence detection.
@@ -99,7 +99,7 @@ PartialEscapeIterative::run(Function &F, FunctionAnalysisManager &FAM) {
   const unsigned Requested = JeandlePEAIterations;
   if (Requested == 0)
     return PreservedAnalyses::all();
-  const unsigned IterCap = std::min(Requested, kHardIterationCap);
+  const unsigned IterCap = std::min(Requested, HardIterationCap);
 
   bool AnyChanged = false;
   unsigned PrevAllocs = countJeandleAllocations(F);

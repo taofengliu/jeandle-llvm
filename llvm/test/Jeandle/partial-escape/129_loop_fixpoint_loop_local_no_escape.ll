@@ -2,7 +2,7 @@
 
 ; Regression — verify the loop-LOCAL alloc (= alloc inside the loop
 ; body, never escapes) still virtualizes under the loop fixpoint driver.
-; This is the same shape as test 50. tier1Allocate registers a VO; the
+; This is the same shape as test 50. processAllocation registers a VO; the
 ; AllocSiteToVO cache ensures the same ID is reused across iterations
 ; (otherwise the fixpoint would diverge on Virtuals-set comparison).
 

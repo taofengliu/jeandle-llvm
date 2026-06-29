@@ -1,9 +1,9 @@
 # B5: Object[] (8888) with element klass 4444; virtual value of klass 5555.
 RequiresStrictLockOrder = 1
-# tier1Allocate(8888 — newarray) calls ElementBasicTypeOfArrayKlass to
+# processAllocation(8888 — newarray) calls ElementBasicTypeOfArrayKlass to
 # populate per-element metadata (B3).
 ElementBasicTypeOfArrayKlass 8888 = 8
-# tier1Allocate(5555 — new_instance) calls IsBoxed (B10). Klass 5555 is
+# processAllocation(5555 — new_instance) calls IsBoxed (B10). Klass 5555 is
 # not an autobox wrapper, so the callback returns JBasicType::Count (9).
 HasFinalizer 5555 = false
 CanVirtualize 5555 = true

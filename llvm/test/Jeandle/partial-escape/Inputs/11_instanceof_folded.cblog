@@ -1,6 +1,6 @@
 # Analyzer ctor consults RequiresStrictLockOrder() once per compilation.
 RequiresStrictLockOrder = 1
-# B10: tier1Allocate queries IsBoxed per Instance alloc. Klass 5 is not
+# B10: processAllocation queries IsBoxed per Instance alloc. Klass 5 is not
 # an autobox wrapper, so the callback returns JBasicType::Count (9).
 HasFinalizer 5 = false
 CanVirtualize 5 = true

@@ -7,7 +7,7 @@
 ; Argument: for ObjectID X to appear in every predecessor of a merge BB,
 ; X's OrigAlloc must reach every pred via SSA flow (the analyzer only tracks
 ; an ID in a per-block state when that state was inherited from a pred that
-; in turn knew the ID, eventually bottoming out at tier1Allocate in the
+; in turn knew the ID, eventually bottoming out at processAllocation in the
 ; alloc's own block). SSA dominance then requires OrigAlloc to dominate BB.
 ; If any pred lacks the ID, mergeStates short-circuits at MissingOnSomePred
 ; before reaching the true-mixed branch.

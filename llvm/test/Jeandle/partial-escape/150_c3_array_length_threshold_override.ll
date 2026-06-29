@@ -5,7 +5,7 @@
 ; -jeandle-pea-max-array-length cl::opt. An array of length 9 is below
 ; the default cap of 32, so the allocation virtualizes and a follow-up
 ; jeandle.arraylength folds to a constant. With -jeandle-pea-max-array-length=8
-; the same array exceeds the cap, tier1Allocate refuses to register a
+; the same array exceeds the cap, processAllocation refuses to register a
 ; virtual, and both the allocation and the array_length call survive.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32)

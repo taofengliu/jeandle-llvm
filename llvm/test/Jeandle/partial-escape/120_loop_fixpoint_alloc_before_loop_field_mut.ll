@@ -44,7 +44,7 @@ u:
 
 ; The alloc, preheader store, and loop-body store/load are all eliminated.
 ; The body's @use call receives %i (the loaded scalar collapses to the
-; just-stored value through tier2Load on a known-virtual field).
+; just-stored value through processLoad on a known-virtual field).
 ; CHECK-LABEL: define void @test_alloc_before_loop_body_mut
 ; CHECK-NOT: jeandle.new_instance
 ; CHECK-NOT: store atomic

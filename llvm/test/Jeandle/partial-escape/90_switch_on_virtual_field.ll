@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; a switch instruction whose condition is a load from a virtual's i32
-; field. tier2Load resolves the load to the stored constant (1) and RAUWs
+; field. processLoad resolves the load to the stored constant (1) and RAUWs
 ; the load. The transform's post-Pass-2 ConstantFoldTerminator then collapses
 ; the switch on a constant condition into an unconditional `br label %case1`.
 ; Allocation is eliminated; the dead arms are pruned by the trivially-dead

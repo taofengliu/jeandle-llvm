@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/386_alloc_reference_subtype_bails.cblog %s | FileCheck %s
 
-; CanVirtualize VMCallback. tier1Allocate refuses to virtualize
+; CanVirtualize VMCallback. processAllocation refuses to virtualize
 ; identity-sensitive Instance allocations (java.lang.ref.Reference and
 ; java.lang.Thread subtypes). For those classes, the runtime's lifecycle
 ; tracking (pending-reference list, thread-list registration) keys off
@@ -8,7 +8,7 @@
 ; registration.
 ;
 ; Klass 7777 represents one such class (its cblog returns false for
-; CanVirtualize). tier1Allocate calls HasFinalizer first (returns false,
+; CanVirtualize). processAllocation calls HasFinalizer first (returns false,
 ; not a finalizer-class), then CanVirtualize, sees false, and refuses
 ; to register a VirtualObject — the original new_instance survives.
 

@@ -235,7 +235,7 @@ enum class VMCallbackValueType : uint8_t {
 ///                         original allocation site so HotSpot's
 ///                         finalizer registration runs, otherwise the
 ///                         finalize() method would never be invoked.
-///                         tier1Allocate refuses to virtualize the alloc
+///                         processAllocation refuses to virtualize the alloc
 ///                         when this returns true. For null inputs the
 ///                         implementation must return false.
 ///   CanVirtualize        — Returns true iff the klass is safe to
@@ -246,7 +246,7 @@ enum class VMCallbackValueType : uint8_t {
 ///                         identity-sensitive subtypes (java.lang.ref.
 ///                         Reference and Thread hierarchies) and returns
 ///                         false for those; everything else returns
-///                         true. tier1Allocate refuses to virtualize
+///                         true. processAllocation refuses to virtualize
 ///                         when this returns false. For null inputs the
 ///                         implementation must return false (analogous
 ///                         to the value-based / boxed callbacks: a null

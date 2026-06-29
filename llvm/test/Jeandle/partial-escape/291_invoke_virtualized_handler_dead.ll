@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Exception edge state splitting — when an invoke is virtualized
-; away by tier2JavaOpFold (e.g. jeandle.arraylength on a virtual array
+; away by processJavaOp (e.g. jeandle.arraylength on a virtual array
 ; folds to a compile-time constant), the analyzer emits a ReplaceCall
 ; effect on the InvokeInst. The transform rewrites that invoke as an
 ; unconditional branch to the normal dest, dropping the unwind edge.
@@ -35,7 +35,7 @@ n:
             ptr inttoptr (i64 54321 to ptr), i32 16)
        to label %n2 unwind label %u_a
 n2:
-  ; This invoke is folded by tier2JavaOpFold (foldArrayLength) into the
+  ; This invoke is folded by processJavaOp (foldArrayLength) into the
   ; compile-time constant 7, emitting a ReplaceCall effect on the invoke.
   ; The transform replaces the invoke with `br label %normal`, which
   ; drops the unwind edge into %handler.
