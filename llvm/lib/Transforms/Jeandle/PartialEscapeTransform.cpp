@@ -257,13 +257,11 @@ static void applyMaterialize(Function &F, const jeandle::PEAResult &Result,
   // Metadata first; addRetAttr below then takes precedence. Argument attrs are
   // safe to reuse because the invoke has the same {Arg0, Arg1} signature as a
   // frontend allocation site; return attrs are added explicitly below.
-  if (OrigAlloc) {
-    NewInv->copyMetadata(*OrigAlloc, /*WL=*/{});
-    AttributeList OrigAttrs = OrigAlloc->getAttributes();
-    AttributeList CurAttrs = NewInv->getAttributes();
-    AttrBuilder RetAB(Ctx, CurAttrs.getRetAttrs());
-    NewInv->setAttributes(OrigAttrs.addRetAttributes(Ctx, RetAB));
-  }
+  NewInv->copyMetadata(*OrigAlloc, /*WL=*/{});
+  AttributeList OrigAttrs = OrigAlloc->getAttributes();
+  AttributeList CurAttrs = NewInv->getAttributes();
+  AttrBuilder RetAB(Ctx, CurAttrs.getRetAttrs());
+  NewInv->setAttributes(OrigAttrs.addRetAttributes(Ctx, RetAB));
   // Carry forward the precise return klass. Added after the merge so they
   // override the same Kind slot from the original.
   NewInv->addRetAttr(Attribute::get(Ctx, jeandle::Attribute::JavaKlass,
@@ -447,11 +445,6 @@ void jeandle::ReplaceLoadEffect::apply(jeandle::TransformContext &Ctx) {
       if (I->getParent() == nullptr)
         I->insertBefore(Target->getIterator());
     }
-    // Defensive: if the coercion's operand happens to be an OrigAlloc that's
-    // been materialized, redirect through NewAllocFor.
-    auto It2 = Ctx.NewAllocFor.find(RI);
-    if (It2 != Ctx.NewAllocFor.end())
-      Repl = It2->second;
   }
   if (!Target->use_empty())
     Target->replaceAllUsesWith(Repl);

@@ -789,7 +789,11 @@ private:
   void processLoop(Loop *L);
 
   // Helpers used exclusively by processLoop.
-  void processLoopBodyOnePass(Loop *L,
+  // Loop blocks of L (including its sub-loops) in function-RPO order,
+  // computed once per processLoop and reused across the inner fixpoint body
+  // passes (the loop's CFG is stable across the fixpoint).
+  SmallVector<BasicBlock *, 32> loopBlocksInRPO(Loop *L);
+  void processLoopBodyOnePass(Loop *L, ArrayRef<BasicBlock *> LoopRPO,
                               llvm::SmallPtrSetImpl<BasicBlock *> &OuterDone);
 
   // The per-iteration snapshot. All members are independently restorable.
@@ -1585,14 +1589,12 @@ void Analyzer::MergeProcessor::intersectVirtualObjects() {
   for (jeandle::ObjectID ID : Preds[0]->Materialized)
     Intersect.insert(ID);
   for (unsigned i = 1; i < Preds.size(); ++i) {
-    DenseSet<jeandle::ObjectID> Tracked;
-    for (jeandle::ObjectID ID : Preds[i]->Virtuals)
-      Tracked.insert(ID);
-    for (jeandle::ObjectID ID : Preds[i]->Materialized)
-      Tracked.insert(ID);
+    // Test membership directly against each pred's existing tracked sets
+    // (Preds[i]->Virtuals/Materialized are already DenseSets) rather than
+    // materializing a per-predecessor copy.
     SmallVector<jeandle::ObjectID, 8> ToRemove;
     for (jeandle::ObjectID ID : Intersect)
-      if (!Tracked.count(ID))
+      if (!Preds[i]->Virtuals.count(ID) && !Preds[i]->Materialized.count(ID))
         ToRemove.push_back(ID);
     for (jeandle::ObjectID ID : ToRemove)
       Intersect.erase(ID);
@@ -5042,16 +5044,28 @@ void Analyzer::restoreLoopSnapshot(
   }
 }
 
-void Analyzer::processLoopBodyOnePass(
-    Loop *L, llvm::SmallPtrSetImpl<BasicBlock *> &OuterDone) {
-  // Process loop blocks in function-RPO restricted to L. Sub-loop headers
-  // dispatch recursively to processLoop, and the sub-loop's blocks are
-  // marked Done so we don't re-process them in this pass.
-  llvm::SmallPtrSet<BasicBlock *, 16> Done;
+SmallVector<BasicBlock *, 32> Analyzer::loopBlocksInRPO(Loop *L) {
+  // Function-RPO filtered to L's blocks. The order is identical to what a
+  // per-pass ReversePostOrderTraversal<Function*> plus an L->contains() filter
+  // produces, but this is built once per processLoop instead of once per body
+  // pass (the loop CFG does not change during PEA).
+  SmallVector<BasicBlock *, 32> Order;
   ReversePostOrderTraversal<Function *> RPOT(&F);
-  for (BasicBlock *BB : RPOT) {
-    if (!L->contains(BB))
-      continue;
+  for (BasicBlock *BB : RPOT)
+    if (L->contains(BB))
+      Order.push_back(BB);
+  return Order;
+}
+
+void Analyzer::processLoopBodyOnePass(
+    Loop *L, ArrayRef<BasicBlock *> LoopRPO,
+    llvm::SmallPtrSetImpl<BasicBlock *> &OuterDone) {
+  // Process loop blocks in function-RPO order. Sub-loop headers dispatch
+  // recursively to processLoop, and the sub-loop's blocks are marked Done so
+  // we don't re-process them in this pass. LoopRPO is precomputed by the
+  // caller (loopBlocksInRPO) and reused across the inner fixpoint iterations.
+  llvm::SmallPtrSet<BasicBlock *, 16> Done;
+  for (BasicBlock *BB : LoopRPO) {
     if (Done.count(BB))
       continue;
     Loop *Inner = LI.getLoopFor(BB);
@@ -5142,13 +5156,17 @@ void Analyzer::processLoop(Loop *L) {
     // virtual at creation and they don't escape, so no Materialize
     // effect is emitted).
     llvm::SmallPtrSet<BasicBlock *, 16> _OuterDone;
-    processLoopBodyOnePass(L, _OuterDone);
+    processLoopBodyOnePass(L, loopBlocksInRPO(L), _OuterDone);
     return;
   }
 
   llvm::SmallPtrSet<BasicBlock *, 8> LoopBlocks;
   for (BasicBlock *BB : L->blocks())
     LoopBlocks.insert(BB);
+
+  // Loop blocks in function-RPO order, computed once and reused across the
+  // inner fixpoint body passes below (the loop CFG is stable across PEA).
+  SmallVector<BasicBlock *, 32> LoopRPO = loopBlocksInRPO(L);
 
   // At TOP-LEVEL processLoop entry only (loop.getDepth() == 1 gate),
   // compute the maximum loop depth within this nest. If it exceeds
@@ -5214,7 +5232,7 @@ void Analyzer::processLoop(Loop *L) {
       ++JeandlePEALoopFixpointRetries;
 
       llvm::SmallPtrSet<BasicBlock *, 16> _OuterDone;
-      processLoopBodyOnePass(L, _OuterDone);
+      processLoopBodyOnePass(L, LoopRPO, _OuterDone);
 
       // Overflow (a STOP_NEW materialization of an outer-scope VO) may have
       // been latched by this pass or a deeper recursion. Stop iterating: the

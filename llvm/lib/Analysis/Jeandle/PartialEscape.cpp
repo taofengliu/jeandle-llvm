@@ -34,6 +34,7 @@
 
 #include <algorithm>
 
+
 using namespace llvm;
 using namespace llvm::jeandle;
 
@@ -250,19 +251,23 @@ VirtualObject::matchArrayElementGEP(GetElementPtrInst *GEP,
   return std::nullopt;
 }
 
+void VirtualObject::copyStructuralFieldsFrom(const VirtualObject &O) {
+  Klass = O.Klass;
+  SizeInBytes = O.SizeInBytes;
+  ArrayLength = O.ArrayLength;
+  ArrayElementType = O.ArrayElementType;
+  ArrayIndexScale = O.ArrayIndexScale;
+  ArrayBaseOffset = O.ArrayBaseOffset;
+  Fields = O.Fields;
+}
+
 std::unique_ptr<VirtualObject> VirtualObject::duplicate() const {
   // The clone is detached: ID is set to InvalidObjectID and the caller is
   // expected to register it via PEAResult::createVirtualObject to obtain a
   // fresh ID.
   auto Clone =
       std::make_unique<VirtualObject>(InvalidObjectID, Kind, AllocationCall);
-  Clone->Klass = Klass;
-  Clone->SizeInBytes = SizeInBytes;
-  Clone->ArrayLength = ArrayLength;
-  Clone->ArrayElementType = ArrayElementType;
-  Clone->ArrayIndexScale = ArrayIndexScale;
-  Clone->ArrayBaseOffset = ArrayBaseOffset;
-  Clone->Fields = Fields;
+  Clone->copyStructuralFieldsFrom(*this);
   // Synthetic-state fields are NOT copied — duplicate() is shared by the
   // generic VirtualObject clone path AND the Case C synthesis path; the
   // latter sets IsSynthetic/SyntheticSourceIDs/SyntheticPhi explicitly after
@@ -337,138 +342,44 @@ bool FieldValue::shallowEquals(const FieldValue &O) const {
 // ObjectState
 // ===========================================================================
 
-ObjectState ObjectState::clone() const {
-  ObjectState Copy(0);
-  Copy.Kind = Kind;
-  Copy.Entries = Entries;
-  Copy.Locks = Locks;
-  Copy.MaterializedValue = MaterializedValue;
-  Copy.CopyOnWrite = false;
-  return Copy;
-}
-
 // ===========================================================================
 // PEABlockState
 // ===========================================================================
 
-// Mark every present ObjectState in the given vector as "shared". Called at
-// the moment our backing vector goes from sole-ownership (Count==1) to
-// shared (Count==2).
-static void
-markAllSlotsShared(const SmallVector<std::optional<ObjectState>, 8> &Arr) {
-  for (const auto &Slot : Arr) {
-    if (Slot)
-      Slot->markShared();
-  }
-}
+// copy/move/assign/dtor are implicitly generated (rule of zero): they just
+// copy/move/destroy the ObjectStates shared_ptr, which keeps use_count exact,
+// and the plain `Dead` flag. No manual refcount is maintained.
 
 PEABlockState::PEABlockState()
     : ObjectStates(
-          std::make_shared<SmallVector<std::optional<ObjectState>, 8>>()),
-      ArrayRefCount(std::make_shared<RefCount>()) {}
-
-PEABlockState::PEABlockState(const PEABlockState &Other)
-    : ObjectStates(Other.ObjectStates), ArrayRefCount(Other.ArrayRefCount),
-      Dead(Other.Dead) {
-  if (ArrayRefCount) {
-    // "Share handshake": if the array is about to transition from
-    // sole-ownership to shared (Count 1 -> 2), mark every slot as
-    // CopyOnWrite so a later per-slot mutation triggers a per-slot clone
-    // rather than stomping the value that the now-shared peer can still see.
-    if (ArrayRefCount->Count == 1 && ObjectStates)
-      markAllSlotsShared(*ObjectStates);
-    ++ArrayRefCount->Count;
-  }
-}
-
-PEABlockState::~PEABlockState() {
-  // Decrement the logical Count so survivors (other PEABlockStates that
-  // share this array) see an accurate sharer total. A moved-from instance
-  // has nullified shared_ptrs and skips this path.
-  if (ArrayRefCount) {
-    assert(ArrayRefCount->Count >= 1 && "refcount underflow at destruction");
-    --ArrayRefCount->Count;
-  }
-}
-
-PEABlockState &PEABlockState::operator=(PEABlockState &&Other) noexcept {
-  if (this == &Other)
-    return *this;
-  // Drop *this's old logical ref before overwriting. If we already shared
-  // with Other (same RefCount), the decrement-then-move-in still produces
-  // the right final Count (sole holder == 1) because Other's shared_ptr is
-  // moved out and won't double-decrement on its destruction.
-  if (ArrayRefCount) {
-    assert(ArrayRefCount->Count >= 1 && "refcount underflow on move-assign");
-    --ArrayRefCount->Count;
-  }
-  ObjectStates = std::move(Other.ObjectStates);
-  ArrayRefCount = std::move(Other.ArrayRefCount);
-  Dead = Other.Dead;
-  return *this;
-}
-
-PEABlockState &PEABlockState::operator=(const PEABlockState &Other) {
-  if (this == &Other)
-    return *this;
-  // ObjectStates and ArrayRefCount move in lockstep: if Other's RefCount is
-  // already ours, the count is already accurate and we skip the
-  // decrement/increment dance.
-  if (ArrayRefCount != Other.ArrayRefCount) {
-    if (ArrayRefCount) {
-      assert(ArrayRefCount->Count >= 1 && "refcount underflow on drop");
-      --ArrayRefCount->Count;
-    }
-    ObjectStates = Other.ObjectStates;
-    ArrayRefCount = Other.ArrayRefCount;
-    if (ArrayRefCount) {
-      if (ArrayRefCount->Count == 1 && ObjectStates)
-        markAllSlotsShared(*ObjectStates);
-      ++ArrayRefCount->Count;
-    }
-  }
-  Dead = Other.Dead;
-  return *this;
-}
+          std::make_shared<SmallVector<std::optional<ObjectState>, 8>>()) {}
 
 SmallVector<std::optional<ObjectState>, 8> *
 PEABlockState::getArrayForModification() {
-  // Outer / array-level COW (level 1 of the "two-level" scheme). Inner /
-  // per-slot COW (level 2) lives in getObjectStateForModification, where
-  // a slot still flagged isShared() after the array clone is duplicated
-  // before the caller writes through the returned reference.
-  //
-  // Because Jeandle stores `SmallVector<optional<ObjectState>>` by value,
-  // the vector copy at the array level already deep-copies each slot. The
-  // per-slot CopyOnWrite flag therefore mostly serves as a one-shot tag —
-  // copies inherit `CopyOnWrite=true`, the next mutator clones once and
-  // resets it to false (ObjectState's custom copy ctor), and subsequent
-  // in-place writes are free. The savings vs. always-clone come entirely
-  // from level 1 in the common case where a block state is snapshotted /
-  // adopted and then either never mutated (loop-fixpoint convergence) or
-  // mutated only sparsely.
+  // Array-level copy-on-write. ObjectStates is a shared_ptr; when this
+  // PEABlockState does not uniquely own it (a snapshot or peer shares it),
+  // deep-copy the vector before mutating. ObjectState is stored by value in
+  // the vector, so the deep copy already clones every slot — no per-slot
+  // sharing annotation is needed.
   if (!ObjectStates) {
-    // Defensive: a default-constructed PEABlockState always allocates an
-    // empty vector, but operator=/move could in principle leave us null.
-    assert(!ArrayRefCount &&
-           "ObjectStates and ArrayRefCount must be in lockstep");
+    // Defensive: a default-constructed PEABlockState always allocates an empty
+    // vector, but a moved-from instance can leave us null.
     ObjectStates =
         std::make_shared<SmallVector<std::optional<ObjectState>, 8>>();
-    ArrayRefCount = std::make_shared<RefCount>();
-    return ObjectStates.get();
-  }
-  assert(ArrayRefCount && "ObjectStates and ArrayRefCount must be in lockstep");
-  if (ArrayRefCount->Count > 1) {
-    --ArrayRefCount->Count;
+  } else if (ObjectStates.use_count() > 1) {
+    // Defensive copy-on-write detach. NOTE: in the current architecture this
+    // branch is unreachable — the analyzer's processBlock() resets CurrentState
+    // to a fresh PEABlockState at every block header (resetPerBlockState), so
+    // the one producer of shared state, the loop snapshot (takeLoopSnapshot),
+    // never leaves CurrentState shared at a mutation point (use_count() is
+    // always 1 here). It is retained as insurance: if that per-block-reset
+    // invariant ever changes, mutating a shared vector in place would silently
+    // corrupt the snapshot, and this detach is what prevents it.
     ObjectStates = std::make_shared<SmallVector<std::optional<ObjectState>, 8>>(
         *ObjectStates);
-    ArrayRefCount = std::make_shared<RefCount>();
+    assert(ObjectStates.use_count() == 1 &&
+           "COW detach did not yield sole ownership");
   }
-  // After detach we must be the sole logical owner. ObjectStates may still
-  // have shared_ptr::use_count() > 1 if a snapshot copy exists, but our
-  // RefCount must be 1 since nobody else points to it.
-  assert(ArrayRefCount->Count == 1 &&
-         "getArrayForModification did not produce sole ownership");
   return ObjectStates.get();
 }
 
@@ -505,18 +416,9 @@ ObjectState &PEABlockState::getObjectStateForModification(ObjectID ID) {
   auto *Arr = getArrayForModification();
   assert(ID < Arr->size() && (*Arr)[ID].has_value() &&
          "object not registered in this block state");
-  auto &Slot = (*Arr)[ID];
-  // Level-2 COW. After the array detach above we may still own a slot whose
-  // CopyOnWrite tag was carried over from the time the vector was shared.
-  // Clone the inner ObjectState before handing out a mutable reference;
-  // ObjectState's custom copy ctor resets CopyOnWrite=false so subsequent
-  // mutations of THIS slot are free.
-  if (Slot->isShared()) {
-    ObjectState Cloned = Slot->clone();
-    *Slot = std::move(Cloned);
-    assert(!Slot->isShared() && "clone must reset CopyOnWrite");
-  }
-  return *Slot;
+  // getArrayForModification already COW-detached the whole vector (deep-copying
+  // every slot) if it was shared, so this slot is privately owned.
+  return *(*Arr)[ID];
 }
 
 std::optional<ObjectID>
@@ -637,13 +539,7 @@ ObjectID PEAResult::createVirtualObject(std::unique_ptr<VirtualObject> VO) {
   // the state intact.
   auto Stamped =
       std::make_unique<VirtualObject>(ID, VO->getKind(), VO->AllocationCall);
-  Stamped->Klass = VO->Klass;
-  Stamped->SizeInBytes = VO->SizeInBytes;
-  Stamped->ArrayLength = VO->ArrayLength;
-  Stamped->ArrayElementType = VO->ArrayElementType;
-  Stamped->ArrayIndexScale = VO->ArrayIndexScale;
-  Stamped->ArrayBaseOffset = VO->ArrayBaseOffset;
-  Stamped->Fields = std::move(VO->Fields);
+  Stamped->copyStructuralFieldsFrom(*VO);
   VirtualObjects.push_back(std::move(Stamped));
   return ID;
 }

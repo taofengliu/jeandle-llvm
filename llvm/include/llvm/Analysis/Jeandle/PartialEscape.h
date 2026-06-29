@@ -188,6 +188,11 @@ public:
   matchArrayElementGEP(GetElementPtrInst *GEP,
                        const llvm::DataLayout &DL) const;
 
+  // Copy the structural (non-identity, non-synthetic) fields from O into *this.
+  // Shared by duplicate() and PEAResult::createVirtualObject() so the field
+  // list lives in exactly one place (avoids drift when a field is added).
+  void copyStructuralFieldsFrom(const VirtualObject &O);
+
   std::unique_ptr<VirtualObject> duplicate() const;
 };
 
@@ -263,33 +268,13 @@ private:
   // foldMonitorExit.
   SmallVector<MonitorIdRef, 2> Locks;
   Value *MaterializedValue = nullptr;
-  // CopyOnWrite is logically a sharing annotation, not part of the object's
-  // observable state, so it may be set on a const-borrowed ObjectState by
-  // PEABlockState's copy-on-write machinery (markAllSlotsShared).
-  mutable bool CopyOnWrite = false;
 
 public:
   explicit ObjectState(unsigned numEntries)
       : Entries(numEntries, FieldValue::unknown()) {}
-
-  // Custom copy/move so the per-slot CopyOnWrite annotation is reset on
-  // clone — a freshly-constructed copy is by definition unshared.
-  ObjectState(const ObjectState &Other)
-      : Kind(Other.Kind), Entries(Other.Entries), Locks(Other.Locks),
-        MaterializedValue(Other.MaterializedValue), CopyOnWrite(false) {}
-  ObjectState &operator=(const ObjectState &Other) {
-    if (this == &Other)
-      return *this;
-    Kind = Other.Kind;
-    Entries = Other.Entries;
-    Locks = Other.Locks;
-    MaterializedValue = Other.MaterializedValue;
-    CopyOnWrite = false;
-    return *this;
-  }
-  ObjectState(ObjectState &&) = default;
-  ObjectState &operator=(ObjectState &&) = default;
-  ~ObjectState() = default;
+  // Copy/move/assign/dtor are implicitly generated: ObjectState is a plain bag
+  // of value members, so PEABlockState's array-level copy-on-write (which
+  // deep-copies every slot) needs no per-slot sharing annotation here.
 
   StateKind getKind() const { return Kind; }
   bool isVirtual() const { return Kind == Virtual; }
@@ -350,11 +335,6 @@ public:
     assert(isVirtual());
     Locks.clear();
   }
-
-  void markShared() const { CopyOnWrite = true; }
-  bool isShared() const { return CopyOnWrite; }
-
-  ObjectState clone() const;
 };
 
 // ===========================================================================
@@ -362,40 +342,21 @@ public:
 // ===========================================================================
 
 class PEABlockState {
-public:
-  // Refcount shared by every PEABlockState that holds the same ObjectStates
-  // vector: Count == 1 means sole owner (mutate in place); Count > 1 means
-  // shared (a mutator must clone first). ObjectStates and ArrayRefCount are
-  // always cloned/shared in lockstep — every code path that touches one MUST
-  // touch the other.
-  struct RefCount {
-    mutable unsigned Count = 1;
-  };
-
 private:
+  // ObjectStates is shared via std::shared_ptr and is copy-on-write: a mutator
+  // calls getArrayForModification(), which deep-copies the array when it is
+  // currently shared. Sharing is read directly from ObjectStates.use_count()
+  // (== 1 ⇒ sole owner, mutate in place; > 1 ⇒ clone first). Because every
+  // shared copy/move/destroy of a PEABlockState is just the shared_ptr doing
+  // the same to its control block, use_count() is an exact sharer count and no
+  // parallel manual refcount is needed. copy/move/assign/dtor are therefore
+  // implicitly generated (rule of zero).
   std::shared_ptr<SmallVector<std::optional<ObjectState>, 8>> ObjectStates;
-  std::shared_ptr<RefCount> ArrayRefCount;
 
   bool Dead = false;
 
 public:
   PEABlockState();
-  PEABlockState(const PEABlockState &Other);
-  PEABlockState &operator=(const PEABlockState &Other);
-  // Move ctor: default is correct — moved-from Other has nullified
-  // shared_ptrs, so the array's logical Count is unchanged (Other leaves,
-  // *this joins, net 0). Move assignment is custom because *this had an
-  // old ArrayRefCount that must be logically decremented before being
-  // overwritten — otherwise the survivor of the old shared array would see
-  // a stale Count and trigger needless COW clones.
-  PEABlockState(PEABlockState &&) = default;
-  PEABlockState &operator=(PEABlockState &&Other) noexcept;
-  // Custom destructor: decrement the logical Count of our shared array so
-  // any survivor sees an accurate sharer count. Without this, the shared_ptr
-  // payload would be freed only when the last shared_ptr ref drops, but the
-  // Count field tracked inside it would remain stale (>1) for the surviving
-  // sharer, defeating the COW optimization.
-  ~PEABlockState();
 
   void addObject(ObjectID ID, ObjectState State);
 
@@ -741,11 +702,6 @@ public:
     SmallVectorImpl<std::unique_ptr<Effect>>::iterator It;
     Effect &operator*() const { return **It; }
     Iterator &operator++() { ++It; return *this; }
-    Iterator operator++(int) {
-      Iterator T = *this;
-      ++It;
-      return T;
-    }
     bool operator==(const Iterator &O) const { return It == O.It; }
     bool operator!=(const Iterator &O) const { return It != O.It; }
   };
@@ -753,11 +709,6 @@ public:
     SmallVectorImpl<std::unique_ptr<Effect>>::const_iterator It;
     const Effect &operator*() const { return **It; }
     ConstIterator &operator++() { ++It; return *this; }
-    ConstIterator operator++(int) {
-      ConstIterator T = *this;
-      ++It;
-      return T;
-    }
     bool operator==(const ConstIterator &O) const { return It == O.It; }
     bool operator!=(const ConstIterator &O) const { return It != O.It; }
   };

@@ -466,16 +466,6 @@ std::optional<int64_t> resolveFieldOffset(Value *Ptr, const DataLayout &DL) {
 // Misc
 // ===========================================================================
 
-bool isJavaHeapPointer(const Value *V) {
-  if (!V)
-    return false;
-  Type *Ty = V->getType();
-  if (!Ty || !Ty->isPointerTy())
-    return false;
-  return cast<PointerType>(Ty)->getAddressSpace() ==
-         jeandle::AddrSpace::JavaHeapAddrSpace;
-}
-
 uintptr_t extractAllocationKlass(const CallBase *AllocCB) {
   if (!AllocCB || AllocCB->arg_size() == 0)
     return 0;

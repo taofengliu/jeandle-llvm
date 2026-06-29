@@ -84,9 +84,6 @@ std::optional<ObjectID> resolveVirtualRef(Value *V, const PEABlockState &State,
 // non-constant index, inttoptr, or unrecognised pattern).
 std::optional<int64_t> resolveFieldOffset(Value *Ptr, const DataLayout &DL);
 
-// True iff V is a pointer in the JavaHeapAddrSpace (ptr addrspace(1)).
-bool isJavaHeapPointer(const Value *V);
-
 // Returns the klass pointer (as uintptr_t) attached to the allocation call's
 // klass argument, or 0 if not statically known.  Wraps
 // jeandle::extractKlassConstant for the allocation-specific operand index.
