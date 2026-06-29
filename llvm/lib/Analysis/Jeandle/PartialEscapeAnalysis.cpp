@@ -541,8 +541,8 @@ private:
   // post-cascade (distinct values => not equivalent). Keyed by
   // {predecessor-block, ObjectID}: a given (PH, ID) has exactly one
   // materialization, so the cache is sound AND loop-stable — the same
-  // placeholder is returned across loop-fixpoint iterations, keeping
-  // loopBlockExitsEquivalent converging. Placeholders live in
+  // placeholder is returned across loop-fixpoint iterations, keeping the
+  // header's B-vs-B' convergence stable. Placeholders live in
   // Result.OwnedMatPlaceholders; the transform resolves them away (never
   // inserts them). See Effect::PerPredPlaceholder.
   DenseMap<std::pair<BasicBlock *, jeandle::ObjectID>, Value *>
@@ -565,17 +565,6 @@ private:
   // a dead-but-still-parented `phi [poison, ..., poison]` survivor
   // in the IR.
   DenseMap<jeandle::ObjectID, SmallVector<llvm::PHINode *, 2>> CaseBPhiAliases;
-
-  // Monotonicity guard for per-loop fixpoint iterations. For the loop
-  // currently being processed, this records every loop block that has had a
-  // BlockExits entry on at least one iteration. The fixpoint invariant is
-  // that once a loop block has produced exit state, subsequent iterations
-  // must continue
-  // to produce exit state for that block (the convergence comparison is
-  // structural; a dropped key on iter N+1 would otherwise be observed as a
-  // structural change forever, never converging). Cleared at the end of
-  // each top-level processLoop call to keep the map scoped to one loop.
-  DenseMap<BasicBlock *, bool> KnownAliveLoopEnds;
 
   // Graal-aligned MergeProcessor (mirrors PartialEscapeClosure's inner
   // MergeProcessor class). Holds the per-merge context (merge block,
@@ -696,8 +685,8 @@ private:
   // survives across iterations (not snapshotted by take/restoreLoopSnapshot)
   // so the same synthetic VO ID is reused at the header. Combined with
   // LoopFieldPhiCache (stable per-offset PHI shells), this keeps FieldStates
-  // structurally equal across iterations, which the convergence check
-  // (loopBlockExitsEquivalent) requires.
+  // structurally equal across iterations, which the single-state B-vs-B'
+  // convergence check requires.
   struct CaseCKey {
     BasicBlock *Block;
     SmallVector<jeandle::ObjectID, 4> SourceIDs;
@@ -846,18 +835,9 @@ private:
   restoreLoopSnapshot(const llvm::SmallPtrSetImpl<BasicBlock *> &LoopBlocks,
                       const LoopSnapshot &S);
 
-  // Convergence: structural equivalence of two snapshots of (loop block ->
-  // BlockExitInfo).
-  bool loopBlockExitsEquivalent(
-      const llvm::SmallPtrSetImpl<BasicBlock *> &LoopBlocks,
-      const DenseMap<BasicBlock *, BlockExitInfo> &A,
-      const DenseMap<BasicBlock *, BlockExitInfo> &B) const;
-
-  static bool blockExitInfoEquivalent(const BlockExitInfo &A,
-                                      const BlockExitInfo &B);
-  // Structural equivalence of just the BlockExitData base (the per-object
-  // book-keeping). Factored out so blockExitInfoEquivalent can compare
-  // both the base data and the optional UnwindData snapshot.
+  // Structural equivalence of the BlockExitData base (the per-object
+  // book-keeping). The loop fixpoint's single-state B-vs-B' convergence test
+  // (paper §5.2.5 / Graal EClosure:472 equivalentTo).
   static bool exitDataEquivalent(const BlockExitData &A,
                                  const BlockExitData &B);
 
@@ -1033,6 +1013,7 @@ void Analyzer::processBlock(BasicBlock *BB) {
     // pred-side virtuality). mergeStates calls processBlockPhis itself.
     mergeStates(BB);
   }
+
 
   // Exception edge state splitting. If the block ends in an InvokeInst,
   // snapshot the per-object state immediately BEFORE applying the invoke.
@@ -1251,7 +1232,7 @@ Value *Analyzer::getOrCreatePerPredMatPlaceholder(BasicBlock *PH,
   // identity) — it is NOT a real merge PHI, and lives in OwnedMatPlaceholders
   // (separate from OwnedPhis/OwnedLoopFieldPhis) so it is never confused with
   // one. Keyed by {PH, ID} the same pointer is returned across loop-fixpoint
-  // iterations, preserving loopBlockExitsEquivalent convergence.
+  // iterations, preserving the B-vs-B' convergence.
   Type *PtrTy = PointerType::get(F.getContext(),
                                  jeandle::AddrSpace::JavaHeapAddrSpace);
   PHINode *Placeholder = PHINode::Create(PtrTy, 0, "pea.perpred");
@@ -4859,68 +4840,6 @@ bool Analyzer::exitDataEquivalent(const BlockExitData &A,
   return true;
 }
 
-// Equality on BlockExitInfo. Compares the per-object base data AND the
-// state-split fields (TerminatorInvoke / UnwindDest / UnwindEdgeKilled /
-// optional UnwindData snapshot). The exception-edge fields participate in the
-// loop fixpoint convergence check so that a state-split appearing or
-// disappearing across iterations is correctly observed as a change.
-bool Analyzer::blockExitInfoEquivalent(const BlockExitInfo &A,
-                                       const BlockExitInfo &B) {
-  if (!exitDataEquivalent(A, B))
-    return false;
-  if (A.TerminatorInvoke != B.TerminatorInvoke)
-    return false;
-  if (A.UnwindDest != B.UnwindDest)
-    return false;
-  if (A.UnwindEdgeKilled != B.UnwindEdgeKilled)
-    return false;
-  const bool HasA = A.UnwindData.has_value();
-  const bool HasB = B.UnwindData.has_value();
-  if (HasA != HasB)
-    return false;
-  if (HasA && !exitDataEquivalent(*A.UnwindData, *B.UnwindData))
-    return false;
-  return true;
-}
-
-bool Analyzer::loopBlockExitsEquivalent(
-    const llvm::SmallPtrSetImpl<BasicBlock *> &LoopBlocks,
-    const DenseMap<BasicBlock *, BlockExitInfo> &A,
-    const DenseMap<BasicBlock *, BlockExitInfo> &B) const {
-  for (BasicBlock *BB : LoopBlocks) {
-    auto AIt = A.find(BB);
-    auto BIt = B.find(BB);
-    bool HasA = (AIt != A.end());
-    bool HasB = (BIt != B.end());
-    if (HasA != HasB) {
-      // Monotonicity guard. If this BB is known-alive from a prior
-      // iteration but is missing from one of A/B, the fixpoint has dropped
-      // exit state for a previously-live block. In debug builds, treat
-      // this as a hard invariant violation so the regression surfaces at
-      // the iteration boundary (instead of silently looping until the
-      // iteration cap escalates to MATERIALIZE_ALL). In release builds we
-      // treat the BB as equivalent and continue — a benign over-approxim-
-      // ation that lets the rest of the structural comparison drive the
-      // verdict (knownAliveLoopEnds invariant tolerance for this edge
-      // case).
-      if (KnownAliveLoopEnds.lookup(BB)) {
-#ifndef NDEBUG
-        llvm_unreachable("PEA loop monotonicity violation: known-alive loop "
-                         "block dropped exit state across iterations");
-#else
-        continue;
-#endif
-      }
-      return false;
-    }
-    if (!HasA)
-      continue;
-    if (!blockExitInfoEquivalent(AIt->second, BIt->second))
-      return false;
-  }
-  return true;
-}
-
 void Analyzer::takeLoopSnapshot(
     Loop *L, const llvm::SmallPtrSetImpl<BasicBlock *> &LoopBlocks,
     LoopSnapshot &S) {
@@ -5221,10 +5140,26 @@ void Analyzer::processLoop(Loop *L) {
   // once and retry the whole fixpoint; a second failure hard-bails.
   // TooManyIterationsSeen is LOCAL to each processLoop (one independent
   // escalation per loop), matching Graal's per-call local (EClosure:439).
+  // Single-state B fixpoint context (Graal lastMergedState, paper §5.2.5) as
+  // LOCALS — each processLoop call is its own C++ stack frame, so nesting is
+  // isolated without a shared member (the outer's locals are untouched while a
+  // recursive processLoop(inner) runs). B := A (EClosure:445): Jeandle has no
+  // PEA-level killed-location strip (PEReadEliminationClosure machinery), so
+  // the entry state is just the preheader's exit data, populated by the outer
+  // RPO walk before processLoop is dispatched.
+  BlockExitData LastMergedState =
+      static_cast<const BlockExitData &>(BlockExits[Preheader]);
+  BlockExitData NewMergedState; // B' each pass (post-body header merge result)
+
   bool TooManyIterationsSeen = false;
   while (true) {
     // ---- inner fixpoint: up to MaxLoopFixpointIters body passes ----
-    std::optional<DenseMap<BasicBlock *, BlockExitInfo>> LastExits;
+    // Single-state B convergence (paper §5.2.5 / Graal EClosure:439-524). B is
+    // the header's merged state (seeded := A, the preheader exit). Each pass
+    // runs the body, then a post-body merge computes B' = merge(A, fresh latch
+    // exits) (Graal doMergeWithoutDead); converge when B' == B. Because the
+    // post-body merge sees iteration 0's latch exits, the loop can converge in
+    // a single body pass — matching Graal's structure exactly.
     bool Converged = false;
     for (unsigned Iter = 0; Iter < MaxLoopFixpointIters; ++Iter) {
       if (Iter > 0)
@@ -5240,28 +5175,44 @@ void Analyzer::processLoop(Loop *L) {
       if (OverflowFlag)
         break;
 
-      DenseMap<BasicBlock *, BlockExitInfo> CurExits;
-      for (BasicBlock *BB : LoopBlocks) {
-        auto It = BlockExits.find(BB);
-        if (It != BlockExits.end())
-          CurExits[BB] = It->second;
+      // Post-body merge (Graal doMergeWithoutDead, EClosure:466): compute the
+      // TRUE B' = merge(A, fresh latch end-states) AFTER the body pass. On
+      // iteration 0 the in-pass header merge is just A — the latch BlockExits
+      // is not yet populated when the header is processed — so only a post-body
+      // merge sees this pass's latch exits, letting iteration 0 compare
+      // meaningfully and the loop converge in a single body pass (paper §5.2.5
+      // / Graal's structure).
+      //
+      // Re-run mergeStates(Header) — now reading the populated latch BlockExits
+      // — in an isolated takeLoopSnapshot/restoreLoopSnapshot so this
+      // comparison-only merge's transient outputs are discarded. Only its
+      // monotone latch ExitInfo flips persist (restoreLoopSnapshot deliberately
+      // preserves loop-block BlockExits), which the next iteration's real
+      // in-pass merge re-derives identically. PendingMergePhis[Header] is empty
+      // here (processBlock drained it at end-of-block), so clearing removes
+      // only what this re-run added. B' is correct by construction (it IS the
+      // real merge); the IR test suite guards against any snapshot/restore leak.
+      {
+        LoopSnapshot PostSnap;
+        takeLoopSnapshot(L, LoopBlocks, PostSnap);
+        resetPerBlockState();
+        mergeStates(Header);
+        NewMergedState = BlockExitData{};
+        snapshotExitStateInto(NewMergedState); // B'
+        PendingMergePhis[Header].clear();
+        restoreLoopSnapshot(LoopBlocks, PostSnap);
       }
-      // Monotonicity: once a loop block produces exit state it must keep
-      // doing so every subsequent iter (debug-only guard in
-      // loopBlockExitsEquivalent via KnownAliveLoopEnds).
-      for (auto &P : CurExits)
-        KnownAliveLoopEnds[P.first] = true;
-      if (LastExits &&
-          loopBlockExitsEquivalent(LoopBlocks, *LastExits, CurExits)) {
+      // B' vs B (Graal EClosure:472). No iteration gate: with the post-body
+      // merge, iteration 0 already has a true B' to compare against B := A.
+      if (exitDataEquivalent(LastMergedState, NewMergedState)) {
         Converged = true;
         LLVM_DEBUG(dbgs() << "PEA: loop @ " << Header->getName()
-                          << " converged in " << (Iter + 1) << " iters\n");
+                          << " converged in " << (Iter + 1)
+                          << " iters (B-based, post-body)\n");
         break;
       }
-      LastExits = std::move(CurExits);
+      LastMergedState = NewMergedState; // B := B'   (Graal EClosure:512)
     }
-    // Scope KnownAliveLoopEnds to this fixpoint run.
-    KnownAliveLoopEnds.clear();
 
     if (Converged) {
       // Force-materialise at exits that flow into EH pads, so exception
@@ -5308,6 +5259,11 @@ void Analyzer::processLoop(Loop *L) {
       // starts with no live virtuals on entry — Graal's
       // processStateBeforeLoopOnOverflow (PartialEscapeClosure.java:230-237).
       processStateBeforeLoopOnOverflow(L);
+      // Re-seed B := A: processStateBeforeLoopOnOverflow materializes pre-loop
+      // virtuals at the loop's forward end, so BlockExits[Preheader] changed.
+      // The MATERIALIZE_ALL redo must compare against the POST-overflow entry
+      // state, not the stale pre-overflow LastMergedState.
+      LastMergedState = static_cast<const BlockExitData &>(BlockExits[Preheader]);
       // Consume the overflow signal so the retry's nested processLoops run
       // rather than short-circuit on a stale flag.
       OverflowFlag = false;
