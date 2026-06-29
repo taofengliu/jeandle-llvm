@@ -49,6 +49,7 @@ bool isJeandleInstanceOf(const CallBase *CB);
 bool isJeandleCheckInstanceOf(const CallBase *CB);
 bool isJeandleCheckIfValueBased(const CallBase *CB);
 bool isJeandleArrayStoreCheck(const CallBase *CB);
+bool isJeandlePostBarrier(const CallBase *CB);
 bool isJeandleMonitorEnter(const CallBase *CB);
 bool isJeandleMonitorExit(const CallBase *CB);
 bool isJeandleRegisterFinalizerIfNeeded(const CallBase *CB);

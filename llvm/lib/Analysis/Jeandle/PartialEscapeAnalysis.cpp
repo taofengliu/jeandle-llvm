@@ -899,6 +899,7 @@ private:
   // elide-path pre-cascade.
   void materializeVirtualLocksBefore(CallBase *MonEnter);
   bool foldArrayStoreCheck(CallBase *CB);
+  bool foldPostBarrier(CallBase *CB);
   bool foldCheckIfValueBased(CallBase *CB);
   bool foldRegisterFinalizerIfNeeded(CallBase *CB);
   // Common helper for checkcast/check_instanceof: returns the folded constant
@@ -3863,6 +3864,22 @@ bool Analyzer::foldArrayStoreCheck(CallBase *CB) {
   return false;
 }
 
+bool Analyzer::foldPostBarrier(CallBase *CB) {
+  if (CB->arg_size() < 1)
+    return false;
+  auto BaseID = jeandle::pea::resolveVirtualRef(CB->getArgOperand(0),
+                                                CurrentState, Aliases, DL);
+  if (!BaseID)
+    return false;
+
+  // A post barrier for a store into a virtual object has no concrete card to
+  // mark. The store is replayed as initialization when the object is
+  // materialized, so the original barrier must not survive with the old slot
+  // address.
+  emitReplaceCall(CB, nullptr, *BaseID);
+  return true;
+}
+
 bool Analyzer::foldCheckIfValueBased(CallBase *CB) {
   // jeandle.check_if_value_based(oop) -> i1.  Java emits this around
   // monitorenter on receivers whose static type could be a value-based class
@@ -4092,6 +4109,8 @@ bool Analyzer::processJavaOp(CallBase *CB) {
     return foldMonitorExit(CB);
   if (isJeandleArrayStoreCheck(CB))
     return foldArrayStoreCheck(CB);
+  if (isJeandlePostBarrier(CB))
+    return foldPostBarrier(CB);
   if (isJeandleCheckIfValueBased(CB))
     return foldCheckIfValueBased(CB);
   if (isJeandleRegisterFinalizerIfNeeded(CB))

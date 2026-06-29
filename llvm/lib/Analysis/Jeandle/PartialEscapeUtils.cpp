@@ -88,6 +88,10 @@ bool isJeandleArrayStoreCheck(const CallBase *CB) {
   return isJeandleCallNamed(CB, "jeandle.array_store_check");
 }
 
+bool isJeandlePostBarrier(const CallBase *CB) {
+  return isJeandleCallNamed(CB, "jeandle.post_barrier");
+}
+
 bool isJeandleMonitorEnter(const CallBase *CB) {
   return isJeandleCallNamed(CB, "jeandle.monitorenter_with_monitor_lock") ||
          isJeandleCallNamed(CB, "jeandle.monitorenter_with_thin_lock") ||
