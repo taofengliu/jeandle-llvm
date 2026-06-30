@@ -172,7 +172,7 @@ public:
   bool isInstance() const { return Kind == Instance; }
   bool isArray() const { return Kind == Array; }
 
-  int getOrCreateFieldIndex(int64_t Offset, Type *Ty);
+  int getOrCreateFieldIndex(int64_t Offset, Type *Ty, const DataLayout &DL);
 
   // Result of matching a GEP against the array's element-address pattern.
   // Index is the (possibly symbolic) Value* that names the Java-level
@@ -318,15 +318,26 @@ public:
     assert(Ptr);
     Kind = Materialized;
     MaterializedValue = Ptr;
-    // A materialized object has no virtual lock state — any outstanding
-    // monitorenters are captured for re-emit by the caller before flipping
-    // the state. Clear defensively so any stale element does not survive
-    // into the Materialized state and confuse a later equivalentTo / hash.
-    Locks.clear();
+    // Graal ObjectState.escape (ObjectState.java:195-202) retains the lock
+    // state across the virtual->materialized flip — the materialized state
+    // still reads locks for re-emit and the strict-lock cascade. We match
+    // that: escape() does NOT clear Locks. Callers that need the live lock
+    // state dropped (the live-path materializeAt, via ClearLockState ->
+    // clearLocks) do so explicitly before flipping; the analyzer-side
+    // LiveLockEnters/LockCounts maps remain the cross-block authority, so
+    // any retained on-VO locks are informational only.
   }
 
   void addLock(MonitorIdRef M) {
     assert(isVirtual());
+    // Graal ObjectState.addLock guarantees strictly descending depth on the
+    // head (ObjectState.java:212): the new (innermost) lock's depth is
+    // strictly greater than the previous head. Jeandle's vector runs
+    // front=min(outermost)..back=max(innermost), so the invariant is that the
+    // pushed depth strictly exceeds the current back. Mirrors Graal's
+    // GraalError.guarantee; the lock cascade (ensureMaterialized /
+    // materializeVirtualLocksBefore) relies on front()=min / back()=max.
+    assert(Locks.empty() || M.BytecodeDepth > Locks.back().BytecodeDepth);
     Locks.push_back(M);
   }
   void removeLock() {

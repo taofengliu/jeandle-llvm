@@ -21,6 +21,7 @@
 #include "llvm/IR/Function.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Jeandle/JavaType.h"
 #include "llvm/IR/Jeandle/Metadata.h"
 #include "llvm/IR/Jeandle/VMCallback.h"
@@ -149,6 +150,56 @@ Type *llvmElementTypeFor(JBasicType Kind, LLVMContext &Ctx) {
 // Structural pointer chain walker
 // ===========================================================================
 
+// If V is `inttoptr(ptrtoint(x))` with matching pointer/int bit widths — a
+// legal pointer-laundering round-trip — return x (the ptrtoint's pointer
+// operand, after stripping offset-neutral `add/or X,0` chains the frontend
+// may emit between the two casts). Tagged/masked encodings (any non-zero
+// addend) are NOT round-trips and return nullptr.
+//
+// Shared by resolveVirtualRefImpl (identity resolution, case 7) and
+// stripPointerCastsAndOffsets (offset resolution) so the two agree on exactly
+// which laundered pointers are transparent: an `inttoptr` that is NOT a clean
+// round-trip is opaque to both (identity -> nullopt, offset -> stop walking).
+static Value *getIntToPtrRoundTripInner(Value *V, const DataLayout &DL) {
+  auto *I2P = dyn_cast<IntToPtrInst>(V);
+  if (!I2P)
+    return nullptr;
+  Value *Inner = I2P->getOperand(0);
+  // Peel `add X, 0` / `or X, 0` chains between PtrToInt and IntToPtr; some
+  // frontends emit these as part of constant-folded address arithmetic and
+  // they are transparent (offset-neutral) to the round-trip.
+  for (unsigned StripDepth = 0; StripDepth < 8; ++StripDepth) {
+    if (auto *BO = dyn_cast<BinaryOperator>(Inner)) {
+      if (BO->getOpcode() == Instruction::Add ||
+          BO->getOpcode() == Instruction::Or) {
+        if (auto *RHS = dyn_cast<ConstantInt>(BO->getOperand(1));
+            RHS && RHS->isZero()) {
+          Inner = BO->getOperand(0);
+          continue;
+        }
+        if (auto *LHS = dyn_cast<ConstantInt>(BO->getOperand(0));
+            LHS && LHS->isZero() && BO->getOpcode() == Instruction::Add) {
+          Inner = BO->getOperand(1);
+          continue;
+        }
+      }
+    }
+    break;
+  }
+  auto *P2I = dyn_cast<PtrToIntInst>(Inner);
+  if (!P2I)
+    return nullptr;
+  Type *PtrTy = P2I->getPointerOperand()->getType();
+  if (auto *PT = dyn_cast<PointerType>(PtrTy)) {
+    unsigned AS = PT->getAddressSpace();
+    unsigned PtrBits = DL.getPointerSizeInBits(AS);
+    unsigned IntBits = P2I->getType()->getIntegerBitWidth();
+    if (PtrBits == IntBits)
+      return P2I->getPointerOperand();
+  }
+  return nullptr;
+}
+
 Value *stripPointerCastsAndOffsets(Value *Ptr, const DataLayout &DL,
                                    int64_t *OutOffset, bool *NonConstant) {
   if (OutOffset)
@@ -196,6 +247,26 @@ Value *stripPointerCastsAndOffsets(Value *Ptr, const DataLayout &DL,
     }
     if (auto *FI = dyn_cast<FreezeInst>(V)) {
       V = FI->getOperand(0);
+      continue;
+    }
+    // llvm.launder/strip.invariant.group are pointer-identity-preserving.
+    // resolveVirtualRef sees them through the alias map (processIntrinsic
+    // installs it); offset resolution must peel them too, so a launder-wrapped
+    // GEP keeps its accumulated byte offset.
+    if (auto *II = dyn_cast<IntrinsicInst>(V)) {
+      Intrinsic::ID ID = II->getIntrinsicID();
+      if (ID == Intrinsic::launder_invariant_group ||
+          ID == Intrinsic::strip_invariant_group) {
+        V = II->getArgOperand(0);
+        continue;
+      }
+    }
+    // inttoptr(ptrtoint(x)) same-width round-trip (legal laundering): peel to
+    // x so any GEP inside the round-trip contributes its offset. A non-round-
+    // trip inttoptr is opaque — stop here. (resolveVirtualRef would not have
+    // resolved such a pointer to a virtual, so the offset is unused there.)
+    if (Value *Inner = getIntToPtrRoundTripInner(V, DL)) {
+      V = Inner;
       continue;
     }
     break;
@@ -313,45 +384,13 @@ resolveVirtualRefImpl(Value *V, const PEABlockState &State,
                                  Depth + 1);
 
   // (7) IntToPtr(PtrToInt(x)) round-trip with matching widths is a legal
-  // laundering pattern; tagged-pointer encodings (with masking/shifting) must
-  // escape and are caught by the fall-through.
-  //
-  // Peel off `add X, 0` chains between PtrToInt and IntToPtr; some frontends
-  // emit these as part of constant-folded address arithmetic and they should
-  // be transparent to alias resolution.
-  if (auto *I2P = dyn_cast<IntToPtrInst>(V)) {
-    Value *Inner = I2P->getOperand(0);
-    // Strip any number of `add X, 0` instructions and `or X, 0` (also a
-    // no-op on integer types).
-    for (unsigned StripDepth = 0; StripDepth < 8; ++StripDepth) {
-      if (auto *BO = dyn_cast<BinaryOperator>(Inner)) {
-        if (BO->getOpcode() == Instruction::Add ||
-            BO->getOpcode() == Instruction::Or) {
-          if (auto *RHS = dyn_cast<ConstantInt>(BO->getOperand(1));
-              RHS && RHS->isZero()) {
-            Inner = BO->getOperand(0);
-            continue;
-          }
-          if (auto *LHS = dyn_cast<ConstantInt>(BO->getOperand(0));
-              LHS && LHS->isZero() && BO->getOpcode() == Instruction::Add) {
-            Inner = BO->getOperand(1);
-            continue;
-          }
-        }
-      }
-      break;
-    }
-    if (auto *P2I = dyn_cast<PtrToIntInst>(Inner)) {
-      Type *PtrTy = P2I->getPointerOperand()->getType();
-      if (auto *PT = dyn_cast<PointerType>(PtrTy)) {
-        unsigned AS = PT->getAddressSpace();
-        unsigned PtrBits = DL.getPointerSizeInBits(AS);
-        unsigned IntBits = P2I->getType()->getIntegerBitWidth();
-        if (PtrBits == IntBits)
-          return resolveVirtualRefImpl(P2I->getPointerOperand(), State, Aliases,
-                                       DL, Visited, Depth + 1);
-      }
-    }
+  // laundering pattern (see getIntToPtrRoundTripInner); tagged-pointer
+  // encodings (with masking/shifting) must escape. A non-round-trip inttoptr
+  // is opaque — return nullopt so the caller materializes.
+  if (isa<IntToPtrInst>(V)) {
+    if (Value *Inner = getIntToPtrRoundTripInner(V, DL))
+      return resolveVirtualRefImpl(Inner, State, Aliases, DL, Visited,
+                                   Depth + 1);
     return std::nullopt;
   }
 
@@ -429,37 +468,18 @@ std::optional<ObjectID> resolveVirtualRef(Value *V, const PEABlockState &State,
 std::optional<int64_t> resolveFieldOffset(Value *Ptr, const DataLayout &DL) {
   if (!Ptr)
     return std::nullopt;
-
-  if (auto *GEP = dyn_cast<GEPOperator>(Ptr)) {
-    const unsigned PtrBits =
-        DL.getPointerSizeInBits(GEP->getPointerAddressSpace());
-
-    // Arbitrary GEP with all-constant indices. accumulateConstantOffset
-    // already covers the Jeandle-canonical i8 single-index form.
-    APInt Acc(PtrBits, 0, /*isSigned=*/true);
-    if (GEP->accumulateConstantOffset(DL, Acc))
-      return Acc.getSExtValue();
-
+  // Delegate to the shared offset accumulator so identity- and offset-resolution
+  // peel the same set of wrappers (GEP constant offsets, bitcast, JavaHeap
+  // addrspacecast, freeze, launder/strip.invariant.group, inttoptr(ptrtoint(x))
+  // round-trip): a pointer that resolves to a virtual base yields its true byte
+  // offset here. A non-constant GEP -> nullopt (caller materializes); a non-GEP
+  // base (the object itself, a whole-object Case-B PHI/Select) -> 0.
+  int64_t Off = 0;
+  bool NonConst = false;
+  stripPointerCastsAndOffsets(Ptr, DL, &Off, &NonConst);
+  if (NonConst)
     return std::nullopt;
-  }
-
-  // Pattern 3.5: freeze on a pointer is a pointer-identity-preserving
-  // passthrough; peel and retry against the operand. Mirrors the FreezeInst
-  // handling in stripPointerCastsAndOffsets and resolveVirtualRefImpl.
-  if (auto *FI = dyn_cast<FreezeInst>(Ptr))
-    return resolveFieldOffset(FI->getOperand(0), DL);
-
-  // Pattern 4: cast / alias chain to a GEP — strip and retry.  Guard against
-  // infinite recursion: only recurse if stripping actually changes the value.
-  Value *Stripped = Ptr->stripPointerCastsAndAliases();
-  if (Stripped != Ptr)
-    return resolveFieldOffset(Stripped, DL);
-
-  // Pattern 5: no GEP — the access targets the base of the (presumed virtual)
-  // object.  Offset is zero by construction of the IR.  The caller is
-  // responsible for first establishing via resolveVirtualRef that Ptr does
-  // resolve to a virtual base; this function only reports the offset.
-  return 0;
+  return Off;
 }
 
 // ===========================================================================

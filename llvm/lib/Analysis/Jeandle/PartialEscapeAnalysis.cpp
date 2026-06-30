@@ -854,18 +854,50 @@ private:
   // pointer (e.g. `store ptr %virt, ptr @G`).
   bool processStore(StoreInst *SI);
   void processLoad(LoadInst *LI);
+  // Resolve a load/store pointer to a byte offset within the virtual object
+  // BaseID, applying the array-element GEP fast path, the general
+  // constant-offset resolver, and the header-offset guard (instance AND
+  // array). Returns nullopt (caller marks BaseID ineligible) when the access
+  // cannot be virtualized: symbolic array index, non-constant GEP offset,
+  // out-of-bounds index, or a header (mark/klass) field access. Graal
+  // correspondence: the constant-offset + entryIndex resolution shared by
+  // LoadFieldNode/StoreFieldNode/LoadIndexedNode/StoreIndexedNode/RawLoad/
+  // RawStoreNode.virtualize.
+  std::optional<int64_t> resolveAccess(Value *Ptr, jeandle::ObjectID BaseID);
   // TODO(unsafe-inliner): processAtomicRMW / processCmpXchg (re-add with the
   // jeandle-jdk frontend inliner for Unsafe atomic intrinsics), processArrayCopy
   // (System.arraycopy → llvm.memcpy/memmove), processMemSet (Arrays.fill →
   // llvm.memset). Until then these shapes fall through to conservative
   // materialization.
   bool processJavaOp(CallBase *CB);
+  // §2.3.14: known non-escaping LLVM intrinsics (assume, lifetime/invariant
+  // markers, debug, annotations, branch hints, ...) are no-ops for PEA;
+  // launder/strip.invariant.group forward the argument's virtual alias.
+  // Returns true if the intrinsic was handled (no-op or alias-forwarded),
+  // false to fall through to the ICmp/JavaOp/generic-escape path.
+  bool processIntrinsic(llvm::IntrinsicInst *II);
+  // §2.3.11/§2.3.12: fold an equality icmp against a virtual pointer to a
+  // constant (virtuals are non-null by construction; identity comparison).
+  // Returns true if folded, false to fall through to materialization.
+  bool foldICmpEquality(llvm::ICmpInst *ICmp);
   bool foldArrayLength(CallBase *CB);
   bool foldLoadKlass(CallBase *CB);
   bool foldCheckCast(CallBase *CB);
   bool foldInstanceOf(CallBase *CB);
   bool foldMonitorEnter(CallBase *CB);
   bool foldMonitorExit(CallBase *CB);
+  // Resolve the bytecode lock depth of a monitorenter call site: the
+  // !jeandle.lock_depth metadata if present, else the FIRST NextLockEnterOrder
+  // value cached in FallbackBytecodeDepth (stable across loop-fixpoint
+  // iterations). Shared by foldMonitorEnter and materializeVirtualLocksBefore.
+  uint32_t getOrCreateLockDepth(CallBase *CB);
+  // Graal materializeVirtualLocksBefore (PartialEscapeClosure.java:641-652):
+  // before a REAL (non-virtualized) monitorenter whose depth is D, materialize
+  // every still-virtual VO holding an elided lock with a strictly shallower
+  // min depth. Fired from processInstruction on the not-deleted monitorenter
+  // branch (Graal PClosure:263-264), distinct from foldMonitorEnter's
+  // elide-path pre-cascade.
+  void materializeVirtualLocksBefore(CallBase *MonEnter);
   bool foldArrayStoreCheck(CallBase *CB);
   bool foldCheckIfValueBased(CallBase *CB);
   bool foldRegisterFinalizerIfNeeded(CallBase *CB);
@@ -2609,7 +2641,7 @@ bool Analyzer::synthesizeCaseC(
     for (unsigned i = 0; i < N; ++i) {
       const jeandle::VirtualObject &PVO = *Result.VirtualObjects[PerPredIDs[i]];
       for (const auto &FD : PVO.Fields) {
-        if (MergedVO.getOrCreateFieldIndex(FD.Offset, FD.LLVMType) < 0) {
+        if (MergedVO.getOrCreateFieldIndex(FD.Offset, FD.LLVMType, DL) < 0) {
           Eligible[NewID] = false;
           return false;
         }
@@ -2726,6 +2758,32 @@ bool Analyzer::synthesizeCaseC(
 }
 
 void Analyzer::processInstruction(Instruction *I) {
+  // Graal correspondence: PartialEscapeClosure.processNode /
+  // processNodeInternal (PartialEscapeClosure.java:214-276). Graal dispatches
+  // in three stages; this function mirrors them, adapted to LLVM's opcode-
+  // keyed IR (Graal uses a Virtualizable interface + graph nodes):
+  //
+  //   (1) ALLOCATION STAGE (Graal requiresProcessing -> processVirtualizable):
+  //       isJeandleAllocation -> processAllocation (NewInstanceNode/
+  //       NewArrayNode.virtualize).
+  //   (2) VIRTUALIZABLE STAGE (Graal hasVirtualInputs + Virtualizable ->
+  //       processVirtualizable; MonitorEnter not-deleted branch ->
+  //       materializeVirtualLocksBefore): the per-opcode handlers below —
+  //       processStore/processLoad (Store/LoadField/Indexed/RawNode),
+  //       propagatePointerAlias (LLVM pointer derivation, no Graal analog),
+  //       processIntrinsic (LLVM intrinsics), foldICmpEquality
+  //       (IsNullNode/UnaryOpLogicNode), processJavaOp (ArrayLength/LoadHub/
+  //       InstanceOf/Monitor/MonitorExit/ArrayStoreCheck/...).
+  //   (3) processNodeInputs STAGE (Graal:433-451): materializeAllVirtualOperands
+  //       — materializes every virtual operand the specific fold did not itself
+  //       account for.
+  //
+  // CONTRACT: a (2)-stage handler may return / early-exit ONLY once every
+  // virtual operand has been folded or materialized. A handler that leaves a
+  // virtual operand unaccounted for MUST fall through to (3) so the generic
+  // escape path materializes it. (Graal guarantees this by always running
+  // processNodeInputs after the virtualizable stage.)
+  //
   // PHINodes are handled in processBlockPhis (which runs before this loop)
   // and have their alias status (Case B) or per-pred materialization (Case A)
   // recorded there. Re-walking them in the generic instruction dispatch would
@@ -2765,6 +2823,32 @@ void Analyzer::processInstruction(Instruction *I) {
   // atomicrmw/cmpxchg falls through to the generic-escape path below,
   // materializing conservatively.
 
+  // Graal materializeVirtualLocksBefore (PartialEscapeClosure.java:263-264,
+  // 641-652): under strict lock order, a REAL (non-virtualized) monitorenter
+  // must first materialize every still-virtual object holding a shallower live
+  // lock, so each such object's re-emitted lock lands below this real lock on
+  // the lightweight-locking thread lock stack (preserving lexical nesting).
+  //
+  // Placement: Graal reaches this from processNodeInternal's hasVirtualInputs-
+  // gated virtualizable stage because a Graal MonitorEnterNode carries a
+  // stateAfter FrameState that references the virtual object. LLVM monitorenters
+  // carry no such frame state (deopt is deferred), so a non-virtual receiver has
+  // NO virtual input and never enters the gate below — the cascade is therefore
+  // checked here, outside the gate. A virtual-receiver monitorenter is handled
+  // by foldMonitorEnter inside the gate (elision + its own elide-path
+  // pre-cascade), so this fires only when the receiver does NOT resolve to a
+  // virtual.
+  if (StrictLockOrder) {
+    if (auto *CB = dyn_cast<CallBase>(I)) {
+      if (jeandle::pea::isJeandleMonitorEnter(CB) && CB->arg_size() >= 1) {
+        auto RecvID = jeandle::pea::resolveVirtualRef(CB->getArgOperand(0),
+                                                      CurrentState, Aliases, DL);
+        if (!RecvID)
+          materializeVirtualLocksBefore(CB);
+      }
+    }
+  }
+
   // Other virtual-input consumers (access folding + scalar-replaced inputs).
   if (Aliases.hasVirtualInputs(I)) {
     // Pointer-derivation forwards the virtual alias to the derived pointer so
@@ -2785,72 +2869,18 @@ void Analyzer::processInstruction(Instruction *I) {
     // virtual stays virtual and the call is left alone in IR (some are
     // DCE'd downstream; others are harmless). Must run BEFORE the JavaOp
     // fold + generic-escape fall-through.
+    // §2.3.14: known non-escaping LLVM intrinsics (assume, lifetime markers,
+    // invariant markers, debug intrinsics, ...) are no-ops for PEA. The
+    // virtual stays virtual and the call is left alone in IR (some are
+    // DCE'd downstream; others are harmless). launder/strip.invariant.group
+    // forward the argument's virtual alias. Must run BEFORE the JavaOp fold +
+    // generic-escape fall-through.
     if (auto *II = dyn_cast<IntrinsicInst>(I)) {
-      // Extra debug-only assert — PEA must run BEFORE
-      // RewriteStatepointsForGC. A statepoint intrinsic appearing here means
-      // the pass scheduling has been broken; bail loudly in debug, fall
-      // through to the generic-escape path in release (safe — every
-      // statepoint operand is forced to materialize via the
-      // hasVirtualInputs handler).
-      assert(II->getIntrinsicID() != Intrinsic::experimental_gc_statepoint &&
-             II->getIntrinsicID() != Intrinsic::experimental_gc_relocate &&
-             II->getIntrinsicID() != Intrinsic::experimental_gc_result &&
-             "PEA must not run after RewriteStatepointsForGC");
-      switch (II->getIntrinsicID()) {
-      case Intrinsic::assume:
-      case Intrinsic::lifetime_start:
-      case Intrinsic::lifetime_end:
-      case Intrinsic::invariant_start:
-      case Intrinsic::invariant_end:
-      case Intrinsic::experimental_noalias_scope_decl:
-      case Intrinsic::dbg_declare:
-      case Intrinsic::dbg_value:
-      case Intrinsic::dbg_label:
-      case Intrinsic::donothing:
-      case Intrinsic::sideeffect:
-      // Extended allowlist. None of these intrinsics produce a
-      // pointer with a different identity than their argument, none mutate
-      // memory we care about, and none cross the heap/abstract boundary —
-      // all safe to leave in IR alongside a virtual without forcing escape.
-      // ptr.annotation/var.annotation: TBAA-style debug annotation. The
-      //   call returns nothing meaningful and its operand is purely
-      //   informational.
-      // is.constant / expect / expect.with.probability: branch-prediction
-      //   hints; their value-result is i1/iN derived from a primitive
-      //   (the predicate or the comparison value), not from the virtual
-      //   pointer's identity, so the virtual doesn't escape through them.
-      // allow.runtime.check / allow.ubsan.check: similar — return i1.
-      case Intrinsic::ptr_annotation:
-      case Intrinsic::var_annotation:
-      case Intrinsic::is_constant:
-      case Intrinsic::expect:
-      case Intrinsic::expect_with_probability:
-      case Intrinsic::allow_runtime_check:
-      case Intrinsic::allow_ubsan_check:
+      if (processIntrinsic(II))
         return;
-      // launder/strip invariant.group are pointer-identity-
-      // preserving. resolveVirtualRef does not recurse through CallInst, so
-      // propagatePointerAlias would fall through to
-      // materializeAllVirtualOperands. Directly forward the argument's
-      // virtual alias to the result instead.
-      case Intrinsic::launder_invariant_group:
-      case Intrinsic::strip_invariant_group: {
-        Value *Arg = II->getArgOperand(0);
-        if (auto BaseID = jeandle::pea::resolveVirtualRef(Arg, CurrentState,
-                                                          Aliases, DL)) {
-          Aliases.addVirtualAlias(II, *BaseID);
-          return;
-        }
-        // Argument doesn't resolve to a virtual: not virtual-relevant; the
-        // call has no PEA effect, so leave it alone (no escape).
-        return;
-      }
-      default:
-        break;
-      }
+      // default: fall through to the ICmp / JavaOp / generic-escape path.
     }
-    // Deferred virtualization handlers — NOT WIRED because the current
-    // Jeandle frontend does not emit any of these shapes:
+    // Deferred virtualization handlers — NOT WIRED yet:
     //   - TODO: processArrayCopy / processMemSet — llvm.memcpy/memmove
     //     (System.arraycopy) and llvm.memset (Arrays.fill). The only
     //     llvm.memset producer today is jeandle.new_instance's lower-phase=1
@@ -2858,83 +2888,41 @@ void Analyzer::processInstruction(Instruction *I) {
     //   - TODO: llvm.reachability_fence — upstream LLVM this fork tracks
     //     does not define Intrinsic::reachability_fence, and the frontend
     //     emits no analogue.
-    //   - TODO: ObjectClone / Object.getClass / FinalFieldBarrier /
-    //     EnsureVirtualized — no jeandle.clone / get_class /
-    //     final_field_barrier / ensure_virtualized JavaOp exists in the
-    //     frontend inventory.
+    //   - TODO: ObjectClone / FinalFieldBarrier / EnsureVirtualized — no
+    //     jeandle.clone / final_field_barrier / ensure_virtualized JavaOp
+    //     exists in the frontend inventory.
+    //   - TODO(get_class): the frontend DOES emit jeandle.get_class
+    //     (jeandleIntrinsicLowering.cpp _getClass), but the Graal fold
+    //     (GetClassNode.virtualize:91-99 — replaceWithValue(constant Class via
+    //     constantReflection.asJavaClass(type))) is NOT implemented. It needs
+    //     (a) a new GetJavaMirror(Klass)->uintptr_t VMCallback and (b) the
+    //     ability to embed a GC'd JavaHeap oop constant in IR — every existing
+    //     fold emits only a primitive or a CHeap Klass pointer
+    //     (foldLoadKlass), so there is no precedent for an embedded GC oop
+    //     (statepoint/barrier treatment). Until then a virtual receiver of
+    //     jeandle.get_class hits this fall-through and materializes (sound,
+    //     conservative).
     //
     // Current frontend JavaOp inventory (grep `jeandle.[a-z_]+` in
     // jeandle-jdk/src/hotspot/share/jeandle/): array_store_check, arraylength,
     // card_table_barrier, check_if_value_based, check_inflated,
     // check_instanceof, check_klass_subtype, check_klass_subtype_slow_path,
     // checkcast, clear_oop_in_lock_stack_top, current_thread,
-    // decrement_lock_count, get_stack_pointer, idiv, increment_lock_count,
-    // instanceof, irem, ldiv, load_klass, lrem, monitorenter_*, monitorexit_*,
-    // new_instance, newarray, personality, post_barrier, pre_barrier,
+    // decrement_lock_count, get_class, get_stack_pointer, idiv,
+    // increment_lock_count, instanceof, irem, ldiv, load_klass, lrem,
+    // monitorenter_*, monitorexit_*, new_instance, newarray, personality,
+    // post_barrier, pre_barrier,
     // safepoint_poll, try_acquire_monitor_lock, try_release_monitor_lock. When
     // the frontend grows a new JavaOp, wire its fold in processJavaOp and add
     // the isJeandle* predicate in PartialEscapeUtils.{h,cpp}.
     //
-    // §2.3.11/§2.3.12: equality compare against a virtual pointer folds.
-    // Virtual objects are never null (by construction they track an in-flight
-    // alloc), so `icmp eq virt, null` -> false, `icmp ne virt, null` -> true.
-    // Two virtuals: same ID -> eq=true; different IDs -> eq=false.
-    // Mixed virtual + non-null non-virtual pointer: identity differs -> eq
-    // folds to false.
+    // §2.3.11/§2.3.12: equality compare against a virtual pointer folds
+    // (virtuals are never null; identity comparison). Non-equality ICmp on
+    // virtual heap pointers (slt/sgt/...) is UB on GC pointers; fall through
+    // to conservative materialization.
     if (auto *ICmp = dyn_cast<ICmpInst>(I)) {
-      if (ICmp->isEquality()) {
-        Value *Op0 = ICmp->getOperand(0);
-        Value *Op1 = ICmp->getOperand(1);
-        auto V0 =
-            jeandle::pea::resolveVirtualRef(Op0, CurrentState, Aliases, DL);
-        auto V1 =
-            jeandle::pea::resolveVirtualRef(Op1, CurrentState, Aliases, DL);
-        bool Op0IsNull = isa<ConstantPointerNull>(Op0);
-        bool Op1IsNull = isa<ConstantPointerNull>(Op1);
-        bool Folded = false;
-        bool EqResult = false;
-        jeandle::ObjectID BaseID = jeandle::InvalidObjectID;
-        if (V0 && Op1IsNull) {
-          Folded = true;
-          EqResult = false;
-          BaseID = *V0;
-        } else if (V1 && Op0IsNull) {
-          Folded = true;
-          EqResult = false;
-          BaseID = *V1;
-        } else if (V0 && V1) {
-          Folded = true;
-          EqResult = (*V0 == *V1);
-          BaseID = *V0;
-        } else if (V0 && !V1 && !Op1IsNull) {
-          // Virtual vs. non-virtual non-null pointer: distinct identity.
-          Folded = true;
-          EqResult = false;
-          BaseID = *V0;
-        } else if (V1 && !V0 && !Op0IsNull) {
-          Folded = true;
-          EqResult = false;
-          BaseID = *V1;
-        }
-        if (Folded) {
-          bool IsEq = (ICmp->getPredicate() == ICmpInst::ICMP_EQ);
-          bool FinalResult = IsEq ? EqResult : !EqResult;
-          Constant *C = ConstantInt::get(ICmp->getType(), FinalResult ? 1 : 0);
-          // Reuse ReplaceLoad: its handler does generic Instruction RAUW +
-          // erase, which is exactly what we need here.
-          auto E = std::make_unique<jeandle::ReplaceLoadEffect>();
-          E->Block = ICmp->getParent();
-          E->Target = ICmp;
-          E->Replacement = C;
-          E->SeqNo = Result.nextSeqNo();
-          E->ObjID = BaseID;
-          Result.addBlockEffect(std::move(E));
-          Aliases.addScalarAlias(ICmp, C);
-          return;
-        }
-      }
-      // Non-equality ICmp on virtual heap pointers (slt/sgt/...) is UB on
-      // GC pointers; conservatively materialize.
+      if (foldICmpEquality(ICmp))
+        return;
     }
     // Recognise JavaOps that read/inspect a virtual receiver and try to
     // constant-fold them. processJavaOp returns true if the JavaOp was
@@ -3160,6 +3148,55 @@ void Analyzer::processAllocation(CallBase *CB) {
   }
 }
 
+std::optional<int64_t>
+Analyzer::resolveAccess(Value *Ptr, jeandle::ObjectID BaseID) {
+  jeandle::VirtualObject &VObj = *Result.VirtualObjects[BaseID];
+
+  // Array-element GEP fast path: for array VOs with populated element
+  // metadata, recognise the typed-element GEP the abstract interpreter emits
+  // for indexed accesses. matchArrayElementGEP returns {idx, etype} on a
+  // recognised shape; idx is a ConstantInt for constant indices (use the
+  // canonical byte offset) and any other Value for symbolic indices (force
+  // materialization, matching the "constant index only" policy).
+  if (VObj.isArray() && VObj.ArrayElementType) {
+    if (auto *G = dyn_cast<GetElementPtrInst>(Ptr)) {
+      if (auto Match = VObj.matchArrayElementGEP(G, DL)) {
+        if (auto *CI = dyn_cast<ConstantInt>(Match->Index)) {
+          int64_t Cidx = CI->getSExtValue();
+          if (Cidx < 0 || static_cast<uint64_t>(Cidx) >= VObj.ArrayLength)
+            return std::nullopt; // out of bounds
+          return static_cast<int64_t>(VObj.ArrayBaseOffset) +
+                 Cidx * static_cast<int64_t>(VObj.ArrayIndexScale);
+        }
+        return std::nullopt; // symbolic index
+      }
+    }
+  }
+
+  // General constant-offset resolver. A non-constant GEP offset yields
+  // nullopt (caller materializes).
+  std::optional<int64_t> Offset = jeandle::pea::resolveFieldOffset(Ptr, DL);
+  if (!Offset)
+    return std::nullopt;
+
+  // Header-offset guard: mark/klass words are VM metadata, not Java fields,
+  // and must not be virtualized into a field slot. Instances are guarded by
+  // instanceBaseOffset; arrays are mirrored by ArrayBaseOffset (a raw GEP
+  // into the array header, e.g. an offset-0 store to the mark word, would
+  // otherwise replay as a Java-field write on materialization).
+  if (VObj.isInstance()) {
+    const jeandle::VMConstants VMConsts =
+        jeandle::VMConstants::fromModule(*F.getParent());
+    if (*Offset < VMConsts.instanceBaseOffset())
+      return std::nullopt;
+  } else if (VObj.isArray()) {
+    if (*Offset < static_cast<int64_t>(VObj.ArrayBaseOffset))
+      return std::nullopt;
+  }
+
+  return Offset;
+}
+
 bool Analyzer::processStore(StoreInst *SI) {
   Value *Ptr = SI->getPointerOperand();
   Value *Val = SI->getValueOperand();
@@ -3170,49 +3207,12 @@ bool Analyzer::processStore(StoreInst *SI) {
 
   jeandle::VirtualObject &VObj = *Result.VirtualObjects[*BaseID];
 
-  // For array VOs with populated element metadata, recognise the
-  // typed-element GEP chain that the abstract interpreter emits for
-  // indexed accesses. matchArrayElementGEP returns Some(idx, etype) on a
-  // recognised array-element GEP shape; idx is a ConstantInt for constant
-  // indices (use the canonical byte offset) and any other Value for
-  // symbolic indices (force materialization, matching the
-  // "index constant only" policy).
-  std::optional<int64_t> Offset;
-  if (VObj.isArray() && VObj.ArrayElementType) {
-    if (auto *G = dyn_cast<GetElementPtrInst>(Ptr)) {
-      if (auto Match = VObj.matchArrayElementGEP(G, DL)) {
-        if (auto *CI = dyn_cast<ConstantInt>(Match->Index)) {
-          int64_t Cidx = CI->getSExtValue();
-          if (Cidx < 0 || static_cast<uint64_t>(Cidx) >= VObj.ArrayLength) {
-            markIneligible(*BaseID);
-            return true;
-          }
-          Offset = static_cast<int64_t>(VObj.ArrayBaseOffset) +
-                   Cidx * static_cast<int64_t>(VObj.ArrayIndexScale);
-        } else {
-          // Symbolic index — materialize.
-          markIneligible(*BaseID);
-          return true;
-        }
-      }
-    }
-  }
-
-  if (!Offset)
-    Offset = jeandle::pea::resolveFieldOffset(Ptr, DL);
+  // Shared offset resolution (array-element GEP fast path + constant-offset
+  // resolver + header guard). See resolveAccess.
+  std::optional<int64_t> Offset = resolveAccess(Ptr, *BaseID);
   if (!Offset) {
-    // Non-constant offset access — punt on materialization.
     markIneligible(*BaseID);
     return true;
-  }
-  if (VObj.isInstance()) {
-    const jeandle::VMConstants VMConsts =
-        jeandle::VMConstants::fromModule(*F.getParent());
-    if (*Offset < VMConsts.instanceBaseOffset()) {
-      // Header accesses (mark/klass) are VM metadata, not Java fields.
-      markIneligible(*BaseID);
-      return true;
-    }
   }
 
   // TODO(unsafe-inliner): see the access dispatch (processStore/processLoad).
@@ -3221,7 +3221,7 @@ bool Analyzer::processStore(StoreInst *SI) {
   // Type-overlap validation via VirtualObject::getOrCreateFieldIndex. We don't
   // actually use the returned index (FieldStates is keyed by raw offset), but
   // -1 means an overlap/size conflict that forces escape.
-  if (VObj.getOrCreateFieldIndex(*Offset, Val->getType()) < 0) {
+  if (VObj.getOrCreateFieldIndex(*Offset, Val->getType(), DL) < 0) {
     markIneligible(*BaseID);
     return true;
   }
@@ -3264,42 +3264,12 @@ void Analyzer::processLoad(LoadInst *LI) {
 
   jeandle::VirtualObject &VObj = *Result.VirtualObjects[*BaseID];
 
-  // Array-element GEP matcher — see the processStore mirror for the
-  // rationale. Symbolic index forces the array to materialize.
-  std::optional<int64_t> Offset;
-  if (VObj.isArray() && VObj.ArrayElementType) {
-    if (auto *G = dyn_cast<GetElementPtrInst>(Ptr)) {
-      if (auto Match = VObj.matchArrayElementGEP(G, DL)) {
-        if (auto *CI = dyn_cast<ConstantInt>(Match->Index)) {
-          int64_t Cidx = CI->getSExtValue();
-          if (Cidx < 0 || static_cast<uint64_t>(Cidx) >= VObj.ArrayLength) {
-            markIneligible(*BaseID);
-            return;
-          }
-          Offset = static_cast<int64_t>(VObj.ArrayBaseOffset) +
-                   Cidx * static_cast<int64_t>(VObj.ArrayIndexScale);
-        } else {
-          markIneligible(*BaseID);
-          return;
-        }
-      }
-    }
-  }
-
-  if (!Offset)
-    Offset = jeandle::pea::resolveFieldOffset(Ptr, DL);
+  // Shared offset resolution (array-element GEP fast path + constant-offset
+  // resolver + header guard). See resolveAccess.
+  std::optional<int64_t> Offset = resolveAccess(Ptr, *BaseID);
   if (!Offset) {
     markIneligible(*BaseID);
     return;
-  }
-  if (VObj.isInstance()) {
-    const jeandle::VMConstants VMConsts =
-        jeandle::VMConstants::fromModule(*F.getParent());
-    if (*Offset < VMConsts.instanceBaseOffset()) {
-      // Header accesses (mark/klass) are VM metadata, not Java fields.
-      markIneligible(*BaseID);
-      return;
-    }
   }
 
   Type *LoadTy = LI->getType();
@@ -3669,6 +3639,47 @@ static std::optional<uint32_t> readBytecodeLockDepth(llvm::CallBase *CB) {
 //
 // See ensureMaterialized's lock-capture block and applyMaterialize's re-emit
 // loop for the capture + re-emit mechanism.
+uint32_t Analyzer::getOrCreateLockDepth(CallBase *CB) {
+  // !jeandle.lock_depth metadata (the true Java-bytecode monitor depth) wins
+  // when present. Otherwise cache the FIRST NextLockEnterOrder value for this
+  // call site in FallbackBytecodeDepth and reuse it on every subsequent visit
+  // — using NextLockEnterOrder directly is unsound across loop-fixpoint
+  // iterations (the counter advances on every re-push, mutating
+  // ObjectState::Locks[i].BytecodeDepth and breaking equivalentTo).
+  if (auto Depth = readBytecodeLockDepth(CB))
+    return *Depth;
+  auto FIt = FallbackBytecodeDepth.find(CB);
+  if (FIt != FallbackBytecodeDepth.end())
+    return FIt->second;
+  uint32_t D = NextLockEnterOrder;
+  FallbackBytecodeDepth[CB] = D;
+  return D;
+}
+
+void Analyzer::materializeVirtualLocksBefore(CallBase *MonEnter) {
+  // Graal PartialEscapeClosure.materializeVirtualLocksBefore
+  // (PartialEscapeClosure.java:641-652), fired from processNodeInternal
+  // (PClosure:263-264) on the not-deleted MonitorEnter branch under strict
+  // lock order. Before a REAL monitorenter whose bytecode depth is D,
+  // materialize every still-virtual VO holding an elided lock with a strictly
+  // shallower min depth (LiveLockEnters[id].front() = outermost/min depth,
+  // Graal's getMinimumLockDepth). This keeps each such VO's re-emitted lock
+  // below this real lock on the lightweight-locking thread lock stack,
+  // preserving lexical nesting.
+  assert(StrictLockOrder && "caller gates on StrictLockOrder");
+  uint32_t LockDepth = getOrCreateLockDepth(MonEnter);
+  SmallVector<jeandle::ObjectID, 4> Cascade;
+  for (auto &Kv : LiveLockEnters) {
+    if (Kv.second.empty())
+      continue;
+    if (Kv.second.front().BytecodeDepth < LockDepth)
+      Cascade.push_back(Kv.first);
+  }
+  llvm::sort(Cascade); // deterministic
+  for (jeandle::ObjectID OID : Cascade)
+    materializeAt(OID, MonEnter, MatReason::Cascade);
+}
+
 bool Analyzer::foldMonitorEnter(CallBase *CB) {
   if (CB->arg_size() < 1)
     return false;
@@ -3677,37 +3688,18 @@ bool Analyzer::foldMonitorEnter(CallBase *CB) {
   if (!BaseID)
     return false;
 
-  // Resolve the bytecode lock depth for this enter.
-  //   * When the JDK frontend's !jeandle.lock_depth metadata is present, use
-  //     the metadata value (the true Java-bytecode monitor depth, stable per
-  //     call site and lexically consistent across paths).
-  //   * Otherwise, fall back to FallbackBytecodeDepth: cache the FIRST
-  //     NextLockEnterOrder value ever assigned to this call site and reuse
-  //     it on every subsequent visit. Using NextLockEnterOrder directly is
-  //     unsound across loop-fixpoint iterations (the counter advances on
-  //     every re-push, which would mutate ObjectState::Locks[i].BytecodeDepth
-  //     and break PEABlockState::equivalentTo convergence checks).
-  std::optional<uint32_t> MaybeDepth = readBytecodeLockDepth(CB);
-  uint32_t NewBytecodeDepth;
-  if (MaybeDepth.has_value()) {
-    NewBytecodeDepth = *MaybeDepth;
-  } else {
-    auto FIt = FallbackBytecodeDepth.find(CB);
-    if (FIt != FallbackBytecodeDepth.end()) {
-      NewBytecodeDepth = FIt->second;
-    } else {
-      NewBytecodeDepth = NextLockEnterOrder;
-      FallbackBytecodeDepth[CB] = NewBytecodeDepth;
-    }
-  }
+  // Resolve the bytecode lock depth for this enter (see getOrCreateLockDepth).
+  uint32_t NewBytecodeDepth = getOrCreateLockDepth(CB);
 
-  // materializeVirtualLocksBefore pre-cascade. Before virtualising a
-  // monitorenter on a NEW receiver ID while another VO already holds an OLDER
+  // materializeVirtualLocksBefore pre-cascade (elide-path). Before virtualising
+  // a monitorenter on a NEW receiver ID while another VO already holds an OLDER
   // (shallower-depth) elided lock, force every such sibling to materialise
   // BEFORE the new virtual lock is added — otherwise the runtime lock-stack
   // ordering observable at a later escape point would be reversed (the older
   // VO would materialise alone without its sibling's lock on the stack).
-  // Compares BytecodeDepth (the Order proxy when metadata is absent).
+  // Compares BytecodeDepth (the Order proxy when metadata is absent). This is
+  // distinct from materializeVirtualLocksBefore above, which fires on the
+  // not-deleted (real-receiver) branch from processInstruction.
   if (StrictLockOrder) {
     SmallVector<jeandle::ObjectID, 4> ToPreCascade;
     for (auto &Kv : LiveLockEnters) {
@@ -3736,7 +3728,13 @@ bool Analyzer::foldMonitorEnter(CallBase *CB) {
   // Also record the bytecode depth so the (depth-aware) cascade and
   // merge-time stack-identity comparisons use the JDK-supplied value.
   uint32_t MyOrder = NextLockEnterOrder++;
-  LiveLockEnters[*BaseID].push_back({CB, MyOrder, NewBytecodeDepth});
+  auto &Stack = LiveLockEnters[*BaseID];
+  // Depth monotonicity invariant (mirrors Graal ObjectState.java:212 and the
+  // assert in ObjectState::addLock): nested monitorenters acquire strictly
+  // increasing bytecode depth, so a newly pushed enter must be strictly
+  // deeper than the current innermost (back) live enter on this VO.
+  assert(Stack.empty() || NewBytecodeDepth > Stack.back().BytecodeDepth);
+  Stack.push_back({CB, MyOrder, NewBytecodeDepth});
   // Keep the per-VO ObjectState::Locks mirror in lockstep with the analyzer-
   // side DenseMap. ObjectState::Locks does not carry the Order proxy —
   // structural ObjectState equivalence (used by merge-time
@@ -3795,34 +3793,37 @@ bool Analyzer::foldMonitorExit(CallBase *CB) {
 }
 
 bool Analyzer::foldArrayStoreCheck(CallBase *CB) {
-  // jeandle.array_store_check(value, array). §2.3.14 of the PEA paper
-  // marks the op as read-only on the heap, so a virtual base by itself does
-  // not constitute an escape. The fold compares the value's klass against
-  // the array's element klass (via VMCallback ArrayElementKlass) and
-  // either elides the call (provably compatible / primitive element) or
-  // forces materialization (provably incompatible / element klass unknown
-  // / value klass unknown).
+  // jeandle.array_store_check(value, array). §2.3.14 of the PEA paper marks the
+  // op read-only on the heap, so a virtual base is NOT an escape when the check
+  // is ELIDED (provably compatible / primitive element): the call is deleted, so
+  // no operand reference survives.
+  //
+  // CONTRACT (mirrors Graal processNodeInputs on a non-deleted node): when the
+  // check SURVIVES (cannot be proven elidable) it needs real operands, so BOTH
+  // the array and any virtual value must materialize. Such paths return FALSE so
+  // the generic escape path (materializeAllVirtualOperands) handles every virtual
+  // operand. The only return-true paths are the two elisions below, where the
+  // call is deleted and holds no surviving operand reference.
   if (CB->arg_size() < 2)
-    return true; // malformed; treat as non-escaping no-op
+    return false; // malformed — let the generic path materialize any virtual.
   auto ArrayID = jeandle::pea::resolveVirtualRef(CB->getArgOperand(1),
                                                  CurrentState, Aliases, DL);
   if (!ArrayID)
-    return true;
+    return false; // array not virtual — a virtual VALUE operand still escapes.
   jeandle::VirtualObject &ArrayObj = *Result.VirtualObjects[*ArrayID];
 
   const jeandle::VMCallbacks *VMCB = jeandle::getVMCallbacks();
-  if (!VMCB || !VMCB->ArrayElementKlass) {
-    // No VMCallback — leave the call alone; the array does not formally
-    // escape per §2.3.14.
-    return true;
-  }
+  if (!VMCB || !VMCB->ArrayElementKlass)
+    return false; // cannot prove elidable — survive + materialize.
   if (ArrayObj.Klass == 0)
-    return true;
+    return false;
 
   uintptr_t ElementKlass = VMCB->ArrayElementKlass(ArrayObj.Klass);
   if (ElementKlass == 0) {
     // Primitive (type-array) element: array_store_check is a no-op on
-    // primitive arrays. Unconditionally elide.
+    // primitive arrays (no covariant store check for primitives). Elide to
+    // true. A primitive array's value is a primitive, never a virtual object,
+    // and the elision deletes the call, so no operand reference survives.
     Constant *True = ConstantInt::getTrue(CB->getType());
     emitReplaceCall(CB, True, *ArrayID);
     return true;
@@ -3841,32 +3842,24 @@ bool Analyzer::foldArrayStoreCheck(CallBase *CB) {
     ValueKlass = JT.Klass;
   }
 
-  if (ValueKlass == 0) {
-    // Unknown value klass — cannot prove compatibility. Bail conservatively
-    // by materializing the array so the surviving array_store_check sees a
-    // real array pointer.
-    Eligible[*ArrayID] = false;
-    return true;
-  }
+  if (ValueKlass == 0)
+    return false; // unknown value klass — cannot prove elidable.
 
   auto Folded = evalSubtypeRelation(ValueKlass, ElementKlass);
-  if (!Folded) {
-    // Could not prove subtype OR incompatibility (e.g., neither direction
-    // of IsSubtype gave a definitive answer for a non-final element klass).
-    // Bail conservatively.
-    Eligible[*ArrayID] = false;
-    return true;
-  }
+  if (!Folded)
+    return false; // indeterminate subtype — cannot prove elidable.
+
   if (*Folded) {
-    // Provably compatible — elide.
+    // Provably compatible — elide. The value does not escape through the
+    // (deleted) check.
     Constant *True = ConstantInt::getTrue(CB->getType());
     emitReplaceCall(CB, True, *ArrayID);
     return true;
   }
-  // Provably incompatible: at runtime this would throw ArrayStoreException.
-  // Materialize the array so the surviving call hits a real pointer.
-  Eligible[*ArrayID] = false;
-  return true;
+  // Provably incompatible: at runtime this throws ArrayStoreException. The
+  // surviving check must inspect the real value and array klass — materialize
+  // both (return false -> generic escape path).
+  return false;
 }
 
 bool Analyzer::foldCheckIfValueBased(CallBase *CB) {
@@ -3960,6 +3953,123 @@ bool Analyzer::foldRegisterFinalizerIfNeeded(CallBase *CB) {
   assert(!VMCB->HasFinalizer(VObj.Klass) &&
          "processAllocation must refuse finalizable klasses");
   emitReplaceCall(CB, nullptr, *BaseID);
+  return true;
+}
+
+bool Analyzer::processIntrinsic(IntrinsicInst *II) {
+  // Debug-only assert: PEA must run BEFORE RewriteStatepointsForGC. A
+  // statepoint intrinsic appearing here means the pass scheduling has been
+  // broken; bail loudly in debug, fall through (return false) in release —
+  // safe, every statepoint operand is forced to materialize via the
+  // hasVirtualInputs handler / generic-escape path.
+  assert(II->getIntrinsicID() != Intrinsic::experimental_gc_statepoint &&
+         II->getIntrinsicID() != Intrinsic::experimental_gc_relocate &&
+         II->getIntrinsicID() != Intrinsic::experimental_gc_result &&
+         "PEA must not run after RewriteStatepointsForGC");
+  switch (II->getIntrinsicID()) {
+  case Intrinsic::assume:
+  case Intrinsic::lifetime_start:
+  case Intrinsic::lifetime_end:
+  case Intrinsic::invariant_start:
+  case Intrinsic::invariant_end:
+  case Intrinsic::experimental_noalias_scope_decl:
+  case Intrinsic::dbg_declare:
+  case Intrinsic::dbg_value:
+  case Intrinsic::dbg_label:
+  case Intrinsic::donothing:
+  case Intrinsic::sideeffect:
+  // Extended allowlist. None of these intrinsics produce a pointer with a
+  // different identity than their argument, none mutate memory we care about,
+  // and none cross the heap/abstract boundary — all safe to leave in IR
+  // alongside a virtual without forcing escape.
+  // ptr.annotation/var.annotation: TBAA-style debug annotation. The call
+  //   returns nothing meaningful and its operand is purely informational.
+  // is.constant / expect / expect.with.probability: branch-prediction hints;
+  //   their value-result is i1/iN derived from a primitive (the predicate or
+  //   the comparison value), not from the virtual pointer's identity, so the
+  //   virtual doesn't escape through them.
+  // allow.runtime.check / allow.ubsan.check: similar — return i1.
+  case Intrinsic::ptr_annotation:
+  case Intrinsic::var_annotation:
+  case Intrinsic::is_constant:
+  case Intrinsic::expect:
+  case Intrinsic::expect_with_probability:
+  case Intrinsic::allow_runtime_check:
+  case Intrinsic::allow_ubsan_check:
+    return true;
+  // launder/strip invariant.group are pointer-identity-preserving.
+  // resolveVirtualRef does not recurse through CallInst, so
+  // propagatePointerAlias would fall through to materializeAllVirtualOperands.
+  // Directly forward the argument's virtual alias to the result instead.
+  case Intrinsic::launder_invariant_group:
+  case Intrinsic::strip_invariant_group: {
+    Value *Arg = II->getArgOperand(0);
+    if (auto BaseID = jeandle::pea::resolveVirtualRef(Arg, CurrentState,
+                                                      Aliases, DL))
+      Aliases.addVirtualAlias(II, *BaseID);
+    // Whether or not the arg resolved, the call has no PEA escape effect.
+    return true;
+  }
+  default:
+    return false;
+  }
+}
+
+bool Analyzer::foldICmpEquality(ICmpInst *ICmp) {
+  // §2.3.11/§2.3.12: equality compare against a virtual pointer folds.
+  // Virtual objects are never null (by construction they track an in-flight
+  // alloc), so `icmp eq virt, null` -> false, `icmp ne virt, null` -> true.
+  // Two virtuals: same ID -> eq=true; different IDs -> eq=false.
+  // Mixed virtual + non-null non-virtual pointer: identity differs -> eq
+  // folds to false.
+  if (!ICmp->isEquality())
+    return false;
+  Value *Op0 = ICmp->getOperand(0);
+  Value *Op1 = ICmp->getOperand(1);
+  auto V0 = jeandle::pea::resolveVirtualRef(Op0, CurrentState, Aliases, DL);
+  auto V1 = jeandle::pea::resolveVirtualRef(Op1, CurrentState, Aliases, DL);
+  bool Op0IsNull = isa<ConstantPointerNull>(Op0);
+  bool Op1IsNull = isa<ConstantPointerNull>(Op1);
+  bool Folded = false;
+  bool EqResult = false;
+  jeandle::ObjectID BaseID = jeandle::InvalidObjectID;
+  if (V0 && Op1IsNull) {
+    Folded = true;
+    EqResult = false;
+    BaseID = *V0;
+  } else if (V1 && Op0IsNull) {
+    Folded = true;
+    EqResult = false;
+    BaseID = *V1;
+  } else if (V0 && V1) {
+    Folded = true;
+    EqResult = (*V0 == *V1);
+    BaseID = *V0;
+  } else if (V0 && !V1 && !Op1IsNull) {
+    // Virtual vs. non-virtual non-null pointer: distinct identity.
+    Folded = true;
+    EqResult = false;
+    BaseID = *V0;
+  } else if (V1 && !V0 && !Op0IsNull) {
+    Folded = true;
+    EqResult = false;
+    BaseID = *V1;
+  }
+  if (!Folded)
+    return false;
+  bool IsEq = (ICmp->getPredicate() == ICmpInst::ICMP_EQ);
+  bool FinalResult = IsEq ? EqResult : !EqResult;
+  Constant *C = ConstantInt::get(ICmp->getType(), FinalResult ? 1 : 0);
+  // Reuse ReplaceLoad: its handler does generic Instruction RAUW + erase,
+  // which is exactly what we need here.
+  auto E = std::make_unique<jeandle::ReplaceLoadEffect>();
+  E->Block = ICmp->getParent();
+  E->Target = ICmp;
+  E->Replacement = C;
+  E->SeqNo = Result.nextSeqNo();
+  E->ObjID = BaseID;
+  Result.addBlockEffect(std::move(E));
+  Aliases.addScalarAlias(ICmp, C);
   return true;
 }
 

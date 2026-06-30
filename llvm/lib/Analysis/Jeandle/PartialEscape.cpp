@@ -54,17 +54,21 @@ static llvm::cl::opt<bool> JeandleTracePEA(
 // VirtualObject
 // ===========================================================================
 
-int VirtualObject::getOrCreateFieldIndex(int64_t Offset, Type *Ty) {
+int VirtualObject::getOrCreateFieldIndex(int64_t Offset, Type *Ty,
+                                         const DataLayout &DL) {
   assert(Ty && "field type must be non-null");
   uint8_t ByteSize = 0;
   bool IsReference = false;
   if (Ty->isPointerTy()) {
-    // Reference field: ptr addrspace(1). We treat reference fields as pointer
-    // sized; the actual byte size depends on target oop size, so we use 8.
+    // Reference field: ptr addrspace(1). Its byte size is the target's Java
+    // heap pointer size (DL.getPointerSize(JavaHeapAddrSpace)) — 8 on the
+    // current 64-bit target, but derived from the DataLayout so a 32-bit or
+    // compressed-oop heap model stays correct rather than hardcoding 8.
     assert(Ty->getPointerAddressSpace() ==
                jeandle::AddrSpace::JavaHeapAddrSpace &&
            "reference field must be in JavaHeapAddrSpace");
-    ByteSize = 8;
+    ByteSize = static_cast<uint8_t>(
+        DL.getPointerSize(jeandle::AddrSpace::JavaHeapAddrSpace));
     IsReference = true;
   } else {
     unsigned Bits = Ty->getPrimitiveSizeInBits();

@@ -3,9 +3,10 @@
 ; Virtual Object[] (array klass 8888, element klass 4444) plus a
 ; virtual instance value whose exact klass (7777) is provably incompatible
 ; with the array's element klass. evalSubtypeRelation returns false
-; (IsSubtype false, areKlassesIncompatible true via Exact=true), and
-; foldArrayStoreCheck marks the array ineligible so the array allocation
-; and the surviving array_store_check call both stay in IR.
+; (IsSubtype false, areKlassesIncompatible true via Exact=true). The check
+; SURVIVES in IR and — per the processJavaOp contract (Graal processNodeInputs
+; on a non-deleted node) — BOTH the array and the virtual value operand
+; materialize, so the surviving array_store_check observes real pointers.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32)
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
@@ -32,7 +33,10 @@ u:
 }
 
 ; CHECK-LABEL: define i1 @test_storecheck_incompat
+; The surviving array_store_check must observe REAL operands — both the
+; array and the (virtual) value materialize, never poison.
 ; CHECK: jeandle.new_array
+; CHECK: jeandle.new_instance
 ; CHECK: jeandle.array_store_check
 
 !java-method-compilation = !{}
