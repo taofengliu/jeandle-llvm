@@ -25,7 +25,9 @@ u:
 ; CHECK-LABEL: define ptr addrspace(1) @test_float_field
 ; CHECK: %[[MAT:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
 ; CHECK: %[[SLOT:[A-Za-z0-9._]+]] = getelementptr inbounds i8, ptr addrspace(1) %[[MAT]], i64 8
-; CHECK: store atomic float 0x40091EB860000000, ptr addrspace(1) %[[SLOT]] unordered
+; The replayed atomic store must carry natural 4-byte alignment for a float
+; (a hardcoded align 1 would be an under-aligned atomic store — illegal).
+; CHECK: store atomic float 0x40091EB860000000, ptr addrspace(1) %[[SLOT]] unordered, align 4
 ; CHECK: ret ptr addrspace(1) %[[MAT]]
 
 !java-method-compilation = !{}

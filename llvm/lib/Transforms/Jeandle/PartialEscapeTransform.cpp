@@ -49,10 +49,13 @@
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/Jeandle/PartialEscape.h"
 #include "llvm/Analysis/Jeandle/PartialEscapeAnalysis.h"
+#include "llvm/Analysis/Jeandle/PartialEscapeUtils.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/IR/EHPersonalities.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstrTypes.h"
@@ -61,6 +64,7 @@
 #include "llvm/IR/Jeandle/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
@@ -71,6 +75,16 @@ static bool eraseAllocation(Instruction *Target) {
   assert(Target && "EliminateAllocation target must be non-null");
 
   if (auto *II = dyn_cast<InvokeInst>(Target)) {
+    // The transform is the last line of defense: dropping the unwind edge is
+    // only sound because the analyzer proved this allocation never observably
+    // escapes, and a Jeandle allocation intrinsic's exception edge handles
+    // OOM only (unobservable — re-thrown identically by the materialized
+    // invoke or, for NeverEscapes, never taken). Assert the analyzer's
+    // NeverEscapes contract so a future misclassification of a side-effecting
+    // invoke as eliminable fails loudly instead of silently miscompiling.
+    assert(jeandle::pea::isJeandleAllocation(II) &&
+           "EliminateAllocation may only drop the unwind edge of a Jeandle "
+           "allocation intrinsic (OOM-only, unobservable throw)");
     BasicBlock *Normal = II->getNormalDest();
     BasicBlock *Unwind = II->getUnwindDest();
     BasicBlock *Parent = II->getParent();
@@ -90,6 +104,11 @@ static bool eraseAllocation(Instruction *Target) {
   }
 
   if (auto *CI = dyn_cast<CallInst>(Target)) {
+    // Same NeverEscapes contract as the invoke branch above (a call-form
+    // allocation has no unwind edge to drop, but the eliminability guarantee
+    // is identical).
+    assert(jeandle::pea::isJeandleAllocation(CI) &&
+           "EliminateAllocation target must be a Jeandle allocation intrinsic");
     if (!CI->use_empty())
       CI->replaceAllUsesWith(PoisonValue::get(CI->getType()));
     CI->eraseFromParent();
@@ -99,31 +118,43 @@ static bool eraseAllocation(Instruction *Target) {
   return false;
 }
 
-// Synthesize a minimal landingpad+resume block at the end of F for use as
-// the unwind destination of a materialization invoke. The frontend always
-// emits the function's personality so this landingpad is well-formed.
-static BasicBlock *createMinimalLandingpadBlock(Function &F) {
+// Synthesize a minimal unwind-destination block at the end of F for use as the
+// unwind destination of a materialization invoke. The frontend always emits the
+// function's personality so this is well-formed. When the materialization site
+// sits inside a Windows-EH funclet (EnclosingPad != null), the unwind dest must
+// itself be a funclet pad nested in the enclosing pad — a plain landingpad is
+// illegal inside a funclet — so we emit `cleanuppad within %EnclosingPad` +
+// `cleanupret ... unwind to caller`. Otherwise emit the landingpad+resume form.
+static BasicBlock *createMinimalUnwindBlock(Function &F,
+                                            FuncletPadInst *EnclosingPad) {
   LLVMContext &Ctx = F.getContext();
   BasicBlock *BB = BasicBlock::Create(Ctx, "pea.unwind", &F);
   IRBuilder<> B(BB);
-  LandingPadInst *LP = B.CreateLandingPad(Type::getInt64Ty(Ctx), 0, "pea.lp");
-  LP->setCleanup(true);
-  B.CreateResume(LP);
+  if (EnclosingPad) {
+    CleanupPadInst *CP = B.CreateCleanupPad(EnclosingPad);
+    B.CreateCleanupRet(CP, /*UnwindBB=*/nullptr); // unwind to caller
+  } else {
+    LandingPadInst *LP = B.CreateLandingPad(Type::getInt64Ty(Ctx), 0, "pea.lp");
+    LP->setCleanup(true);
+    B.CreateResume(LP);
+  }
   return BB;
 }
 
 // Pick (or synthesize) the unwind destination for a materialization invoke.
-// Strategy 1: reuse the original allocation's unwind dest if the original
-// was itself an InvokeInst (it's guaranteed landingpad-compatible because
-// the frontend created it for OOM handling). Strategy 2 (fallback):
-// synthesize a minimal landingpad+resume block.
-static BasicBlock *findOrSynthesizeUnwindDest(Function &F,
-                                              CallBase *OrigAlloc) {
-  if (auto *OrigInv = dyn_cast<InvokeInst>(OrigAlloc)) {
-    if (BasicBlock *UD = OrigInv->getUnwindDest())
-      return UD;
-  }
-  return createMinimalLandingpadBlock(F);
+// Strategy 1: reuse the original allocation's unwind dest if the original was
+// itself an InvokeInst (it's guaranteed landingpad-compatible because the
+// frontend created it for OOM handling) AND the materialization site is not
+// inside a funclet — reuse would be illegal when the new invoke is funclet-
+// nested but the reused dest belongs to a different (or no) funclet. Strategy 2
+// (fallback): synthesize a minimal unwind block, funclet-aware when needed.
+static BasicBlock *findOrSynthesizeUnwindDest(Function &F, CallBase *OrigAlloc,
+                                              FuncletPadInst *EnclosingPad) {
+  if (!EnclosingPad)
+    if (auto *OrigInv = dyn_cast<InvokeInst>(OrigAlloc))
+      if (BasicBlock *UD = OrigInv->getUnwindDest())
+        return UD;
+  return createMinimalUnwindBlock(F, EnclosingPad);
 }
 
 // Emit the materialization sequence for a single Materialize effect: split the
@@ -164,6 +195,7 @@ static void applyMaterialize(Function &F, const jeandle::PEAResult &Result,
 
   Module *M = F.getParent();
   LLVMContext &Ctx = M->getContext();
+  const DataLayout &DL = M->getDataLayout();
 
   // InsertBefore is a WeakTrackingVH. A lower-SeqNo ReplaceLoad/ReplaceCall on
   // the same instruction may have RAUW'd and erased it, nulling the handle;
@@ -199,8 +231,34 @@ static void applyMaterialize(Function &F, const jeandle::PEAResult &Result,
       Type::getInt32Ty(Ctx),
       VObj.isInstance() ? VObj.SizeInBytes : VObj.ArrayLength);
 
-  // Step 3: find or synthesize the unwind destination.
-  BasicBlock *UnwindDest = findOrSynthesizeUnwindDest(F, OrigAlloc);
+  // Step 3: determine the enclosing EH funclet pad of the materialization site
+  // BEFORE the split below — colorEHFunclets requires well-formed IR (every
+  // block terminated), but Step 4 transiently leaves Origin without a
+  // terminator. The new invoke is emitted at the END of `Origin` (Step 6), so
+  // it belongs to ORIGIN's funclet; the split does not change Origin's funclet
+  // membership. A funclet pad sits at the ENTRY of a funclet, never at an
+  // arbitrary block head, so inspecting a post-split block head (the old
+  // MatCont->getFirstNonPHI() approach) both missed real pads and could bind
+  // the wrong one. Gated on a funclet personality so it is a true no-op (no
+  // O(F) coloring) on the current non-funclet target — Jeandle is not on
+  // Windows, but the standing IR-defensiveness rule requires tolerating any
+  // legal IR.
+  FuncletPadInst *EnclosingFuncletPad = nullptr;
+  if (F.hasPersonalityFn() &&
+      isFuncletEHPersonality(classifyEHPersonality(F.getPersonalityFn()))) {
+    DenseMap<BasicBlock *, ColorVector> BlockColors = colorEHFunclets(F);
+    auto CIt = BlockColors.find(Origin);
+    if (CIt != BlockColors.end() && !CIt->second.empty())
+      // A block in a funclet has exactly one color (its funclet's entry pad);
+      // the entry block colors to itself (no pad). front() is that color.
+      EnclosingFuncletPad =
+          dyn_cast<FuncletPadInst>(CIt->second.front()->getFirstNonPHI());
+  }
+
+  // Step 3b: find or synthesize the unwind destination (funclet-aware when the
+  // materialization site is inside a funclet).
+  BasicBlock *UnwindDest =
+      findOrSynthesizeUnwindDest(F, OrigAlloc, EnclosingFuncletPad);
 
   // Step 4: split the origin block at InsertBefore. SplitBlock leaves Origin
   // ending with an unconditional br to the new MatCont block; we drop that
@@ -227,21 +285,17 @@ static void applyMaterialize(Function &F, const jeandle::PEAResult &Result,
           Bundles.emplace_back(std::move(OBD));
     }
   }
-  // Synthesize a funclet bundle when the materialization site sits inside an
-  // EH funclet pad and the recorded source didn't already supply one. Jeandle
-  // is not currently on Windows, but the standing IR-defensiveness rule
-  // requires PEA to tolerate any legal IR.
+  // Attach the funclet bundle computed pre-split (Step 3b) when the
+  // materialization site sits inside an EH funclet and the recorded source
+  // didn't already supply one.
   bool HasFunclet = false;
   for (const OperandBundleDef &BD : Bundles)
     if (BD.getTag() == "funclet") {
       HasFunclet = true;
       break;
     }
-  if (!HasFunclet) {
-    if (auto *Pad = MatCont->getFirstNonPHI())
-      if (auto *FPI = dyn_cast<FuncletPadInst>(Pad))
-        Bundles.emplace_back("funclet", static_cast<Value *>(FPI));
-  }
+  if (!HasFunclet && EnclosingFuncletPad)
+    Bundles.emplace_back("funclet", static_cast<Value *>(EnclosingFuncletPad));
 
   // Step 6: emit the InvokeInst at the end of Origin.
   IRBuilder<> B(Origin);
@@ -302,8 +356,21 @@ static void applyMaterialize(Function &F, const jeandle::PEAResult &Result,
       continue;
     Value *Slot = SB.CreateInBoundsGEP(I8, NewInv, SB.getInt64(FE.Offset),
                                        "pea.matslot");
-    StoreInst *S = SB.CreateAlignedStore(
-        V, Slot, Align(V->getType()->isPointerTy() ? 8 : 1));
+    // Natural alignment = the field type's store size rounded up to a power of
+    // two (ptr addrspace(1) -> heap pointer width, i64/double -> 8, i32/float
+    // -> 4, i16 -> 2, i8 -> 1). The replayed stores are atomic-unordered, and
+    // atomic accesses MUST be naturally aligned (an under-aligned atomic store
+    // lowers to a libcall or is rejected by the backend). Note we deliberately
+    // do NOT use getABITypeAlign: the ABI alignment of a type may legally be
+    // SMALLER than its size (e.g. i64 has ABI align 4 under LLVM's default
+    // datalayout), which is too weak for an atomic. The store size is derived
+    // from the DataLayout, so this stays correct under a future compressed-oop
+    // / 32-bit heap model and matches the frontend's natural-aligned emission
+    // (and VirtualObject::FieldDesc::ByteSize). A hardcoded pointer?8:1 was
+    // both wrong for sub-word primitives and a brittle 8-byte-pointer guess.
+    uint64_t StoreSz = DL.getTypeStoreSize(V->getType()).getFixedValue();
+    Align NaturalAlign(llvm::PowerOf2Ceil(StoreSz ? StoreSz : 1));
+    StoreInst *S = SB.CreateAlignedStore(V, Slot, NaturalAlign);
     // Java heap stores are atomic-unordered (matches jeandle-jdk emission).
     S->setAtomic(AtomicOrdering::Unordered);
   }

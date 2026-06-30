@@ -41,8 +41,9 @@ u2:
 ; CHECK: %[[OUTER:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 67890 to ptr), i32 16)
 ; CHECK-NEXT: to label %{{.*}} unwind label %{{.*}}
 ; The outer's MatCont stores the new inner pointer at offset 8 of the new outer.
+; A reference field is replayed with natural 8-byte (heap pointer width) alignment.
 ; CHECK: %[[SLOT:[A-Za-z0-9._]+]] = getelementptr inbounds i8, ptr addrspace(1) %[[OUTER]], i64 8
-; CHECK: store atomic ptr addrspace(1) %[[INNER]], ptr addrspace(1) %[[SLOT]] unordered
+; CHECK: store atomic ptr addrspace(1) %[[INNER]], ptr addrspace(1) %[[SLOT]] unordered, align 8
 ; CHECK: ret ptr addrspace(1) %[[OUTER]]
 
 !java-method-compilation = !{}
