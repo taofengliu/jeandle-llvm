@@ -755,9 +755,9 @@ private:
   // At every exit block of L, force-materialise still-virtual VOs
   // when the exit successor is an EH-pad block (landingpad / catchpad /
   // cleanuppad), to keep exception handlers from observing a
-  // partially-materialised state. Downstream "deopt-bundle within reach"
-  // detection is deferred because Jeandle currently has no deopt
-  // machinery. Called from processLoop after convergence.
+  // partially-materialised state. TODO: downstream "deopt-bundle within
+  // reach" detection is deferred (Jeandle currently has no deopt machinery).
+  // Called from processLoop after convergence.
   void processLoopExit(Loop *L);
   // SkipGlobalRAUW=true marks the emitted Materialize as IsPerPred, attaching a
   // per-pred placeholder so its OrigAlloc->NewInv mapping is recorded
@@ -1482,7 +1482,7 @@ void Analyzer::MergeProcessor::run() {
     if (Iter >= MaxRetries) {
       // Safety net. Cap reached — bail every VO in the working set so the
       // original IR survives at this merge. This indicates a pathology in the
-      // input (or a bug in the convergence-measure proof).
+      // input.
       LLVM_DEBUG(dbgs() << "PEA: mergeStates retry cap (" << MaxRetries
                         << ") reached at BB '" << BB->getName()
                         << "'; bailing all VOs at merge.\n");
@@ -2165,16 +2165,14 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
       BlockExitData *PredED = exitDataFor(Pred, BB);
       if (AID && PredED && PredED->Virtuals.count(*AID)) {
         Found = *AID;
-        // Case B/C alias the PHI to the object at byte offset 0
-        // (resolveFieldOffset() of a PHI returns 0). That is only sound when
-        // every resolved incoming actually denotes the object at offset 0 --
-        // e.g. OrigAlloc itself, a bitcast, a zero-offset GEP, or a whole-
-        // object Case-B PHI alias. An incoming with a non-zero OR non-constant
-        // byte offset (a GEP-with-offset, including a variable index) would be
-        // miscompiled: a later field access through the PHI reads offset 0
-        // instead of the incoming's offset (reproduced: a load of an all-
-        // derived PHI folded to field[0]). Route such PHIs to Case A, which
-        // materializes per pred and re-derives each incoming at its offset.
+        // A Case-B/C PHI aliases the whole object at byte offset 0
+        // (resolveFieldOffset() of a PHI returns 0), so every incoming must
+        // denote the object at offset 0 -- e.g. OrigAlloc itself, a bitcast, a
+        // zero-offset GEP, or a whole-object Case-B PHI alias. An incoming with
+        // a non-zero OR non-constant byte offset (a GEP-with-offset, including
+        // a variable index) cannot be represented by a whole-object alias, so
+        // we route the PHI to Case A: materialize per pred and re-derive each
+        // incoming at its true offset.
         std::optional<int64_t> FOff = jeandle::pea::resolveFieldOffset(V, DL);
         if (!FOff || *FOff != 0)
           AnyDerived = true;
@@ -4247,7 +4245,7 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
   // (the transform substitutes the live NewInv at apply time via NewAllocFor /
   // MatPerBlock). NOTE: the field-replay value stays OrigAlloc (not the per-pred
   // placeholder) so the per-field dominance check below sees a real, parented
-  // instruction; nested/sibling per-pred field precision is a known limitation.
+  // instruction. TODO: nested/sibling per-pred field precision is not tracked.
   {
     auto FSIt = C.FieldStates.find(ID);
     if (FSIt != C.FieldStates.end()) {
@@ -4401,8 +4399,8 @@ void Analyzer::materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
     // The ONE case that must fall back to the allocation's normal-dest is a
     // loop-body escape of an object allocated OUTSIDE that loop: the
     // materialize would re-execute per iteration, re-allocating a
-    // once-allocated object. Loop-body partial escape (materializedValuePhi at
-    // the loop header) is deferred loop work.
+    // once-allocated object. TODO: loop-body partial escape
+    // (materializedValuePhi at the loop header) is deferred loop work.
     Instruction *EscapeIP = InsertBefore;
     CallBase *Alloc = Result.VirtualObjects[ID]->AllocationCall;
     Loop *EscapeLoop = LI.getLoopFor(EscapeIP->getParent());

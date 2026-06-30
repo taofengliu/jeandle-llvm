@@ -315,8 +315,8 @@ static void applyMaterialize(Function &F, const jeandle::PEAResult &Result,
   // (callee + non-receiver args + bytecode depth). Clone each with the freshly
   // materialized pointer as receiver, after the field stores (object fully
   // initialized before the lock is acquired) and before the escape instruction.
-  // Mechanism note (#13): Graal lowers a fresh MonitorEnterNode carrying the
-  // original MonitorId; Jeandle clones the original callee + BasicLock args,
+  // Graal lowers a fresh MonitorEnterNode carrying the original MonitorId;
+  // Jeandle clones the original callee + BasicLock args,
   // receiver = NewInv — behaviorally equivalent, the LLVM-IR form of the same
   // lock acquisition at the materialize point.
   for (const jeandle::MaterializedLock &ML : E.Locks) {

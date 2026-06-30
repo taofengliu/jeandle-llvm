@@ -275,13 +275,9 @@ public:
   // Graal propagates an ObjectState[] across the CFG inside
   // PartialEscapeBlockState; Jeandle cannot (LLVM's Analysis/Transform split +
   // SSA single-pass walk — see the STATE MODEL comment in
-  // PartialEscapeAnalysis.cpp and docs/Jeandle-PEA-Review.md §3.1), so field
-  // values are tracked in the analyzer-wide FieldStates DenseMap keyed by
-  // (ObjectID, byte-offset). There is deliberately NO entries member here: an
-  // earlier SmallVector<FieldValue,8> Entries was always empty (every
-  // construction passed numEntries=0 and nothing ever wrote real field data into
-  // it) and was removed so it could not masquerade as Graal's authoritative
-  // field storage — a soundness landmine if a future change ever read it.
+  // PartialEscapeAnalysis.cpp), so field values are tracked in the
+  // analyzer-wide FieldStates DenseMap keyed by (ObjectID, byte-offset), and
+  // ObjectState intentionally carries no field-storage member.
   // Copy/move/assign/dtor are implicitly generated: ObjectState is a plain bag
   // of value members, so PEABlockState's array-level copy-on-write (which
   // deep-copies every slot) needs no per-slot sharing annotation here.
@@ -478,9 +474,9 @@ public:
   virtual ~Effect() = default;
 
   // Graal isCfgKill(): drives the two-pass apply (non-cfgKill first across all
-  // blocks, cfgKill second). True ONLY for EliminateAllocation (reproduces the
-  // prior Pass-1/Pass-2 split and maps to Graal's deleteNode(WithExceptionNode)
-  // / killIfBranch / replaceWithSink). NOTE this is NOT the same as
+  // blocks, cfgKill second). True ONLY for EliminateAllocation (maps to Graal's
+  // deleteNode(WithExceptionNode) / killIfBranch / replaceWithSink). NOTE this
+  // is NOT the same as
   // "structurally rewrites the CFG": Materialize (splitBasicBlock) and
   // CreatePHI (PHI insertion) DO rewrite control flow but run in the first
   // pass — they are not cfg-kill in Graal's apply-ordering sense.
