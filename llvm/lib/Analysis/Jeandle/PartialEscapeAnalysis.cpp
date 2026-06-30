@@ -346,7 +346,8 @@ private:
   // equivalent information across the analyzer-wide maps declared below, each
   // keyed by ObjectID:
   //   CurrentState (PEABlockState)   <-> the live PartialEscapeBlockState
-  //   FieldStates[ID][offset]        <-> ObjectState.entries (field values)
+  //   FieldStates[ID][offset]        <-> Graal ObjectState.entries (Jeandle's
+  //                                    ObjectState carries NO field state)
   //   LockCounts[ID] / LiveLockEnters[ID]  <-> ObjectState.locks (lock stack)
   //   Materialized (DenseSet) / MaterializedValues[ID]  <->
   //                                    ObjectState's materialized flag + value
@@ -366,9 +367,11 @@ private:
   // the end of the block.
   jeandle::PEABlockState CurrentState;
 
-  // Per-object field state: ObjectID -> (offset -> FieldValue). Decoupled from
-  // ObjectState::Entries because field discovery is lazy and we don't want to
-  // keep VirtualObject::Fields and ObjectState::Entries in lock step.
+  // Per-object field state: ObjectID -> (offset -> FieldValue). This — not the
+  // (field-less) ObjectState — is Jeandle's counterpart to Graal's
+  // ObjectState.entries. Field discovery is lazy, so this map is deliberately
+  // kept decoupled from VirtualObject::Fields (the two are not kept in lock
+  // step).
   // Both VirtualObject::Fields and this map are path-dependent: they record
   // only offsets that some store/load actually touched, never the declared
   // field layout. An offset absent here means "Java default" (zero/null), not
@@ -1153,13 +1156,13 @@ void Analyzer::inheritFromExit(const BlockExitData &Exit) {
   for (jeandle::ObjectID ID : Exit.Virtuals) {
     if (!Eligible.lookup(ID))
       continue;
-    CurrentState.addObject(ID, jeandle::ObjectState(/*numEntries=*/0));
+    CurrentState.addObject(ID, jeandle::ObjectState());
   }
   for (jeandle::ObjectID ID : Exit.Materialized) {
     if (!Eligible.lookup(ID))
       continue;
     jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
-    jeandle::ObjectState OS(0);
+    jeandle::ObjectState OS;
     // Prefer the snapshot's MaterializedValues entry (e.g. a merge-block
     // PHI synthesized by an earlier mergeStates) over the OrigAlloc fallback.
     Value *MV = nullptr;
@@ -1626,7 +1629,7 @@ bool Analyzer::MergeProcessor::mergeObjectState(jeandle::ObjectID ID) {
     bool IsPerPredPlaceholder =
         AllSame && Preds.size() > 1 && Unique == VObj.AllocationCall;
     if (AllSame && !IsPerPredPlaceholder) {
-      jeandle::ObjectState OS(0);
+      jeandle::ObjectState OS;
       OS.escape(Unique);
       CurrentState.addObject(ID, std::move(OS));
       Materialized.insert(ID);
@@ -1785,7 +1788,7 @@ bool Analyzer::MergeProcessor::materializeAndBuildPhi(jeandle::ObjectID ID) {
   PE->RAUWOrigToPHI = true;
   MergeEffects.add(std::move(PE));
 
-  jeandle::ObjectState OS(0);
+  jeandle::ObjectState OS;
   OS.escape(Phi);
   CurrentState.addObject(ID, std::move(OS));
   Materialized.insert(ID);
@@ -2052,7 +2055,7 @@ bool Analyzer::MergeProcessor::mergeFieldStates(jeandle::ObjectID ID) {
   MergeEffects.addAll(PendingPhiEffects);
 
   // Case B: object stays virtual at BB entry with the merged field state.
-  CurrentState.addObject(ID, jeandle::ObjectState(/*numEntries=*/0));
+  CurrentState.addObject(ID, jeandle::ObjectState());
   if (!Merged.empty())
     FieldStates[ID] = std::move(Merged);
   if (RefLC != 0) {
@@ -2705,7 +2708,7 @@ bool Analyzer::synthesizeCaseC(
   // MergeProcessor's MergeEffects for a merge, PendingMergePhis[BB] for an
   // entry/single-pred path). They are assigned SeqNos at drain time.
   Out.addAll(PendingPhiEffects);
-  CurrentState.addObject(NewID, jeandle::ObjectState(/*numEntries=*/0));
+  CurrentState.addObject(NewID, jeandle::ObjectState());
   Eligible[NewID] = true;
   if (!Merged.empty())
     FieldStates[NewID] = std::move(Merged);
@@ -2955,7 +2958,7 @@ void Analyzer::processInstruction(Instruction *I) {
 // Allocation virtualization. Graal correspondence:
 // VirtualizerToolImpl.createVirtualObject (VirtualizerToolImpl.java:345-369) —
 // build the VirtualObject (VirtualInstanceNode/VirtualArrayNode in Graal), give
-// it an ObjectState with default entries + the lock list, add the virtual alias
+// it an ObjectState (presence marker + lock list), add the virtual alias
 // (virtual <-> itself), and record the EliminateAllocation effect. Jeandle's
 // AllocSiteToVO cache (ObjectIDs stable across loop-fixpoint iterations) and
 // VMCallbacks gates (HasFinalizer / CanVirtualize) are Jeandle-specific
@@ -2998,7 +3001,7 @@ void Analyzer::processAllocation(CallBase *CB) {
     if (!Aliases.getVirtualAlias(CB))
       Aliases.addVirtualAlias(CB, ID);
     if (!CurrentState.hasObjectState(ID))
-      CurrentState.addObject(ID, jeandle::ObjectState(/*numEntries=*/0));
+      CurrentState.addObject(ID, jeandle::ObjectState());
     // Re-emit the EliminateAllocation effect. The pre-iter snapshot has
     // wiped BlockEffects[CB->getParent()] of this iteration's prior copy,
     // and addBlockEffect doesn't dedup, so this is exactly the right place.
@@ -3122,15 +3125,15 @@ void Analyzer::processAllocation(CallBase *CB) {
   //   - instead of deleting the node (Graal effects.deleteNode) an
   //     EliminateAllocation effect is emitted, applied by the transform later;
   //   - the per-field FieldValue tracking lives in the analyzer-side
-  //     FieldStates map (decoupled from ObjectState::Entries) — see the class
-  //     comment.
+  //     FieldStates map (Jeandle's counterpart to Graal ObjectState.entries;
+  //     the on-VO ObjectState carries no field state) — see the class comment.
   jeandle::ObjectID ID = Result.createVirtualObject(std::move(VO)); // :354-359
   AllocSiteToVO[CB] = ID; // Jeandle: stable id per site (loop fixpoint).
   Aliases.addVirtualAlias(CB, ID);                 // addVirtualAlias :361
-  // Register a Virtual ObjectState with zero entries (addObject :360).
-  // resolveVirtualRef only needs the slot present + Kind == Virtual; the
-  // per-field FieldValue tracking lives in FieldStates (see class comment).
-  CurrentState.addObject(ID, jeandle::ObjectState(/*numEntries=*/0));
+  // Register a Virtual ObjectState — a presence marker carrying only Kind ==
+  // Virtual (addObject :360). resolveVirtualRef only needs the slot present;
+  // the per-field FieldValue tracking lives in FieldStates (see class comment).
+  CurrentState.addObject(ID, jeandle::ObjectState());
   Eligible[ID] = true;
 
   // replaceWithVirtual analog (Graal effects.deleteNode :362). Deferred: emit

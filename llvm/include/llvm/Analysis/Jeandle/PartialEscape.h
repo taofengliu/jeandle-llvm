@@ -256,7 +256,6 @@ public:
 
 private:
   StateKind Kind = Virtual;
-  SmallVector<FieldValue, 8> Entries;
   // Per-VO live monitor stack: each element is a MonitorIdRef identifying
   // the (enter-call, bytecode-depth) pair pushed by a folded monitorenter
   // on this VO whose matching monitorexit hasn't yet been seen on this
@@ -270,8 +269,19 @@ private:
   Value *MaterializedValue = nullptr;
 
 public:
-  explicit ObjectState(unsigned numEntries)
-      : Entries(numEntries, FieldValue::unknown()) {}
+  // ObjectState carries ONLY the per-VO virtual/materialized flag, the live lock
+  // stack, and (once materialized) the materialized pointer. Per-FIELD state
+  // does NOT live here. Graal's ObjectState.entries is authoritative because
+  // Graal propagates an ObjectState[] across the CFG inside
+  // PartialEscapeBlockState; Jeandle cannot (LLVM's Analysis/Transform split +
+  // SSA single-pass walk — see the STATE MODEL comment in
+  // PartialEscapeAnalysis.cpp and docs/Jeandle-PEA-Review.md §3.1), so field
+  // values are tracked in the analyzer-wide FieldStates DenseMap keyed by
+  // (ObjectID, byte-offset). There is deliberately NO entries member here: an
+  // earlier SmallVector<FieldValue,8> Entries was always empty (every
+  // construction passed numEntries=0 and nothing ever wrote real field data into
+  // it) and was removed so it could not masquerade as Graal's authoritative
+  // field storage — a soundness landmine if a future change ever read it.
   // Copy/move/assign/dtor are implicitly generated: ObjectState is a plain bag
   // of value members, so PEABlockState's array-level copy-on-write (which
   // deep-copies every slot) needs no per-slot sharing annotation here.
@@ -312,7 +322,6 @@ public:
     assert(Ptr);
     Kind = Materialized;
     MaterializedValue = Ptr;
-    Entries.clear();
     // A materialized object has no virtual lock state — any outstanding
     // monitorenters are captured for re-emit by the caller before flipping
     // the state. Clear defensively so any stale element does not survive
