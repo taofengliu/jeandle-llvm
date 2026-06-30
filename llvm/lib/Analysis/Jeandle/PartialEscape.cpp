@@ -580,6 +580,9 @@ void Effect::dump(raw_ostream &OS) const {
   case Kind::CreatePHI:
     OS << "CreatePHI";
     break;
+  case Kind::RewritePhiIncoming:
+    OS << "RewritePhiIncoming";
+    break;
   }
   if (ObjID != InvalidObjectID)
     OS << " [VO=" << static_cast<unsigned>(ObjID) << "]";

@@ -2151,6 +2151,8 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
     // in any block is visible here.
     SmallVector<std::optional<jeandle::ObjectID>, 4> InIDs;
     bool AnyVirtual = false;
+    bool AnyDerived = false; // a resolved incoming with a non-zero/non-constant
+                             // byte offset (a GEP-with-offset, not the object)
     InIDs.reserve(Phi.getNumIncomingValues());
     for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I) {
       BasicBlock *Pred = Phi.getIncomingBlock(I);
@@ -2158,8 +2160,22 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
       std::optional<jeandle::ObjectID> Found;
       auto AID = Aliases.getVirtualAlias(V);
       BlockExitData *PredED = exitDataFor(Pred, BB);
-      if (AID && PredED && PredED->Virtuals.count(*AID))
+      if (AID && PredED && PredED->Virtuals.count(*AID)) {
         Found = *AID;
+        // Case B/C alias the PHI to the object at byte offset 0
+        // (resolveFieldOffset() of a PHI returns 0). That is only sound when
+        // every resolved incoming actually denotes the object at offset 0 --
+        // e.g. OrigAlloc itself, a bitcast, a zero-offset GEP, or a whole-
+        // object Case-B PHI alias. An incoming with a non-zero OR non-constant
+        // byte offset (a GEP-with-offset, including a variable index) would be
+        // miscompiled: a later field access through the PHI reads offset 0
+        // instead of the incoming's offset (reproduced: a load of an all-
+        // derived PHI folded to field[0]). Route such PHIs to Case A, which
+        // materializes per pred and re-derives each incoming at its offset.
+        std::optional<int64_t> FOff = jeandle::pea::resolveFieldOffset(V, DL);
+        if (!FOff || *FOff != 0)
+          AnyDerived = true;
+      }
       InIDs.push_back(Found);
       if (Found)
         AnyVirtual = true;
@@ -2184,7 +2200,7 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
       }
     }
 
-    if (AllSame && First) {
+    if (AllSame && First && !AnyDerived) {
       const jeandle::ObjectState *OS =
           CurrentState.getObjectStateOptional(*First);
       if (OS && OS->isVirtual()) {
@@ -2208,7 +2224,7 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
     // checks) we fall through to Case A.
     bool TryCaseC = (First /* at least one virtual */) &&
                     !AllSame; // Case B already returned if AllSame succeeded.
-    if (TryCaseC) {
+    if (TryCaseC && !AnyDerived) {
       bool EveryInputVirtual = true;
       for (auto &O : InIDs) {
         if (!O) {
@@ -2237,6 +2253,46 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
       }
       materializeAtPredFromExitInfo(*InIDs[I], Pred, *PredED,
                                     /*SkipGlobalRAUW=*/false, MatReason::Phi);
+
+      // Re-derive a DERIVED carry (GEP/bitcast of the object) at the back-edge
+      // so the PHI carries a value computed over the freshly-materialized base,
+      // not the original body GEP — which no materialization point dominates
+      // (it lives before the latch), so the point-sensitive resolution sub-pass
+      // cannot rewrite its OrigAlloc operand and it would leak poison. This
+      // mirrors Graal getAliasAndResolve + setPhiInput (re-derive the incoming
+      // from the per-pred materialized object state at the merge), extended to
+      // replay the byte offset (LLVM derived pointers have no Graal analog).
+      // Object-carry (V == OrigAlloc) is left to the resolution sub-pass.
+      jeandle::ObjectID OID = *InIDs[I];
+      if (!Eligible.lookup(OID))
+        continue; // a prior/sibling incoming already made this object ineligible.
+      Value *V = Phi.getIncomingValue(I);
+      Value *OrigAlloc = Result.VirtualObjects[OID]->AllocationCall;
+      if (V == OrigAlloc)
+        continue; // object-carry: resolution sub-pass rewrites this OrigAlloc use.
+      int64_t Off = 0;
+      bool NonConst = false;
+      Value *Base =
+          jeandle::pea::stripPointerCastsAndOffsets(V, DL, &Off, &NonConst);
+      if (Base != OrigAlloc || NonConst) {
+        // Variable-index GEP, or a non-structural alias chain (select/load/PHI
+        // embedded in the derivation): cannot soundly re-derive a constant
+        // byte offset at the latch. Sound fallback — keep the object real.
+        // commit()->dropEffectsFor(ID) purges the materialize above (and this
+        // would-be effect by ObjID), so the original allocation survives and no
+        // poison leaks.
+        markIneligible(OID);
+        continue;
+      }
+      auto RE = std::make_unique<jeandle::RewritePhiIncomingEffect>();
+      RE->Block = Pred; // same bucket as the per-pred Materialize (e.g. latch)
+      RE->SeqNo = Result.nextSeqNo(); // strictly after that Materialize's SeqNo
+      RE->ObjID = OID; // so dropEffectsFor purges it if the object turns ineligible
+      RE->Phi = &Phi;
+      RE->Pred = Pred;
+      RE->PerPredPlaceholder = getOrCreatePerPredMatPlaceholder(Pred, OID);
+      RE->ByteOffset = Off;
+      Result.addBlockEffect(std::move(RE));
     }
   }
 }
@@ -5065,17 +5121,31 @@ void Analyzer::processLoop(Loop *L) {
     // Body walk in REGULAR mode (single pass — no fixpoint, since there is
     // no way to verify convergence at a non-existent preheader). Loop-local
     // allocs that don't outlive a single iteration are still virtualised.
-    //
-    // Soundness for cross-back-edge allocs: explicit IR PHIs at the
-    // header with a back-edge virtual incoming go through Case A /
-    // ineligible (no Case-B match because BlockExits[back-edge] hasn't
-    // been populated when processBlock(header) runs); the original
-    // alloc + stores survive. Loop-local allocs that NEVER cross a
-    // back-edge are correctly folded (the body's single pass sees them
-    // virtual at creation and they don't escape, so no Materialize
-    // effect is emitted).
     llvm::SmallPtrSet<BasicBlock *, 16> _OuterDone;
     processLoopBodyOnePass(L, loopBlocksInRPO(L), _OuterDone);
+
+    // Post-body merge (Graal doMergeWithoutDead run AFTER the body,
+    // EffectsClosure.java:461-466). The in-pass header merge (header first in
+    // RPO) runs before any loop-body alloc is virtualized, so it cannot resolve
+    // an object allocated INSIDE the loop and carried across the back-edge via
+    // a header pointer-phi — the back-edge slot is nullopt and the PHI is
+    // skipped, which would misclassify the alloc NeverEscapes and RAUW it to
+    // poison. Re-running mergeStates(Header) now that the latch BlockExits is
+    // populated lets processBlockPhis Case A fire and materialize such a
+    // carried object at the back-edge pred's terminator (Graal
+    // ensureMaterialized at predecessor.getEndNode(),
+    // PartialEscapeClosure.java:996/1504), matching the fixpoint path's
+    // post-body merge. This is a one-shot merge (no convergence loop here), so
+    // its effects simply persist to commit().
+    resetPerBlockState();
+    mergeStates(Header);
+    PendingMergePhis[Header].clear();
+
+    // Force-materialise at exits that flow into EH pads, matching the fixpoint
+    // path (processLoopExit at :5220 / PartialEscapeClosure.java:737-799), so
+    // exception handlers never see partially-materialised loop-internal
+    // virtuals.
+    processLoopExit(L);
     return;
   }
 
@@ -5183,24 +5253,36 @@ void Analyzer::processLoop(Loop *L) {
       // meaningfully and the loop converge in a single body pass (paper §5.2.5
       // / Graal's structure).
       //
-      // Re-run mergeStates(Header) — now reading the populated latch BlockExits
-      // — in an isolated takeLoopSnapshot/restoreLoopSnapshot so this
-      // comparison-only merge's transient outputs are discarded. Only its
-      // monotone latch ExitInfo flips persist (restoreLoopSnapshot deliberately
-      // preserves loop-block BlockExits), which the next iteration's real
-      // in-pass merge re-derives identically. PendingMergePhis[Header] is empty
-      // here (processBlock drained it at end-of-block), so clearing removes
-      // only what this re-run added. B' is correct by construction (it IS the
-      // real merge); the IR test suite guards against any snapshot/restore leak.
+      // This merge runs AFTER the body (Graal runs the LoopBegin merge after
+      // the body too, EffectsClosure.java:461-466), so it is the ONLY place
+      // that can resolve an object allocated INSIDE the loop body and carried
+      // across the back-edge via a header pointer-phi: the in-pass header merge
+      // (header first in RPO) runs before that alloc is virtualized, so its
+      // alias is not registered and the back-edge slot resolves to nullopt.
+      // Here the latch BlockExits is populated and the alias is known, so
+      // processBlockPhis Case A fires and materializes the carried object at
+      // the back-edge pred's terminator (Graal ensureMaterialized at
+      // predecessor.getEndNode(), PartialEscapeClosure.java:996/1504).
+      //
+      // The merge's effects are KEPT (Graal keeps blockEffects.get(predecessor)
+      // on convergence, EffectsClosure.java:472-474) — no snapshot/restore
+      // discard. A non-converged iteration's effects are cleared by the next
+      // iteration's restoreLoopSnapshot(Pre) at the top of the loop (it
+      // restores per-loop-block BlockEffects/MaterializedAtPred). The per-pred
+      // materialized value is stable across iterations
+      // (getOrCreatePerPredMatPlaceholder, cached per {PH,ID} in
+      // OwnedMatPlaceholders which restoreLoopSnapshot does not pop), so B' is
+      // stable and the fixpoint converges rather than escalating to
+      // MATERIALIZE_ALL. PendingMergePhis[Header].clear() drops the re-run's
+      // CreatePHI effects (redundant with the in-pass merge's already-drained
+      // effects for before-loop objects; Case A records its materialize in
+      // BlockEffects[latch], not PendingMergePhis).
       {
-        LoopSnapshot PostSnap;
-        takeLoopSnapshot(L, LoopBlocks, PostSnap);
         resetPerBlockState();
         mergeStates(Header);
         NewMergedState = BlockExitData{};
         snapshotExitStateInto(NewMergedState); // B'
         PendingMergePhis[Header].clear();
-        restoreLoopSnapshot(LoopBlocks, PostSnap);
       }
       // B' vs B (Graal EClosure:472). No iteration gate: with the post-body
       // merge, iteration 0 already has a true B' to compare against B := A.

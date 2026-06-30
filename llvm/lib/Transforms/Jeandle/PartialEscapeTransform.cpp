@@ -548,6 +548,59 @@ void jeandle::CreatePHIEffect::apply(jeandle::TransformContext &Ctx) {
   Ctx.Changed = true;
 }
 
+void jeandle::RewritePhiIncomingEffect::apply(jeandle::TransformContext &Ctx) {
+  // Resolve this pred's freshly-materialized base (NewInv) from the per-pred
+  // placeholder that the Materialize effect recorded into MatPerBlock.
+  Value *NewInv = nullptr;
+  auto It = Ctx.MatPerBlock.find({Pred, PerPredPlaceholder});
+  if (It != Ctx.MatPerBlock.end())
+    NewInv = It->second;
+  else {
+    auto It2 = Ctx.NewAllocFor.find(PerPredPlaceholder);
+    if (It2 != Ctx.NewAllocFor.end())
+      NewInv = It2->second;
+  }
+  if (!NewInv)
+    return; // the Materialize was dropped (object ineligible) — nothing to rewire.
+
+  // Resolve the live merge-pred (e.g. latch -> ... -> MatCont) through the
+  // block-split rename chain, mirroring CreatePHIEffect::apply.
+  BasicBlock *LivePred = Pred;
+  while (true) {
+    auto R = Ctx.BlockRename.find(LivePred);
+    if (R == Ctx.BlockRename.end())
+      break;
+    LivePred = R->second;
+  }
+
+  // Re-derive the carried value over the materialized base at the
+  // materialization point. NewInv is the materialization invoke; its result
+  // dominates the normal-dest (MatCont), so the GEP goes there (same placement
+  // as the field-replay slots in applyMaterialize). Offset 0 (bitcast/identity
+  // carry) reuses NewInv directly.
+  Value *Rederived = NewInv;
+  if (ByteOffset != 0) {
+    BasicBlock *MatCont;
+    if (auto *II = dyn_cast<InvokeInst>(NewInv))
+      MatCont = II->getNormalDest();
+    else
+      MatCont = cast<Instruction>(NewInv)->getParent();
+    IRBuilder<> B(MatCont, MatCont->getFirstInsertionPt());
+    Rederived = B.CreateInBoundsGEP(B.getInt8Ty(), NewInv,
+                                    B.getInt64(ByteOffset), "pea.matoff");
+  }
+
+  // Rewire the carrying PHI's incoming for this predecessor. splitBasicBlock
+  // in applyMaterialize already updated the incoming block to the post-split
+  // MatCont; LivePred is resolved through BlockRename as a belt-and-suspenders.
+  for (unsigned i = 0; i < Phi->getNumIncomingValues(); ++i)
+    if (Phi->getIncomingBlock(i) == LivePred) {
+      Phi->setIncomingValue(i, Rederived);
+      break;
+    }
+  Ctx.Changed = true;
+}
+
 // Apply every effect where isCfgKill()==CfgKills, in SeqNo order (Jeandle's
 // substitute for Graal's list-order — see Effect::SeqNo). Pass 1 calls this
 // with CfgKills=false (every effect except EliminateAllocation); Pass 2 with

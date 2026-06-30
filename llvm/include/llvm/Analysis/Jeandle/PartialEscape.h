@@ -449,6 +449,7 @@ public:
     EliminateAllocation,
     Materialize,
     CreatePHI,
+    RewritePhiIncoming,
   };
 
   // --- common fields (read by commit/dropEffectsFor/the transform) ---
@@ -628,6 +629,34 @@ public:
   void apply(TransformContext &Ctx) override;
   std::unique_ptr<Effect> clone() const override {
     return std::make_unique<CreatePHIEffect>(*this);
+  }
+};
+
+// Re-derive a loop/merge-carried DERIVED pointer (GEP/bitcast of a virtual
+// object) at the per-predecessor materialization point and rewire the carrying
+// PHI's incoming to it. This is Jeandle's extension of Graal
+// getAliasAndResolve + setPhiInput (PartialEscapeClosure.java:1575-1584 /
+// :1511) to LLVM derived pointers, which have no Graal analog: Graal only ever
+// carries object-identity aliases, so its merge re-derivation hands back the
+// materialized object directly; LLVM can carry a field address (a GEP with a
+// byte offset), so the re-derivation must replay that offset over the freshly-
+// materialized base. Non-cfgKill (Pass 1); must sort strictly after the per-pred
+// Materialize in the same block bucket so NewInv is recorded before apply.
+class RewritePhiIncomingEffect : public Effect {
+public:
+  PHINode *Phi = nullptr;              // the existing carrying PHI (already in IR)
+  BasicBlock *Pred = nullptr;          // analyzer-recorded predecessor (e.g. latch)
+  Value *PerPredPlaceholder = nullptr; // resolves to this pred's NewInv at apply
+  int64_t ByteOffset = 0;   // constant byte offset of the carry from OrigAlloc
+                            // (0 = bitcast/identity -> reuse NewInv directly)
+
+  Kind getKind() const override { return Kind::RewritePhiIncoming; }
+  static bool classof(const Effect *E) {
+    return E->getKind() == Kind::RewritePhiIncoming;
+  }
+  void apply(TransformContext &Ctx) override;
+  std::unique_ptr<Effect> clone() const override {
+    return std::make_unique<RewritePhiIncomingEffect>(*this);
   }
 };
 
