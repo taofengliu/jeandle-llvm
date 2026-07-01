@@ -594,6 +594,25 @@ void jeandle::CreatePHIEffect::apply(jeandle::TransformContext &Ctx) {
           V = It2->second;
       }
     }
+    // An unresolved per-pred placeholder reaches here when this pred's per-pred
+    // Materialize was dropped — most commonly because the object is already
+    // globally materialized (materialize-before-loops), so the redundant
+    // per-pred materialize is elided and no MatPerBlock/NewAllocFor entry is
+    // recorded. Leaving the placeholder as the incoming would plant a dangling,
+    // never-defined value into the PHI (a latent verifier fault; surfaced when a
+    // downstream use — e.g. the §1.4 deepest-def resolution — keeps the PHI
+    // alive). Detect the placeholder precisely via the analyzer's placeholder
+    // set (NOT by "unparented PHINode": a loop field-PHI incoming can also be
+    // momentarily unparented and must be left as-is), then fall back to the
+    // global materialization, which exists precisely because the object is
+    // materialized; otherwise the original allocation (valid IR that the
+    // resolution sub-pass / Pass 2 then handles).
+    if (Ctx.Result.PerPredMatPlaceholders.count(V) &&
+        ObjID != jeandle::InvalidObjectID) {
+      Value *OrigAlloc = Ctx.Result.VirtualObjects[ObjID]->AllocationCall;
+      auto ItG = Ctx.NewAllocFor.find(OrigAlloc);
+      V = (ItG != Ctx.NewAllocFor.end()) ? ItG->second : OrigAlloc;
+    }
     // Resolve the live pred BB through BlockRename.
     BasicBlock *LivePred = Pred;
     while (true) {
@@ -685,6 +704,29 @@ void jeandle::EffectList::apply(jeandle::TransformContext &Ctx, bool CfgKills) {
       E->apply(Ctx);
 }
 
+// Of two definitions that BOTH already dominate a target use, return true when
+// Candidate is the closer (deeper / later) one. The dominating defs of a single
+// use form a totally-ordered dominator chain (PEA uniqueness invariant), so the
+// deepest is well-defined and unique. Iterating keeps the deepest: a new
+// Candidate wins iff the current best dominates it (Candidate is strictly
+// deeper, or later in the same block). This is Jeandle's explicit form of
+// Graal's per-point alias resolution — Graal replaces the allocation node in
+// place so each use automatically sees the most-recent materialized value
+// (getAlias/getAliasAndResolve, PartialEscapeClosure.java ~1563-1584; the
+// aliases map is reset per node, EffectsClosure.java:279). LLVM's Analysis/
+// Transform split forbids mutating IR during analysis, so OrigAlloc persists as
+// a real invoke and Jeandle must instead pick the most-recent materialized def
+// among the surviving defs.
+static bool isCloserDominatingDef(Value *Candidate, Value *Current,
+                                  const DominatorTree &DT) {
+  if (!Current || Candidate == Current)
+    return !Current;
+  auto *CandidateI = dyn_cast<Instruction>(Candidate);
+  if (!CandidateI)
+    return false;
+  return DT.dominates(Current, CandidateI);
+}
+
 // Point-sensitive resolution of original-allocation uses — Jeandle's analog of
 // Graal's per-point alias resolution (the `aliases` map / getAlias /
 // getAliasAndResolve, which Graal maintains because it REPLACES the allocation
@@ -696,11 +738,12 @@ void jeandle::EffectList::apply(jeandle::TransformContext &Ctx, bool CfgKills) {
 //
 // Run AFTER Pass 1 (which has placed every materialize NewInv and merge PHI and
 // settled the CFG via block splits), so a freshly-computed DominatorTree is
-// valid. For each OrigAlloc use: pick the unique def in Defs[OrigAlloc] that
-// dominates it. PEA guarantees uniqueness per use-path — an arm's NewInv
-// dominates only that arm's pre-merge uses; a merge PHI dominates only
-// post-merge uses (no single arm dominates a real multi-pred merge). Deopt-
-// bundle operands are scrubbed to a typed null (PEA stays deopt-agnostic).
+// valid. For each OrigAlloc use, pick the CLOSEST (deepest) def in
+// Defs[OrigAlloc] that dominates it. Normally only one def dominates a use, but
+// a later materialization or merge PHI may shadow an earlier dominating def; in
+// that case the deeper/later def is the SSA value that represents this point
+// (§1.4). Deopt-bundle operands are scrubbed to a typed null (PEA stays
+// deopt-agnostic).
 static void resolveMaterializedUses(
     Function &F, DenseMap<Value *, SmallVector<Value *, 4>> &Defs) {
   if (Defs.empty())
@@ -715,13 +758,29 @@ static void resolveMaterializedUses(
     Value *NullVO =
         ConstantPointerNull::get(cast<PointerType>(OrigAlloc->getType()));
     for (Use &U : llvm::make_early_inc_range(OrigAlloc->uses())) {
-      // Find the unique dominating definition.
+      // Pick the NEAREST (deepest) dominating definition, not merely the first
+      // in DefList order. DefList insertion order = Pass-1 RPO apply order, so a
+      // loop-header materialized-ptr PHI is inserted before a loop-body NewInv;
+      // when both dominate the same use, "first" would wrongly thread the header
+      // PHI (the previous iteration's merged pointer). Iterating to the deepest
+      // converges on the unique dominator-tree leaf among the dominating defs
+      // (§1.4).
       Value *Dom = nullptr;
-      for (Value *Def : DefList)
-        if (DT.dominates(Def, U)) {
+      for (Value *Def : DefList) {
+        if (!DT.dominates(Def, U))
+          continue;
+#ifndef NDEBUG
+        // PEA invariant: dominating defs of one use form a dominator chain. If
+        // two were ever incomparable, "deepest" would be order-dependent — the
+        // exact bug class §1.4 guards. Cheap to verify; piggybacks on the loop.
+        if (Dom && Def != Dom)
+          assert((DT.dominates(cast<Instruction>(Dom), cast<Instruction>(Def)) ||
+                  DT.dominates(cast<Instruction>(Def), cast<Instruction>(Dom))) &&
+                 "PEA: dominating defs of a use must be totally ordered");
+#endif
+        if (isCloserDominatingDef(Def, Dom, DT))
           Dom = Def;
-          break;
-        }
+      }
       if (!Dom)
         continue; // no dominating def; leave for Pass 2's poison RAUW.
       // Scrub deopt-bundle operands to a typed null rather than threading a

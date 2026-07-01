@@ -1274,6 +1274,7 @@ Value *Analyzer::getOrCreatePerPredMatPlaceholder(BasicBlock *PH,
   Result.OwnedMatPlaceholders.emplace_back(Placeholder);
   PerPredMatPlaceholderCache[Key] = Placeholder;
   PerPredMatPlaceholders.insert(Placeholder);
+  Result.PerPredMatPlaceholders.insert(Placeholder);
   return Placeholder;
 }
 

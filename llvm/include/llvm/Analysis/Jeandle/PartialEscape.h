@@ -823,6 +823,13 @@ public:
   // if a placeholder is ever erased. See Effect::PerPredPlaceholder.
   SmallVector<WeakTrackingVH, 4> OwnedMatPlaceholders;
 
+  // Membership view of OwnedMatPlaceholders for O(1) "is this Value a per-pred
+  // placeholder?" queries from the transform (CreatePHIEffect must distinguish
+  // an unresolved per-pred placeholder — to be resolved/fallen-back — from a
+  // legitimately-unparented loop field-PHI incoming, which must be left as-is).
+  // Populated alongside OwnedMatPlaceholders in getOrCreatePerPredMatPlaceholder.
+  DenseSet<Value *> PerPredMatPlaceholders;
+
   // Parented LLVM PHIs the transform should RAUW to poison + erase after
   // the main Pass-2 EliminateAllocation sweep. These are Case-B aliases on
   // a virtual that ended up NeverEscapes: the PHI was registered as an
