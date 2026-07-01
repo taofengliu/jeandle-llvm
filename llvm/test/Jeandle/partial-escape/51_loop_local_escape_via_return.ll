@@ -1,12 +1,12 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA: a loop body allocates an object, stores a loop-invariant arg into
-; one field, then conditionally returns the alloc on one branch (= escape)
-; or continues on the other. Because the field-store source dominates the
-; alloc's SafeIP (it's a function arg), materializeAt's dominance check
-; passes and a materialization invoke is emitted at the alloc site. The
-; return path observes the materialized pointer; the continue path is
-; unaffected by the materialization beyond seeing the new alloc value.
+; Loop-body partial escape (Case B): a loop-body allocation is stored into,
+; then conditionally returned on one branch (= escape via a path that EXITS
+; the loop) or continues on the other. The escape block is not a loop block
+; (it returns), so the object stays scalar-replaced on the continue path and
+; is materialized ONLY on the return path; the continue path observes no
+; allocation at all. (Previously the materialize was hoisted to the alloc's
+; normal-dest, allocating every iteration even when dead.)
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare i32 @__gxx_personality_v0(...)

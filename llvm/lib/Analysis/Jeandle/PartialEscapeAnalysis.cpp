@@ -4495,31 +4495,45 @@ void Analyzer::materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
       Aliases.resetAlias(V);
   };
   auto ComputeSafeIP = [&]() -> Instruction * {
-    // Escape-point placement (Graal materializeBefore=node): materialize at the
-    // instruction that triggered the escape. OrigAlloc uses that the escape-
-    // point NewInv does not dominate — notably uses at a multi-pred merge where
-    // the object is still virtual on another arm — are resolved per-point by
-    // the transform: the merge collapse (materializeAndBuildPhi) builds a
-    // materializedValuePhi over the per-arm materialized pointers, and the
-    // resolution sub-pass (resolveMaterializedUses) rewrites the use to the PHI
-    // that dominates it. So escape-point placement is SSA-sound for any
-    // non-loop escape, and each arm's materialize at its own escape point is
-    // independently necessary for that arm.
+    // Escape-point placement (Graal materializeBefore=node,
+    // PartialEscapeClosure.ensureMaterialized -> materializeBefore): always
+    // materialize at the instruction that triggered the escape. Graal never
+    // hoists a live-path materialize to the allocation's normal-dest, and
+    // neither do we.
     //
-    // The ONE case that must fall back to the allocation's normal-dest is a
-    // loop-body escape of an object allocated OUTSIDE that loop: the
-    // materialize would re-execute per iteration, re-allocating a
-    // once-allocated object. TODO: loop-body partial escape
-    // (materializedValuePhi at the loop header) is deferred loop work.
-    Instruction *EscapeIP = InsertBefore;
-    CallBase *Alloc = Result.VirtualObjects[ID]->AllocationCall;
-    Loop *EscapeLoop = LI.getLoopFor(EscapeIP->getParent());
-    Loop *AllocLoop = LI.getLoopFor(Alloc->getParent());
-    if (EscapeLoop == AllocLoop)
-      return EscapeIP;
-    if (auto *II = dyn_cast<InvokeInst>(Alloc))
-      return &*II->getNormalDest()->getFirstNonPHIOrDbg();
-    return Alloc->getNextNode();
+    // Loop-body escape — the escape point sits in a loop that does not contain
+    // the allocation — does NOT require hoisting for soundness. The loop
+    // fixpoint (processLoop) clears every loop-block effect on each retry
+    // (restoreLoopSnapshot), and the post-body mergeStates(Header) builds the
+    // Graal materializedValuePhi + a single materialize at the preheader end
+    // (materializeAndBuildPhi -> materializeAtPredFromExitInfo, SafeIP =
+    // PH->getTerminator() = Graal predecessor.getEndNode()). Concretely:
+    //   * Escape FLOWS TO THE LATCH (escape block is a loop block): the Iter-0
+    //     escape-point Materialize is cleared on Iter 1; the header merge flips
+    //     the object to materialized{phi} so the body escape becomes a no-op
+    //     (resolveVirtualRef returns nullopt for a materialized object); on
+    //     convergence phi(M_pre, phi) is trivial (folds to M_pre via
+    //     CreatePHIEffect resolving the OrigAlloc incoming to NewInv_pre). This
+    //     is exactly Graal's materializedValuePhi at the loop header.
+    //   * Escape EXITS THE LOOP (escape block is not in the loop): the latch
+    //     sees the object virtual, the header merge keeps it virtual
+    //     (mergeFieldStates), and the escape-point Materialize persists only on
+    //     the escape-exiting path — executed at most once because that path
+    //     leaves the loop. The object stays scalar-replaced on the normal path:
+    //     true partial escape.
+    // Nested loops are handled by the recursive processLoop: the outer fixpoint
+    // clears the inner-preheader Materialize and the outer materializedValuePhi
+    // propagates materialization into the inner loop, yielding a single
+    // materialize at the outermost preheader. Mode::StopNewInLoopNest +
+    // MATERIALIZE_ALL escalation remain the safety net for pathological nests.
+    //
+    // OrigAlloc uses that the escape-point NewInv does not dominate — notably
+    // uses at a multi-pred merge where the object is still virtual on another
+    // arm — are resolved per-point by the transform: materializeAndBuildPhi
+    // builds a materializedValuePhi over the per-arm materialized pointers, and
+    // the resolution sub-pass (resolveMaterializedUses) rewrites the use to the
+    // dominating def. So escape-point placement is SSA-sound for every escape.
+    return InsertBefore;
   };
   auto SetEffectFlags = [&](jeandle::MaterializeEffect &E, Instruction *) {
     jeandle::VirtualObject &V = *Result.VirtualObjects[ID];

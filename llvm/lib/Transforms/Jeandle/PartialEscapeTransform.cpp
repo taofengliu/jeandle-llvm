@@ -962,6 +962,34 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
                            /*TLI=*/nullptr, /*DTU=*/nullptr);
   }
 
+  // Fold trivial PHIs. Loop-body partial escape builds a materializedValuePhi
+  // at each enclosing loop header, but because a single allocation (the
+  // preheader NewInv) is the materialized value on every path, each such phi
+  // is trivial — phi(NewInv, NewInv), or for nested loops a dead cycle
+  // phi(innerPhi, NewInv) where innerPhi is itself phi(self, outerPhi). The
+  // trivially-dead sweep below cannot break that cycle (each phi is "used" by
+  // the next), so fold them first: PHINode::hasConstantValue collapses both
+  // phi(X,X) and phi(self, X) to X. Iterate to fixpoint so a fold that makes
+  // an enclosing phi trivial is caught. (This mirrors what downstream
+  // GVN/InstCombine would do; doing it here keeps the PEA output clean and is
+  // required for the nested-loop dead cycle, which downstream sees later.)
+  bool FoldedPhi = true;
+  while (FoldedPhi) {
+    FoldedPhi = false;
+    for (BasicBlock &BB : F) {
+      for (Instruction &I : llvm::make_early_inc_range(BB)) {
+        auto *PN = dyn_cast<PHINode>(&I);
+        if (!PN || PN->getNumIncomingValues() == 0)
+          continue;
+        if (Value *V = PN->hasConstantValue()) {
+          PN->replaceAllUsesWith(V);
+          PN->eraseFromParent();
+          FoldedPhi = true;
+        }
+      }
+    }
+  }
+
   // Sweep trivially-dead instructions that became unused after our rewrites
   // (e.g., GEPs derived from eliminated allocations whose only users were the
   // loads/stores we replaced in Pass 1). Iterate to fixpoint so cascading
