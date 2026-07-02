@@ -12,6 +12,7 @@
 #include "llvm/Transforms/Jeandle/ConstantFieldFolding.h"
 #include "llvm/Transforms/Jeandle/InsertGCBarriers.h"
 #include "llvm/Transforms/Jeandle/JavaOperationLower.h"
+#include "llvm/Transforms/Jeandle/JeandleInliner.h"
 #include "llvm/Transforms/Jeandle/RepeatedConstantFolding.h"
 #include "llvm/Transforms/Jeandle/TLSPointerRewrite.h"
 #include "llvm/Transforms/Jeandle/TypeCheckElimination.h"
@@ -20,7 +21,8 @@
 
 namespace llvm::jeandle {
 
-Pipeline::Pipeline(OptimizationLevel level, LLVMContext &Ctx)
+Pipeline::Pipeline(OptimizationLevel level, LLVMContext &Ctx,
+                   PipelineOptions Options)
     : SI(Ctx, /*DebugLogging=*/false) {
   SI.registerCallbacks(PIC, &MAM);
 
@@ -33,23 +35,57 @@ Pipeline::Pipeline(OptimizationLevel level, LLVMContext &Ctx)
   PB.registerLoopAnalyses(LAM);
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
-  PM = buildJeandlePipeline(PB, level);
+  PM = buildJeandlePipeline(PB, level, Options);
 }
 
 // TODO: The pass selection/ordering is not optimal. We need to improve it.
 ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
-                                                 OptimizationLevel level) {
+                                                 OptimizationLevel level,
+                                                 PipelineOptions Options) {
   ModulePassManager PM;
+  // JeandleInlineDriver owns the inline-specific loop. Devirtualization
+  // refinement between inline rounds should be wired inside the driver so
+  // inline-scope state can be preserved across IR rewrites.
+  switch (Options.Inlining) {
+  case InlineMode::Disabled:
+    break;
+  case InlineMode::Default:
+    PM.addPass(JeandleInlineDriver());
+    break;
+  case InlineMode::AccessorOnly:
+    PM.addPass(JeandleInlineDriver(/*InlineAccessorsOnly=*/true));
+    break;
+  }
   PM.addPass(JavaOperationLower(0));
   PM.addPass(createModuleToFunctionPassAdaptor(InstSimplifyPass()));
   PM.addPass(createModuleToFunctionPassAdaptor(TypeCheckElimination()));
   PM.addPass(createModuleToFunctionPassAdaptor(RepeatedConstantFolding()));
   PM.addPass(createModuleToFunctionPassAdaptor(TypeCheckElimination()));
+  // TODO: InsertGCBarriers currently inserts high-level barrier calls before
+  // O3 because it cannot handle O3 generated memory intrinsics and vector 
+  // instructions. But the uninlined barrier calls can still block useful 
+  // optimizations.
   PM.addPass(createModuleToFunctionPassAdaptor(InsertGCBarriers()));
   PM.addPass(JavaOperationLower(1));
-  PM.addPass(createModuleToFunctionPassAdaptor(TLSPointerRewrite()));
   PM.addPass(std::move(PB.buildPerModuleDefaultPipeline(level)));
   PM.addPass(RewriteStatepointsForGC());
+  // Phase 9 is reserved for JavaOps that must be lowered after O3/RS4GC.
+  //
+  // JavaOperationLower(9) lowers GC barriers only after O3/RS4GC. Lowered G1
+  // barriers may compute raw addresses derived from oops, such as card-table
+  // addresses. Those raw derived addresses are not oops, are not tracked by
+  // RS4GC, and the JVM has no mechanism to update them if a safepoint moves
+  // the source oop.
+  //
+  // The required invariant is that the def-use range of each such raw derived
+  // address must not contain a safepoint. Lowering barriers too early exposes
+  // the raw address computations to O3, which may extend or reuse them across
+  // safepoints and break that invariant. Delaying only the lowering preserves
+  // optimization opportunities while keeping raw derived addresses local to the
+  // final barrier code.
+  PM.addPass(JavaOperationLower(9));
+  PM.addPass(createModuleToFunctionPassAdaptor(TLSPointerRewrite()));
+  PM.addPass(createModuleToFunctionPassAdaptor(InstSimplifyPass()));
   return PM;
 }
 

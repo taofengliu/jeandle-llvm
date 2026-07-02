@@ -238,9 +238,29 @@ namespace {
 
 struct ReplayData {
   DenseMap<CallbackKey, CallbackValue, CallbackKeyDenseMapInfo> Entries;
+  std::string InlineCalleeIRPath;
 };
 
 static std::unique_ptr<ReplayData> LogData;
+static thread_local Module *CurrentReplayDestModule = nullptr;
+static InlineCalleeIRReplayMaterializerFn InlineCalleeIRReplayMaterializer =
+    nullptr;
+
+static void materializeInlineCalleeIR(uintptr_t CalleeMethod) {
+  if (!CurrentReplayDestModule)
+    report_fatal_error("VMCallbackLog GetInlineCalleeIR replay has no active "
+                       "destination module");
+
+  if (!LogData)
+    report_fatal_error("VMCallbackLog replay not initialized");
+
+  if (!InlineCalleeIRReplayMaterializer)
+    report_fatal_error("VMCallbackLog GetInlineCalleeIR replay has no inline "
+                       "callee IR materializer");
+
+  InlineCalleeIRReplayMaterializer(*CurrentReplayDestModule,
+                                   LogData->InlineCalleeIRPath, CalleeMethod);
+}
 
 /// Look up a callback result by (Kind, Args). Returns a reference into the
 /// long-lived log data, so the returned pointer is stable (important for
@@ -270,10 +290,28 @@ static const CallbackValue &lookupValue(unsigned Kind,
 // Replay dispatch
 // =============================================================================
 
+static void handleReplaySideEffects(unsigned Kind, ArrayRef<CallbackValue> Args,
+                                    const CallbackValue &RawResult) {
+  switch (Kind) {
+  case CK_GetInlineCalleeIR:
+    if (!decodeVMCallbackValue<bool>(RawResult))
+      return;
+    assert(Args.size() == 1 && "GetInlineCalleeIR expects one argument");
+    assert(!Args[0].IsString && "GetInlineCalleeIR expects numeric method id");
+    materializeInlineCalleeIR(decodeVMCallbackValue<uintptr_t>(Args[0]));
+    return;
+
+  default:
+    return;
+  }
+}
+
 template <typename T>
 static T fetchReplayedResult(unsigned Kind, ArrayRef<CallbackValue> Args,
                              const char *Name) {
-  return decodeVMCallbackValue<T>(lookupValue(Kind, Args, Name));
+  const CallbackValue &RawResult = lookupValue(Kind, Args, Name);
+  handleReplaySideEffects(Kind, Args, RawResult);
+  return decodeVMCallbackValue<T>(RawResult);
 }
 
 // REPLAY_CALLBACK(Name, RetType, (param-decls), (arg-names))
@@ -293,6 +331,22 @@ ALL_JEANDLE_VM_CALLBACKS(DEF_REPLAY_CB)
 #undef REPLAY_CALLBACK
 
 } // anonymous namespace
+
+llvm::jeandle::VMCallbackReplayModuleScope::VMCallbackReplayModuleScope(
+    Module &M) {
+  assert(!CurrentReplayDestModule &&
+         "Nested VMCallbackReplayModuleScope is not supported");
+  CurrentReplayDestModule = &M;
+}
+
+llvm::jeandle::VMCallbackReplayModuleScope::~VMCallbackReplayModuleScope() {
+  CurrentReplayDestModule = nullptr;
+}
+
+void llvm::jeandle::registerInlineCalleeIRReplayMaterializer(
+    InlineCalleeIRReplayMaterializerFn Materializer) {
+  InlineCalleeIRReplayMaterializer = Materializer;
+}
 
 // =============================================================================
 // Log file parser — descriptor-driven
@@ -477,7 +531,8 @@ static Error parseLogBuffer(
   return Error::success();
 }
 
-Error jeandle::loadAndRegisterVMCallbackLog(StringRef FilePath) {
+Error jeandle::loadAndRegisterVMCallbackLog(StringRef FilePath,
+                                            StringRef InlineCalleeIRPath) {
   if (LogData != nullptr) {
     return createStringError("VMCallbackLog already loaded");
   }
@@ -491,6 +546,7 @@ Error jeandle::loadAndRegisterVMCallbackLog(StringRef FilePath) {
   if (Error Err =
           parseLogBuffer(BufferOrErr.get()->getBuffer(), ParsedData->Entries))
     return Err;
+  ParsedData->InlineCalleeIRPath = InlineCalleeIRPath.str();
 
   LogData = std::move(ParsedData);
 

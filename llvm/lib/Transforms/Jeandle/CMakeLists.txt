@@ -2,6 +2,9 @@ add_llvm_component_library(LLVMJeandleTransforms
   ConstantFieldFolding.cpp
   InsertGCBarriers.cpp
   JavaOperationLower.cpp
+  JeandleDevirtualization.cpp
+  JeandleInlineDriver.cpp
+  JeandleInliner.cpp
   RepeatedConstantFolding.cpp
   TLSPointerRewrite.cpp
   TypeCheckElimination.cpp
@@ -12,6 +15,7 @@ add_llvm_component_library(LLVMJeandleTransforms
   LINK_COMPONENTS
   Analysis
   Core
+  IRReader
   Scalar
   TransformUtils
   )
