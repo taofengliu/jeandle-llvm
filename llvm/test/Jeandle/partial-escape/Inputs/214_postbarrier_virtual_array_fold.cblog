@@ -1,0 +1,10 @@
+# 214: Object[] (klass 8888) with Object element kind (JBasicType::Object = 8),
+# plus a virtual instance (klass 5555) that is stored into the array.
+# processAllocation queries ElementBasicTypeOfArrayKlass (array) and
+# HasFinalizer / CanVirtualize (instance). IsBoxed is not invoked by the
+# analyzer today but is harmless.
+RequiresStrictLockOrder = 1
+ElementBasicTypeOfArrayKlass 8888 = 8
+HasFinalizer 5555 = false
+CanVirtualize 5555 = true
+IsBoxed 5555 = 9
