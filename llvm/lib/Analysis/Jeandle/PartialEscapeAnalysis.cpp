@@ -778,15 +778,16 @@ private:
   // pessimistic path: force-materialize at preheader (drains every virtual)
   // and process the body once in MATERIALIZE_ALL mode (no new VOs created
   // inside).
-  void processLoop(Loop *L);
+  void processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO);
 
   // Helpers used exclusively by processLoop.
   // Loop blocks of L (including its sub-loops) in function-RPO order,
   // computed once per processLoop and reused across the inner fixpoint body
   // passes (the loop's CFG is stable across the fixpoint).
-  SmallVector<BasicBlock *, 32> loopBlocksInRPO(Loop *L);
+  SmallVector<BasicBlock *, 32>
+  loopBlocksInRPO(Loop *L, ArrayRef<BasicBlock *> FunctionRPO);
   void processLoopBodyOnePass(Loop *L, ArrayRef<BasicBlock *> LoopRPO,
-                              llvm::SmallPtrSetImpl<BasicBlock *> &OuterDone);
+                              ArrayRef<BasicBlock *> FunctionRPO);
 
   // The per-iteration snapshot. All members are independently restorable.
   //
@@ -5164,14 +5165,12 @@ void Analyzer::restoreLoopSnapshot(
   }
 }
 
-SmallVector<BasicBlock *, 32> Analyzer::loopBlocksInRPO(Loop *L) {
-  // Function-RPO filtered to L's blocks. The order is identical to what a
-  // per-pass ReversePostOrderTraversal<Function*> plus an L->contains() filter
-  // produces, but this is built once per processLoop instead of once per body
-  // pass (the loop CFG does not change during PEA).
+SmallVector<BasicBlock *, 32>
+Analyzer::loopBlocksInRPO(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
+  // Function-RPO filtered to L's blocks. FunctionRPO is computed once by
+  // Analyzer::run and reused by every loop in the function.
   SmallVector<BasicBlock *, 32> Order;
-  ReversePostOrderTraversal<Function *> RPOT(&F);
-  for (BasicBlock *BB : RPOT)
+  for (BasicBlock *BB : FunctionRPO)
     if (L->contains(BB))
       Order.push_back(BB);
   return Order;
@@ -5179,11 +5178,12 @@ SmallVector<BasicBlock *, 32> Analyzer::loopBlocksInRPO(Loop *L) {
 
 void Analyzer::processLoopBodyOnePass(
     Loop *L, ArrayRef<BasicBlock *> LoopRPO,
-    llvm::SmallPtrSetImpl<BasicBlock *> &OuterDone) {
+    ArrayRef<BasicBlock *> FunctionRPO) {
   // Process loop blocks in function-RPO order. Sub-loop headers dispatch
   // recursively to processLoop, and the sub-loop's blocks are marked Done so
-  // we don't re-process them in this pass. LoopRPO is precomputed by the
-  // caller (loopBlocksInRPO) and reused across the inner fixpoint iterations.
+  // we don't re-process them in this pass. FunctionRPO is computed once by
+  // Analyzer::run; LoopRPO is the filtered loop-local view reused across the
+  // inner fixpoint iterations.
   llvm::SmallPtrSet<BasicBlock *, 16> Done;
   for (BasicBlock *BB : LoopRPO) {
     if (Done.count(BB))
@@ -5191,20 +5191,17 @@ void Analyzer::processLoopBodyOnePass(
     Loop *Inner = LI.getLoopFor(BB);
     if (Inner && Inner != L && Inner->getHeader() == BB) {
       // Found a sub-loop's header — recurse.
-      processLoop(Inner);
-      for (BasicBlock *SB : Inner->blocks()) {
+      processLoop(Inner, FunctionRPO);
+      for (BasicBlock *SB : Inner->blocks())
         Done.insert(SB);
-        OuterDone.insert(SB);
-      }
       continue;
     }
     processBlock(BB);
     Done.insert(BB);
-    OuterDone.insert(BB);
   }
 }
 
-void Analyzer::processLoop(Loop *L) {
+void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
   // Record EVERY processLoop entry (including for loops with no
   // header / no preheader / OverflowFlag short-circuit) so the safety-net
   // pass treats this loop as visited and skips it.
@@ -5266,8 +5263,7 @@ void Analyzer::processLoop(Loop *L) {
     // Body walk in REGULAR mode (single pass — no fixpoint, since there is
     // no way to verify convergence at a non-existent preheader). Loop-local
     // allocs that don't outlive a single iteration are still virtualised.
-    llvm::SmallPtrSet<BasicBlock *, 16> _OuterDone;
-    processLoopBodyOnePass(L, loopBlocksInRPO(L), _OuterDone);
+    processLoopBodyOnePass(L, loopBlocksInRPO(L, FunctionRPO), FunctionRPO);
 
     // Post-body merge (Graal doMergeWithoutDead run AFTER the body,
     // EffectsClosure.java:461-466). The in-pass header merge (header first in
@@ -5300,7 +5296,7 @@ void Analyzer::processLoop(Loop *L) {
 
   // Loop blocks in function-RPO order, computed once and reused across the
   // inner fixpoint body passes below (the loop CFG is stable across PEA).
-  SmallVector<BasicBlock *, 32> LoopRPO = loopBlocksInRPO(L);
+  SmallVector<BasicBlock *, 32> LoopRPO = loopBlocksInRPO(L, FunctionRPO);
 
   // At TOP-LEVEL processLoop entry only (loop.getDepth() == 1 gate),
   // compute the maximum loop depth within this nest. If it exceeds
@@ -5381,8 +5377,7 @@ void Analyzer::processLoop(Loop *L) {
         restoreLoopSnapshot(LoopBlocks, Pre);
       ++JeandlePEALoopFixpointRetries;
 
-      llvm::SmallPtrSet<BasicBlock *, 16> _OuterDone;
-      processLoopBodyOnePass(L, LoopRPO, _OuterDone);
+      processLoopBodyOnePass(L, LoopRPO, FunctionRPO);
 
       // Overflow (a STOP_NEW materialization of an outer-scope VO) may have
       // been latched by this pass or a deeper recursion. Stop iterating: the
@@ -5536,6 +5531,9 @@ jeandle::PEAResult Analyzer::run() {
   // handles sub-loops). All other blocks are processed directly.
   llvm::SmallPtrSet<BasicBlock *, 16> Done;
   ReversePostOrderTraversal<Function *> RPOT(&F);
+  SmallVector<BasicBlock *, 32> FunctionRPO;
+  for (BasicBlock *BB : RPOT)
+    FunctionRPO.push_back(BB);
   // Defensive sweep for cycles LoopInfo missed (indirectbr /
   // callbr / catchswitch back-edges). When the RPO walk reaches a non-
   // loop block whose preds include an as-yet-UNVISITED block, that
@@ -5569,7 +5567,7 @@ jeandle::PEAResult Analyzer::run() {
     }
     BlockExits.erase(BB);
   };
-  for (BasicBlock *BB : RPOT) {
+  for (BasicBlock *BB : FunctionRPO) {
     if (Done.count(BB))
       continue;
     Loop *L = LI.getLoopFor(BB);
@@ -5587,7 +5585,7 @@ jeandle::PEAResult Analyzer::run() {
     // If we haven't reached the top-level header in RPO yet (e.g. when a
     // block inside the loop appears before its header), still dispatch on
     // the top-level loop and mark all its blocks Done.
-    processLoop(Top);
+    processLoop(Top, FunctionRPO);
     for (BasicBlock *SB : Top->blocks())
       Done.insert(SB);
   }
