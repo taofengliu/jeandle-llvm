@@ -802,14 +802,19 @@ public:
   // sweep.
   SmallVector<WeakTrackingVH, 4> OwnedInsts;
 
-  // PHI nodes synthesized by mergeStates at a LOOP HEADER block, stored
-  // separately from OwnedPhis because they must survive rollback within the
-  // loop-fixpoint iteration. Each iteration re-runs mergeStates(Header) and
-  // would otherwise allocate a fresh PHI per (ID, offset), producing fresh
-  // Value* pointers in FieldStates so the convergence check could never
-  // compare equal. The analyzer's LoopFieldPhiCache (keyed on
-  // (Header, ID, offset)) returns the same PHI across iterations; only the
-  // per-iteration CreatePHI Effect is rebuilt. Lifecycle is identical to
+  // PHI nodes synthesized by mergeStates at ANY in-loop merge block (a loop
+  // header OR a non-header block inside a loop), stored separately from
+  // OwnedPhis because they must survive rollback within the loop-fixpoint
+  // iteration. Each iteration re-runs mergeStates(Header) and would otherwise
+  // allocate a fresh PHI per (BB, ID, offset), producing fresh Value* pointers
+  // in FieldStates so the convergence check could never compare equal. The
+  // analyzer's LoopFieldPhiCache (keyed on (BB, ID, offset)) returns the same
+  // PHI across iterations; only the per-iteration CreatePHI Effect is rebuilt.
+  // Non-header in-loop merges are included because restoreLoopSnapshot
+  // preserves BlockExits[BB] for every loop block across iterations, so any
+  // Value* reachable from a preserved BlockExits[BB] must outlive rollback —
+  // were such a PHI to land in OwnedPhis (which IS truncated), the preserved
+  // BlockExits[BB] would reference a deleted PHI. Lifecycle is identical to
   // OwnedPhis.
   SmallVector<WeakTrackingVH, 4> OwnedLoopFieldPhis;
 

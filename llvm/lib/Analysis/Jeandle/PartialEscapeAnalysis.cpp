@@ -507,19 +507,24 @@ private:
   // that need this safety-net drain are those processLoop never ran on.
   DenseSet<Loop *> VisitedLoops;
 
-  // Per-loop-header field-PHI cache. Keyed on (Header, ID, Offset). The
-  // cache returns a STABLE PHINode* across fixpoint iterations so the
+  // Per-in-loop-block field-PHI cache. Keyed on (BB, ID, Offset) where BB is
+  // any merge block inside a loop (loop header OR non-header in-loop merge).
+  // The cache returns a STABLE PHINode* across fixpoint iterations so the
   // convergence check on BlockExitInfo.FieldStates can compare FieldValues
   // by Value pointer (otherwise every iteration would synthesize a fresh
-  // PHI and the fixpoint would never close). Offset == -1 (i.e. the magic
-  // VirtualObject::ArrayLengthSlotOffset value, also used as a sentinel
-  // here for the "merged materialized pointer" PHI in the all-materialized
-  // merge branch) is overloaded as the cache key for the materialized-ptr
-  // PHI; offsets >= 0 are field PHIs. The cached PHI lives in
-  // Result.OwnedLoopFieldPhis, which is preserved across rollback (unlike
+  // PHI and the fixpoint would never close), AND so that the preserved
+  // BlockExits[BB] (restoreLoopSnapshot does not roll back loop-block
+  // BlockExits) never references a PHI that rollback deletes. Offset == -1
+  // (i.e. the magic VirtualObject::ArrayLengthSlotOffset value, also used as
+  // a sentinel here for the "merged materialized pointer" PHI in the
+  // all-materialized merge branch) is overloaded as the cache key for the
+  // materialized-ptr PHI; offsets >= 0 are field PHIs. The cached PHI lives
+  // in Result.OwnedLoopFieldPhis, which is preserved across rollback (unlike
   // OwnedPhis, which is truncated). The CreatePHI Effect referencing the
-  // cached PHI is re-emitted in BlockEffects[Header] on every iteration —
-  // BlockEffects[Header] is wiped on rollback, but the PHI itself is not.
+  // cached PHI is re-emitted in BlockEffects[BB] on every iteration —
+  // BlockEffects[BB] is wiped on rollback, but the PHI itself is not. The
+  // field is named Header for historical reasons; semantically it is the
+  // merge block BB passed to getOrCreateLoopFieldPhi.
   struct LoopPhiKey {
     BasicBlock *Header;
     jeandle::ObjectID ID;
@@ -555,11 +560,6 @@ private:
   // gate in ensureMaterialized skips these: their eventual NewInv is materialized
   // at the same predecessor (keyed {PH, ID}), dominating SafeIP by construction.
   DenseSet<Value *> PerPredMatPlaceholders;
-
-  // Set of all loop-header blocks in F (populated up-front from LI). Used
-  // by the merge code to gate the LoopFieldPhiCache lookup so non-loop
-  // merges keep their current single-shot PHI behaviour.
-  DenseSet<BasicBlock *> LoopHeaderSet;
 
   // Per-VO record of LLVM pointer-PHIs that processBlockPhis
   // aliased via Case-B (every incoming agrees on the same ObjectID).
@@ -617,10 +617,13 @@ private:
     bool materializeAndBuildPhi(jeandle::ObjectID ID);
   };
 
-  // Returns a stable PHI for the given (loop header, ID, offset) tuple,
-  // creating one (and registering it in OwnedLoopFieldPhis) on first use.
-  // Falls back to createUnparentedPhi (i.e. the legacy OwnedPhis path) when
-  // BB is not a loop header.
+  // Returns a stable PHI for the given (in-loop merge block, ID, offset)
+  // tuple, creating one (and registering it in OwnedLoopFieldPhis) on first
+  // use. Falls back to createUnparentedPhi (i.e. the legacy OwnedPhis path)
+  // when BB is not inside any loop (LI.getLoopFor(BB) == nullptr). Inside a
+  // loop — including non-header in-loop merge blocks — the PHI must be cached
+  // so its Value* survives restoreLoopSnapshot (which preserves BlockExits[BB]
+  // for loop blocks but truncates OwnedPhis).
   PHINode *getOrCreateLoopFieldPhi(BasicBlock *BB, jeandle::ObjectID ID,
                                    int64_t Offset, Type *Ty, unsigned N,
                                    const Twine &Name);
@@ -1283,11 +1286,21 @@ Value *Analyzer::getOrCreatePerPredMatPlaceholder(BasicBlock *PH,
 PHINode *Analyzer::getOrCreateLoopFieldPhi(BasicBlock *BB, jeandle::ObjectID ID,
                                            int64_t Offset, Type *Ty, unsigned N,
                                            const Twine &Name) {
-  // Outside a loop header, fall back to the legacy single-shot OwnedPhis path.
-  if (!LoopHeaderSet.count(BB))
+  // Outside any loop (LI.getLoopFor(BB) == nullptr), fall back to the legacy
+  // single-shot OwnedPhis path. Inside a loop — including NON-HEADER in-loop
+  // merge blocks — the PHI is cached so its Value* stays stable across
+  // fixpoint iterations: restoreLoopSnapshot preserves BlockExits[BB] for
+  // every loop block (so the next iteration's in-pass mergeStates(Header)
+  // can read the back-edge pred's exit state), and any Value* reachable from
+  // a preserved BlockExits[BB] must therefore survive rollback. Cached PHIs
+  // live in OwnedLoopFieldPhis, which restoreLoopSnapshot does NOT pop
+  // (unlike OwnedPhis); were a non-header in-loop merge to bypass the cache,
+  // its PHI would land in OwnedPhis and be deleted on rollback while the
+  // preserved BlockExits[BB] still references it → dangling Value*.
+  if (!LI.getLoopFor(BB))
     return createUnparentedPhi(Ty, N, Name);
 
-  // At a loop-header BB, size the PHI shell for the block's FULL
+  // At an in-loop BB, size the PHI shell for the block's FULL
   // fan-in (every predecessor — forward edge AND back edge), regardless of
   // how many incomings the caller has visited on this particular iteration.
   // Without this, iter 1 (which only sees forward-edge preds before the
@@ -2143,11 +2156,12 @@ void Analyzer::snapshotExitState(BasicBlock *BB) {
 void Analyzer::deleteOwnedSince(size_t PhiMark, size_t InstMark) {
   // Pop and delete any unparented PHIs/insts added since the marks. The merge
   // only creates unparented PHIs via createUnparentedPhi / getOrCreateLoopFieldPhi's
-  // non-header fallback; insertion into a BasicBlock happens in the transform
+  // out-of-loop fallback; insertion into a BasicBlock happens in the transform
   // pass, so any value added during a failed merge iteration is still
-  // unparented when we discard it. Loop-header-cached PHIs live in
-  // OwnedLoopFieldPhis (a separate bucket) and are intentionally preserved so
-  // they stay stable across fixpoint iterations.
+  // unparented when we discard it. In-loop-cached PHIs (loop headers AND
+  // non-header in-loop merge blocks) live in OwnedLoopFieldPhis (a separate
+  // bucket) and are intentionally preserved so they stay stable across
+  // fixpoint iterations and across per-merge retries.
   while (Result.OwnedPhis.size() > PhiMark) {
     WeakTrackingVH &VH = Result.OwnedPhis.back();
     if (Value *V = VH) {
@@ -2712,11 +2726,13 @@ bool Analyzer::synthesizeCaseC(
       }
       InValues.push_back(In);
     }
-    // At a loop-header BB, route through the LoopFieldPhiCache so
-    // the per-(BB, NewID, Off) PHI shell is REUSED across loop-fixpoint
-    // iterations. Same Value* across iters keeps FieldStates structurally
-    // equivalent for the convergence check. For non-header BBs the cache
-    // is bypassed (getOrCreateLoopFieldPhi falls back to createUnparentedPhi).
+    // Route through the LoopFieldPhiCache so the per-(BB, NewID, Off) PHI
+    // shell is REUSED across loop-fixpoint iterations. Same Value* across
+    // iters keeps FieldStates structurally equivalent for the convergence
+    // check, and — for non-header in-loop merge BBs — keeps the PHI alive
+    // (OwnedLoopFieldPhis) so the preserved BlockExits[BB] does not reference
+    // a PHI that rollback deletes. For BBs outside any loop the cache is
+    // bypassed (getOrCreateLoopFieldPhi falls back to createUnparentedPhi).
     PHINode *NewPhi = getOrCreateLoopFieldPhi(BB, NewID, P.Off, P.PhiType, N,
                                               "pea.casec.field.phi");
     auto PE = std::make_unique<jeandle::CreatePHIEffect>();
@@ -5111,6 +5127,45 @@ void Analyzer::restoreLoopSnapshot(
     Eligible[Result.VirtualObjects[I]->getID()] = true;
   }
 
+  // Defensive invariant: no PRESERVED BlockExits[BB] (BB ∈ LoopBlocks) may
+  // reference an unparented PHI we are about to delete below. BlockExits for
+  // loop blocks is deliberately preserved across rollback (see the rationale
+  // at the bottom of this function), so every Value* reachable from a
+  // preserved entry must outlive rollback. In-loop merge-block field PHIs
+  // stay alive because getOrCreateLoopFieldPhi caches them (gated on
+  // LI.getLoopFor(BB)) in OwnedLoopFieldPhis, which this cleanup does NOT
+  // pop. Were a non-header in-loop merge to bypass that cache (landing its
+  // PHI in OwnedPhis), the next iteration's mergeStates(Header) would read a
+  // dangling Value* through the preserved BlockExits[BB] — use-after-free.
+  // This check makes that regression deterministic.
+  assert((([&] {
+           SmallPtrSet<Value *, 16> ToDelete;
+           for (size_t I = S.OwnedPhisSize; I < Result.OwnedPhis.size(); ++I)
+             if (Value *V = Result.OwnedPhis[I])
+               ToDelete.insert(V);
+           for (BasicBlock *BB : LoopBlocks) {
+             auto It = BlockExits.find(BB);
+             if (It == BlockExits.end())
+               continue;
+             for (const auto &FS : It->second.FieldStates)
+               for (const auto &FV : FS.second) {
+                 if (FV.second.isScalar() &&
+                     ToDelete.count(FV.second.getScalar()))
+                   return false;
+                 if (FV.second.isMaterializedRef() &&
+                     ToDelete.count(FV.second.getMaterialized()))
+                   return false;
+               }
+             for (const auto &MV : It->second.MaterializedValues)
+               if (ToDelete.count(MV.second))
+                 return false;
+           }
+           return true;
+         })()) &&
+         "BlockExits[loop-block] references an unparented PHI that "
+         "restoreLoopSnapshot is about to delete; the in-loop merge PHI "
+         "must be cached via getOrCreateLoopFieldPhi, not OwnedPhis");
+
   // Pop and delete unparented PHIs / insts created during the rolled-back
   // iteration. OwnedLoopFieldPhis are NOT touched — they're the per-loop
   // PHI cache, and the whole point of the cache is to keep them alive
@@ -5150,7 +5205,13 @@ void Analyzer::restoreLoopSnapshot(
   // BlockEffects and MaterializedAtPred MUST be rolled back (they accumulate
   // emitted-effect side-data; leaving them would duplicate effects across
   // iterations). LoopFieldPhiCache / OwnedLoopFieldPhis cover the stable
-  // PHI Value* need for iter-spanning structural equivalence.
+  // PHI Value* need for iter-spanning structural equivalence AND for the
+  // BlockExits-preservation invariant above: getOrCreateLoopFieldPhi gates
+  // the cache on LI.getLoopFor(BB), so EVERY in-loop merge-block PHI (header
+  // or not) is cached and survives this rollback. Were a non-header in-loop
+  // merge to bypass the cache, its PHI would land in OwnedPhis and be deleted
+  // by the cleanup above while the preserved BlockExits[BB] still references
+  // it — the debug assert earlier in this function guards exactly this.
   for (BasicBlock *BB : LoopBlocks) {
     auto SF = S.SavedBlockEffects.find(BB);
     if (S.HadBlockEffects.count(BB))
@@ -5520,11 +5581,6 @@ jeandle::PEAResult Analyzer::run() {
   if (!JeandleEscapeAnalyzeOnly.empty() &&
       !F.getName().contains(JeandleEscapeAnalyzeOnly))
     return jeandle::PEAResult();
-
-  // Pre-compute the set of loop headers for the LoopFieldPhiCache gate.
-  for (BasicBlock &BB : F)
-    if (LI.isLoopHeader(&BB))
-      LoopHeaderSet.insert(&BB);
 
   // Outer walk: RPO over F. When we hit any block belonging to a top-level
   // loop, dispatch to processLoop on that top-level loop (which recursively
