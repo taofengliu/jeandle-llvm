@@ -2975,7 +2975,48 @@ void Analyzer::processAllocation(CallBase *CB) {
   // every other state intact — already-virtual objects (registered in a
   // shallower enclosing scope, or before the nest entry) continue to be
   // tracked and folded as usual.
-  // TODO: EnsureVirtualized override is deferred.
+  //
+  // TODO(ensure-virtualized): GRAAL DIVERGENCE — the refusal below is
+  // unconditional, but Graal's processVirtualizable
+  // (PartialEscapeClosure.java:287-303) exempts allocations whose usages
+  // contain an EnsureVirtualizedNode (the mayEnsureVirtualized scan): such
+  // an allocation is still virtualised PAST EscapeAnalysisLoopCutoff
+  // (default 20). The marker is produced only by GraalDirectives
+  // .ensureVirtualized / ensureVirtualizedHere, lowered by the graph
+  // builder to an EnsureVirtualizedNode (EnsureVirtualizedNode.java:50-110;
+  // StandardGraphBuilderPlugins.java:2082-2095). Jeandle's frontend has no
+  // ensure_virtualized JavaOp / intrinsic, so mayEnsureVirtualized would be
+  // uniformly false here — there is currently nothing to override.
+  //
+  // The override is one leg of a three-part Graal design that must be
+  // wired up together:
+  //  (1) Override at this site — needs an IR marker the analyser recognises
+  //      plus an EnsureVirtualized bit on ObjectState (serialised through
+  //      clone / takeLoopSnapshot / restoreLoopSnapshot).
+  //  (2) Materialisation guard — Graal's ensureMaterialized
+  //      (PartialEscapeClosure.java:538-562) throws RetryableBailoutException
+  //      (a non-permanent bailout: retry the whole compilation without PEA)
+  //      when an ensure-virtualised object must be materialised inside a
+  //      deep nest, which is what keeps the override from going exponential
+  //      in nest depth. Jeandle is -fno-exceptions with no per-pass
+  //      bailout, so this leg is deopt-adjacent and deferred — see the
+  //      matching note in ensureMaterialized below.
+  //  (3) Flag bookkeeping — AND-reduce the bit across merge predecessors
+  //      with setEnsureVirtualized(false) where not all preds agree
+  //      (PartialEscapeClosure.java:991-995, 1321-1324, 1500-1503) and
+  //      propagate it transitively in stripKilledLoopLocations (:685-714).
+  //      Jeandle's ObjectState has no such bit, so the three per-pred
+  //      materialisation sites that route through
+  //      materializeAtPredFromExitInfo (inside materializeAndBuildPhi, the
+  //      AllMaterialized-divergence arm of mergeObjectState, and
+  //      synthesizeCaseC) currently do no downgrade either — flagged in
+  //      docs/Jeandle-PEA-Review.md §2.3 but not yet TODO-marked in code.
+  //
+  // Soundness: the unconditional return below is CONSERVATIVE — Jeandle
+  // merely virtualises less than Graal in deep nests; it never miscompiles.
+  // Were an ensure-virtualised marker to appear today, the object would
+  // simply stay in IR and be materialised at its escape point, preserving
+  // correctness while violating the (advisory) directive.
   if (CurrentMode == Mode::StopNewInLoopNest)
     return;
 
