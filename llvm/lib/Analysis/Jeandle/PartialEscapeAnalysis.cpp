@@ -1939,6 +1939,17 @@ bool Analyzer::MergeProcessor::materializeAndBuildPhi(jeandle::ObjectID ID) {
 // Graal's mergeObjectStates — materialize every pred + materializedValuePhi —
 // corresponds to materializeAndBuildPhi here.) Returns true if a nested
 // inner-VO materialize emitted an Effect (retry).
+//
+// TODO(mergeObjectStates-two-slot-and-bytearray): mirror Graal's
+// virtualByteCount / twoSlotKinds compatibility pre-scan
+// (PartialEscapeClosure.java:1110-1253) and widened-PHI synthesis
+// (:1256-1283). The integer-widening zext below is guarded so a narrow pred
+// with a conflicting non-default scalar in the wide type's byte span bails
+// instead of discarding adjacent-byte contributions. Today that widening is
+// unreachable — processStore's getOrCreateFieldIndex bails on a width
+// mismatch at the same offset, so two preds never present different integer
+// widths for one offset here — but the guard keeps the merge sound if that
+// ever changes (e.g. byte-array write decomposition under unsafe support).
 bool Analyzer::MergeProcessor::mergeFieldStates(jeandle::ObjectID ID) {
   unsigned RefLC = Preds[0]->LockCounts.lookup(ID); // all preds agree here.
   bool Changed = false;
@@ -2100,6 +2111,30 @@ bool Analyzer::MergeProcessor::mergeFieldStates(jeandle::ObjectID ID) {
               V->getType()->getIntegerBitWidth() <
                   PhiType->getIntegerBitWidth()) {
             if (auto *CI = dyn_cast<ConstantInt>(V)) {
+              // Graal isEntryDefaults mirror (PartialEscapeClosure.java:1110-
+              // 1253): the narrow pred must have NO conflicting non-default
+              // scalar in the wide type's byte span [Off+1, Off+WideBytes),
+              // or the zext would discard adjacent-byte contributions.
+              unsigned WideBytes = PhiType->getIntegerBitWidth() / 8;
+              auto SpanIt = Preds[i]->FieldStates.find(ID);
+              for (unsigned B = 1; B < WideBytes; ++B) {
+                if (SpanIt == Preds[i]->FieldStates.end())
+                  break;
+                auto AOff = SpanIt->second.find(Off + (int64_t)B);
+                if (AOff == SpanIt->second.end())
+                  continue; // missing entry == default
+                const jeandle::FieldValue &AFV = AOff->second;
+                if (AFV.isUnknown())
+                  continue;
+                if (AFV.isScalar())
+                  if (auto *ACI = dyn_cast<ConstantInt>(AFV.getScalar()))
+                    if (ACI->isZero())
+                      continue;
+                LocalBail = true; // conflicting non-default adjacent byte
+                break;
+              }
+              if (LocalBail)
+                break;
               In = ConstantInt::get(
                   PhiType, CI->getValue().zext(PhiType->getIntegerBitWidth()));
             } else {
