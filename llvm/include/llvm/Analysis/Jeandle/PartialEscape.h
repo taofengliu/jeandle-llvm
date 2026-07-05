@@ -477,8 +477,10 @@ public:
   // deferred-CreatePHI trick (emit at SeqNo=0, reassign a fresh nextSeqNo()
   // at drain) is load-bearing for the self-loop back-edge ordering invariant
   // (CreatePHI must sort strictly after per-pred Materialize in the same
-  // block); adopting list-order would require reworking merge/loop emission,
-  // which is deferred. Kept on the base.
+  // block).
+  // TODO(list-order): adopting Graal's pure list-order would require reworking
+  // merge/loop emission; SeqNo + the deferred-CreatePHI trick covers ordering
+  // meanwhile.
   uint32_t SeqNo = 0;
   ObjectID ObjID = InvalidObjectID;
 
@@ -715,9 +717,9 @@ public:
       Effects.push_back(std::move(E));
     Other.Effects.clear();
   }
-  // Graal insertAll(): insert all of Other at Pos, preserving order. Used for
-  // loop-header precedence when list-order is adopted (currently the deferred-
-  // CreatePHI SeqNo trick covers ordering, but the API is kept for parity).
+  // Graal insertAll(): insert all of Other at Pos, preserving order. Kept for
+  // loop-header precedence should pure list-order be adopted (see TODO(list-
+  // order) on Effect::SeqNo); currently unused.
   void insertAll(EffectList &Other, size_t Pos) {
     assert(Pos <= Effects.size());
     for (auto &E : Other.Effects)

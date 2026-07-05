@@ -16,9 +16,8 @@
 // polymorphic records (jeandle::Effect subclasses). isCfgKill() orders the
 // transform's two apply passes and is true ONLY for EliminateAllocation;
 // "control-flow-rewriting" (Materialize's splitBasicBlock, CreatePHI's PHI
-// insertion) is a separate notion and runs in Pass 1 — matching Graal's
-// EffectList.isCfgKill() (NOT the original "CFG-kill" wording above, which
-// conflated the two).
+// insertion) is a separate notion and runs in Pass 1, matching Graal's
+// EffectList.isCfgKill().
 //
 // Per-block exit state (virtual set, field values, lock counts) is snapshotted
 // into BlockExits; at each block header we inherit a single pred's snapshot or
@@ -337,8 +336,8 @@ private:
   jeandle::PEAResult Result;
 
   // ---------------------------------------------------------------------
-  // STATE MODEL — intentional divergence from Graal (OUT OF SCOPE to refactor;
-  // documented so each map below maps to its Graal counterpart).
+  // STATE MODEL — intentional divergence from Graal (documented so each
+  // map below maps to its Graal counterpart).
   //
   // Graal carries a block's entire PEA state in ONE PartialEscapeBlockState
   // whose core is an ObjectState[] array indexed by VO id (each ObjectState
@@ -356,9 +355,10 @@ private:
   // This is deliberate: Jeandle is an RPO single-pass walk over LLVM IR (not
   // Graal's CFG-block-effect closure), and per-block snapshots for the merge
   // fixpoint are encoded in BlockExitData/BlockExitInfo rather than cloned
-  // PartialEscapeBlockState arrays. Unifying to Graal's single-container model
-  // is a large, risky refactor (~every state read/write, snapshot/restore, the
-  // merge fixpoint, LoopSnapshot) with no observable IR benefit — deferred.
+  // PartialEscapeBlockState arrays.
+  // TODO(graal-unify): unifying to Graal's single-container model would touch
+  // ~every state read/write, snapshot/restore, the merge fixpoint, and
+  // LoopSnapshot, with no observable IR benefit.
   // ---------------------------------------------------------------------
   jeandle::AliasMap Aliases;
   // Per-block accumulating object state. Reset at the top of every block from
@@ -530,8 +530,7 @@ private:
   // OwnedPhis, which is truncated). The CreatePHI Effect referencing the
   // cached PHI is re-emitted in BlockEffects[BB] on every iteration —
   // BlockEffects[BB] is wiped on rollback, but the PHI itself is not. The
-  // field is named Header for historical reasons; semantically it is the
-  // merge block BB passed to getOrCreateLoopFieldPhi.
+  // `Header` field is the merge block BB passed to getOrCreateLoopFieldPhi.
   struct LoopPhiKey {
     BasicBlock *Header;
     jeandle::ObjectID ID;
@@ -920,15 +919,15 @@ private:
   // llvm.memset). Until then these shapes fall through to conservative
   // materialization.
   bool processJavaOp(CallBase *CB);
-  // §2.3.14: known non-escaping LLVM intrinsics (assume, lifetime/invariant
+  // Known non-escaping LLVM intrinsics (assume, lifetime/invariant
   // markers, debug, annotations, branch hints, ...) are no-ops for PEA;
   // launder/strip.invariant.group forward the argument's virtual alias.
   // Returns true if the intrinsic was handled (no-op or alias-forwarded),
   // false to fall through to the ICmp/JavaOp/generic-escape path.
   bool processIntrinsic(llvm::IntrinsicInst *II);
-  // §2.3.11/§2.3.12: fold an equality icmp against a virtual pointer to a
-  // constant (virtuals are non-null by construction; identity comparison).
-  // Returns true if folded, false to fall through to materialization.
+  // Fold an equality icmp against a virtual pointer to a constant (virtuals
+  // are non-null by construction; identity comparison). Returns true if
+  // folded, false to fall through to materialization.
   bool foldICmpEquality(llvm::ICmpInst *ICmp);
   bool foldArrayLength(CallBase *CB);
   bool foldLoadKlass(CallBase *CB);
@@ -1848,6 +1847,10 @@ bool Analyzer::MergeProcessor::mergeObjectState(jeandle::ObjectID ID) {
 // the PHI), and for lock/stack mismatch (every virtual pred materialized).
 // Returns true if a per-pred materialize emitted an Effect this iteration (the
 // run() do/while re-runs on true).
+// TODO(ensure-virtualized): when an EnsureVirtualized bit lands on ObjectState,
+// downgrade it here per-pred (Graal setEnsureVirtualized(false) where not all
+// preds agree) — this entry covers the AllMaterialized-divergence arm of
+// mergeObjectState.
 bool Analyzer::MergeProcessor::materializeAndBuildPhi(jeandle::ObjectID ID) {
   jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
   Type *PtrTy = PointerType::get(A.F.getContext(),
@@ -2391,22 +2394,22 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
         Eligible[*InIDs[I]] = false;
         continue;
       }
-      // Issue-1 guard: skip if the VO is already materialized for THIS merge.
-      // Two cases: (a) escape-point/Case-A already flipped the shared state
-      // (VO no longer virtual in BlockExits[Pred]); (b) a per-pred mat for THIS
-      // merge (Pred, BB, ID) was already emitted — per-pred does NOT flip the
-      // shared state (it must not leak to non-target successors), so the
-      // Virtuals check alone would miss it. Re-firing Case-A here would emit a
-      // DUPLICATE invoke (the per-pred mat's NewInv already handles this merge's
-      // incoming via the resolution sub-pass). A per-pred mat for a DIFFERENT
-      // merge is recorded under (Pred, M2, ID), so the check correctly does NOT
-      // skip in that case — Case-A fires, original behavior.
+      // Skip if the VO is already materialized for THIS merge. Two cases:
+      // (a) escape-point/Case-A already flipped the shared state (VO no
+      // longer virtual in BlockExits[Pred]); (b) a per-pred mat for THIS
+      // merge (Pred, BB, ID) was already emitted — per-pred does NOT flip
+      // the shared state (it must not leak to non-target successors), so the
+      // Virtuals check alone would miss it. Re-firing Case-A here would emit
+      // a DUPLICATE invoke (the per-pred mat's NewInv already handles this
+      // merge's incoming via the resolution sub-pass). A per-pred mat for a
+      // DIFFERENT merge is recorded under (Pred, M2, ID), so the check
+      // correctly does NOT skip in that case — Case-A fires normally.
       if (!PredED->Virtuals.count(*InIDs[I]) ||
           isMaterializedAtPred(Pred, BB, *InIDs[I]))
         continue;
       // Case-A mat at PH end (SkipGlobalRAUW=false): NewInv dominates all
-      // successors — flips the shared ExitInfo (original behavior) so other
-      // merges sharing this pred see the materialization.
+      // successors — flips the shared ExitInfo so other merges sharing this
+      // pred see the materialization.
       materializeAtPredFromExitInfo(*InIDs[I], Pred, *PredED,
                                     /*SkipGlobalRAUW=*/false, MatReason::Phi,
                                     /*TargetMerge=*/nullptr);
@@ -2458,6 +2461,10 @@ bool Analyzer::synthesizeCaseC(
     BasicBlock *BB, PHINode *Phi,
     ArrayRef<std::optional<jeandle::ObjectID>> InIDs,
     jeandle::EffectList &Out) {
+  // TODO(ensure-virtualized): when an EnsureVirtualized bit lands on
+  // ObjectState, downgrade it here per-pred (Graal setEnsureVirtualized(false)
+  // where not all preds agree). This entry routes the Case-C per-pred
+  // materialisations through materializeAtPredFromExitInfo.
   const unsigned N = Phi->getNumIncomingValues();
   assert(InIDs.size() == N);
 
@@ -2523,9 +2530,9 @@ bool Analyzer::synthesizeCaseC(
         return false;
       // Compare Call AND BytecodeDepth so that two stacks built
       // from the same call sites but at different bytecode depths are not
-      // collapsed by the Case-C identity-merge fast path. The legacy Order
-      // tag is still ignored here (the loop fixpoint refreshes Order on
-      // every re-push, which would diverge across iterations).
+      // collapsed by the Case-C identity-merge fast path. Order is ignored
+      // here because the loop fixpoint refreshes Order on every re-push,
+      // which would diverge across iterations.
       for (unsigned k = 0; k < S.size(); ++k)
         if (S[k].Call != RefStack[k].Call ||
             S[k].BytecodeDepth != RefStack[k].BytecodeDepth)
@@ -2991,12 +2998,7 @@ void Analyzer::processInstruction(Instruction *I) {
       propagatePointerAlias(I);
       return;
     }
-    // §2.3.14: known non-escaping LLVM intrinsics (assume, lifetime markers,
-    // invariant markers, debug intrinsics, ...) are no-ops for PEA. The
-    // virtual stays virtual and the call is left alone in IR (some are
-    // DCE'd downstream; others are harmless). Must run BEFORE the JavaOp
-    // fold + generic-escape fall-through.
-    // §2.3.14: known non-escaping LLVM intrinsics (assume, lifetime markers,
+    // Known non-escaping LLVM intrinsics (assume, lifetime markers,
     // invariant markers, debug intrinsics, ...) are no-ops for PEA. The
     // virtual stays virtual and the call is left alone in IR (some are
     // DCE'd downstream; others are harmless). launder/strip.invariant.group
@@ -3043,10 +3045,10 @@ void Analyzer::processInstruction(Instruction *I) {
     // the frontend grows a new JavaOp, wire its fold in processJavaOp and add
     // the isJeandle* predicate in PartialEscapeUtils.{h,cpp}.
     //
-    // §2.3.11/§2.3.12: equality compare against a virtual pointer folds
-    // (virtuals are never null; identity comparison). Non-equality ICmp on
-    // virtual heap pointers (slt/sgt/...) is UB on GC pointers; fall through
-    // to conservative materialization.
+    // Equality compare against a virtual pointer folds (virtuals are never
+    // null; identity comparison). Non-equality ICmp on virtual heap pointers
+    // (slt/sgt/...) is UB on GC pointers; fall through to conservative
+    // materialization.
     if (auto *ICmp = dyn_cast<ICmpInst>(I)) {
       if (foldICmpEquality(ICmp))
         return;
@@ -3113,12 +3115,11 @@ void Analyzer::processAllocation(CallBase *CB) {
   //      with setEnsureVirtualized(false) where not all preds agree
   //      (PartialEscapeClosure.java:991-995, 1321-1324, 1500-1503) and
   //      propagate it transitively in stripKilledLoopLocations (:685-714).
-  //      Jeandle's ObjectState has no such bit, so the three per-pred
-  //      materialisation sites that route through
-  //      materializeAtPredFromExitInfo (inside materializeAndBuildPhi, the
-  //      AllMaterialized-divergence arm of mergeObjectState, and
-  //      synthesizeCaseC) currently do no downgrade either — flagged in
-  //      docs/Jeandle-PEA-Review.md §2.3 but not yet TODO-marked in code.
+  //      Jeandle's ObjectState has no such bit, so the per-pred materialisation
+  //      sites that route through materializeAtPredFromExitInfo currently do no
+  //      downgrade either — tagged TODO(ensure-virtualized) at their entry
+  //      points (materializeAndBuildPhi, which the AllMaterialized-divergence
+  //      arm of mergeObjectState routes through; and synthesizeCaseC).
   //
   // Soundness: the unconditional return below is CONSERVATIVE — Jeandle
   // merely virtualises less than Graal in deep nests; it never miscompiles.
@@ -3961,10 +3962,10 @@ bool Analyzer::foldMonitorExit(CallBase *CB) {
 }
 
 bool Analyzer::foldArrayStoreCheck(CallBase *CB) {
-  // jeandle.array_store_check(value, array). §2.3.14 of the PEA paper marks the
-  // op read-only on the heap, so a virtual base is NOT an escape when the check
-  // is ELIDED (provably compatible / primitive element): the call is deleted, so
-  // no operand reference survives.
+  // jeandle.array_store_check(value, array). The op is read-only on the heap,
+  // so a virtual base is NOT an escape when the check is ELIDED (provably
+  // compatible / primitive element): the call is deleted, so no operand
+  // reference survives.
   //
   // CONTRACT (mirrors Graal processNodeInputs on a non-deleted node): when the
   // check SURVIVES (cannot be proven elidable) it needs real operands, so BOTH
@@ -4200,12 +4201,11 @@ bool Analyzer::processIntrinsic(IntrinsicInst *II) {
 }
 
 bool Analyzer::foldICmpEquality(ICmpInst *ICmp) {
-  // §2.3.11/§2.3.12: equality compare against a virtual pointer folds.
-  // Virtual objects are never null (by construction they track an in-flight
-  // alloc), so `icmp eq virt, null` -> false, `icmp ne virt, null` -> true.
-  // Two virtuals: same ID -> eq=true; different IDs -> eq=false.
-  // Mixed virtual + non-null non-virtual pointer: identity differs -> eq
-  // folds to false.
+  // Equality compare against a virtual pointer folds. Virtual objects are
+  // never null (by construction they track an in-flight alloc), so `icmp eq
+  // virt, null` -> false, `icmp ne virt, null` -> true. Two virtuals: same ID
+  // -> eq=true; different IDs -> eq=false. Mixed virtual + non-null
+  // non-virtual pointer: identity differs -> eq folds to false.
   if (!ICmp->isEquality())
     return false;
   Value *Op0 = ICmp->getOperand(0);
@@ -4460,17 +4460,16 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
   // RAUW from). Conservatively drop the synthetic and every per-pred source to
   // ineligible so the original allocations and stores survive.
   //
-  // GRAAL DIVERGENCE (deferred): Graal materializes a synthetic Case-C VO by
-  // materializing each per-pred source VO (mergeObjectEntry / the processPhi
-  // fallback, PartialEscapeClosure.java:1340-1365 & 1493-1514) and reusing the
-  // existing materializedValuePhi as the materialized value. Jeandle bails
-  // instead. Implementing this needs (a) per-pred-source materialization that
-  // threads each pred's NewInv through the Case-C PHI, and (b) the
-  // materialize-placement + lock-model alignment noted at
-  // materializeAt / foldMonitorEnter (synthetics' borrowed
-  // AllocationCall has no dominating alloc point). Deferred.
-  // TODO(cascade-materialize): per-pred source materialization + reuse of the
-  // existing PHI as the materialized pointer is not implemented.
+  // GRAAL DIVERGENCE: Graal materializes a synthetic Case-C VO by materializing
+  // each per-pred source VO (mergeObjectEntry / the processPhi fallback,
+  // PartialEscapeClosure.java:1340-1365 & 1493-1514) and reusing the existing
+  // materializedValuePhi as the materialized value. Jeandle bails instead.
+  // TODO(cascade-materialize): implement (a) per-pred-source materialization
+  // that threads each pred's NewInv through the Case-C PHI and reuses the
+  // existing materializedValuePhi as the materialized pointer, plus (b) the
+  // materialize-placement + lock-model alignment noted at materializeAt /
+  // foldMonitorEnter (synthetics' borrowed AllocationCall has no dominating
+  // alloc point).
   if (VObj.IsSynthetic) {
     markIneligible(ID); // cascades transitively over nested synthetics.
     C.MaterializedSet.insert(ID); // idempotent guard for re-entries.
@@ -5057,13 +5056,13 @@ void Analyzer::materializePreheaderVirtualsForUnvisitedLoops() {
 //    dominates only that edge. Therefore the per-pred path does NOT flip the
 //    shared `ExitInfo` (`BlockExits[PH]`) — a flip would leak to non-target
 //    successors, who would inherit a placeholder whose NewInv doesn't dominate
-//    them (test 416 / review §2.1). The placeholder is handed to the caller
-//    directly (materializeAndBuildPhi reads it via getOrCreatePerPredMatPlaceholder).
+//    them. The placeholder is handed to the caller directly
+//    (materializeAndBuildPhi reads it via getOrCreatePerPredMatPlaceholder).
 //  - Case-A / global mat (!SkipGlobalRAUW): the invoke is at the pred's
 //    terminator end, so its NewInv dominates ALL successors (Graal-aligned —
 //    Graal's CommitAllocationNode sits before the control split). The flip of
-//    the shared `ExitInfo` is therefore benign and is applied (original
-//    behavior), so other merges sharing this pred see the materialization.
+//    the shared `ExitInfo` is therefore benign and is applied, so other merges
+//    sharing this pred see the materialization.
 void Analyzer::materializeAtPredFromExitInfo(jeandle::ObjectID ID,
                                              BasicBlock *PH,
                                              BlockExitData &ExitInfo,

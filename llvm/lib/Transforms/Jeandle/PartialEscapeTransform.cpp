@@ -238,12 +238,11 @@ static void applyMaterialize(Function &F, const jeandle::PEAResult &Result,
   // terminator. The new invoke is emitted at the END of `Origin` (Step 6), so
   // it belongs to ORIGIN's funclet; the split does not change Origin's funclet
   // membership. A funclet pad sits at the ENTRY of a funclet, never at an
-  // arbitrary block head, so inspecting a post-split block head (the old
-  // MatCont->getFirstNonPHI() approach) both missed real pads and could bind
-  // the wrong one. Gated on a funclet personality so it is a true no-op (no
-  // O(F) coloring) on the current non-funclet target — Jeandle is not on
-  // Windows, but the standing IR-defensiveness rule requires tolerating any
-  // legal IR.
+  // arbitrary block head, so we resolve the pad from Origin's own funclet
+  // color rather than scanning a post-split block head. Gated on a funclet
+  // personality so it is a true no-op (no O(F) coloring) on the current
+  // non-funclet target — Jeandle is not on Windows, but the standing
+  // IR-defensiveness rule requires tolerating any legal IR.
   FuncletPadInst *EnclosingFuncletPad = nullptr;
   if (F.hasPersonalityFn() &&
       isFuncletEHPersonality(classifyEHPersonality(F.getPersonalityFn()))) {
@@ -367,8 +366,7 @@ static void applyMaterialize(Function &F, const jeandle::PEAResult &Result,
     // datalayout), which is too weak for an atomic. The store size is derived
     // from the DataLayout, so this stays correct under a future compressed-oop
     // / 32-bit heap model and matches the frontend's natural-aligned emission
-    // (and VirtualObject::FieldDesc::ByteSize). A hardcoded pointer?8:1 was
-    // both wrong for sub-word primitives and a brittle 8-byte-pointer guess.
+    // (and VirtualObject::FieldDesc::ByteSize).
     uint64_t StoreSz = DL.getTypeStoreSize(V->getType()).getFixedValue();
     Align NaturalAlign(llvm::PowerOf2Ceil(StoreSz ? StoreSz : 1));
     StoreInst *S = SB.CreateAlignedStore(V, Slot, NaturalAlign);
@@ -600,14 +598,15 @@ void jeandle::CreatePHIEffect::apply(jeandle::TransformContext &Ctx) {
     // globally materialized (materialize-before-loops), so the redundant
     // per-pred materialize is elided and no MatPerBlock/NewAllocFor entry is
     // recorded. Leaving the placeholder as the incoming would plant a dangling,
-    // never-defined value into the PHI (a latent verifier fault; surfaced when a
-    // downstream use — e.g. the §1.4 deepest-def resolution — keeps the PHI
-    // alive). Detect the placeholder precisely via the analyzer's placeholder
-    // set (NOT by "unparented PHINode": a loop field-PHI incoming can also be
-    // momentarily unparented and must be left as-is), then fall back to the
-    // global materialization, which exists precisely because the object is
-    // materialized; otherwise the original allocation (valid IR that the
-    // resolution sub-pass / Pass 2 then handles).
+    // never-defined value into the PHI (a latent verifier fault; surfaced when
+    // a downstream use — e.g. the deepest-def resolution in
+    // resolveMaterializedUses — keeps the PHI alive). Detect the placeholder
+    // precisely via the analyzer's placeholder set (NOT by "unparented
+    // PHINode": a loop field-PHI incoming can also be momentarily unparented
+    // and must be left as-is), then fall back to the global materialization,
+    // which exists precisely because the object is materialized; otherwise the
+    // original allocation (valid IR that the resolution sub-pass / Pass 2 then
+    // handles).
     if (Ctx.Result.PerPredMatPlaceholders.count(V) &&
         ObjID != jeandle::InvalidObjectID) {
       Value *OrigAlloc = Ctx.Result.VirtualObjects[ObjID]->AllocationCall;
@@ -754,8 +753,8 @@ static bool isCloserDominatingDef(Value *Candidate, Value *Current,
 // valid. For each OrigAlloc use, pick the CLOSEST (deepest) def in
 // Defs[OrigAlloc] that dominates it. Normally only one def dominates a use, but
 // a later materialization or merge PHI may shadow an earlier dominating def; in
-// that case the deeper/later def is the SSA value that represents this point
-// (§1.4). Deopt-bundle operands are scrubbed to a typed null (PEA stays
+// that case the deeper/later def is the SSA value that represents this point.
+// Deopt-bundle operands are scrubbed to a typed null (PEA stays
 // deopt-agnostic).
 static void resolveMaterializedUses(
     Function &F, DenseMap<Value *, SmallVector<Value *, 4>> &Defs) {
@@ -776,8 +775,7 @@ static void resolveMaterializedUses(
       // loop-header materialized-ptr PHI is inserted before a loop-body NewInv;
       // when both dominate the same use, "first" would wrongly thread the header
       // PHI (the previous iteration's merged pointer). Iterating to the deepest
-      // converges on the unique dominator-tree leaf among the dominating defs
-      // (§1.4).
+      // converges on the unique dominator-tree leaf among the dominating defs.
       Value *Dom = nullptr;
       for (Value *Def : DefList) {
         if (!DT.dominates(Def, U))
@@ -785,7 +783,8 @@ static void resolveMaterializedUses(
 #ifndef NDEBUG
         // PEA invariant: dominating defs of one use form a dominator chain. If
         // two were ever incomparable, "deepest" would be order-dependent — the
-        // exact bug class §1.4 guards. Cheap to verify; piggybacks on the loop.
+        // exact bug class this guard catches. Cheap to verify; piggybacks on
+        // the loop.
         if (Dom && Def != Dom)
           assert((DT.dominates(cast<Instruction>(Dom), cast<Instruction>(Def)) ||
                   DT.dominates(cast<Instruction>(Def), cast<Instruction>(Dom))) &&
