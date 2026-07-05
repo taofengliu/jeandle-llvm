@@ -3376,11 +3376,29 @@ bool Analyzer::processStore(StoreInst *SI) {
 
   jeandle::VirtualObject &VObj = *Result.VirtualObjects[*BaseID];
 
+  // The store could not be virtualized. Keep the base's ORIGINAL allocation
+  // real (markIneligible) so a pre-computed derived store address — e.g. a
+  // symbolic-index GEP computed earlier in the block — stays valid:
+  // materializing the base via the gate would insert a fresh alloc at the
+  // store that does not dominate that derived GEP, so its pointer operand
+  // would resolve to poison. The stored value, if itself virtual, must also be
+  // kept real or it would be eliminated (NeverEscapes -> poison) while the
+  // store survives, writing poison into the base's field. The store itself
+  // stays as a real store (no EliminateStoreEffect is emitted); returning true
+  // keeps processInstruction from re-running the gate on it.
+  auto bailKeepingOperandsReal = [&] {
+    markIneligible(*BaseID);
+    if (auto RefID =
+            jeandle::pea::resolveVirtualRef(Val, CurrentState, Aliases, DL))
+      markIneligible(*RefID);
+  };
+
   // Shared offset resolution (array-element GEP fast path + constant-offset
-  // resolver + header guard). See resolveAccess.
+  // resolver + header guard). See resolveAccess. Unresolved offset (symbolic
+  // array index, non-constant GEP, header offset) -> bail.
   std::optional<int64_t> Offset = resolveAccess(Ptr, *BaseID);
   if (!Offset) {
-    markIneligible(*BaseID);
+    bailKeepingOperandsReal();
     return true;
   }
 
@@ -3389,9 +3407,10 @@ bool Analyzer::processStore(StoreInst *SI) {
 
   // Type-overlap validation via VirtualObject::getOrCreateFieldIndex. We don't
   // actually use the returned index (FieldStates is keyed by raw offset), but
-  // -1 means an overlap/size conflict that forces escape.
+  // -1 means an overlap/size conflict, or an unknown-size value type such as a
+  // vector/struct — bail either way.
   if (VObj.getOrCreateFieldIndex(*Offset, Val->getType(), DL) < 0) {
-    markIneligible(*BaseID);
+    bailKeepingOperandsReal();
     return true;
   }
 

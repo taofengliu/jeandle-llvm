@@ -72,7 +72,8 @@ int VirtualObject::getOrCreateFieldIndex(int64_t Offset, Type *Ty,
     IsReference = true;
   } else {
     unsigned Bits = Ty->getPrimitiveSizeInBits();
-    assert(Bits > 0 && "field must have a known primitive size");
+    if (Bits == 0)
+      return -1; // unknown-size type (e.g. vector/struct) — conservative escape
     ByteSize = static_cast<uint8_t>((Bits + 7) / 8);
   }
 
