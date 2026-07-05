@@ -4981,14 +4981,31 @@ static void collectLoopsPreorder(Loop *L, SmallVectorImpl<Loop *> &Out) {
 // and BEFORE commit() (so the Materialize effects we add are subject to the
 // same eligibility filter that drops effects for objects we've decided to
 // abandon).
+// A 0-clause cleanup landingpad block that is exactly `landingpad <t> cleanup;
+// resume <t> %lp` — the canonical OOM handler — cannot observe a loop-local
+// virtual, so a loop exit into it need not force materialization. Any other
+// EH-pad successor (catch handler, clause-bearing landingpad, or a cleanup
+// that does more than resume) may observe, so it must.
+static bool isPureResumeCleanup(const BasicBlock &BB) {
+  const Instruction *LP = BB.getFirstNonPHI();
+  if (!isa<LandingPadInst>(LP))
+    return false;
+  const Instruction *Next = LP->getNextNode();
+  return Next == &BB.back() && isa<ResumeInst>(Next);
+}
+
 void Analyzer::processLoopExit(Loop *L) {
-  // Force materialisation at any loop-exit whose successor is an EH pad
-  // (landingpad / catchpad / cleanuppad). Without this, a loop-internal
-  // materialise that produced only per-pred MatPerBlock entries leaves
-  // exit-edge LCSSA PHIs (and exception handlers reading them) wired to
-  // stale OrigAlloc placeholders. The forced drain at the exit block
-  // ensures every still-virtual VO has a real allocation by the time the
-  // EH handler executes.
+  // Force materialisation at any loop-exit whose successor is an EH pad that
+  // may observe a loop-local virtual. Without this, a loop-internal materialise
+  // that produced only per-pred MatPerBlock entries leaves exit-edge LCSSA PHIs
+  // (and exception handlers reading them) wired to stale OrigAlloc
+  // placeholders; the forced drain ensures every still-virtual VO has a real
+  // allocation by the time the EH handler executes.
+  // Graal runs processLoopExit unconditionally (PartialEscapeClosure.java:737-
+  // 766) and force-materializes loop-local virtuals at any exception-handling
+  // exit. Jeandle preserves the common OOM-cleanup optimization by skipping
+  // only a pure-resume 0-clause cleanup (isPureResumeCleanup), which provably
+  // cannot observe; every other EH-pad successor forces materialization.
   // TODO(jeandle-deopt): see PartialEscapeTransform.cpp applyMaterialize().
   SmallVector<BasicBlock *, 4> ExitingBBs;
   L->getExitingBlocks(ExitingBBs);
@@ -5000,14 +5017,14 @@ void Analyzer::processLoopExit(Loop *L) {
     for (BasicBlock *Succ : successors(ExitingBB)) {
       if (L->contains(Succ))
         continue;
-      // Detect a real catch-handler exit. Pure cleanup landingpads
-      // (clauses==0, the C++/Java `resume` pattern) are NOT considered:
-      // the cleanup handler only runs `resume`, never observes the VO,
-      // and forcing a materialisation there would defeat virtualisation
-      // for every loop-local alloc that happens to be the body of an
-      // invoke (which is the canonical Jeandle shape — every alloc IS
-      // an invoke). Only catchswitch / catchpad headers and landingpads
-      // with at least one explicit clause qualify here.
+      // Graal runs processLoopExit unconditionally for every LoopExitNode and
+      // force-materializes every loop-local virtual whose exit reaches an
+      // exception-handling context (PartialEscapeClosure.java:737-766, gated
+      // only by isExceptionHandlingBCI). Any EH-pad successor — catchswitch,
+      // catchpad, or landingpad — counts: a 0-clause cleanup handler is NOT
+      // guaranteed to only `resume`; legal IR may read a loop-local virtual's
+      // field from it. Jeandle preserves the OOM-cleanup optimization by
+      // skipping only a pure-resume 0-clause cleanup (isPureResumeCleanup).
       // TODO(jeandle-deopt): see PartialEscapeTransform.cpp applyMaterialize().
       if (auto *CSI = dyn_cast<CatchSwitchInst>(&*Succ->getFirstNonPHIIt())) {
         (void)CSI;
@@ -5019,7 +5036,10 @@ void Analyzer::processLoopExit(Loop *L) {
         break;
       }
       if (auto *LP = dyn_cast<LandingPadInst>(&*Succ->getFirstNonPHIIt())) {
-        if (LP->getNumClauses() > 0) {
+        // A catch handler (clauses > 0) or a non-trivial cleanup may observe a
+        // loop-local virtual; a pure-resume 0-clause cleanup (OOM handler)
+        // cannot.
+        if (LP->getNumClauses() > 0 || !isPureResumeCleanup(*Succ)) {
           ExitsToEH = true;
           break;
         }
