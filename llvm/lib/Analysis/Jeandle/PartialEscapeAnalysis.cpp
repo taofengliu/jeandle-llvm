@@ -3880,30 +3880,6 @@ bool Analyzer::foldMonitorEnter(CallBase *CB) {
   // Resolve the bytecode lock depth for this enter (see getOrCreateLockDepth).
   uint32_t NewBytecodeDepth = getOrCreateLockDepth(CB);
 
-  // materializeVirtualLocksBefore pre-cascade (elide-path). Before virtualising
-  // a monitorenter on a NEW receiver ID while another VO already holds an OLDER
-  // (shallower-depth) elided lock, force every such sibling to materialise
-  // BEFORE the new virtual lock is added — otherwise the runtime lock-stack
-  // ordering observable at a later escape point would be reversed (the older
-  // VO would materialise alone without its sibling's lock on the stack).
-  // Compares BytecodeDepth (the Order proxy when metadata is absent). This is
-  // distinct from materializeVirtualLocksBefore above, which fires on the
-  // not-deleted (real-receiver) branch from processInstruction.
-  if (StrictLockOrder) {
-    SmallVector<jeandle::ObjectID, 4> ToPreCascade;
-    for (auto &Kv : LiveLockEnters) {
-      if (Kv.first == *BaseID)
-        continue;
-      if (Kv.second.empty())
-        continue;
-      if (Kv.second.front().BytecodeDepth < NewBytecodeDepth)
-        ToPreCascade.push_back(Kv.first);
-    }
-    llvm::sort(ToPreCascade); // deterministic
-    for (jeandle::ObjectID OID : ToPreCascade)
-      materializeAt(OID, CB, MatReason::Cascade);
-  }
-
   // Lock confinement: the lock counter is balanced per-block at commit
   // time. A monitorenter on a virtual is always safe to provisionally
   // elide; if the matching monitorexit is missing, commit() will flip the

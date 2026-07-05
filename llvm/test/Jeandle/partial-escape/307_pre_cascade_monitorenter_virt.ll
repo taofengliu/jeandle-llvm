@@ -1,18 +1,15 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; materializeVirtualLocksBefore pre-cascade.
+; Two virtual-locked objects escaping at separate points.
 ;
-; Two virtuals A and B, both entered (virtual monitorenter). At sink(%a),
-; the narrow lock-cascade rule (other.minOrder < this.maxOrder) would
-; observe Order(B).front=1 vs A.back=0 → 1<0 false → no cascade of B at
-; A's escape. Without the pre-cascade at foldMonitorEnter, B would only
-; materialise at sink(%b), so the lock-stack observable from sink(%a)
-; would silently lack B's lock — a Java-semantics change.
-;
-; At foldMonitorEnter(B) we pre-cascade A (because A.front=0 <
-; B.NewOrder=1) so A materialises BEFORE B's virtual lock is added. The
-; result is that both monitorenters appear in IR before sink(%a), and the
-; runtime lock stack at sink(%a) is correctly [A, B].
+; A and B are each virtual-monitorenter'd, then escape at distinct sink calls
+; (A first, then B). Each escape is its own single materialize point: A
+; materializes at sink(%a) and re-emits its monitorenter there, B materializes
+; at sink(%b). Because the two escape at different instructions they do not
+; form a cascade group, so each re-emits its own monitorenter per-effect; the
+; re-emitted enters keep source order (A before B), matching the acquisition
+; order. (A single shared escape point with interleaved locks would instead
+; be globally depth-sorted via the merged re-emit — see 427.)
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
@@ -33,7 +30,7 @@ n1:
             ptr inttoptr (i64 22222 to ptr), i32 16)
        to label %n2 unwind label %u
 n2:
-  ; Virtual monitorenter on B — fires the pre-cascade of A.
+  ; Virtual monitorenter on B.
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
                   ptr addrspace(1) %b, ptr %lb)
   ; Escape A first.

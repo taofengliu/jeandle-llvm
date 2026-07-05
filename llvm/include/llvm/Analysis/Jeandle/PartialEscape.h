@@ -99,6 +99,17 @@ struct MaterializedLock {
   uint32_t BytecodeDepth = 0;
 };
 
+// A lock re-emitted at a materialization point, tagged with its source VO's
+// original allocation so the transform can pick the right receiver per lock
+// when a cascade group's locks are merged and globally depth-sorted. See
+// PEAResult::EscapePointLocks.
+struct MergedLock {
+  Function *Callee = nullptr;
+  SmallVector<Value *, 2> NonReceiverArgs;
+  uint32_t BytecodeDepth = 0;
+  Instruction *OrigAlloc = nullptr; // receiver lookup key (NewAllocFor)
+};
+
 class VirtualObject {
 public:
   enum ClassKind : uint8_t { Instance, Array };
@@ -799,6 +810,22 @@ public:
   DenseMap<ObjectID, EscapeKind> EscapeClassification;
 
   DenseMap<BasicBlock *, EffectList> BlockEffects;
+
+  // Locks to re-emit at each escape point (the shared InsertBefore of a
+  // materialize / cascade group), globally sorted ascending by BytecodeDepth,
+  // and the highest MaterializeEffect SeqNo at each escape point. Graal
+  // flattens every lock materialized at one point into a single
+  // CommitAllocationNode and lowers them globally depth-sorted with a strict-
+  // increase guarantee (DefaultJavaLoweringProvider). Jeandle's per-VO
+  // MaterializeEffect model otherwise re-emits per-effect, which mis-orders
+  // re-entrant interleaved cascades (e.g. [a@0,b@1,a@2,c@3] re-emitting as
+  // 0,2,1,3). The transform emits each escape point's merged list once, from
+  // its highest-SeqNo effect (by then every sibling's NewInv exists), each
+  // lock's receiver resolved via NewAllocFor[OrigAlloc]. Populated by
+  // computeEscapePointLocks(), called once before the transform applies Pass 1.
+  DenseMap<Instruction *, SmallVector<MergedLock, 4>> EscapePointLocks;
+  DenseMap<Instruction *, uint32_t> MaxSeqForEscapePoint;
+  void computeEscapePointLocks();
 
   int VirtualizationDelta = 0;
   int AllocationDelta = 0;

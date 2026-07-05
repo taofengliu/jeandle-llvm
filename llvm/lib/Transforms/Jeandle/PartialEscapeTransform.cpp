@@ -374,26 +374,61 @@ static void applyMaterialize(Function &F, const jeandle::PEAResult &Result,
     S->setAtomic(AtomicOrdering::Unordered);
   }
 
-  // Re-emit surviving monitorenters at the materialize point (Graal analog:
-  // synthetic MonitorEnterNodes attached to the CommitAllocationNode during
-  // lowering, sorted ascending by lock depth). The analyzer deleted the
-  // original enters and captured each here as a self-contained MaterializedLock
-  // (callee + non-receiver args + bytecode depth). Clone each with the freshly
-  // materialized pointer as receiver, after the field stores (object fully
-  // initialized before the lock is acquired) and before the escape instruction.
-  // Graal lowers a fresh MonitorEnterNode carrying the original MonitorId;
-  // Jeandle clones the original callee + BasicLock args,
-  // receiver = NewInv — behaviorally equivalent, the LLVM-IR form of the same
-  // lock acquisition at the materialize point.
-  for (const jeandle::MaterializedLock &ML : E.Locks) {
-    if (!ML.Callee)
-      continue;
+  // Re-emit surviving monitorenters at the materialize point. Graal flattens
+  // every lock materialized at one point into a single CommitAllocationNode and
+  // lowers them globally sorted ascending by lock depth; the analyzer captured
+  // each VO's locks per-effect, and PEAResult::computeEscapePointLocks merged
+  // them per escape point (the shared InsertBefore of this cascade group) into
+  // Result.EscapePointLocks. This effect emits the merged list ONCE — iff it is
+  // the highest-SeqNo effect at its escape point (by then every sibling's NewInv
+  // is in NewAllocFor, so each lock's receiver resolves; chained block-splits
+  // also leave this effect's MatCont last at the escape call, so emitting here
+  // after the field stores precedes the escape and follows every sibling's
+  // field stores). Emitting per-effect here would mis-order re-entrant
+  // interleaved cascades. If the escape-point key is unresolved (the escape
+  // call was erased by a sibling effect), fall back to this effect's own locks.
+  auto EmitLock = [&](Value *Recv, Function *Callee,
+                      ArrayRef<Value *> NonReceiverArgs) {
+    if (!Callee)
+      return;
     SmallVector<Value *, 4> Args;
-    Args.push_back(NewInv);
-    for (Value *A : ML.NonReceiverArgs)
+    Args.push_back(Recv);
+    for (Value *A : NonReceiverArgs)
       Args.push_back(A);
-    CallInst *Enter = SB.CreateCall(ML.Callee, Args);
+    CallInst *Enter = SB.CreateCall(Callee, Args);
     Enter->setCallingConv(CallingConv::Hotspot_JIT);
+  };
+  if (E.IsPerPred) {
+    // A per-pred materialization lives on a split critical edge whose NewInv
+    // does not dominate any sibling emit point, so it re-emits its own locks
+    // here (the pre-fix per-effect behaviour).
+    for (const jeandle::MaterializedLock &ML : E.Locks)
+      EmitLock(NewInv, ML.Callee, ML.NonReceiverArgs);
+  } else {
+    Instruction *EscapeKey = dyn_cast_or_null<Instruction>(E.InsertBefore);
+    auto MaxIt = EscapeKey ? Result.MaxSeqForEscapePoint.find(EscapeKey)
+                           : Result.MaxSeqForEscapePoint.end();
+    if (MaxIt != Result.MaxSeqForEscapePoint.end() &&
+        E.SeqNo == MaxIt->second) {
+      // Cascade emitter: emit the escape point's globally-merged lock list
+      // once. Every sibling's NewInv is in NewAllocFor (lower SeqNo, already
+      // applied) and this effect's own was just registered, so each lock's
+      // receiver resolves.
+      auto It = Result.EscapePointLocks.find(EscapeKey);
+      if (It != Result.EscapePointLocks.end())
+        for (const jeandle::MergedLock &ML : It->second) {
+          auto RIt = NewAllocFor.find(ML.OrigAlloc);
+          EmitLock(RIt != NewAllocFor.end() ? RIt->second : NewInv, ML.Callee,
+                   ML.NonReceiverArgs);
+        }
+    } else if (MaxIt == Result.MaxSeqForEscapePoint.end()) {
+      // Not a cascade group (single-effect escape point, or the escape call
+      // was erased): emit this effect's own locks per-effect. A sibling in an
+      // actual cascade (MaxIt found, SeqNo != max) emits nothing here — the
+      // emitter handles the whole group.
+      for (const jeandle::MaterializedLock &ML : E.Locks)
+        EmitLock(NewInv, ML.Callee, ML.NonReceiverArgs);
+    }
   }
 
   // Record this materialization in NewAllocFor so any later applyMaterialize
@@ -957,6 +992,10 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
   // Recompute RPOT AFTER any critical-edge splits so the new edge-blocks
   // are visited in Pass 1.
   ReversePostOrderTraversal<Function *> RPOT(&F);
+
+  // Build the per-escape-point merged lock lists (one global depth-sort per
+  // materialize point) before Pass 1 applies effects.
+  Result.computeEscapePointLocks();
 
   // -------------------------------------------------------------------------
   // Pass 1: non-cfgKill effects (ReplaceLoad, ReplaceCall, EliminateStore,

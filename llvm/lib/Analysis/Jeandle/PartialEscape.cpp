@@ -496,6 +496,51 @@ void AliasMap::restore(const AliasMap &S) { *this = S; }
 // PEAResult
 // ===========================================================================
 
+void PEAResult::computeEscapePointLocks() {
+  // Globally merge + depth-sort the locks of every CASCADE group: a set of
+  // live-path (non-per-pred) MaterializeEffects that share one escape point
+  // (InsertBefore). Only such groups (>= 2 effects at a point) need a merged
+  // re-emit; a single-effect escape point emits its own locks per-effect (its
+  // NewInv trivially dominates its own emit point), and per-pred effects
+  // always emit per-effect (their NewInv lives on a split edge). Also record
+  // the highest SeqNo per escape point so the transform emits the merged list
+  // once, from the last-applied effect (all sibling NewInvs then exist for
+  // receiver lookup). See the comment on EscapePointLocks.
+  DenseMap<Instruction *, unsigned> Count;
+  for (auto &Kv : BlockEffects)
+    for (jeandle::Effect &E : Kv.second) {
+      auto *ME = dyn_cast<jeandle::MaterializeEffect>(&E);
+      if (!ME || ME->IsPerPred)
+        continue;
+      if (auto *Key = dyn_cast_or_null<Instruction>(ME->InsertBefore))
+        ++Count[Key];
+    }
+  for (auto &Kv : BlockEffects)
+    for (jeandle::Effect &E : Kv.second) {
+      auto *ME = dyn_cast<jeandle::MaterializeEffect>(&E);
+      if (!ME || ME->IsPerPred)
+        continue;
+      Instruction *Key = dyn_cast_or_null<Instruction>(ME->InsertBefore);
+      if (!Key)
+        continue;
+      auto CIt = Count.find(Key);
+      if (CIt == Count.end() || CIt->second < 2)
+        continue; // single-effect escape point — per-effect emit
+      auto &Vec = EscapePointLocks[Key];
+      for (const jeandle::MaterializedLock &ML : ME->Locks)
+        Vec.push_back({ML.Callee, ML.NonReceiverArgs, ML.BytecodeDepth,
+                       ME->Target});
+      uint32_t &Max = MaxSeqForEscapePoint[Key];
+      if (ME->SeqNo > Max)
+        Max = ME->SeqNo;
+    }
+  for (auto &Kv : EscapePointLocks)
+    llvm::sort(Kv.second, [](const jeandle::MergedLock &A,
+                             const jeandle::MergedLock &B) {
+      return A.BytecodeDepth < B.BytecodeDepth;
+    });
+}
+
 PEAResult::~PEAResult() {
   // Any unparented PHI created by the analyzer (e.g., the analyzer ran
   // but the transform never consumed the result) must be freed. Once a PHI
