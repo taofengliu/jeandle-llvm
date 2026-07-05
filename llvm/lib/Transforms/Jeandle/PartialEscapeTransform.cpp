@@ -184,7 +184,8 @@ static void applyMaterialize(Function &F, const jeandle::PEAResult &Result,
                              DenseMap<Value *, Value *> &NewAllocFor,
                              DenseMap<std::pair<BasicBlock *, Value *>, Value *>
                                  &MatPerBlock,
-                             DenseMap<BasicBlock *, BasicBlock *> &BlockRename,
+                             DenseMap<std::pair<BasicBlock *, BasicBlock *>,
+                                      BasicBlock *> &BlockRename,
                              DenseMap<Value *, SmallVector<Value *, 4>> &Defs) {
   assert(E.ObjID != jeandle::InvalidObjectID);
   assert(E.Target && "Materialize effect must carry the original allocation");
@@ -416,7 +417,7 @@ static void applyMaterialize(Function &F, const jeandle::PEAResult &Result,
     MatPerBlock[{AnalyzerRecordedPred, E.PerPredPlaceholder}] = NewInv;
     NewAllocFor[E.PerPredPlaceholder] = NewInv;
   }
-  BlockRename[Origin] = MatCont;
+  BlockRename[{Origin, E.TargetMergeBB}] = MatCont;
 
   // Record this NewInv as a definition point of OrigAlloc. OrigAlloc is not
   // RAUW'd inline — the point-sensitive resolution sub-pass (run after
@@ -440,7 +441,7 @@ struct jeandle::TransformContext {
   jeandle::PEAResult &Result;
   DenseMap<Value *, Value *> &NewAllocFor;
   DenseMap<std::pair<BasicBlock *, Value *>, Value *> &MatPerBlock;
-  DenseMap<BasicBlock *, BasicBlock *> &BlockRename;
+  DenseMap<std::pair<BasicBlock *, BasicBlock *>, BasicBlock *> &BlockRename;
   DenseMap<Value *, SmallVector<Value *, 4>> &Defs;
   bool &Changed;
 };
@@ -613,12 +614,22 @@ void jeandle::CreatePHIEffect::apply(jeandle::TransformContext &Ctx) {
       auto ItG = Ctx.NewAllocFor.find(OrigAlloc);
       V = (ItG != Ctx.NewAllocFor.end()) ? ItG->second : OrigAlloc;
     }
-    // Resolve the live pred BB through BlockRename.
+    // Resolve the live pred BB through BlockRename. Keyed by (LivePred,
+    // this->Block) — CreatePHI is always per-pred, so this->Block IS the target
+    // merge M; two per-pred mats from the same PH to different merges route
+    // through their own split→MatCont chains. Fallback to (LivePred, null) so a
+    // merge consuming an escape-point / Case-A NewInv (TargetMergeBB=null,
+    // seeded under {Origin, null}) resolves e.g. then → mat.cont.
     BasicBlock *LivePred = Pred;
     while (true) {
-      auto It = Ctx.BlockRename.find(LivePred);
-      if (It == Ctx.BlockRename.end())
-        break;
+      auto It = Ctx.BlockRename.find({LivePred, Block});
+      if (It == Ctx.BlockRename.end()) {
+        auto ItN = Ctx.BlockRename.find({LivePred, nullptr});
+        if (ItN == Ctx.BlockRename.end())
+          break;
+        LivePred = ItN->second;
+        continue;
+      }
       LivePred = It->second;
     }
     Phi->addIncoming(V, LivePred);
@@ -650,10 +661,12 @@ void jeandle::RewritePhiIncomingEffect::apply(jeandle::TransformContext &Ctx) {
     return; // the Materialize was dropped (object ineligible) — nothing to rewire.
 
   // Resolve the live merge-pred (e.g. latch -> ... -> MatCont) through the
-  // block-split rename chain, mirroring CreatePHIEffect::apply.
+  // block-split rename chain, mirroring CreatePHIEffect::apply. Keyed by
+  // (LivePred, TargetMergeBB) — null for this effect (Case-A only: mat at PH
+  // end, single MatCont, no critical-edge split).
   BasicBlock *LivePred = Pred;
   while (true) {
-    auto R = Ctx.BlockRename.find(LivePred);
+    auto R = Ctx.BlockRename.find({LivePred, TargetMergeBB});
     if (R == Ctx.BlockRename.end())
       break;
     LivePred = R->second;
@@ -823,10 +836,15 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
   // CreatePHI to pick the right NewInv for each merge incoming when the same
   // OrigAlloc is materialized at multiple preds.
   DenseMap<std::pair<BasicBlock *, Value *>, Value *> MatPerBlock;
-  // Block-split rename map: Origin BasicBlock → MatCont. Used to resolve
-  // the analyzer-recorded PHI incoming block (which named the original pred
-  // pre-split) to the live merge-pred (post-split MatCont chain).
-  DenseMap<BasicBlock *, BasicBlock *> BlockRename;
+  // Block-split rename map: (Origin BasicBlock, target-merge BB) → next block in
+  // the post-split MatCont chain. Used to resolve the analyzer-recorded PHI
+  // incoming block (which named the original pred pre-split) to the live
+  // merge-pred. Keyed by (PH, target-merge) so two per-pred materializes from
+  // the same PH to DIFFERENT target merges (two split edges) do not collide —
+  // each merge's CreatePHI incoming routes through its own edge's split→MatCont
+  // chain. The target-merge is null for the Case-A / global path (mat at PH
+  // end, single MatCont, no critical-edge split).
+  DenseMap<std::pair<BasicBlock *, BasicBlock *>, BasicBlock *> BlockRename;
   // Per-OrigAlloc definition points (every materialize NewInv + every merge
   // PHI) populated during Pass 1. Consumed by resolveMaterializedUses after
   // Pass 1 to rewrite each surviving OrigAlloc use to its dominating def.
@@ -838,15 +856,19 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
   // A per-pred Materialize replaces PH's terminator with a materialisation
   // invoke carrying an OOM unwind edge. If PH has multiple successors the OOM
   // would become observable on every PH→* edge — a Java-semantics change. So
-  // for each IsPerPred Materialize on a PH with >1 successor, split the
-  // PH→S edge where S is the merge that requested the per-pred mat (S has
-  // >1 pred and BlockEffects[S] has a CreatePHI naming PH), then re-aim the
+  // for each IsPerPred Materialize on a PH with >1 successor, split the PH→S
+  // edge where S is the target merge (MaterializeEffect::TargetMergeBB, the
+  // merge whose MergeProcessor requested the per-pred mat), then re-aim the
   // per-pred Materialize effects onto the new edge-block PH' and seed
-  // BlockRename[PH] = PH' so CreatePHI's BlockRename-chain walk routes the
-  // analyzer-recorded PH incoming through PH' to MatCont.
+  // BlockRename[{PH, S}] = PH' so CreatePHI's BlockRename-chain walk (keyed by
+  // (LivePred, this->Block=S)) routes the analyzer-recorded PH incoming through
+  // PH' to MatCont. Keying by (PH, S) means two per-pred mats from the same PH
+  // to different target merges (S1, S2) split two distinct edges and do not
+  // collide.
   {
     struct EdgeKey {
       BasicBlock *PH;
+      BasicBlock *S; // target merge
       unsigned SuccIdx;
     };
     SmallVector<EdgeKey, 4> Splits;
@@ -857,7 +879,8 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
         if (!M || !M->IsPerPred)
           continue;
         BasicBlock *PH = E.Block;
-        if (!PH)
+        BasicBlock *S = M->TargetMergeBB;
+        if (!PH || !S)
           continue;
         Instruction *Term = PH->getTerminator();
         if (!Term || Term->getNumSuccessors() <= 1)
@@ -866,39 +889,24 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
         // original monitorenter and re-emits it at the materialize point, so no
         // surviving enter sits in PH that would lose its dominating receiver if
         // the Materialize moved to a new edge block.
+        unsigned SuccIdx = UINT_MAX;
         for (unsigned i = 0, n = Term->getNumSuccessors(); i < n; ++i) {
-          BasicBlock *S = Term->getSuccessor(i);
-          if (S->hasNPredecessors(1))
-            continue;
-          // Check that BlockEffects[S] contains a CreatePHI that names PH
-          // (i.e. S is the merge for which PEA emitted the per-pred mat).
-          auto SIt = Result.BlockEffects.find(S);
-          if (SIt == Result.BlockEffects.end())
-            continue;
-          bool MatchingPhi = false;
-          for (const auto &PE : SIt->second) {
-            const auto *CPE = dyn_cast<jeandle::CreatePHIEffect>(&PE);
-            if (!CPE)
-              continue;
-            for (BasicBlock *IB : CPE->PHIIncomingBlocks) {
-              if (IB == PH) {
-                MatchingPhi = true;
-                break;
-              }
-            }
-            if (MatchingPhi)
-              break;
+          if (Term->getSuccessor(i) == S) {
+            SuccIdx = i;
+            break;
           }
-          if (!MatchingPhi)
-            continue;
-          auto Key = std::make_pair(PH, S);
-          if (!SeenEdges.insert(Key).second)
-            continue;
-          Splits.push_back({PH, i});
         }
+        if (SuccIdx == UINT_MAX)
+          continue; // S not a successor of PH — malformed.
+        if (S->hasNPredecessors(1))
+          continue; // single-pred S: no critical edge to split.
+        auto Key = std::make_pair(PH, S);
+        if (!SeenEdges.insert(Key).second)
+          continue;
+        Splits.push_back({PH, S, SuccIdx});
       }
     }
-    DenseMap<BasicBlock *, BasicBlock *> PHRename;
+    DenseMap<std::pair<BasicBlock *, BasicBlock *>, BasicBlock *> PHRename;
     for (const EdgeKey &K : Splits) {
       Instruction *Term = K.PH->getTerminator();
       BasicBlock *NewBB = SplitCriticalEdge(
@@ -907,20 +915,23 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
       if (!NewBB)
         continue;
       NewBB->setName("pea.crit.split");
-      PHRename[K.PH] = NewBB;
+      PHRename[{K.PH, K.S}] = NewBB;
       // Seed the transform's BlockRename so the CreatePHI handler's chain
-      // walk routes PH → NewBB and then (after applyMaterialize) NewBB →
-      // MatCont.
-      BlockRename[K.PH] = NewBB;
+      // walk (keyed by (LivePred, this->Block=S)) routes PH → NewBB and then
+      // (after applyMaterialize) NewBB → MatCont.
+      BlockRename[{K.PH, K.S}] = NewBB;
     }
     // Re-aim per-pred Materialize effects from their original PH bucket onto
     // the new edge-block. Also move the BlockEffects entry so the RPO walk
     // applies the effects at the correct block boundary. The Stay effects
     // remain in the Old bucket; each Move effect is spliced out, re-aimed via
-    // the MaterializeEffect setters, and added to the New bucket.
+    // the MaterializeEffect setters, and added to the New bucket. The
+    // E.TargetMergeBB == M filter ensures a per-pred mat for (PH, M1) is NOT
+    // moved onto M2's split edge when two merges share PH.
     if (!PHRename.empty()) {
       for (const auto &KvOut : PHRename) {
-        BasicBlock *Old = KvOut.first;
+        BasicBlock *Old = KvOut.first.first;
+        BasicBlock *S = KvOut.first.second;
         BasicBlock *New = KvOut.second;
         auto It = Result.BlockEffects.find(Old);
         if (It == Result.BlockEffects.end())
@@ -931,7 +942,7 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
         while (I < Src.size()) {
           jeandle::Effect &E = Src[I];
           auto *M = dyn_cast<jeandle::MaterializeEffect>(&E);
-          if (M && M->IsPerPred && E.Block == Old) {
+          if (M && M->IsPerPred && E.Block == Old && M->TargetMergeBB == S) {
             M->setBlock(New);
             M->setInsertBefore(&*New->getFirstNonPHIOrDbg());
             Move.add(Src.spliceOut(I));

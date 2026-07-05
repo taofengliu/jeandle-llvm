@@ -611,6 +611,18 @@ public:
   Instruction *DeoptBundleSource = nullptr;
   bool IsPerPred = false;
   Value *PerPredPlaceholder = nullptr;
+  // The target merge block this per-pred materialize is destined for (the merge
+  // whose `MergeProcessor::BB` was in scope when this effect was emitted), or
+  // null for the Case-A / global path (mat placed at the pred's terminator end,
+  // whose NewInv dominates all successors — Graal-aligned, benign shared flip).
+  // IR-form divergence: Graal places the CommitAllocationNode before the pred's
+  // control split so its materialized value dominates every successor; Jeandle
+  // emits a real invoke with a single normal dest on one critical edge, so the
+  // NewInv dominates only that edge. The transform's critical-edge pre-pass keys
+  // `PHRename`/`BlockRename` by (PH, TargetMergeBB) so two per-pred mats from the
+  // same PH to different merges do not collide, and `MatPerBlock`/`BlockRename`
+  // chain walks route each merge's CreatePHI incoming through its own edge.
+  BasicBlock *TargetMergeBB = nullptr;
 
   Kind getKind() const override { return Kind::Materialize; }
   static bool classof(const Effect *E) { return E->getKind() == Kind::Materialize; }
@@ -665,6 +677,12 @@ public:
   Value *PerPredPlaceholder = nullptr; // resolves to this pred's NewInv at apply
   int64_t ByteOffset = 0;   // constant byte offset of the carry from OrigAlloc
                             // (0 = bitcast/identity -> reuse NewInv directly)
+  // Always null for this effect: RewritePhiIncoming is created only by the
+  // Case-A path (processBlockPhis, SkipGlobalRAUW=false), whose mat is placed at
+  // the pred's terminator end (NewInv dominates all successors, shared flip). The
+  // transform's `BlockRename` chain walk keys by (LivePred, TargetMergeBB); null
+  // here routes through the single shared MatCont (no critical-edge split).
+  BasicBlock *TargetMergeBB = nullptr;
 
   Kind getKind() const override { return Kind::RewritePhiIncoming; }
   static bool classof(const Effect *E) {

@@ -437,12 +437,19 @@ private:
   // Per-block exit snapshots, keyed by the block that produced them.
   DenseMap<BasicBlock *, BlockExitInfo> BlockExits;
 
-  // Function-wide dedup of (Pred, ObjectID) materializations. Multiple
-  // merge-time Materialize-at-pred emissions for the same (Pred, ObjectID)
-  // would otherwise produce duplicate invokes; this set ensures we emit
-  // exactly one Materialize effect per (Pred, ObjectID) pair across the
-  // entire run.
-  DenseMap<BasicBlock *, DenseSet<jeandle::ObjectID>> MaterializedAtPred;
+  // Function-wide dedup of (Pred, TargetMerge, ObjectID) materializations.
+  // Multiple merge-time Materialize-at-pred emissions for the same (Pred, M, ID)
+  // would otherwise produce duplicate invokes; this nested map ensures we emit
+  // exactly one Materialize effect per (Pred, M, ID) across the entire run.
+  // Per-pred mats for distinct target merges M1, M2 at the same PH are NOT
+  // deduped (they are distinct edge materializations). The Case-A / global path
+  // passes M=null (mat at the pred's terminator end, shared across merges) so
+  // its (PH, null, ID) entry dedups across all merges sharing PH. Nested as
+  // PH -> M -> ID set so `MaterializedAtPred[PH][M]` is a `DenseSet<ID>&`
+  // (bindable to MaterializeContext::MaterializedSet) and the loop rollback's
+  // `MaterializedAtPred.erase(BB)` still erases per-PH (all M, all ID).
+  DenseMap<BasicBlock *, DenseMap<BasicBlock *, DenseSet<jeandle::ObjectID>>>
+      MaterializedAtPred;
 
   // Per-merge-block deferred CreatePHI effects. mergeStates pushes
   // every CreatePHI it would have committed directly onto this list (keyed
@@ -547,18 +554,37 @@ private:
   // a DISTINCT placeholder Value* for a materialized object, so the
   // MergeProcessor fast-path's deep-value equivalence check is sound
   // post-cascade (distinct values => not equivalent). Keyed by
-  // {predecessor-block, ObjectID}: a given (PH, ID) has exactly one
-  // materialization, so the cache is sound AND loop-stable — the same
-  // placeholder is returned across loop-fixpoint iterations, keeping the
-  // header's B-vs-B' convergence stable. Placeholders live in
+  // {predecessor-block, target-merge, ObjectID}: a per-pred materialize is
+  // destined for ONE target merge (the MergeProcessor::BB in scope), and the
+  // same PH may carry distinct per-pred mats for different target merges (one
+  // per critical edge), so the placeholder must be distinct per (PH, M, ID).
+  // The Case-A / global path passes M=null (mat at the pred's terminator end,
+  // NewInv dominates all successors, shared flip) — its placeholder is shared
+  // across merges (one mat per (PH, ID)). The cache is loop-stable: the same
+  // (PH, M, ID) returns the same placeholder across loop-fixpoint iterations,
+  // keeping the header's B-vs-B' convergence stable. Placeholders live in
   // Result.OwnedMatPlaceholders; the transform resolves them away (never
-  // inserts them). See Effect::PerPredPlaceholder.
-  DenseMap<std::pair<BasicBlock *, jeandle::ObjectID>, Value *>
+  // inserts them). See Effect::PerPredPlaceholder / Effect::TargetMergeBB.
+  struct PerPredPlaceholderKey {
+    BasicBlock *PH;
+    BasicBlock *TargetMerge; // null for Case-A / global
+    jeandle::ObjectID ID;
+    bool operator==(const PerPredPlaceholderKey &O) const {
+      return PH == O.PH && TargetMerge == O.TargetMerge && ID == O.ID;
+    }
+  };
+  struct PerPredPlaceholderKeyHash {
+    size_t operator()(const PerPredPlaceholderKey &K) const {
+      return static_cast<size_t>(
+          hash_combine(hash_value(K.PH), hash_value(K.TargetMerge), K.ID));
+    }
+  };
+  std::unordered_map<PerPredPlaceholderKey, Value *, PerPredPlaceholderKeyHash>
       PerPredMatPlaceholderCache;
   // All placeholder Value*s created by getOrCreatePerPredMatPlaceholder (the
   // cache's value set, mirrored for O(1) membership). The per-field dominance
   // gate in ensureMaterialized skips these: their eventual NewInv is materialized
-  // at the same predecessor (keyed {PH, ID}), dominating SafeIP by construction.
+  // at the same predecessor, dominating SafeIP by construction.
   DenseSet<Value *> PerPredMatPlaceholders;
 
   // Per-VO record of LLVM pointer-PHIs that processBlockPhis
@@ -590,6 +616,13 @@ private:
     Analyzer &A;
     BasicBlock *BB;
     // Per-merge context (the Graal MergeProcessor's mergeBlock + caches).
+    // Preds[i] points at the shared `BlockExits[Pred]` (or its UnwindData
+    // variant) via exitDataFor. Per-pred materialize does NOT flip this shared
+    // state (its NewInv dominates one critical edge — see
+    // materializeAtPredFromExitInfo); the merge reads the per-pred placeholder
+    // directly via getOrCreatePerPredMatPlaceholder. Case-A / global materialize
+    // DOES flip the shared state (NewInv at PH end dominates all successors —
+    // Graal-aligned, benign).
     SmallVector<BlockExitData *, 4> Preds;
     SmallVector<BasicBlock *, 4> PredBBs;
     SmallVector<jeandle::ObjectID, 8> IDs;
@@ -628,11 +661,13 @@ private:
                                    int64_t Offset, Type *Ty, unsigned N,
                                    const Twine &Name);
 
-  // Returns the per-pred materialization placeholder for (PH, ID): a stable,
-  // distinct, analysis-owned Value* that stands in for the per-pred NewInv
-  // the transform creates. Cached by {PH, ID} so it is loop-stable. Created
-  // as an unparented instruction registered in Result.OwnedMatPlaceholders.
-  Value *getOrCreatePerPredMatPlaceholder(BasicBlock *PH, jeandle::ObjectID ID);
+  // Returns the per-pred materialization placeholder for (PH, TargetMerge, ID):
+  // a stable, distinct, analysis-owned Value* that stands in for the per-pred
+  // NewInv the transform creates. Cached by {PH, M, ID} (M=null for Case-A /
+  // global) so it is loop-stable. Created as an unparented instruction registered
+  // in Result.OwnedMatPlaceholders.
+  Value *getOrCreatePerPredMatPlaceholder(BasicBlock *PH, BasicBlock *TargetMerge,
+                                          jeandle::ObjectID ID);
 
   void processBlock(BasicBlock *BB);
   void processInstruction(Instruction *I);
@@ -668,6 +703,14 @@ private:
   // the pred's invoke's unwind dest AND a pre-invoke snapshot was
   // recorded — the pre-invoke unwind variant.
   BlockExitData *exitDataFor(BasicBlock *Pred, BasicBlock *Succ);
+
+  // Has a per-pred / Case-A materialize already been emitted for (Pred, M, ID)?
+  // Used by processBlockPhis Case-A to skip a duplicate mat when the VO was
+  // already per-pred-mat'd for THIS merge (per-pred does not flip the shared
+  // state, so the Virtuals check alone would miss it). M=null queries the
+  // Case-A / global slot.
+  bool isMaterializedAtPred(BasicBlock *Pred, BasicBlock *M,
+                            jeandle::ObjectID ID);
 
   // PHI Case C: synthesize a merged VirtualObject when every incoming of a
   // pointer-PHI resolves to a DIFFERENT but COMPATIBLE virtual ID. Returns
@@ -771,7 +814,8 @@ private:
   void materializeAtPredFromExitInfo(jeandle::ObjectID ID, BasicBlock *PH,
                                      BlockExitData &ExitInfo,
                                      bool SkipGlobalRAUW = false,
-                                     MatReason Reason = MatReason::Merge);
+                                     MatReason Reason = MatReason::Merge,
+                                     BasicBlock *TargetMerge = nullptr);
 
   // Real loop fixpoint. processLoop runs the fixpoint over L (which
   // includes its sub-loops; nested loops are dispatched recursively when
@@ -829,7 +873,9 @@ private:
     // BlockEffects[BB] (if any), captured *before* the loop iteration began.
     DenseMap<BasicBlock *, BlockExitInfo> SavedBlockExits;
     DenseMap<BasicBlock *, jeandle::EffectList> SavedBlockEffects;
-    DenseMap<BasicBlock *, DenseSet<jeandle::ObjectID>> SavedMaterializedAtPred;
+    DenseMap<BasicBlock *,
+             DenseMap<BasicBlock *, DenseSet<jeandle::ObjectID>>>
+        SavedMaterializedAtPred;
     DenseSet<BasicBlock *> HadBlockExits;
     DenseSet<BasicBlock *> HadBlockEffects;
     DenseSet<BasicBlock *> HadMaterializedAtPred;
@@ -932,7 +978,14 @@ private:
     DenseMap<jeandle::ObjectID, DenseMap<int64_t, jeandle::FieldValue>> &FieldStates;
     DenseMap<jeandle::ObjectID, unsigned> &LockCounts;
     DenseMap<jeandle::ObjectID, SmallVector<LockEnter, 4>> &LiveLockEnters;
-    DenseSet<jeandle::ObjectID> &MaterializedSet; // &Materialized | &MaterializedAtPred[PH]
+    // Idempotency set: has this ObjectID already been materialized in this call
+    // chain (cascade cycle-prevention) AND function-wide for this path? Bound to
+    // the analyzer-wide `Materialized` (escape-point path) or to
+    // `MaterializedAtPred[PH][TargetMerge]` (merge-driven path — a DenseSet<ID>
+    // per (PH, target-merge) so distinct target merges each get their own
+    // per-pred mat at the same PH, while Case-A/global M=null dedups across
+    // merges sharing PH).
+    DenseSet<jeandle::ObjectID> &MaterializedSet;
     MatReason Reason;
     // Recurse on a nested/cascade object (materializeAt vs
     // materializeAtPredFromExitInfo — different signatures, hence a callback).
@@ -1189,6 +1242,17 @@ BlockExitData *Analyzer::exitDataFor(BasicBlock *Pred, BasicBlock *Succ) {
   return &Info;
 }
 
+bool Analyzer::isMaterializedAtPred(BasicBlock *Pred, BasicBlock *M,
+                                    jeandle::ObjectID ID) {
+  auto It = MaterializedAtPred.find(Pred);
+  if (It == MaterializedAtPred.end())
+    return false;
+  auto MIt = It->second.find(M);
+  if (MIt == It->second.end())
+    return false;
+  return MIt->second.count(ID);
+}
+
 void Analyzer::inheritFromExit(const BlockExitData &Exit) {
   for (jeandle::ObjectID ID : Exit.Virtuals) {
     if (!Eligible.lookup(ID))
@@ -1259,8 +1323,9 @@ PHINode *Analyzer::createUnparentedPhi(Type *Ty, unsigned N,
 }
 
 Value *Analyzer::getOrCreatePerPredMatPlaceholder(BasicBlock *PH,
+                                                  BasicBlock *TargetMerge,
                                                   jeandle::ObjectID ID) {
-  auto Key = std::make_pair(PH, ID);
+  PerPredPlaceholderKey Key{PH, TargetMerge, ID};
   auto It = PerPredMatPlaceholderCache.find(Key);
   if (It != PerPredMatPlaceholderCache.end())
     if (Value *V = It->second)
@@ -1271,8 +1336,10 @@ Value *Analyzer::getOrCreatePerPredMatPlaceholder(BasicBlock *PH,
   // used purely as a concrete distinct Value* (resolution keys on pointer
   // identity) — it is NOT a real merge PHI, and lives in OwnedMatPlaceholders
   // (separate from OwnedPhis/OwnedLoopFieldPhis) so it is never confused with
-  // one. Keyed by {PH, ID} the same pointer is returned across loop-fixpoint
-  // iterations, preserving the B-vs-B' convergence.
+  // one. Keyed by {PH, TargetMerge, ID} the same pointer is returned across
+  // loop-fixpoint iterations (per-merge), preserving the B-vs-B' convergence.
+  // TargetMerge is null for the Case-A / global path (one shared placeholder
+  // per (PH, ID)).
   Type *PtrTy = PointerType::get(F.getContext(),
                                  jeandle::AddrSpace::JavaHeapAddrSpace);
   PHINode *Placeholder = PHINode::Create(PtrTy, 0, "pea.perpred");
@@ -1447,7 +1514,9 @@ void Analyzer::MergeProcessor::run() {
   // Collect the snapshots of every predecessor we've already processed. RPO
   // guarantees forward-edge preds are visited first; back-edge preds are not
   // yet available and are silently skipped (the loop-preheader force-
-  // materialization sweep handles loop soundness).
+  // materialization sweep handles loop soundness). Preds[i] points at the
+  // shared `BlockExits[P]` (or its UnwindData variant) via exitDataFor; per-pred
+  // materialize does not flip this state (see materializeAtPredFromExitInfo).
   for (BasicBlock *P : predecessors(BB)) {
     // When P ends in an InvokeInst whose unwind dest is BB,
     // exitDataFor returns either the pre-invoke unwind variant (if
@@ -1812,16 +1881,33 @@ bool Analyzer::MergeProcessor::materializeAndBuildPhi(jeandle::ObjectID ID) {
     // so this is a no-op there; lock/stack mismatch materializes each one.
     if (Preds[i]->Virtuals.count(ID)) {
       uint32_t PreSeqNo = Result.NextSeqNo;
+      // Per-pred mat destined for THIS merge (BB): TargetMerge=BB so the
+      // placeholder is keyed (PH, BB, ID) and the transform's critical-edge
+      // pre-pass splits the PH→BB edge. Per-pred does NOT flip the shared
+      // BlockExits[PH] (NewInv dominates one edge, must not leak) — the
+      // placeholder is read back below via getOrCreatePerPredMatPlaceholder.
       A.materializeAtPredFromExitInfo(ID, PredBBs[i], *Preds[i],
                                       /*SkipGlobalRAUW=*/true,
-                                      MatReason::Merge);
+                                      MatReason::Merge,
+                                      /*TargetMerge=*/BB);
       if (Result.NextSeqNo != PreSeqNo)
         Mat = true;
     }
-    auto It = Preds[i]->MaterializedValues.find(ID);
-    Value *V = (It != Preds[i]->MaterializedValues.end())
-                   ? It->second
-                   : VObj.AllocationCall;
+    // Per-pred does NOT flip BlockExits[PH] (it must not leak to non-target
+    // successors), so the placeholder is not in Preds[i]->MaterializedValues.
+    // For a pred that was (or just became) per-pred-mat'd for THIS merge, read
+    // the placeholder directly from the cache (stable across retries); for a
+    // pred already materialized via escape-point/Case-A (real flip), use that
+    // recorded value; else fall back to OrigAlloc (the resolution sub-pass
+    // rewrites it to the dominating def).
+    Value *V;
+    if (Preds[i]->Virtuals.count(ID))
+      V = A.getOrCreatePerPredMatPlaceholder(PredBBs[i], BB, ID);
+    else {
+      auto It = Preds[i]->MaterializedValues.find(ID);
+      V = (It != Preds[i]->MaterializedValues.end()) ? It->second
+                                                     : VObj.AllocationCall;
+    }
     PE->PHIIncomingValues.push_back(V);
     PE->PHIIncomingBlocks.push_back(PredBBs[i]);
   }
@@ -2043,9 +2129,13 @@ bool Analyzer::MergeProcessor::mergeFieldStates(jeandle::ObjectID ID) {
         // transform's MatPerBlock substitutes it with NewInv at apply. Track
         // whether this call emitted any Effects via the SeqNo delta.
         uint32_t PreSeqNo = Result.NextSeqNo;
+        // Case-A inner-VO mat (SkipGlobalRAUW=false): mat at PH end, NewInv
+        // dominates all successors — flips the shared ExitInfo (original
+        // behavior) so other merges sharing this pred see the materialization.
         A.materializeAtPredFromExitInfo(InnerID, PredBBs[i], *Preds[i],
                                         /*SkipGlobalRAUW=*/false,
-                                        MatReason::Phi);
+                                        MatReason::Phi,
+                                        /*TargetMerge=*/nullptr);
         if (Result.NextSeqNo != PreSeqNo)
           Changed = true;
         if (!Eligible.lookup(InnerID)) {
@@ -2301,8 +2391,25 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
         Eligible[*InIDs[I]] = false;
         continue;
       }
+      // Issue-1 guard: skip if the VO is already materialized for THIS merge.
+      // Two cases: (a) escape-point/Case-A already flipped the shared state
+      // (VO no longer virtual in BlockExits[Pred]); (b) a per-pred mat for THIS
+      // merge (Pred, BB, ID) was already emitted — per-pred does NOT flip the
+      // shared state (it must not leak to non-target successors), so the
+      // Virtuals check alone would miss it. Re-firing Case-A here would emit a
+      // DUPLICATE invoke (the per-pred mat's NewInv already handles this merge's
+      // incoming via the resolution sub-pass). A per-pred mat for a DIFFERENT
+      // merge is recorded under (Pred, M2, ID), so the check correctly does NOT
+      // skip in that case — Case-A fires, original behavior.
+      if (!PredED->Virtuals.count(*InIDs[I]) ||
+          isMaterializedAtPred(Pred, BB, *InIDs[I]))
+        continue;
+      // Case-A mat at PH end (SkipGlobalRAUW=false): NewInv dominates all
+      // successors — flips the shared ExitInfo (original behavior) so other
+      // merges sharing this pred see the materialization.
       materializeAtPredFromExitInfo(*InIDs[I], Pred, *PredED,
-                                    /*SkipGlobalRAUW=*/false, MatReason::Phi);
+                                    /*SkipGlobalRAUW=*/false, MatReason::Phi,
+                                    /*TargetMerge=*/nullptr);
 
       // Re-derive a DERIVED carry (GEP/bitcast of the object) at the back-edge
       // so the PHI carries a value computed over the freshly-materialized base,
@@ -2340,7 +2447,7 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
       RE->ObjID = OID; // so dropEffectsFor purges it if the object turns ineligible
       RE->Phi = &Phi;
       RE->Pred = Pred;
-      RE->PerPredPlaceholder = getOrCreatePerPredMatPlaceholder(Pred, OID);
+      RE->PerPredPlaceholder = getOrCreatePerPredMatPlaceholder(Pred, /*TargetMerge=*/nullptr, OID);
       RE->ByteOffset = Off;
       Result.addBlockEffect(std::move(RE));
     }
@@ -2709,7 +2816,8 @@ bool Analyzer::synthesizeCaseC(
         }
         jeandle::ObjectID InnerID = FV.getVirtualRef();
         materializeAtPredFromExitInfo(InnerID, Preds[i], *ExitInfos[i],
-                                      /*SkipGlobalRAUW=*/false, MatReason::Phi);
+                                      /*SkipGlobalRAUW=*/false, MatReason::Phi,
+                                      /*TargetMerge=*/nullptr);
         if (!Eligible.lookup(InnerID)) {
           Eligible[NewID] = false;
           return false;
@@ -4643,7 +4751,8 @@ void Analyzer::materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
   // temporary would be destroyed at the end of the `C{...};` statement, leaving
   // a dangling ref for the ensureMaterialized call on the next line.
   MaterializeContext C{
-      FieldStates, LockCounts, LiveLockEnters, Materialized, Reason,
+      FieldStates, LockCounts, LiveLockEnters,
+      Materialized, Reason,
       Recurse, ClearLockState,
       CaptureLocksIntoEffect, DropInnerAliases, ComputeSafeIP, SetEffectFlags,
       FlipState, MaterializedValue};
@@ -4936,26 +5045,47 @@ void Analyzer::materializePreheaderVirtualsForUnvisitedLoops() {
 // map dedups (and breaks cycles between) recursive nested-virtual
 // materializations within a single PH and across multiple call sites
 // (e.g. a mixed-state merge and a loop-preheader sweep at the same PH).
+//
+// TargetMerge is the merge block this materialize is destined for (the
+// MergeProcessor::BB in scope), or null for the Case-A / global path. It keys
+// the placeholder cache and MaterializedAtPred so distinct target merges each
+// get their own per-pred mat at the same PH.
+//
+// IR-form divergence from Graal (the core rule this function encodes):
+//  - Per-pred mat (SkipGlobalRAUW=true): the invoke is placed on ONE critical
+//    edge (invoke has a single normal dest + OOM unwind), so its NewInv
+//    dominates only that edge. Therefore the per-pred path does NOT flip the
+//    shared `ExitInfo` (`BlockExits[PH]`) — a flip would leak to non-target
+//    successors, who would inherit a placeholder whose NewInv doesn't dominate
+//    them (test 416 / review §2.1). The placeholder is handed to the caller
+//    directly (materializeAndBuildPhi reads it via getOrCreatePerPredMatPlaceholder).
+//  - Case-A / global mat (!SkipGlobalRAUW): the invoke is at the pred's
+//    terminator end, so its NewInv dominates ALL successors (Graal-aligned —
+//    Graal's CommitAllocationNode sits before the control split). The flip of
+//    the shared `ExitInfo` is therefore benign and is applied (original
+//    behavior), so other merges sharing this pred see the materialization.
 void Analyzer::materializeAtPredFromExitInfo(jeandle::ObjectID ID,
                                              BasicBlock *PH,
                                              BlockExitData &ExitInfo,
                                              bool SkipGlobalRAUW,
-                                             MatReason Reason) {
-  // Merge-driven per-predecessor path -> delegates to ensureMaterialized (Graal
-  // ensureMaterialized, invoked at a merge with materializeBefore = the
-  // predecessor's end node). Supplies the predecessor's BlockExitData maps, the
-  // MaterializedAtPred[PH] idempotency set, recursion back into
-  // materializeAtPredFromExitInfo, and the per-pred-path-specific behaviour:
-  // lock capture is part of the Materialize effect's Locks list; SafeIP is at
-  // the predecessor head, IsPerPred + a per-pred placeholder flag (Graal's
-  // distinct AllocatedObjectNode per materialize), and the flip applied to the
-  // ExitInfo snapshot.
-  auto &MatInPH = MaterializedAtPred[PH];
+                                             MatReason Reason,
+                                             BasicBlock *TargetMerge) {
   auto ClearLockState = [&](jeandle::ObjectID Oid) {
     LockCounts[Oid] = 0;
     LiveLockEnters.erase(Oid);
-    ExitInfo.LockCounts.erase(Oid);
-    ExitInfo.LiveLockEnters.erase(Oid);
+    // Case-A / global: clear the shared ExitInfo's lock state (original
+    // behavior — the flip makes the VO materialized, so the lock state is
+    // irrelevant). Per-pred: do NOT clear ExitInfo — per-pred doesn't flip
+    // (NewInv dominates one edge), so clearing the shared pred lock state
+    // would leak to other successors AND make the do/while retry see
+    // locks-match (taking the wrong mergeFieldStates path instead of
+    // re-entering materializeAndBuildPhi). The pred's locks are captured into
+    // the Materialize effect once (on first emit); the retry's dedup skips
+    // re-capture.
+    if (!SkipGlobalRAUW) {
+      ExitInfo.LockCounts.erase(Oid);
+      ExitInfo.LiveLockEnters.erase(Oid);
+    }
   };
   auto ComputeSafeIP = [&]() -> Instruction * {
     // Per-predecessor placement (Graal predecessor.getEndNode(),
@@ -4968,21 +5098,31 @@ void Analyzer::materializeAtPredFromExitInfo(jeandle::ObjectID ID,
   auto SetEffectFlags = [&](jeandle::MaterializeEffect &E, Instruction *) {
     jeandle::VirtualObject &V = *Result.VirtualObjects[ID];
     E.IsPerPred = SkipGlobalRAUW;
-    // Per-pred-distinct materialized value: a stable placeholder per (PH, ID)
-    // the transform resolves to this pred's own NewInv via MatPerBlock.
-    E.PerPredPlaceholder = getOrCreatePerPredMatPlaceholder(PH, ID);
+    E.TargetMergeBB = TargetMerge;
+    // Per-pred-distinct materialized value: a stable placeholder per (PH, M, ID)
+    // (M=null for Case-A / global) the transform resolves to this pred's own
+    // NewInv via MatPerBlock.
+    E.PerPredPlaceholder = getOrCreatePerPredMatPlaceholder(PH, TargetMerge, ID);
     E.DeoptBundleSource = V.AllocationCall;
   };
   auto FlipState = [&](jeandle::ObjectID Oid) {
+    // Per-pred (SkipGlobalRAUW): no flip — the NewInv dominates one critical
+    // edge, so mutating the shared pred state would leak to non-target
+    // successors. Case-A / global (!SkipGlobalRAUW): flip the shared ExitInfo
+    // (NewInv at PH end dominates all successors — Graal-aligned, benign).
+    if (SkipGlobalRAUW)
+      return;
+    Value *Ph = getOrCreatePerPredMatPlaceholder(PH, TargetMerge, Oid);
     ExitInfo.Virtuals.erase(Oid);
     ExitInfo.Materialized.insert(Oid);
-    ExitInfo.MaterializedValues[Oid] = getOrCreatePerPredMatPlaceholder(PH, Oid);
+    ExitInfo.MaterializedValues[Oid] = Ph;
     ExitInfo.FieldStates.erase(Oid);
     ExitInfo.LockCounts.erase(Oid);
   };
 
   auto Recurse = [&](jeandle::ObjectID Oid, MatReason R) {
-    materializeAtPredFromExitInfo(Oid, PH, ExitInfo, SkipGlobalRAUW, R);
+    materializeAtPredFromExitInfo(Oid, PH, ExitInfo, SkipGlobalRAUW, R,
+                                  TargetMerge);
   };
   auto CaptureLocksIntoEffect = [](ArrayRef<LockEnter> Stack,
                                    jeandle::ObjectID,
@@ -4993,14 +5133,15 @@ void Analyzer::materializeAtPredFromExitInfo(jeandle::ObjectID ID,
   // Field-replay value: the per-pred placeholder (Graal's distinct
   // AllocatedObjectNode) — resolves the field to this pred's own NewInv.
   auto MaterializedValue = [&](jeandle::ObjectID Oid) {
-    return getOrCreatePerPredMatPlaceholder(PH, Oid);
+    return getOrCreatePerPredMatPlaceholder(PH, TargetMerge, Oid);
   };
   // NOTE: every callback is a named local (not a temporary) so each outlives C
   // — function_ref does not own its callable; a temporary would dangle after the
   // `C{...};` statement (see the matching note in materializeAt).
+  DenseSet<jeandle::ObjectID> &MatSet = MaterializedAtPred[PH][TargetMerge];
   MaterializeContext C{
       ExitInfo.FieldStates, ExitInfo.LockCounts, ExitInfo.LiveLockEnters,
-      MatInPH, Reason,
+      MatSet, Reason,
       Recurse, ClearLockState,
       CaptureLocksIntoEffect, DropInnerAliasesNop, ComputeSafeIP, SetEffectFlags,
       FlipState, MaterializedValue};
