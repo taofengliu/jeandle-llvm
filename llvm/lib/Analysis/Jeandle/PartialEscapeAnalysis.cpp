@@ -2987,12 +2987,13 @@ void Analyzer::processInstruction(Instruction *I) {
   if (Aliases.hasVirtualInputs(I)) {
     // Pointer-derivation forwards the virtual alias to the derived pointer so
     // downstream load/store handlers can pick up the base via the alias map.
-    // SelectInst is included here: when both arms resolve to
-    // the same virtual ObjectID, the Select denotes that virtual on every
-    // execution path (resolveVirtualRefImpl recurses through Select arms).
-    // If the arms disagree or aren't fully virtual, propagatePointerAlias
-    // falls through to materializeAllVirtualOperands, matching the Case-A
-    // PHI handling for ambiguous merges.
+    // SelectInst is included: when both arms resolve to the same virtual
+    // ObjectID, the Select denotes that virtual on every execution path.
+    // propagatePointerAlias additionally guards Select on per-arm byte offset
+    // (mirroring processBlockPhis' AnyDerived): a Select whose arms carry a
+    // non-zero field offset materializes rather than alias-forwarding, since
+    // resolveFieldOffset has no Select case and would otherwise lose the
+    // offset.
     if (isa<GetElementPtrInst>(I) || isa<BitCastInst>(I) ||
         isa<AddrSpaceCastInst>(I) || isa<FreezeInst>(I) || isa<SelectInst>(I)) {
       propagatePointerAlias(I);
@@ -4245,9 +4246,27 @@ bool Analyzer::foldICmpEquality(ICmpInst *ICmp) {
     EqResult = false;
     BaseID = *V1;
   } else if (V0 && V1) {
-    Folded = true;
-    EqResult = (*V0 == *V1);
-    BaseID = *V0;
+    if (*V0 != *V1) {
+      // Different virtual objects -> distinct identity.
+      Folded = true;
+      EqResult = false;
+      BaseID = *V0;
+    } else {
+      // Same ObjectID. resolveVirtualRef resolved identity and discarded any
+      // derived-pointer byte offset (GEP case chases the base), so two
+      // operands of the SAME virtual at DIFFERENT offsets (e.g. %o vs
+      // gep(%o,8)) would otherwise conflate to equal. Compare the byte
+      // offsets too: equal -> equal addresses, different -> distinct; a
+      // symbolic offset can't be proven either way, so bail and let the gate
+      // materialize.
+      auto O0 = jeandle::pea::resolveFieldOffset(Op0, DL);
+      auto O1 = jeandle::pea::resolveFieldOffset(Op1, DL);
+      if (!O0 || !O1)
+        return false;
+      Folded = true;
+      EqResult = (*O0 == *O1);
+      BaseID = *V0;
+    }
   } else if (V0 && !V1 && !Op1IsNull) {
     // Virtual vs. non-virtual non-null pointer: distinct identity.
     Folded = true;
@@ -4308,6 +4327,33 @@ void Analyzer::propagatePointerAlias(Instruction *I) {
   // operand carries a virtual alias. Forward the alias to the result.
   if (Aliases.getVirtualAlias(I))
     return;
+
+  // SelectInst: resolveVirtualRefImpl returns the common ObjectID of the two
+  // arms and DISCARDS the per-arm byte offset (resolveFieldOffset has no
+  // Select case, so it returns 0 for the Select itself). A `select %c,
+  // gep(%v,16), gep(%v,16)` would otherwise alias-forward to %v and a
+  // downstream load/store through the select be modelled at offset 0 instead
+  // of 16. Mirror processBlockPhis' AnyDerived guard: only alias when BOTH
+  // arms resolve to offset 0 (whole-object); otherwise materialize so the
+  // access sees the real pointer at runtime. A poison arm resolves to offset
+  // 0, so the guard correctly does not trip (the poison arm cannot execute
+  // without UB).
+  if (auto *Sel = dyn_cast<SelectInst>(I)) {
+    auto BaseID = jeandle::pea::resolveVirtualRef(Sel, CurrentState, Aliases, DL);
+    if (!BaseID) {
+      materializeAllVirtualOperands(I);
+      return;
+    }
+    auto TOff = jeandle::pea::resolveFieldOffset(Sel->getTrueValue(), DL);
+    auto FOff = jeandle::pea::resolveFieldOffset(Sel->getFalseValue(), DL);
+    if (!TOff || *TOff != 0 || !FOff || *FOff != 0) {
+      materializeAllVirtualOperands(I);
+      return;
+    }
+    Aliases.addVirtualAlias(I, *BaseID);
+    return;
+  }
+
   auto BaseID = jeandle::pea::resolveVirtualRef(I, CurrentState, Aliases, DL);
   if (!BaseID) {
     // Couldn't resolve — the underlying chain may have already escaped.
