@@ -146,14 +146,18 @@ static BasicBlock *createMinimalUnwindBlock(Function &F,
 // itself an InvokeInst (it's guaranteed landingpad-compatible because the
 // frontend created it for OOM handling) AND the materialization site is not
 // inside a funclet — reuse would be illegal when the new invoke is funclet-
-// nested but the reused dest belongs to a different (or no) funclet. Strategy 2
+// nested but the reused dest belongs to a different (or no) funclet. The dest
+// must also have no PHIs: IRBuilder::CreateInvoke does not add a PHI incoming
+// for the new predecessor, so reusing a PHI-carrying dest would leave the new
+// (materialization-OOM) predecessor without a matching incoming. Strategy 2
 // (fallback): synthesize a minimal unwind block, funclet-aware when needed.
 static BasicBlock *findOrSynthesizeUnwindDest(Function &F, CallBase *OrigAlloc,
                                               FuncletPadInst *EnclosingPad) {
   if (!EnclosingPad)
     if (auto *OrigInv = dyn_cast<InvokeInst>(OrigAlloc))
       if (BasicBlock *UD = OrigInv->getUnwindDest())
-        return UD;
+        if (UD->phis().empty())
+          return UD;
   return createMinimalUnwindBlock(F, EnclosingPad);
 }
 
