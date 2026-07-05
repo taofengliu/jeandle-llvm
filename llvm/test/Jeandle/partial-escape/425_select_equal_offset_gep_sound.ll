@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Select of equal-offset GEPs into a virtual object (review #1.3).
+; Select of equal-offset GEPs into a virtual object.
 ; %g1 and %g2 both offset %o by 16; %sel = select %c, %g1, %g2; the load is
 ; through %sel, whose runtime address is %o+16 (field @16 = 42).
 ;
@@ -20,8 +20,8 @@ declare i32 @__gxx_personality_v0(...)
 define void @test_select_equal_offset_gep(i1 %c) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
-            ptr inttoptr (i64 12345 to ptr), i32 32)
-         to label %n unwind label %u
+  ptr inttoptr (i64 12345 to ptr), i32 32)
+  to label %n unwind label %u
 n:
   %f0 = getelementptr inbounds i8, ptr addrspace(1) %o, i64 0
   %g1 = getelementptr inbounds i8, ptr addrspace(1) %o, i64 16

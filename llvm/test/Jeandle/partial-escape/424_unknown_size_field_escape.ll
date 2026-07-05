@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; getOrCreateFieldIndex unknown-size type (review #3.2). For a non-pointer
+; getOrCreateFieldIndex unknown-size type. For a non-pointer
 ; field type, ByteSize is derived from Type::getPrimitiveSizeInBits(), which
 ; returns 0 for aggregate types (struct/array — and scalable vectors). Before
 ; the fix the `assert(Bits > 0)` fired in debug builds (opt crash); in release a
@@ -15,8 +15,8 @@ declare i32 @__gxx_personality_v0(...)
 define void @test_struct_field_escape() gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
-            ptr inttoptr (i64 12345 to ptr), i32 48)
-         to label %n unwind label %u
+  ptr inttoptr (i64 12345 to ptr), i32 48)
+  to label %n unwind label %u
 n:
   %slot = getelementptr inbounds i8, ptr addrspace(1) %o, i64 16
   store { i32, i32 } zeroinitializer, ptr addrspace(1) %slot, align 4

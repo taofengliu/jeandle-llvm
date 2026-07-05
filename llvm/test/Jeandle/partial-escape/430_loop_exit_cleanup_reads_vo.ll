@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; processLoopExit 0-clause cleanup that observes a VO (review #3.1).
+; processLoopExit 0-clause cleanup that observes a VO.
 ;
 ; %o is a loop-local virtual; the loop body's may_throw invoke unwinds to a
 ; 0-clause cleanup (%cleanup) that READS %o's field. The cleanup is not a pure
@@ -19,8 +19,8 @@ entry:
   br label %loop
 loop:
   %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
-            ptr inttoptr (i64 12345 to ptr), i32 32)
-         to label %body unwind label %oom
+  ptr inttoptr (i64 12345 to ptr), i32 32)
+  to label %body unwind label %oom
 body:
   %f = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
   store atomic i32 42, ptr addrspace(1) %f unordered, align 4

@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; processStore value-side leak (review #1.1, bail path 1). A virtual Object[]
+; processStore value-side leak. A virtual Object[]
 ; %arr is stored into at a SYMBOLIC index. resolveVirtualRef(%elem) chases the
 ; GEP base to %arr's ObjectID, but resolveAccess(%elem) returns nullopt (the
 ; index is a non-constant SSA value, so matchArrayElementGEP / resolveFieldOffset
@@ -22,11 +22,11 @@ declare i32 @__gxx_personality_v0(...)
 define void @test_store_bail_leaks_value(i64 %idx) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   %arr = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
-            ptr inttoptr (i64 22222 to ptr), i32 4)
-         to label %n unwind label %u
+  ptr inttoptr (i64 22222 to ptr), i32 4)
+  to label %n unwind label %u
 n:
   %v = call hotspotcc ptr addrspace(1) @jeandle.new_instance(
-          ptr inttoptr (i64 99999 to ptr), i32 24)
+  ptr inttoptr (i64 99999 to ptr), i32 24)
   %base = getelementptr inbounds i8, ptr addrspace(1) %arr, i32 16
   %elem = getelementptr inbounds ptr addrspace(1), ptr addrspace(1) %base, i64 %idx
   store atomic ptr addrspace(1) %v, ptr addrspace(1) %elem unordered, align 4

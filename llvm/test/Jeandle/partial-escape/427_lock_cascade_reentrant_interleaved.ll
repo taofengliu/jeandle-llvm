@@ -1,9 +1,9 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Cross-VO lock re-emit ordering with a RE-ENTRANT interleaved lock stack
-; (review #1.2). The lexical nest is:
-;   synchronized(a){ synchronized(b){ synchronized(a){ synchronized(c){
-;     escape(c);
+; The lexical nest is:
+; synchronized(a){ synchronized(b){ synchronized(a){ synchronized(c){
+; escape(c);
 ; so at the escape point the live lock stack is [a@0, b@1, a@2, c@3]. Escaping
 ; c (depth 3) cascades a (front 0 < 3) and b (front 1 < 3); all three VO
 ; materialize at the same escape point.
@@ -28,34 +28,34 @@ entry:
   %la2 = alloca i64, align 8
   %lc = alloca i64, align 8
   %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
-            ptr inttoptr (i64 12345 to ptr), i32 16)
-       to label %na unwind label %u
+  ptr inttoptr (i64 12345 to ptr), i32 16)
+  to label %na unwind label %u
 na:
   %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
-            ptr inttoptr (i64 67890 to ptr), i32 16)
-       to label %nb unwind label %u
+  ptr inttoptr (i64 67890 to ptr), i32 16)
+  to label %nb unwind label %u
 nb:
   %c = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
-            ptr inttoptr (i64 33333 to ptr), i32 16)
-       to label %nc unwind label %u
+  ptr inttoptr (i64 33333 to ptr), i32 16)
+  to label %nc unwind label %u
 nc:
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-          ptr addrspace(1) %a, ptr %la), !jeandle.lock_depth !{i32 0}
+  ptr addrspace(1) %a, ptr %la), !jeandle.lock_depth !{i32 0}
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-          ptr addrspace(1) %b, ptr %lb), !jeandle.lock_depth !{i32 1}
+  ptr addrspace(1) %b, ptr %lb), !jeandle.lock_depth !{i32 1}
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-          ptr addrspace(1) %a, ptr %la2), !jeandle.lock_depth !{i32 2}
+  ptr addrspace(1) %a, ptr %la2), !jeandle.lock_depth !{i32 2}
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-          ptr addrspace(1) %c, ptr %lc), !jeandle.lock_depth !{i32 3}
+  ptr addrspace(1) %c, ptr %lc), !jeandle.lock_depth !{i32 3}
   call void @sink(ptr addrspace(1) %c)
   call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
-          ptr addrspace(1) %c, ptr %lc)
+  ptr addrspace(1) %c, ptr %lc)
   call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
-          ptr addrspace(1) %a, ptr %la2)
+  ptr addrspace(1) %a, ptr %la2)
   call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
-          ptr addrspace(1) %b, ptr %lb)
+  ptr addrspace(1) %b, ptr %lb)
   call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
-          ptr addrspace(1) %a, ptr %la)
+  ptr addrspace(1) %a, ptr %la)
   ret void
 u:
   %lp = landingpad i64 cleanup

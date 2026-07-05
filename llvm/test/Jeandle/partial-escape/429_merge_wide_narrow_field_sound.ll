@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; mergeFieldStates two-slot / byte-array gap (review #2.4) — non-regression.
+; mergeFieldStates two-slot / byte-array gap — non-regression.
 ;
 ; Two predecessors write the same field at different widths: pred1 stores an
 ; i64 at offset 0, pred2 stores two i8s at offsets 0 and 1. A Graal-style
@@ -20,8 +20,8 @@ declare i32 @__gxx_personality_v0(...)
 define void @test_merge_wide_narrow_field(i1 %c) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
-            ptr inttoptr (i64 12345 to ptr), i32 32)
-         to label %split unwind label %u
+  ptr inttoptr (i64 12345 to ptr), i32 32)
+  to label %split unwind label %u
 split:
   br i1 %c, label %p1, label %p2
 p1:

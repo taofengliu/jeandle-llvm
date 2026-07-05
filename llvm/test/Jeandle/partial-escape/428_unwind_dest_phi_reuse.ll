@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; findOrSynthesizeUnwindDest PHI reuse (review #2.1). %uw has TWO invoke
+; findOrSynthesizeUnwindDest PHI reuse. %uw has TWO invoke
 ; predecessors (the alloc %o and a second invoke) and a USED PHI over them.
 ; When %o escapes it is materialized; the materialization invoke's unwind dest
 ; is chosen by findOrSynthesizeUnwindDest. Before the fix, Strategy 1 reused %uw
@@ -18,8 +18,8 @@ declare i32 @__gxx_personality_v0(...)
 define void @test_unwind_dest_phi_reuse() gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
-            ptr inttoptr (i64 12345 to ptr), i32 16)
-         to label %cont unwind label %uw
+  ptr inttoptr (i64 12345 to ptr), i32 16)
+  to label %cont unwind label %uw
 cont:
   invoke void @may_throw() to label %escape unwind label %uw
 escape:
