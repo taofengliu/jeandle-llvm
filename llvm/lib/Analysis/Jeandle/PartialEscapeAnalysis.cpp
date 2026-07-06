@@ -4462,6 +4462,20 @@ void Analyzer::markVirtualOperandsIneligible(Instruction *I) {
     }
   }
   llvm::sort(ToBail);
+  // TODO(bail-all-conservative): GRAAL DIVERGENCE — when ANY operand is
+  // derived, this bails EVERY virtual operand's object (including operands
+  // that are themselves the OrigAlloc, i.e. V == AllocationCall, for which
+  // materializing at I WOULD be sound: pea.mat@I dominates that OrigAlloc use
+  // at I). Graal's processNodeInputs (PartialEscapeClosure.java:433-451) has no
+  // derived pointers and always materializes per-input at the use, so it
+  // keeps such objects virtual on non-escaping paths. The bail-all is a
+  // deliberate soundness net: materializing one operand's object at I could
+  // poison a derived GEP of the SAME object on another path that the I-point
+  // materialize does not dominate (the e4f0a55f class of traps). Recovering
+  // the lost scalar-replacement here means proving, per-object, that none of
+  // its live uses across all paths is an undominated derived address — bail
+  // only the derived operand's object, materialize the OrigAlloc operands at
+  // I. Until that cross-path dominance check exists, keep bail-all.
   for (jeandle::ObjectID ID : ToBail)
     markIneligible(ID);
 }
