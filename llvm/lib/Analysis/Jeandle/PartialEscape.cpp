@@ -531,8 +531,7 @@ void PEAResult::computeEscapePointLocks() {
         continue; // single-effect escape point — per-effect emit
       auto &Vec = EscapePointLocks[Key];
       for (const jeandle::MaterializedLock &ML : ME->Locks)
-        Vec.push_back(
-            {ML.Callee, ML.NonReceiverArgs, ML.BytecodeDepth, ME->Target, ME});
+        Vec.push_back({ML.Callee, ML.NonReceiverArgs, ML.BytecodeDepth, ME});
       uint32_t &Max = MaxSeqForEscapePoint[Key];
       if (ME->SeqNo > Max)
         Max = ME->SeqNo;

@@ -507,13 +507,17 @@ static void applyMaterialize(
     auto It = Result.EscapePointLocks.find(EscapeKey);
     if (It != Result.EscapePointLocks.end())
       for (const jeandle::MergedLock &ML : It->second) {
-        Value *Recv = NewInv;
-        if (auto NIt = NewInvOf.find(ML.SourceEffect); NIt != NewInvOf.end())
-          Recv = NIt->second;
-        else if (auto RIt = NewAllocFor.find(ML.OrigAlloc);
-                 RIt != NewAllocFor.end())
-          Recv = RIt->second;
-        EmitLock(Recv, ML.Callee, ML.NonReceiverArgs);
+        // Every cascade member's applyMaterialize reaches NewInvOf[&E] = NewInv
+        // (PartialEscapeTransform.cpp:378) before the tail emits — no early
+        // return between entry and :378, only asserts — so the per-effect
+        // receiver is always populated. Assert it rather than fall back to
+        // NewAllocFor[OrigAlloc], which is last-write-wins across per-pred
+        // materializations of the same object and could pick a non-dominating
+        // NewInv. Mirrors the cascade field-store replay assert at :380-382.
+        auto NIt = NewInvOf.find(ML.SourceEffect);
+        assert(NIt != NewInvOf.end() && "every cascade member's NewInv must be "
+                                        "recorded before the tail emits locks");
+        EmitLock(NIt->second, ML.Callee, ML.NonReceiverArgs);
       }
   } else if (MaxIt == Result.MaxSeqForEscapePoint.end()) {
     // Not a cascade group (single-effect escape point, or the escape call

@@ -164,16 +164,20 @@ Type *llvmElementTypeFor(JBasicType Kind, LLVMContext &Ctx) {
 // stripPointerCastsAndOffsets (offset resolution) so the two agree on exactly
 // which laundered pointers are transparent: an `inttoptr` that is NOT a clean
 // round-trip is opaque to both (identity -> nullopt, offset -> stop walking).
+// Recognize an IntToPtr over both Instruction and ConstantExpr forms. LLVM
+// has `PtrToIntOperator` but no `IntToPtrOperator`, so match via the generic
+// Operator + opcode. Used at both call sites so identity and offset
+// wrapper-stripping stay symmetric for the round-trip (Trap 4).
+static bool isIntToPtrOp(const Value *V) {
+  if (auto *Op = dyn_cast<Operator>(V))
+    return Op->getOpcode() == Instruction::IntToPtr;
+  return false;
+}
+
 static Value *getIntToPtrRoundTripInner(Value *V, const DataLayout &DL) {
-  // IntToPtr has no Operator subclass in this fork (only PtrToIntOperator
-  // exists), so recognize the inttoptr case via a generic Operator + opcode
-  // match. This covers both Instruction (IntToPtrInst) and ConstantExpr
-  // (ConstantExprIntToPtr), keeping identity (resolveVirtualRefImpl case 7)
-  // and offset (stripPointerCastsAndOffsets) wrapper-stripping symmetric for
-  // the round-trip (Trap 4).
-  auto *I2P = dyn_cast<Operator>(V);
-  if (!I2P || I2P->getOpcode() != Instruction::IntToPtr)
+  if (!isIntToPtrOp(V))
     return nullptr;
+  auto *I2P = cast<Operator>(V);
   Value *Inner = I2P->getOperand(0);
   // Peel `add X, 0` / `or X, 0` chains between PtrToInt and IntToPtr; some
   // frontends emit these as part of constant-folded address arithmetic and
@@ -400,12 +404,9 @@ resolveVirtualRefImpl(Value *V, const PEABlockState &State,
   // (7) IntToPtr(PtrToInt(x)) round-trip with matching widths is a legal
   // laundering pattern (see getIntToPtrRoundTripInner); tagged-pointer
   // encodings (with masking/shifting) must escape. A non-round-trip inttoptr
-  // is opaque — return nullopt so the caller materializes. The gate uses an
-  // Operator + opcode match (no IntToPtrOperator exists in this fork) so a
-  // ConstantExpr inttoptr is recognized the same as an IntToPtrInst, keeping
-  // identity resolution symmetric with offset resolution (Trap 4).
-  if (auto *I2P = dyn_cast<Operator>(V);
-      I2P && I2P->getOpcode() == Instruction::IntToPtr) {
+  // is opaque — return nullopt so the caller materializes. isIntToPtrOp
+  // covers both Instruction and ConstantExpr forms (Trap 4 symmetry).
+  if (isIntToPtrOp(V)) {
     if (Value *Inner = getIntToPtrRoundTripInner(V, DL))
       return resolveVirtualRefImpl(Inner, State, Aliases, DL, Visited,
                                    Depth + 1);

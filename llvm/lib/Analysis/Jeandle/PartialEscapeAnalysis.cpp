@@ -1088,25 +1088,6 @@ void Analyzer::markIneligible(jeandle::ObjectID ID) {
       for (jeandle::ObjectID PID : VObj.SyntheticSourceIDs)
         Worklist.push_back(PID);
     }
-    // Nested-virtual cascade: an earlier successful constant-index store
-    // records FieldStates[Cur][off] = VirtualRef(inner); if Cur is later
-    // markIneligible'd, commit()->dropEffectsFor(Cur) erases the
-    // EliminateStoreEffect so that store survives as a real store, but the
-    // inner virtual is left eligible with no surviving Materialize ->
-    // classified NeverEscapes -> Pass 2 RAUWs inner.OrigAlloc to poison ->
-    // the surviving real store writes poison. Cascading the inner to
-    // ineligible here keeps its OrigAlloc real (dropEffectsFor(inner) drops
-    // its EliminateAllocationEffect). Mirrors Graal's recursive entry
-    // cascade in materializeWithCommit (PartialEscapeBlockState.java:292-343)
-    // and Jeandle's live-path ensureMaterialized FieldStates VirtualRef
-    // recursion. Runs for every Cur (synthetic or not); Visited defends
-    // cycles (a.f=b, b.g=a).
-    auto FSIt = FieldStates.find(Cur);
-    if (FSIt != FieldStates.end()) {
-      for (auto &Kv : FSIt->second)
-        if (Kv.second.isVirtualRef())
-          Worklist.push_back(Kv.second.getVirtualRef());
-    }
   }
 }
 
@@ -3322,36 +3303,38 @@ void Analyzer::processAllocation(CallBase *CB) {
     // is unregistered or cannot identify the element kind, leave
     // ArrayElementType nullptr — matchArrayElementGEP will refuse to fire
     // and only constant-byte-offset element accesses (handled directly by
-    // resolveFieldOffset) will be eligible.
+    // resolveFieldOffset) will be eligible. ArrayBaseOffset is always set
+    // (per-kind when known, else the VM's Object-kind default) so the
+    // resolveAccess header guard never degrades to `< 0`.
+    const jeandle::VMConstants VMConsts =
+        jeandle::VMConstants::fromModule(*F.getParent());
     if (auto Kind = jeandle::pea::elementTypeForArrayKlass(Klass)) {
-      // VMConstants are now read out of the module's runtime-defined
-      // globals (patched by HotSpot's
+      // VMConstants are read out of the module's runtime-defined globals
+      // (patched by HotSpot's
       // RuntimeDefinedJavaOps::define_global_variables); see
       // llvm/IR/Jeandle/VMConstants.h for the delivery model. Lit tests
       // that never link the template module fall through to the
       // compile-time defaults declared on `struct VMConstants`.
-      const jeandle::VMConstants VMConsts =
-          jeandle::VMConstants::fromModule(*F.getParent());
-      Type *ElemTy = jeandle::pea::llvmElementTypeFor(*Kind, F.getContext());
-      if (ElemTy) {
+      VO->ArrayBaseOffset =
+          static_cast<uint32_t>(VMConsts.arrayBaseOffsetFor(*Kind));
+      if (Type *ElemTy =
+              jeandle::pea::llvmElementTypeFor(*Kind, F.getContext())) {
         VO->ArrayElementType = ElemTy;
-        VO->ArrayBaseOffset =
-            static_cast<uint32_t>(VMConsts.arrayBaseOffsetFor(*Kind));
         VO->ArrayIndexScale =
             static_cast<uint32_t>(VMConsts.elementSizeFor(*Kind));
       }
     } else {
-      // Unknown element kind: we cannot pin the per-kind header size, so
-      // fall back to the VM's standard array base offset (Object's value,
-      // uniform 16 across all kinds in VMConstants.h and HotSpot). This
-      // keeps the resolveAccess header guard `*Offset < ArrayBaseOffset`
-      // rejecting raw header GEPs (offset < 16) instead of degrading to
+      // Unknown element kind: we cannot pin the per-kind element type, but
+      // the array header size is uniform across element kinds (mark + klass
+      // + length, padded), so fall back to the Object-kind base offset (16
+      // by default, or the module-overridden Object value). This keeps the
+      // resolveAccess header guard `*Offset < ArrayBaseOffset` rejecting
+      // raw header GEPs (offset < ArrayBaseOffset) instead of degrading to
       // `< 0` (which would let a raw mark/klass GEP virtualize as a Java
-      // field) while still accepting element GEPs (offset >= 16, see test
-      // 397). ArrayElementType / ArrayIndexScale stay null / 0 so the
-      // typed-GEP fast path stays inert (correct for unknown-kind arrays).
-      const jeandle::VMConstants VMConsts =
-          jeandle::VMConstants::fromModule(*F.getParent());
+      // field) while still accepting element GEPs (offset >=
+      // ArrayBaseOffset, see test 397). ArrayElementType / ArrayIndexScale
+      // stay null / 0 so the typed-GEP fast path stays inert (correct for
+      // unknown-kind arrays).
       VO->ArrayBaseOffset = static_cast<uint32_t>(
           VMConsts.arrayBaseOffsetFor(jeandle::JBasicType::Object));
     }
@@ -4982,6 +4965,44 @@ void Analyzer::commit() {
   for (auto &Kv : LockCounts) {
     if (Kv.second != 0)
       Eligible[Kv.first] = false;
+  }
+
+  // Transitive ineligibility cascade over FieldStates VirtualRef entries.
+  // Any virtual referenced by a kept-real (ineligible) object's field must
+  // also be kept real: a surviving real store into that field (its
+  // EliminateStoreEffect was dropped by dropEffectsFor below) would
+  // otherwise write a NeverEscapes object's OrigAlloc, which Pass 2 RAUWs
+  // to poison -> miscompile. This is the complete backstop: it catches
+  // VirtualRefs recorded at ANY point — before the object was
+  // markIneligible'd (e.g. `arr[0]=new T(); arr[i]=new T()` — the constant
+  // store precedes the symbolic bail) AND after (`arr[i]=new T();
+  // arr[0]=new T()` — the constant store follows it, recorded because
+  // processStore does not check Eligible). A walk-time cascade in
+  // markIneligible would be order-dependent and miss the latter; doing the
+  // closure once at classification time is order-independent and covers
+  // every recording path (processStore + the merge/per-pred propagators).
+  // Graal has no analog: it materializes in place at the escape point, so
+  // the recursive entry cascade (materializeWithCommit,
+  // PartialEscapeBlockState.java:293-343) runs at the very point the outer
+  // is committed; Jeandle's analysis/transform split defers classification
+  // to here. Visited defends cycles (a.f=b, b.g=a).
+  {
+    SmallVector<jeandle::ObjectID, 8> WList;
+    DenseSet<jeandle::ObjectID> VSet;
+    for (auto &Kv : Eligible)
+      if (!Kv.second)
+        WList.push_back(Kv.first);
+    while (!WList.empty()) {
+      jeandle::ObjectID Cur = WList.pop_back_val();
+      if (!VSet.insert(Cur).second)
+        continue;
+      Eligible[Cur] = false;
+      auto FSIt = FieldStates.find(Cur);
+      if (FSIt != FieldStates.end())
+        for (auto &Kv2 : FSIt->second)
+          if (Kv2.second.isVirtualRef())
+            WList.push_back(Kv2.second.getVirtualRef());
+    }
   }
 
   // Iterate by dense ObjectID order for determinism. The only remaining

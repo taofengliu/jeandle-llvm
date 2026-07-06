@@ -104,17 +104,16 @@ struct MaterializedLock {
 // for each lock when a cascade group's locks are merged and globally
 // depth-sorted. SourceEffect is the per-effect receiver-lookup key (Jeandle's
 // analog of Graal's `allocations[commit.getObjectIndex(monitorId)]`,
-// DefaultJavaLoweringProvider.java:1152) — strictly more precise than
-// OrigAlloc, which is last-write-wins across per-pred materializations of the
-// same object (see applyMaterialize NewAllocFor comment,
-// PartialEscapeTransform.cpp:374-377). OrigAlloc is kept as a defensive
-// fallback. See PEAResult::EscapePointLocks.
+// DefaultJavaLoweringProvider.java:1152) — strictly more precise than an
+// OrigAlloc key, which would be last-write-wins across per-pred
+// materializations of the same object (see applyMaterialize NewAllocFor
+// comment, PartialEscapeTransform.cpp:374-377). See
+// PEAResult::EscapePointLocks.
 class MaterializeEffect;
 struct MergedLock {
   Function *Callee = nullptr;
   SmallVector<Value *, 2> NonReceiverArgs;
   uint32_t BytecodeDepth = 0;
-  Instruction *OrigAlloc = nullptr; // fallback receiver key (NewAllocFor)
   const MaterializeEffect *SourceEffect = nullptr; // per-effect receiver key
 };
 
