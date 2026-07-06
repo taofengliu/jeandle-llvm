@@ -50,11 +50,13 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_lock_mismatch_with_cascade
-; then-pred: B (22222, the locked one) materializes first and re-emits its
-; surviving monitorenter; then A (11111) materializes and re-emits its enter.
+; then-pred: B (22222, the locked one) materializes first (lower SeqNo, the
+; cascade prereq), then A (11111) materializes (the tail). The merged lock
+; re-emit fires ONCE from the tail (A's MatCont), depth-sorted: B's enter
+; (depth 0) then A's enter (depth 1) — both after both invokes.
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock
 ; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock
 ; else-pred: A (11111) and B (22222) per-pred materialize via the merge
 ; collapse (no locks on this arm, so no surviving enters to re-emit).

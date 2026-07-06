@@ -460,13 +460,18 @@ static void applyMaterialize(
   // them per escape point (the shared InsertBefore of this cascade group) into
   // Result.EscapePointLocks. This effect emits the merged list ONCE — iff it is
   // the highest-SeqNo effect at its escape point (by then every sibling's
-  // NewInv is in NewAllocFor, so each lock's receiver resolves; chained
-  // block-splits also leave this effect's MatCont last at the escape call, so
-  // emitting here after the field stores precedes the escape and follows every
-  // sibling's field stores). Emitting per-effect here would mis-order
-  // re-entrant interleaved cascades. If the escape-point key is unresolved (the
-  // escape call was erased by a sibling effect), fall back to this effect's own
-  // locks.
+  // NewInv is in NewInvOf, so each lock's receiver resolves via
+  // NewInvOf[ML.SourceEffect]; chained block-splits also leave this effect's
+  // MatCont last at the escape call, so emitting here after the field stores
+  // precedes the escape and follows every sibling's field stores). Emitting
+  // per-effect here would mis-order re-entrant interleaved cascades. This is
+  // unified across live-path AND per-pred cascades: after the critical-edge
+  // pre-pass re-aims per-pred effects onto a shared split-edge block (or, on a
+  // single-succ pred, they already share the terminator), a per-pred cascade
+  // is structurally identical to a live-path cascade — straight-line NewInv
+  // chain, tail emits — so the tail's MatCont IS dominated by every sibling
+  // NewInv. If the escape-point key is unresolved (the escape call was erased
+  // by a sibling effect), fall back to this effect's own locks.
   auto EmitLock = [&](Value *Recv, Function *Callee,
                       ArrayRef<Value *> NonReceiverArgs) {
     if (!Callee)
@@ -478,47 +483,45 @@ static void applyMaterialize(
     CallInst *Enter = SB.CreateCall(Callee, Args);
     Enter->setCallingConv(CallingConv::Hotspot_JIT);
   };
-  if (E.IsPerPred) {
-    // A per-pred materialization lives on a split critical edge whose NewInv
-    // does not dominate any sibling emit point, so it re-emits its own locks
-    // here (the pre-fix per-effect behaviour).
+  // Use the ORIGINAL escape-point instruction (captured once at pre-scan in
+  // CascadeKeyOf) as the lock-re-emit key, NOT the (possibly re-aimed)
+  // E.InsertBefore. MaxSeqForEscapePoint/EscapePointLocks are keyed by the
+  // original InsertBefore (populated by computeEscapePointLocks before
+  // Pass 1); after the eager-update hook re-aimed E.InsertBefore to the
+  // next instruction, re-reading it would miss the lookup and fall back to
+  // per-effect (mis-ordering re-entrant locks for Case-A cascades). The
+  // captured key may dangle after an erase, but the frozen-map lookup is
+  // pointer-value-only (no deref) — safe, identical to the cascade replay
+  // (CascadeKeyOf[&E] -> CascadeGroups) below. This keying is used for BOTH
+  // live-path and per-pred effects (per-pred effects' split-block first
+  // non-PHI is never a sibling erase target — the split block hosts only
+  // per-pred Materialize effects — so CascadeKeyOf stays valid for them).
+  Instruction *EscapeKey = CascadeKeyOf.lookup(&E);
+  auto MaxIt = EscapeKey ? Result.MaxSeqForEscapePoint.find(EscapeKey)
+                         : Result.MaxSeqForEscapePoint.end();
+  if (MaxIt != Result.MaxSeqForEscapePoint.end() && E.SeqNo == MaxIt->second) {
+    // Cascade emitter (live-path OR per-pred): emit the escape point's
+    // globally-merged lock list once. Every sibling's NewInv is in NewInvOf
+    // (lower SeqNo, already applied) and this effect's own was just registered,
+    // so each lock's receiver resolves per-effect.
+    auto It = Result.EscapePointLocks.find(EscapeKey);
+    if (It != Result.EscapePointLocks.end())
+      for (const jeandle::MergedLock &ML : It->second) {
+        Value *Recv = NewInv;
+        if (auto NIt = NewInvOf.find(ML.SourceEffect); NIt != NewInvOf.end())
+          Recv = NIt->second;
+        else if (auto RIt = NewAllocFor.find(ML.OrigAlloc);
+                 RIt != NewAllocFor.end())
+          Recv = RIt->second;
+        EmitLock(Recv, ML.Callee, ML.NonReceiverArgs);
+      }
+  } else if (MaxIt == Result.MaxSeqForEscapePoint.end()) {
+    // Not a cascade group (single-effect escape point, or the escape call
+    // was erased and no merged list was recorded): emit this effect's own
+    // locks per-effect. A sibling in an actual cascade (MaxIt found,
+    // SeqNo != max) emits nothing here — the tail handles the whole group.
     for (const jeandle::MaterializedLock &ML : E.Locks)
       EmitLock(NewInv, ML.Callee, ML.NonReceiverArgs);
-  } else {
-    // Use the ORIGINAL escape-point instruction (captured once at pre-scan in
-    // CascadeKeyOf) as the lock-re-emit key, NOT the (possibly re-aimed)
-    // E.InsertBefore. MaxSeqForEscapePoint/EscapePointLocks are keyed by the
-    // original InsertBefore (populated by computeEscapePointLocks before
-    // Pass 1); after the eager-update hook re-aimed E.InsertBefore to the
-    // next instruction, re-reading it would miss the lookup and fall back to
-    // per-effect (mis-ordering re-entrant locks for Case-A cascades). The
-    // captured key may dangle after an erase, but the frozen-map lookup is
-    // pointer-value-only (no deref) — safe, identical to the cascade replay
-    // (CascadeKeyOf[&E] -> CascadeGroups) below.
-    Instruction *EscapeKey = CascadeKeyOf.lookup(&E);
-    auto MaxIt = EscapeKey ? Result.MaxSeqForEscapePoint.find(EscapeKey)
-                           : Result.MaxSeqForEscapePoint.end();
-    if (MaxIt != Result.MaxSeqForEscapePoint.end() &&
-        E.SeqNo == MaxIt->second) {
-      // Cascade emitter: emit the escape point's globally-merged lock list
-      // once. Every sibling's NewInv is in NewAllocFor (lower SeqNo, already
-      // applied) and this effect's own was just registered, so each lock's
-      // receiver resolves.
-      auto It = Result.EscapePointLocks.find(EscapeKey);
-      if (It != Result.EscapePointLocks.end())
-        for (const jeandle::MergedLock &ML : It->second) {
-          auto RIt = NewAllocFor.find(ML.OrigAlloc);
-          EmitLock(RIt != NewAllocFor.end() ? RIt->second : NewInv, ML.Callee,
-                   ML.NonReceiverArgs);
-        }
-    } else if (MaxIt == Result.MaxSeqForEscapePoint.end()) {
-      // Not a cascade group (single-effect escape point, or the escape call
-      // was erased and no merged list was recorded): emit this effect's own
-      // locks per-effect. A sibling in an actual cascade (MaxIt found,
-      // SeqNo != max) emits nothing here — the emitter handles the whole group.
-      for (const jeandle::MaterializedLock &ML : E.Locks)
-        EmitLock(NewInv, ML.Callee, ML.NonReceiverArgs);
-    }
   }
 
   // Record this materialization in NewAllocFor so any later applyMaterialize

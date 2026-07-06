@@ -99,15 +99,23 @@ struct MaterializedLock {
   uint32_t BytecodeDepth = 0;
 };
 
-// A lock re-emitted at a materialization point, tagged with its source VO's
-// original allocation so the transform can pick the right receiver per lock
-// when a cascade group's locks are merged and globally depth-sorted. See
-// PEAResult::EscapePointLocks.
+// A lock re-emitted at a materialization point, tagged with its source
+// MaterializeEffect so the transform can pick the right per-effect receiver
+// for each lock when a cascade group's locks are merged and globally
+// depth-sorted. SourceEffect is the per-effect receiver-lookup key (Jeandle's
+// analog of Graal's `allocations[commit.getObjectIndex(monitorId)]`,
+// DefaultJavaLoweringProvider.java:1152) — strictly more precise than
+// OrigAlloc, which is last-write-wins across per-pred materializations of the
+// same object (see applyMaterialize NewAllocFor comment,
+// PartialEscapeTransform.cpp:374-377). OrigAlloc is kept as a defensive
+// fallback. See PEAResult::EscapePointLocks.
+class MaterializeEffect;
 struct MergedLock {
   Function *Callee = nullptr;
   SmallVector<Value *, 2> NonReceiverArgs;
   uint32_t BytecodeDepth = 0;
-  Instruction *OrigAlloc = nullptr; // receiver lookup key (NewAllocFor)
+  Instruction *OrigAlloc = nullptr; // fallback receiver key (NewAllocFor)
+  const MaterializeEffect *SourceEffect = nullptr; // per-effect receiver key
 };
 
 class VirtualObject {
@@ -821,8 +829,13 @@ public:
   // re-entrant interleaved cascades (e.g. [a@0,b@1,a@2,c@3] re-emitting as
   // 0,2,1,3). The transform emits each escape point's merged list once, from
   // its highest-SeqNo effect (by then every sibling's NewInv exists), each
-  // lock's receiver resolved via NewAllocFor[OrigAlloc]. Populated by
-  // computeEscapePointLocks(), called once before the transform applies Pass 1.
+  // lock's receiver resolved via NewInvOf[SourceEffect] (with NewAllocFor
+  // / NewInv fallbacks). Both live-path and per-pred cascades are merged:
+  // per-pred effects sharing a (PH,S) edge are re-aimed onto one split-edge
+  // block by the critical-edge pre-pass (or already share the single-succ
+  // pred's terminator), so they group under one InsertBefore identically to a
+  // live-path cascade. Populated by computeEscapePointLocks(), called once
+  // before the transform applies Pass 1.
   DenseMap<Instruction *, SmallVector<MergedLock, 4>> EscapePointLocks;
   DenseMap<Instruction *, uint32_t> MaxSeqForEscapePoint;
   void computeEscapePointLocks();

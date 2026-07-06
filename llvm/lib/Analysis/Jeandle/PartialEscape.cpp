@@ -498,19 +498,22 @@ void AliasMap::restore(const AliasMap &S) { *this = S; }
 
 void PEAResult::computeEscapePointLocks() {
   // Globally merge + depth-sort the locks of every CASCADE group: a set of
-  // live-path (non-per-pred) MaterializeEffects that share one escape point
+  // MaterializeEffects (live-path OR per-pred) that share one escape point
   // (InsertBefore). Only such groups (>= 2 effects at a point) need a merged
   // re-emit; a single-effect escape point emits its own locks per-effect (its
-  // NewInv trivially dominates its own emit point), and per-pred effects
-  // always emit per-effect (their NewInv lives on a split edge). Also record
-  // the highest SeqNo per escape point so the transform emits the merged list
+  // NewInv trivially dominates its own emit point). Per-pred effects are
+  // included: the critical-edge pre-pass re-aims every per-pred effect sharing
+  // a (PH,S) edge onto the same split-edge block (or, on a single-succ pred,
+  // they already share the pred's terminator), so a per-pred cascade groups
+  // under one InsertBefore exactly like a live-path cascade. Also record the
+  // highest SeqNo per escape point so the transform emits the merged list
   // once, from the last-applied effect (all sibling NewInvs then exist for
   // receiver lookup). See the comment on EscapePointLocks.
   DenseMap<Instruction *, unsigned> Count;
   for (auto &Kv : BlockEffects)
     for (jeandle::Effect &E : Kv.second) {
       auto *ME = dyn_cast<jeandle::MaterializeEffect>(&E);
-      if (!ME || ME->IsPerPred)
+      if (!ME)
         continue;
       if (auto *Key = dyn_cast_or_null<Instruction>(ME->InsertBefore))
         ++Count[Key];
@@ -518,7 +521,7 @@ void PEAResult::computeEscapePointLocks() {
   for (auto &Kv : BlockEffects)
     for (jeandle::Effect &E : Kv.second) {
       auto *ME = dyn_cast<jeandle::MaterializeEffect>(&E);
-      if (!ME || ME->IsPerPred)
+      if (!ME)
         continue;
       Instruction *Key = dyn_cast_or_null<Instruction>(ME->InsertBefore);
       if (!Key)
@@ -528,8 +531,8 @@ void PEAResult::computeEscapePointLocks() {
         continue; // single-effect escape point — per-effect emit
       auto &Vec = EscapePointLocks[Key];
       for (const jeandle::MaterializedLock &ML : ME->Locks)
-        Vec.push_back({ML.Callee, ML.NonReceiverArgs, ML.BytecodeDepth,
-                       ME->Target});
+        Vec.push_back(
+            {ML.Callee, ML.NonReceiverArgs, ML.BytecodeDepth, ME->Target, ME});
       uint32_t &Max = MaxSeqForEscapePoint[Key];
       if (ME->SeqNo > Max)
         Max = ME->SeqNo;
