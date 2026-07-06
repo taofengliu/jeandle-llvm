@@ -38,6 +38,11 @@ u2:
 ; CHECK-LABEL: define ptr addrspace(1) @test_cyclic_nested
 ; CHECK-DAG: invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
 ; CHECK-DAG: invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
+; Both replayed stores use real NewInvs — the back edge B.g = A (A materialized
+; after B in the cascade) resolves instead of lowering to poison.
+; CHECK: store atomic ptr addrspace(1) %pea.mat{{[0-9]*}}, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
+; CHECK: store atomic ptr addrspace(1) %pea.mat{{[0-9]*}}, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
+; CHECK-NOT: poison
 ; CHECK: ret ptr addrspace(1) %{{.*}}
 
 !java-method-compilation = !{}

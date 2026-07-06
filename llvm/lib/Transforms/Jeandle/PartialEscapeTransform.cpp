@@ -183,14 +183,20 @@ static BasicBlock *findOrSynthesizeUnwindDest(Function &F, CallBase *OrigAlloc,
 // uniformly with gc.statepoint/gc.result/gc.relocate; splitBasicBlock is
 // SSA-preserving and the materialized pointer dominates every use in MatCont.
 // See `partial-escape/310_full_pipeline_statepoint.ll`.
-static void applyMaterialize(Function &F, const jeandle::PEAResult &Result,
-                             const jeandle::MaterializeEffect &E,
-                             DenseMap<Value *, Value *> &NewAllocFor,
-                             DenseMap<std::pair<BasicBlock *, Value *>, Value *>
-                                 &MatPerBlock,
-                             DenseMap<std::pair<BasicBlock *, BasicBlock *>,
-                                      BasicBlock *> &BlockRename,
-                             DenseMap<Value *, SmallVector<Value *, 4>> &Defs) {
+static void applyMaterialize(
+    Function &F, const jeandle::PEAResult &Result,
+    const jeandle::MaterializeEffect &E,
+    DenseMap<Value *, Value *> &NewAllocFor,
+    DenseMap<std::pair<BasicBlock *, Value *>, Value *> &MatPerBlock,
+    DenseMap<std::pair<BasicBlock *, BasicBlock *>, BasicBlock *> &BlockRename,
+    DenseMap<Value *, SmallVector<Value *, 4>> &Defs,
+    DenseMap<const jeandle::MaterializeEffect *, InvokeInst *> &NewInvOf,
+    const DenseSet<const jeandle::MaterializeEffect *> &IsCascadeTail,
+    const DenseMap<const jeandle::MaterializeEffect *, Instruction *>
+        &CascadeKeyOf,
+    const DenseMap<Instruction *,
+                   SmallVector<const jeandle::MaterializeEffect *, 4>>
+        &CascadeGroups) {
   assert(E.ObjID != jeandle::InvalidObjectID);
   assert(E.Target && "Materialize effect must carry the original allocation");
 
@@ -327,60 +333,86 @@ static void applyMaterialize(Function &F, const jeandle::PEAResult &Result,
   NewInv->addRetAttr(Attribute::get(Ctx, jeandle::Attribute::JavaKlassExact));
   NewInv->addRetAttr(Attribute::get(Ctx, Attribute::NonNull));
 
-  // Step 7: replay tracked field stores at the top of MatCont.
+  // Record this effect's NewInv keyed by the effect itself (NOT by OrigAlloc,
+  // which is last-write-wins across per-pred materializations of the same
+  // object) so the cascade-tail field-store replay below stores into the
+  // correct per-effect allocation.
+  NewInvOf[&E] = NewInv;
+
+  // Step 7: replay tracked field stores. Only the cascade TAIL emits, and it
+  // emits the WHOLE cascade's stores here (every sibling NewInv already exists
+  // and, the chain being straight-line, dominates this tail block). Non-tail
+  // members defer their stores to their tail. This is what makes a back-edge
+  // field (p.g = o where o is materialized later in the same cascade) resolve:
+  // the store lands in the tail — dominated by o's NewInv — instead of in an
+  // earlier block where o's NewInv could not dominate it. Graal commits every
+  // object at one escape point in a single CommitAllocationNode; emitting all
+  // cascade invokes before any field store is the Jeandle analog. The lock
+  // re-emit below shares this SB so within the tail, stores precede locks.
   IRBuilder<> SB(MatCont, MatCont->getFirstInsertionPt());
   if (InsertBefore->getDebugLoc())
     SB.SetCurrentDebugLocation(InsertBefore->getDebugLoc());
   Type *I8 = Type::getInt8Ty(Ctx);
-  for (const auto &FE : E.FieldEntries) {
-    Value *V = nullptr;
-    if (FE.Value.isScalar()) {
-      V = FE.Value.getScalar();
-    } else if (FE.Value.isMaterializedRef()) {
-      // Field value is an inner virtual's OrigAlloc (the analyzer records
-      // OrigAlloc on both the live and per-pred paths). Emit OrigAlloc here;
-      // the point-sensitive resolution sub-pass (resolveMaterializedUses) then
-      // rewrites this store's value to the NewInv that dominates it (Jeandle's
-      // analog of Graal getAliasAndResolve). This handles self-referential and
-      // forward nested fields. Eager substitution via NewAllocFor would be
-      // last-write-wins and miscompile multi-materialization cases.
-      // TODO(cyclic-field-materialize): a back-edge field (p.g = o when o is
-      // materialized later in the same cascade) has no dominating NewInv — each
-      // invoke is a block terminator, so a cascade's NewInvs chain across blocks
-      // and the later NewInv cannot dominate the earlier field store.
-      // resolveMaterializedUses then leaves the OrigAlloc use and Pass 2 turns
-      // it to poison. Graal commits every object at a point in one
-      // CommitAllocationNode; fixing this needs a two-phase transform that
-      // creates every cascade NewInv before emitting any field store.
-      V = FE.Value.getMaterialized();
-    } else {
-      // The analyzer rewrites every VirtualRef into MaterializedRef during
-      // recursive prerequisite materialization. Unknown entries are filtered
-      // out at snapshot time. Hitting either tag here is a contract violation.
-      assert(false && "VirtualRef field entries must have been rewritten "
-                      "to MaterializedRef during analysis");
-      continue;
+  if (IsCascadeTail.count(&E)) {
+    Instruction *Key = CascadeKeyOf.lookup(&E);
+    auto It = CascadeGroups.find(Key);
+    const jeandle::MaterializeEffect *Self = &E;
+    ArrayRef<const jeandle::MaterializeEffect *> Members =
+        It != CascadeGroups.end()
+            ? ArrayRef<const jeandle::MaterializeEffect *>(It->second)
+            : ArrayRef<const jeandle::MaterializeEffect *>(&Self, 1);
+    for (const jeandle::MaterializeEffect *M : Members) {
+      InvokeInst *Base = NewInvOf.lookup(M);
+      assert(Base &&
+             "every cascade member's NewInv must be recorded before the "
+             "tail emits its field stores");
+      for (const auto &FE : M->FieldEntries) {
+        Value *V = nullptr;
+        if (FE.Value.isScalar()) {
+          V = FE.Value.getScalar();
+        } else if (FE.Value.isMaterializedRef()) {
+          // Field value is an inner/peer virtual's OrigAlloc (the analyzer
+          // records OrigAlloc on both the live and per-pred paths). Emit it
+          // here; the point-sensitive resolution sub-pass
+          // (resolveMaterializedUses) rewrites this store's value to the NewInv
+          // that dominates it (Jeandle's analog of Graal getAliasAndResolve).
+          // Forward, self-referential, AND cyclic back-edge fields all resolve
+          // because the store sits in the cascade tail, dominated by every
+          // peer NewInv. Eager substitution via NewAllocFor would be
+          // last-write-wins and miscompile multi-materialization cases.
+          V = FE.Value.getMaterialized();
+        } else {
+          // The analyzer rewrites every VirtualRef into MaterializedRef during
+          // recursive prerequisite materialization. Unknown entries are
+          // filtered out at snapshot time. Hitting either tag here is a
+          // contract violation.
+          assert(false && "VirtualRef field entries must have been rewritten "
+                          "to MaterializedRef during analysis");
+          continue;
+        }
+        if (!V)
+          continue;
+        Value *Slot = SB.CreateInBoundsGEP(I8, Base, SB.getInt64(FE.Offset),
+                                           "pea.matslot");
+        // Natural alignment = the field type's store size rounded up to a power
+        // of two (ptr addrspace(1) -> heap pointer width, i64/double -> 8,
+        // i32/float -> 4, i16 -> 2, i8 -> 1). The replayed stores are
+        // atomic-unordered, and atomic accesses MUST be naturally aligned (an
+        // under-aligned atomic store lowers to a libcall or is rejected by the
+        // backend). Note we deliberately do NOT use getABITypeAlign: the ABI
+        // alignment of a type may legally be SMALLER than its size (e.g. i64
+        // has ABI align 4 under LLVM's default datalayout), which is too weak
+        // for an atomic. The store size is derived from the DataLayout, so this
+        // stays correct under a future compressed-oop / 32-bit heap model and
+        // matches the frontend's natural-aligned emission (and
+        // VirtualObject::FieldDesc::ByteSize).
+        uint64_t StoreSz = DL.getTypeStoreSize(V->getType()).getFixedValue();
+        Align NaturalAlign(llvm::PowerOf2Ceil(StoreSz ? StoreSz : 1));
+        StoreInst *S = SB.CreateAlignedStore(V, Slot, NaturalAlign);
+        // Java heap stores are atomic-unordered (matches jeandle-jdk emission).
+        S->setAtomic(AtomicOrdering::Unordered);
+      }
     }
-    if (!V)
-      continue;
-    Value *Slot = SB.CreateInBoundsGEP(I8, NewInv, SB.getInt64(FE.Offset),
-                                       "pea.matslot");
-    // Natural alignment = the field type's store size rounded up to a power of
-    // two (ptr addrspace(1) -> heap pointer width, i64/double -> 8, i32/float
-    // -> 4, i16 -> 2, i8 -> 1). The replayed stores are atomic-unordered, and
-    // atomic accesses MUST be naturally aligned (an under-aligned atomic store
-    // lowers to a libcall or is rejected by the backend). Note we deliberately
-    // do NOT use getABITypeAlign: the ABI alignment of a type may legally be
-    // SMALLER than its size (e.g. i64 has ABI align 4 under LLVM's default
-    // datalayout), which is too weak for an atomic. The store size is derived
-    // from the DataLayout, so this stays correct under a future compressed-oop
-    // / 32-bit heap model and matches the frontend's natural-aligned emission
-    // (and VirtualObject::FieldDesc::ByteSize).
-    uint64_t StoreSz = DL.getTypeStoreSize(V->getType()).getFixedValue();
-    Align NaturalAlign(llvm::PowerOf2Ceil(StoreSz ? StoreSz : 1));
-    StoreInst *S = SB.CreateAlignedStore(V, Slot, NaturalAlign);
-    // Java heap stores are atomic-unordered (matches jeandle-jdk emission).
-    S->setAtomic(AtomicOrdering::Unordered);
   }
 
   // Re-emit surviving monitorenters at the materialize point. Graal flattens
@@ -486,6 +518,28 @@ struct jeandle::TransformContext {
   DenseMap<std::pair<BasicBlock *, BasicBlock *>, BasicBlock *> &BlockRename;
   DenseMap<Value *, SmallVector<Value *, 4>> &Defs;
   bool &Changed;
+
+  // Cascade coordination for cyclic-field materialization (Graal's single
+  // CommitAllocationNode model). Within a cascade (>= 2 Materialize effects
+  // sharing one escape-point InsertBefore, plus each singleton as a group of
+  // one), every NewInv invoke is emitted before any of the group's field
+  // stores: only the cascade TAIL replays stores, and it replays the WHOLE
+  // group's into its MatCont (the cascade's final block, dominated by every
+  // NewInv). That makes a back-edge field (referencing a peer materialized
+  // later in the cascade) resolve through the point-sensitive resolution sub-
+  // pass instead of lowering to poison. Populated by run() before the Pass-1
+  // RPO loop; NewInvOf is filled incrementally as each Materialize applies.
+  //   CascadeGroups  escape-point InsertBefore -> member effects (SeqNo-sorted)
+  //   CascadeKeyOf   effect -> its InsertBefore (captured once at pre-scan; the
+  //                  WeakTrackingVH is never re-read for cascade membership)
+  //   IsCascadeTail  the max-SeqNo member of each group (a singleton IS its own
+  //                  tail, so its behavior is identical to per-effect emission)
+  //   NewInvOf       effect -> the InvokeInst it emitted (Phase A records it)
+  DenseMap<Instruction *, SmallVector<const jeandle::MaterializeEffect *, 4>>
+      &CascadeGroups;
+  DenseMap<const jeandle::MaterializeEffect *, Instruction *> &CascadeKeyOf;
+  DenseSet<const jeandle::MaterializeEffect *> &IsCascadeTail;
+  DenseMap<const jeandle::MaterializeEffect *, InvokeInst *> &NewInvOf;
 };
 
 void jeandle::ReplaceLoadEffect::apply(jeandle::TransformContext &Ctx) {
@@ -606,8 +660,10 @@ void jeandle::MaterializeEffect::apply(jeandle::TransformContext &Ctx) {
   // Emit the materialization sequence. The original allocation's uses are
   // resolved later by the point-sensitive resolution sub-pass (not RAUW'd
   // inline); the allocation itself is erased by EliminateAllocation in Pass 2.
+  // The cascade maps drive the two-phase field-store replay (cyclic fields).
   applyMaterialize(Ctx.F, Ctx.Result, *this, Ctx.NewAllocFor, Ctx.MatPerBlock,
-                   Ctx.BlockRename, Ctx.Defs);
+                   Ctx.BlockRename, Ctx.Defs, Ctx.NewInvOf, Ctx.IsCascadeTail,
+                   Ctx.CascadeKeyOf, Ctx.CascadeGroups);
   Ctx.Changed = true;
 }
 
@@ -1006,6 +1062,52 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
   // materialize point) before Pass 1 applies effects.
   Result.computeEscapePointLocks();
 
+  // Cascade coordination for cyclic-field materialization: group every
+  // Materialize effect by its shared escape-point InsertBefore so the transform
+  // can emit every cascade NewInv before any field store (Jeandle's analog of
+  // Graal's single CommitAllocationNode, which holds every object and every
+  // initializer value at one point so cyclic peer references resolve). Capture
+  // each effect's key ONCE here; never re-read the WeakTrackingVH InsertBefore
+  // for cascade membership at apply time (a sibling effect may null it). The
+  // max-SeqNo member of each group is the "tail" that replays the whole group's
+  // field stores; a singleton (null or unique InsertBefore) is its own tail.
+  // Per-pred effects were re-aimed onto their split edge blocks by the pre-pass
+  // above, so per-pred cascades (one per edge block) key correctly here.
+  DenseMap<Instruction *, SmallVector<const jeandle::MaterializeEffect *, 4>>
+      CascadeGroups;
+  DenseMap<const jeandle::MaterializeEffect *, Instruction *> CascadeKeyOf;
+  DenseSet<const jeandle::MaterializeEffect *> IsCascadeTail;
+  DenseMap<const jeandle::MaterializeEffect *, InvokeInst *> NewInvOf;
+  {
+    DenseMap<Instruction *, SmallVector<const jeandle::MaterializeEffect *, 4>>
+        ByKey;
+    for (auto &Kv : Result.BlockEffects)
+      for (jeandle::Effect &E : Kv.second) {
+        auto *M = dyn_cast<jeandle::MaterializeEffect>(&E);
+        if (!M)
+          continue;
+        Instruction *Key = dyn_cast_or_null<Instruction>(M->InsertBefore);
+        CascadeKeyOf[M] = Key;
+        if (Key)
+          ByKey[Key].push_back(M);
+        else
+          // Degenerate (InsertBefore already null at pre-scan): the effect is
+          // its own singleton tail and replays its own stores in its own
+          // MatCont.
+          IsCascadeTail.insert(M);
+      }
+    for (auto &Kv : ByKey) {
+      llvm::sort(Kv.second, [](const jeandle::MaterializeEffect *A,
+                               const jeandle::MaterializeEffect *B) {
+        return A->SeqNo < B->SeqNo;
+      });
+      // The max-SeqNo member is applied last, so by the time it runs every
+      // sibling NewInv exists and its MatCont is the cascade's final block.
+      IsCascadeTail.insert(Kv.second.back());
+      CascadeGroups[Kv.first] = std::move(Kv.second);
+    }
+  }
+
   // -------------------------------------------------------------------------
   // Pass 1: non-cfgKill effects (ReplaceLoad, ReplaceCall, EliminateStore,
   // Materialize, CreatePHI) — applied per-block in RPO via EffectList::apply,
@@ -1014,9 +1116,10 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
   // apply(graph, obsoleteNodes, cfgKills=false)). isCfgKill() partitions the
   // two passes; EliminateAllocation is the only cfgKill, so it is skipped here.
   // -------------------------------------------------------------------------
-  jeandle::TransformContext Ctx{F, Result,        NewAllocFor,
-                                MatPerBlock, BlockRename,   Defs,
-                                Changed};
+  jeandle::TransformContext Ctx{
+      F,       Result,        NewAllocFor,  MatPerBlock,   BlockRename, Defs,
+      Changed, CascadeGroups, CascadeKeyOf, IsCascadeTail, NewInvOf};
+
   for (BasicBlock *BB : RPOT) {
     auto It = Result.BlockEffects.find(BB);
     if (It == Result.BlockEffects.end())

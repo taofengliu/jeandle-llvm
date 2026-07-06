@@ -1,17 +1,13 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
-; XFAIL: *
 
-; Mutual reference (o.f = p, p.g = o). EXPECTED TO FAIL — see
-; TODO(cyclic-field-materialize) in PartialEscapeTransform.cpp. A back-edge field
-; (p.g = o, where o is materialized later in the same cascade) has no dominating
-; NewInv: each materialize invoke is a block terminator, so a cascade's NewInvs
-; chain across blocks and the later NewInv cannot dominate the earlier field
-; store. resolveMaterializedUses leaves the OrigAlloc use and Pass 2 turns it to
-; poison. The forward edge (o.f = p) resolves correctly; only the back edge
-; miscompiles. Graal commits every object at a point in one CommitAllocationNode;
-; Jeandle needs a two-phase transform (create every cascade NewInv, then emit
-; field stores) to match. The CHECKs below assert the correct post-fix behavior,
-; so this flips to XPASS once the two-phase transform lands.
+; Mutual reference (o.f = p, p.g = o) on the per-pred path. Both edges must
+; resolve to real per-pred NewInvs: the transform emits every cascade NewInv
+; before any field store (the cascade tail replays the whole group's stores in
+; its MatCont, dominated by every NewInv — Jeandle's analog of Graal's single
+; CommitAllocationNode), so the back edge p.g = o (o materialized later in the
+; same cascade) resolves via the point-sensitive resolution sub-pass instead of
+; lowering to poison. See PartialEscapeTransform.cpp applyMaterialize (cyclic-
+; field-materialize).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -45,12 +41,13 @@ u:
 !java-method-compilation = !{}
 
 ; CHECK-LABEL: define void @mutual_field_perpred
-; Each object is per-pred materialized at both preds (4 NewInvs total).
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr)
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr)
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr)
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr)
-; Replayed field stores use real per-pred NewInvs (no <badref>).
-; CHECK: store atomic ptr addrspace(1) %pea.mat{{[0-9]*}}, ptr addrspace(1) %pea.matslot unordered, align 8
-; CHECK: store atomic ptr addrspace(1) %pea.mat{{[0-9]*}}, ptr addrspace(1) %pea.matslot unordered, align 8
+; Both objects materialize once at the escape point (a live-path cascade of 2
+; sharing one InsertBefore).
+; CHECK-DAG: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr)
+; CHECK-DAG: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr)
+; Replayed field stores use real NewInvs — the back edge p.g = o (o materialized
+; after p in the cascade) resolves instead of lowering to poison.
+; CHECK: store atomic ptr addrspace(1) %pea.mat{{[0-9]*}}, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
+; CHECK: store atomic ptr addrspace(1) %pea.mat{{[0-9]*}}, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
+; CHECK-NOT: poison
 ; CHECK: ret void

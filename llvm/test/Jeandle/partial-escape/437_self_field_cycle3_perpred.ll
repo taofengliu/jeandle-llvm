@@ -1,12 +1,12 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
-; XFAIL: *
 
-; Three-object cycle (o.f = p, p.g = q, q.h = o). EXPECTED TO FAIL — see
-; TODO(cyclic-field-materialize) in PartialEscapeTransform.cpp and the matching
-; 435_mutual_field_perpred.ll. The cycle's back edge (q.h = o, where o is the
-; last object materialized in the cascade) has no dominating NewInv and lowers
-; to poison; the forward edges resolve correctly. The CHECKs below assert the
-; correct post-fix behavior (flips to XPASS once the two-phase transform lands).
+; Three-object cycle (o.f = p, p.g = q, q.h = o) on the per-pred path. The
+; cycle's back edge q.h = o (o materialized last in the cascade) resolves to a
+; real per-pred NewInv: the cascade tail replays the whole group's field stores
+; in its MatCont (dominated by every NewInv), so every edge — forward and back —
+; resolves via the point-sensitive resolution sub-pass. See
+; PartialEscapeTransform.cpp applyMaterialize (cyclic-field-materialize) and the
+; matching 435_mutual_field_perpred.ll.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -45,15 +45,15 @@ u:
 !java-method-compilation = !{}
 
 ; CHECK-LABEL: define void @self_field_cycle3_perpred
-; Each object per-pred materialized at both preds (6 NewInvs).
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr)
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr)
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr)
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr)
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 33333 to ptr)
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 33333 to ptr)
-; Replayed field stores use real per-pred NewInvs (no <badref>).
-; CHECK: store atomic ptr addrspace(1) %pea.mat{{[0-9]*}}, ptr addrspace(1) %pea.matslot unordered, align 8
-; CHECK: store atomic ptr addrspace(1) %pea.mat{{[0-9]*}}, ptr addrspace(1) %pea.matslot unordered, align 8
-; CHECK: store atomic ptr addrspace(1) %pea.mat{{[0-9]*}}, ptr addrspace(1) %pea.matslot unordered, align 8
+; All three objects materialize once at the escape point (a live-path cascade
+; of 3 sharing one InsertBefore).
+; CHECK-DAG: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr)
+; CHECK-DAG: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr)
+; CHECK-DAG: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 33333 to ptr)
+; Replayed field stores use real NewInvs — the cycle's back edge q.h = o (o
+; materialized last in the cascade) resolves instead of lowering to poison.
+; CHECK: store atomic ptr addrspace(1) %pea.mat{{[0-9]*}}, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
+; CHECK: store atomic ptr addrspace(1) %pea.mat{{[0-9]*}}, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
+; CHECK: store atomic ptr addrspace(1) %pea.mat{{[0-9]*}}, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
+; CHECK-NOT: poison
 ; CHECK: ret void
