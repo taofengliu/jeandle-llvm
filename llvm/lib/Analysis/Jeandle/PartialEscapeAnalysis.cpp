@@ -958,6 +958,21 @@ private:
                                           uintptr_t SuperKlass);
   void emitReplaceCall(CallBase *CB, Value *Replacement, jeandle::ObjectID ID);
   void materializeAllVirtualOperands(Instruction *I);
+  // Sound analog of materializeAllVirtualOperands: materialize only when no
+  // operand is a DERIVED pointer of a still-virtual object (a derived operand
+  // computed before I would resolve to poison, since pea.mat at I cannot
+  // dominate its def); otherwise mark every virtual operand's object ineligible
+  // so derived pointers stay valid. Graal's processNodeInputs
+  // (PartialEscapeClosure.java:433-451) always materializes — Jeandle diverges
+  // to markIneligible only because LLVM represents field access as derived
+  // address computations, which Graal's identity-based alias model does not.
+  void materializeVirtualOperandsSafely(Instruction *I);
+  // Mark every distinct virtual ObjectID among I's operands ineligible (each
+  // keeps its ORIGINAL allocation real). The bail primitive backing
+  // materializeVirtualOperandsSafely; same principle as the processStore/
+  // processLoad bail (markIneligible rather than materialize, to keep a
+  // pre-computed derived address valid).
+  void markVirtualOperandsIneligible(Instruction *I);
   void materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
                      MatReason Reason = MatReason::Unhandled);
 
@@ -3098,8 +3113,10 @@ void Analyzer::processInstruction(Instruction *I) {
         return;
       // Fall through to the generic-escape path for unrecognised calls.
     }
-    // Any other consumer of a virtual operand triggers materialization.
-    materializeAllVirtualOperands(I);
+    // Any other consumer of a virtual operand. Materialize when sound; if a
+    // derived-GEP virtual operand is present, markIneligible instead so it
+    // doesn't resolve to poison (see materializeVirtualOperandsSafely).
+    materializeVirtualOperandsSafely(I);
     return;
   }
 
@@ -4267,13 +4284,17 @@ bool Analyzer::foldICmpEquality(ICmpInst *ICmp) {
       // derived-pointer byte offset (GEP case chases the base), so two
       // operands of the SAME virtual at DIFFERENT offsets (e.g. %o vs
       // gep(%o,8)) would otherwise conflate to equal. Compare the byte
-      // offsets too: equal -> equal addresses, different -> distinct; a
-      // symbolic offset can't be proven either way, so bail and let the gate
-      // materialize.
+      // offsets too: equal -> equal addresses, different -> distinct. A
+      // symbolic offset can't be proven either way; keep the object real
+      // (markIneligible) so a derived-GEP operand stays valid and the icmp
+      // survives as a real compare — returning false would hit the gate's
+      // materializeAllVirtualOperands(icmp) and poison that operand.
       auto O0 = jeandle::pea::resolveFieldOffset(Op0, DL);
       auto O1 = jeandle::pea::resolveFieldOffset(Op1, DL);
-      if (!O0 || !O1)
-        return false;
+      if (!O0 || !O1) {
+        markIneligible(*V0); // *V0 == *V1 (same object).
+        return true;
+      }
       Folded = true;
       EqResult = (*O0 == *O1);
       BaseID = *V0;
@@ -4344,24 +4365,22 @@ void Analyzer::propagatePointerAlias(Instruction *I) {
   // Select case, so it returns 0 for the Select itself). A `select %c,
   // gep(%v,16), gep(%v,16)` would otherwise alias-forward to %v and a
   // downstream load/store through the select be modelled at offset 0 instead
-  // of 16. Mirror processBlockPhis' AnyDerived guard: only alias when BOTH
-  // arms resolve to offset 0 (whole-object); otherwise materialize so the
-  // access sees the real pointer at runtime. A poison arm resolves to offset
-  // 0, so the guard correctly does not trip (the poison arm cannot execute
-  // without UB).
+  // of 16. So alias-forward only when both arms denote the WHOLE object
+  // (resolveFieldOffset 0 each — a poison arm also resolves to 0 and cannot
+  // execute without UB). Any other shape (non-zero/symbolic offset, or
+  // different objects) is handed to materializeVirtualOperandsSafely: it
+  // materializes whole-object arms but calls markIneligible on any object whose
+  // derived-GEP arm would poison if materialized at the select (same class as
+  // the processStore/processLoad bail — see materializeVirtualOperandsSafely).
   if (auto *Sel = dyn_cast<SelectInst>(I)) {
     auto BaseID = jeandle::pea::resolveVirtualRef(Sel, CurrentState, Aliases, DL);
-    if (!BaseID) {
-      materializeAllVirtualOperands(I);
-      return;
-    }
     auto TOff = jeandle::pea::resolveFieldOffset(Sel->getTrueValue(), DL);
     auto FOff = jeandle::pea::resolveFieldOffset(Sel->getFalseValue(), DL);
-    if (!TOff || *TOff != 0 || !FOff || *FOff != 0) {
-      materializeAllVirtualOperands(I);
+    if (BaseID && TOff && FOff && *TOff == 0 && *FOff == 0) {
+      Aliases.addVirtualAlias(I, *BaseID);
       return;
     }
-    Aliases.addVirtualAlias(I, *BaseID);
+    materializeVirtualOperandsSafely(I);
     return;
   }
 
@@ -4398,6 +4417,59 @@ void Analyzer::materializeAllVirtualOperands(Instruction *I) {
   llvm::sort(ToMaterialize);
   for (jeandle::ObjectID ID : ToMaterialize)
     materializeAt(ID, I, MatReason::Unhandled);
+}
+
+void Analyzer::materializeVirtualOperandsSafely(Instruction *I) {
+  // Materializing at I is sound only when every virtual operand is the object's
+  // ORIGINAL allocation (AllocationCall) — a direct use at I that pea.mat at I
+  // dominates, so the resolution sub-pass rewrites it. A DERIVED operand (any
+  // value != AllocationCall that resolveVirtualRef chases to a virtual: GEP,
+  // bitcast, addrspacecast, freeze, inttoptr-roundtrip, PHI, select, or an
+  // alias-map entry) is computed before I, so its OrigAlloc use sits at its own
+  // def, which pea.mat at I cannot dominate — resolveMaterializedUses leaves it
+  // for EliminateAllocation's poison RAUW, turning the operand into
+  // `getelementptr ... poison`. When any operand is derived, keep every virtual
+  // operand's object real via markIneligible (derived pointers then stay valid);
+  // otherwise materialize as usual. The derived test is structural
+  // (V != AllocationCall), NOT offset-based: a zero-offset `gep %o, 0` is still
+  // a derived instruction and would still poison.
+  for (Use &U : I->operands()) {
+    Value *V = U.get();
+    if (!V)
+      continue;
+    auto ID = jeandle::pea::resolveVirtualRef(V, CurrentState, Aliases, DL);
+    if (!ID)
+      continue;
+    if (V != Result.VirtualObjects[*ID]->AllocationCall) {
+      markVirtualOperandsIneligible(I);
+      return;
+    }
+  }
+  materializeAllVirtualOperands(I);
+}
+
+void Analyzer::markVirtualOperandsIneligible(Instruction *I) {
+  // Bail primitive: mark every distinct virtual ObjectID among I's operands
+  // ineligible so each keeps its ORIGINAL allocation real (AlwaysEscapes via
+  // commit() -> dropEffectsFor dropping EliminateAllocationEffect). Mirrors
+  // materializeAllVirtualOperands enumeration but markIneligible instead of
+  // materializeAt. Used wherever materializing at I would poison a derived
+  // operand (processStore/processLoad bail, materializeVirtualOperandsSafely).
+  SmallVector<jeandle::ObjectID, 4> ToBail;
+  DenseSet<jeandle::ObjectID> Seen;
+  for (Use &U : I->operands()) {
+    Value *V = U.get();
+    if (!V)
+      continue;
+    if (auto MaybeID =
+            jeandle::pea::resolveVirtualRef(V, CurrentState, Aliases, DL)) {
+      if (Seen.insert(*MaybeID).second)
+        ToBail.push_back(*MaybeID);
+    }
+  }
+  llvm::sort(ToBail);
+  for (jeandle::ObjectID ID : ToBail)
+    markIneligible(ID);
 }
 
 // Materialize placement is escape-point / predecessor-end (Graal
@@ -5020,26 +5092,24 @@ void Analyzer::processLoopExit(Loop *L) {
       // Graal runs processLoopExit unconditionally for every LoopExitNode and
       // force-materializes every loop-local virtual whose exit reaches an
       // exception-handling context (PartialEscapeClosure.java:737-766, gated
-      // only by isExceptionHandlingBCI). Any EH-pad successor — catchswitch,
-      // catchpad, or landingpad — counts: a 0-clause cleanup handler is NOT
-      // guaranteed to only `resume`; legal IR may read a loop-local virtual's
-      // field from it. Jeandle preserves the OOM-cleanup optimization by
-      // skipping only a pure-resume 0-clause cleanup (isPureResumeCleanup).
+      // only by isExceptionHandlingBCI). Any EH-pad successor counts —
+      // catchswitch, catchpad, cleanuppad, or landingpad: a 0-clause cleanup
+      // handler is NOT guaranteed to only `resume`; legal IR may read a
+      // loop-local virtual's field from it. Jeandle preserves the OOM-cleanup
+      // optimization by skipping only a pure-resume 0-clause landingpad
+      // (isPureResumeCleanup). isEHPad() covers all four EH-pad kinds (and any
+      // future one), so funclet-EH cleanuppad successors are not missed.
       // TODO(jeandle-deopt): see PartialEscapeTransform.cpp applyMaterialize().
-      if (auto *CSI = dyn_cast<CatchSwitchInst>(&*Succ->getFirstNonPHIIt())) {
-        (void)CSI;
-        ExitsToEH = true;
-        break;
-      }
-      if (isa<CatchPadInst>(&*Succ->getFirstNonPHIIt())) {
-        ExitsToEH = true;
-        break;
-      }
-      if (auto *LP = dyn_cast<LandingPadInst>(&*Succ->getFirstNonPHIIt())) {
+      Instruction *First = &*Succ->getFirstNonPHIIt();
+      if (First->isEHPad()) {
         // A catch handler (clauses > 0) or a non-trivial cleanup may observe a
-        // loop-local virtual; a pure-resume 0-clause cleanup (OOM handler)
-        // cannot.
-        if (LP->getNumClauses() > 0 || !isPureResumeCleanup(*Succ)) {
+        // loop-local virtual; a pure-resume 0-clause landingpad (OOM handler)
+        // cannot. cleanuppad/catchpad/catchswitch have no pure-resume exemption
+        // (isPureResumeCleanup requires a LandingPadInst).
+        bool PureOOMResume = false;
+        if (auto *LP = dyn_cast<LandingPadInst>(First))
+          PureOOMResume = LP->getNumClauses() == 0 && isPureResumeCleanup(*Succ);
+        if (!PureOOMResume) {
           ExitsToEH = true;
           break;
         }

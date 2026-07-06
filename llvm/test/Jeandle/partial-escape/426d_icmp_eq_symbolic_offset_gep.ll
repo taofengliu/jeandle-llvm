@@ -1,9 +1,11 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; #2.2 variant: symbolic-offset GEP. %g = gep %o, %sym where %sym is a
-; non-constant SSA value, so resolveFieldOffset returns nullopt. foldICmpEquality
-; must NOT fold (it cannot prove the offsets equal); it returns false so the
-; gate materializes %o and the icmp survives as a real compare.
+; Symbolic-offset derived GEP in an equality icmp. %g = gep %o, %sym where %sym
+; is a non-constant SSA value, so resolveFieldOffset returns nullopt. The icmp
+; can't be folded (the offset can't be proven equal or distinct to 0), and the
+; derived GEP %g is computed before any materialize point, so PEA keeps %o real
+; (markIneligible) instead of materializing at the icmp (which would poison
+; %g). The icmp survives as a real compare over two valid pointers.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i1)
@@ -25,9 +27,12 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_icmp_eq_symbolic_offset
-; %o materializes and the icmp survives as a real compare (not folded).
+; The derived GEP must keep a real base (never poison).
+; CHECK-NOT: getelementptr{{.*}}poison
+; %o stays real and the icmp survives as a real compare (not folded).
 ; CHECK: invoke{{.*}}@jeandle.new_instance
 ; CHECK: icmp eq ptr addrspace(1)
 ; CHECK-NOT: call{{.*}}@use(i1 true)
+; CHECK-NOT: call{{.*}}@use(i1 false)
 
 !java-method-compilation = !{}

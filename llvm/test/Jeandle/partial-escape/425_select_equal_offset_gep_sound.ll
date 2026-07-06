@@ -1,17 +1,13 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Select of equal-offset GEPs into a virtual object.
-; %g1 and %g2 both offset %o by 16; %sel = select %c, %g1, %g2; the load is
-; through %sel, whose runtime address is %o+16 (field @16 = 42).
-;
-; Before the fix, propagatePointerAlias alias-forwarded %sel to %o's ObjectID
-; with no offset guard (resolveVirtualRefImpl's Select case returns the common
-; ObjectID and discards per-arm offset). resolveFieldOffset(%sel) then returned
-; 0 (stripPointerCastsAndOffsets has no Select case), so processLoad modelled
-; the load at field @0 (= 7) instead of @16 (= 42) -> a miscompile, not a
-; conservative bail. After the fix, a Select with any non-zero-offset arm falls
-; through to materializeAllVirtualOperands: %o materializes at the select and
-; the load reads the real %o+16 address.
+; Select of equal-offset derived GEPs into a virtual object. %g1 and %g2 both
+; offset %o by 16; %sel = select %c, %g1, %g2; the load is through %sel, whose
+; runtime address is %o+16 (field @16 = 42). The GEP arms are computed before
+; any materialize point, so PEA keeps %o real (markIneligible) rather than
+; materializing at the select, which would place pea.mat after the arms and
+; leave them resolving to poison. The object survives as a real allocation,
+; the select/load survive reading %o+16, and the load is NOT folded to the
+; field@0 value 7.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)
@@ -38,11 +34,13 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_select_equal_offset_gep
-; The object materializes (the select bail forces it) and the load survives as
-; a real load through %sel, reading %o+16. The load must NOT be folded to the
-; field@0 value 7.
+; The GEP arms must keep a real base (never poison) — checked first so the
+; CHECK-NOT scope spans the function body where the (pre-fix) poison GEPs sit.
+; CHECK-NOT: getelementptr{{.*}}poison
+; The object stays real and the load survives through %sel reading %o+16.
 ; CHECK: invoke{{.*}}@jeandle.new_instance
 ; CHECK: load atomic i32, ptr addrspace(1) %sel
+; The load must NOT fold to the field@0 value 7.
 ; CHECK-NOT: call{{.*}}@use(i32 7)
 
 !java-method-compilation = !{}
