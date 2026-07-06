@@ -183,6 +183,40 @@ static BasicBlock *findOrSynthesizeUnwindDest(Function &F, CallBase *OrigAlloc,
 // uniformly with gc.statepoint/gc.result/gc.relocate; splitBasicBlock is
 // SSA-preserving and the materialized pointer dominates every use in MatCont.
 // See `partial-escape/310_full_pipeline_statepoint.ll`.
+
+// Eager-update hook: call this BEFORE erasing `Dying` from IR. Re-aims every
+// MaterializeEffect whose InsertBefore == Dying to `Next` (the normal-flow
+// successor in the SAME block — for a non-terminator that is
+// Target->getNextNode(); for an invoke terminator it is the `br` created by
+// BranchInst::Create, captured as II->getNextNode() after Create but before
+// erase). This keeps the WeakTrackingVH alive so applyMaterialize never sees
+// a null InsertBefore. Mirrors Graal's "fixed deleted -> use node.next()"
+// (PartialEscapeClosure.java:310-329, MATERIALIZE_ALL); Graal mutates IR
+// during analysis so its `fixed` is always the live post-fold node, whereas
+// Jeandle's analysis/transform split captures a stale IP that a sibling erase
+// can invalidate — this hook is the transform-time equivalent of Graal's
+// re-derivation. Re-indexes each dependent into Next's bucket so a future
+// erase of Next chains correctly.
+static void relocateDependentMaterializes(
+    DenseMap<Instruction *, SmallVector<jeandle::MaterializeEffect *, 4>>
+        &Dependents,
+    Instruction *Dying, Instruction *Next) {
+  if (!Next || Next == Dying)
+    return;
+  auto It = Dependents.find(Dying);
+  if (It == Dependents.end())
+    return;
+  // Move the bucket out and erase Dying's entry BEFORE any insert: inserting
+  // into Dependents[Next] below could rehash and invalidate `It`.
+  SmallVector<jeandle::MaterializeEffect *, 4> Bucket = std::move(It->second);
+  Dependents.erase(It);
+  auto &NextBucket = Dependents[Next];
+  for (jeandle::MaterializeEffect *M : Bucket) {
+    M->setInsertBefore(Next);
+    NextBucket.push_back(M);
+  }
+}
+
 static void applyMaterialize(
     Function &F, const jeandle::PEAResult &Result,
     const jeandle::MaterializeEffect &E,
@@ -208,18 +242,22 @@ static void applyMaterialize(
   LLVMContext &Ctx = M->getContext();
   const DataLayout &DL = M->getDataLayout();
 
-  // InsertBefore is a WeakTrackingVH. A lower-SeqNo ReplaceLoad/ReplaceCall on
-  // the same instruction may have RAUW'd and erased it, nulling the handle;
-  // dyn_cast_or_null<Instruction> covers that case, and we recover by
-  // recomputing the safe IP at the head of the alloc's normal-dest block.
+  // The eager-update hook (relocateDependentMaterializes, called from
+  // ReplaceLoad/ReplaceCall/EliminateStore before erasing) re-aims every
+  // dependent Materialize to the next instruction before the erase nulls this
+  // WeakTrackingVH, so InsertBefore is always live at apply time. Assert it,
+  // rather than silently hoisting to the alloc's normal-dest (the old fallback
+  // was unsound: premature escape + SSA-dominance-unsound replay of field
+  // stores for values defined between the normal-dest head and the escape
+  // point). This ports Graal's `fixed`-never-erased guarantee (Trap 9), now
+  // enforced by the eager update rather than merely assumed. Keep the
+  // WeakTrackingVH so a future erase path that misses the hook surfaces as a
+  // clean null-assert instead of use-after-free.
+  // TODO(jeandle-pea): if a future erase path is added, add the hook there too.
   Instruction *InsertBefore = dyn_cast_or_null<Instruction>(E.InsertBefore);
-  if (!InsertBefore) {
-    if (auto *II = dyn_cast<InvokeInst>(OrigAlloc))
-      InsertBefore = &*II->getNormalDest()->getFirstNonPHIOrDbg();
-    else
-      InsertBefore = OrigAlloc->getNextNode();
-  }
-  assert(InsertBefore && "Materialize effect requires an insertion point");
+  assert(InsertBefore &&
+         "Materialize InsertBefore was erased — an erase path "
+         "missed the eager-update hook (see relocateDependentMaterializes)");
   BasicBlock *Origin = InsertBefore->getParent();
   // Capture the analyzer's recorded pred BB at this effect (which may
   // already have been renamed by an earlier applyMaterialize at the same
@@ -238,9 +276,9 @@ static void applyMaterialize(
       ConstantInt::get(Type::getInt64Ty(Ctx),
                        static_cast<uint64_t>(VObj.Klass)),
       PointerType::get(Ctx, /*AS=*/0));
-  Value *Arg1 = ConstantInt::get(
-      Type::getInt32Ty(Ctx),
-      VObj.isInstance() ? VObj.SizeInBytes : VObj.ArrayLength);
+  Value *Arg1 =
+      ConstantInt::get(Type::getInt32Ty(Ctx),
+                       VObj.isInstance() ? VObj.SizeInBytes : VObj.ArrayLength);
 
   // Step 3: determine the enclosing EH funclet pad of the materialization site
   // BEFORE the split below — colorEHFunclets requires well-formed IR (every
@@ -312,8 +350,8 @@ static void applyMaterialize(
   if (InsertBefore->getDebugLoc())
     B.SetCurrentDebugLocation(InsertBefore->getDebugLoc());
   InvokeInst *NewInv = B.CreateInvoke(AllocFn, /*NormalDest=*/MatCont,
-                                      /*UnwindDest=*/UnwindDest,
-                                      {Arg0, Arg1}, Bundles, "pea.mat");
+                                      /*UnwindDest=*/UnwindDest, {Arg0, Arg1},
+                                      Bundles, "pea.mat");
   NewInv->setCallingConv(CallingConv::Hotspot_JIT);
   // Copy metadata and merge attrs from the original allocation so downstream
   // RewriteStatepointsForGC / GC barriers don't see weaker output (lost
@@ -421,13 +459,14 @@ static void applyMaterialize(
   // each VO's locks per-effect, and PEAResult::computeEscapePointLocks merged
   // them per escape point (the shared InsertBefore of this cascade group) into
   // Result.EscapePointLocks. This effect emits the merged list ONCE — iff it is
-  // the highest-SeqNo effect at its escape point (by then every sibling's NewInv
-  // is in NewAllocFor, so each lock's receiver resolves; chained block-splits
-  // also leave this effect's MatCont last at the escape call, so emitting here
-  // after the field stores precedes the escape and follows every sibling's
-  // field stores). Emitting per-effect here would mis-order re-entrant
-  // interleaved cascades. If the escape-point key is unresolved (the escape
-  // call was erased by a sibling effect), fall back to this effect's own locks.
+  // the highest-SeqNo effect at its escape point (by then every sibling's
+  // NewInv is in NewAllocFor, so each lock's receiver resolves; chained
+  // block-splits also leave this effect's MatCont last at the escape call, so
+  // emitting here after the field stores precedes the escape and follows every
+  // sibling's field stores). Emitting per-effect here would mis-order
+  // re-entrant interleaved cascades. If the escape-point key is unresolved (the
+  // escape call was erased by a sibling effect), fall back to this effect's own
+  // locks.
   auto EmitLock = [&](Value *Recv, Function *Callee,
                       ArrayRef<Value *> NonReceiverArgs) {
     if (!Callee)
@@ -446,7 +485,17 @@ static void applyMaterialize(
     for (const jeandle::MaterializedLock &ML : E.Locks)
       EmitLock(NewInv, ML.Callee, ML.NonReceiverArgs);
   } else {
-    Instruction *EscapeKey = dyn_cast_or_null<Instruction>(E.InsertBefore);
+    // Use the ORIGINAL escape-point instruction (captured once at pre-scan in
+    // CascadeKeyOf) as the lock-re-emit key, NOT the (possibly re-aimed)
+    // E.InsertBefore. MaxSeqForEscapePoint/EscapePointLocks are keyed by the
+    // original InsertBefore (populated by computeEscapePointLocks before
+    // Pass 1); after the eager-update hook re-aimed E.InsertBefore to the
+    // next instruction, re-reading it would miss the lookup and fall back to
+    // per-effect (mis-ordering re-entrant locks for Case-A cascades). The
+    // captured key may dangle after an erase, but the frozen-map lookup is
+    // pointer-value-only (no deref) — safe, identical to the cascade replay
+    // (CascadeKeyOf[&E] -> CascadeGroups) below.
+    Instruction *EscapeKey = CascadeKeyOf.lookup(&E);
     auto MaxIt = EscapeKey ? Result.MaxSeqForEscapePoint.find(EscapeKey)
                            : Result.MaxSeqForEscapePoint.end();
     if (MaxIt != Result.MaxSeqForEscapePoint.end() &&
@@ -464,9 +513,9 @@ static void applyMaterialize(
         }
     } else if (MaxIt == Result.MaxSeqForEscapePoint.end()) {
       // Not a cascade group (single-effect escape point, or the escape call
-      // was erased): emit this effect's own locks per-effect. A sibling in an
-      // actual cascade (MaxIt found, SeqNo != max) emits nothing here — the
-      // emitter handles the whole group.
+      // was erased and no merged list was recorded): emit this effect's own
+      // locks per-effect. A sibling in an actual cascade (MaxIt found,
+      // SeqNo != max) emits nothing here — the emitter handles the whole group.
       for (const jeandle::MaterializedLock &ML : E.Locks)
         EmitLock(NewInv, ML.Callee, ML.NonReceiverArgs);
     }
@@ -540,6 +589,19 @@ struct jeandle::TransformContext {
   DenseMap<const jeandle::MaterializeEffect *, Instruction *> &CascadeKeyOf;
   DenseSet<const jeandle::MaterializeEffect *> &IsCascadeTail;
   DenseMap<const jeandle::MaterializeEffect *, InvokeInst *> &NewInvOf;
+  // Reverse index of CascadeKeyOf: escape-point InsertBefore -> the non-const
+  // MaterializeEffect list keyed on it. Built in the pre-scan alongside
+  // CascadeKeyOf. Consumed by relocateDependentMaterializes: when an erase
+  // effect (ReplaceLoad/ReplaceCall/EliminateStore) deletes an instruction
+  // that is one or more Materializes' InsertBefore, it re-aims each to the
+  // next instruction before the erase nulls the WeakTrackingVH. This is the
+  // Jeandle analog of Graal's "fixed deleted -> use node.next()" (MATERIALIZE_
+  // ALL, PartialEscapeClosure.java:310-329) and keeps InsertBefore live at
+  // apply time so applyMaterialize can assert it. Non-const MaterializeEffect*
+  // because the hook calls setInsertBefore. Re-indexed to the next
+  // instruction's bucket for chained erases.
+  DenseMap<Instruction *, SmallVector<jeandle::MaterializeEffect *, 4>>
+      &InsertBeforeDependents;
 };
 
 void jeandle::ReplaceLoadEffect::apply(jeandle::TransformContext &Ctx) {
@@ -612,6 +674,11 @@ void jeandle::ReplaceLoadEffect::apply(jeandle::TransformContext &Ctx) {
   }
   if (!Target->use_empty())
     Target->replaceAllUsesWith(Repl);
+  // Re-aim any Materialize keyed on `Target` to its next instruction before
+  // the erase nulls the WeakTrackingVH. (Loads are never block terminators,
+  // so getNextNode() is the in-block normal-flow successor.)
+  relocateDependentMaterializes(Ctx.InsertBeforeDependents, Target,
+                                Target->getNextNode());
   Target->eraseFromParent();
   Ctx.Changed = true;
 }
@@ -637,8 +704,20 @@ void jeandle::ReplaceCallEffect::apply(jeandle::TransformContext &Ctx) {
     BasicBlock *Parent = II->getParent();
     Unwind->removePredecessor(Parent, /*KeepOneInputPHIs=*/true);
     BranchInst::Create(Normal, Parent);
+    // Re-aim any Materialize keyed on `II` to the freshly-created `br` (II's
+    // normal successor in the SAME block) before erasing II. This must use the
+    // `br` (II->getNextNode() after the Create), NOT
+    // Normal->getFirstNonPHIOrDbg — the latter lives in the (multi-pred)
+    // normal-dest block and would split the merge, mis-placing the materialize
+    // on every predecessor's path.
+    relocateDependentMaterializes(Ctx.InsertBeforeDependents, II,
+                                  II->getNextNode());
     II->eraseFromParent();
   } else {
+    // Re-aim any Materialize keyed on `Target` to its next instruction before
+    // the erase nulls the WeakTrackingVH.
+    relocateDependentMaterializes(Ctx.InsertBeforeDependents, Target,
+                                  Target->getNextNode());
     Target->eraseFromParent();
   }
   Ctx.Changed = true;
@@ -647,6 +726,13 @@ void jeandle::ReplaceCallEffect::apply(jeandle::TransformContext &Ctx) {
 void jeandle::EliminateStoreEffect::apply(jeandle::TransformContext &Ctx) {
   if (!Target)
     return;
+  // Re-aim any Materialize keyed on `Target` to its next instruction before
+  // the erase nulls the WeakTrackingVH. Defensive: EliminateStore and
+  // Materialize-at-store are mutually exclusive by the processStore dispatch,
+  // so this never fires today, but a store CAN be a Materialize IP (value-side
+  // fall-through), so the hook is future-proof.
+  relocateDependentMaterializes(Ctx.InsertBeforeDependents, Target,
+                                Target->getNextNode());
   Target->eraseFromParent();
   Ctx.Changed = true;
 }
@@ -757,7 +843,8 @@ void jeandle::RewritePhiIncomingEffect::apply(jeandle::TransformContext &Ctx) {
       NewInv = It2->second;
   }
   if (!NewInv)
-    return; // the Materialize was dropped (object ineligible) — nothing to rewire.
+    return; // the Materialize was dropped (object ineligible) — nothing to
+            // rewire.
 
   // Resolve the live merge-pred (e.g. latch -> ... -> MatCont) through the
   // block-split rename chain, mirroring CreatePHIEffect::apply. Keyed by
@@ -856,8 +943,9 @@ static bool isCloserDominatingDef(Value *Candidate, Value *Current,
 // that case the deeper/later def is the SSA value that represents this point.
 // Deopt-bundle operands are scrubbed to a typed null (PEA stays
 // deopt-agnostic).
-static void resolveMaterializedUses(
-    Function &F, DenseMap<Value *, SmallVector<Value *, 4>> &Defs) {
+static void
+resolveMaterializedUses(Function &F,
+                        DenseMap<Value *, SmallVector<Value *, 4>> &Defs) {
   if (Defs.empty())
     return;
   DominatorTree DT(F);
@@ -871,11 +959,12 @@ static void resolveMaterializedUses(
         ConstantPointerNull::get(cast<PointerType>(OrigAlloc->getType()));
     for (Use &U : llvm::make_early_inc_range(OrigAlloc->uses())) {
       // Pick the NEAREST (deepest) dominating definition, not merely the first
-      // in DefList order. DefList insertion order = Pass-1 RPO apply order, so a
-      // loop-header materialized-ptr PHI is inserted before a loop-body NewInv;
-      // when both dominate the same use, "first" would wrongly thread the header
-      // PHI (the previous iteration's merged pointer). Iterating to the deepest
-      // converges on the unique dominator-tree leaf among the dominating defs.
+      // in DefList order. DefList insertion order = Pass-1 RPO apply order, so
+      // a loop-header materialized-ptr PHI is inserted before a loop-body
+      // NewInv; when both dominate the same use, "first" would wrongly thread
+      // the header PHI (the previous iteration's merged pointer). Iterating to
+      // the deepest converges on the unique dominator-tree leaf among the
+      // dominating defs.
       Value *Dom = nullptr;
       for (Value *Def : DefList) {
         if (!DT.dominates(Def, U))
@@ -886,9 +975,10 @@ static void resolveMaterializedUses(
         // exact bug class this guard catches. Cheap to verify; piggybacks on
         // the loop.
         if (Dom && Def != Dom)
-          assert((DT.dominates(cast<Instruction>(Dom), cast<Instruction>(Def)) ||
-                  DT.dominates(cast<Instruction>(Def), cast<Instruction>(Dom))) &&
-                 "PEA: dominating defs of a use must be totally ordered");
+          assert(
+              (DT.dominates(cast<Instruction>(Dom), cast<Instruction>(Def)) ||
+               DT.dominates(cast<Instruction>(Def), cast<Instruction>(Dom))) &&
+              "PEA: dominating defs of a use must be totally ordered");
 #endif
         if (isCloserDominatingDef(Def, Dom, DT))
           Dom = Def;
@@ -910,8 +1000,8 @@ static void resolveMaterializedUses(
   }
 }
 
-PreservedAnalyses
-PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
+PreservedAnalyses PartialEscapeTransform::run(Function &F,
+                                              FunctionAnalysisManager &FAM) {
   // Gate on jeandle.java_method_compilation.
   Module *M = F.getParent();
   if (!M || !M->getNamedMetadata(jeandle::Metadata::JavaMethodCompilation))
@@ -935,8 +1025,8 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
   // CreatePHI to pick the right NewInv for each merge incoming when the same
   // OrigAlloc is materialized at multiple preds.
   DenseMap<std::pair<BasicBlock *, Value *>, Value *> MatPerBlock;
-  // Block-split rename map: (Origin BasicBlock, target-merge BB) → next block in
-  // the post-split MatCont chain. Used to resolve the analyzer-recorded PHI
+  // Block-split rename map: (Origin BasicBlock, target-merge BB) → next block
+  // in the post-split MatCont chain. Used to resolve the analyzer-recorded PHI
   // incoming block (which named the original pred pre-split) to the live
   // merge-pred. Keyed by (PH, target-merge) so two per-pred materializes from
   // the same PH to DIFFERENT target merges (two split edges) do not collide —
@@ -1078,6 +1168,8 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
   DenseMap<const jeandle::MaterializeEffect *, Instruction *> CascadeKeyOf;
   DenseSet<const jeandle::MaterializeEffect *> IsCascadeTail;
   DenseMap<const jeandle::MaterializeEffect *, InvokeInst *> NewInvOf;
+  DenseMap<Instruction *, SmallVector<jeandle::MaterializeEffect *, 4>>
+      InsertBeforeDependents;
   {
     DenseMap<Instruction *, SmallVector<const jeandle::MaterializeEffect *, 4>>
         ByKey;
@@ -1088,9 +1180,14 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
           continue;
         Instruction *Key = dyn_cast_or_null<Instruction>(M->InsertBefore);
         CascadeKeyOf[M] = Key;
-        if (Key)
+        if (Key) {
           ByKey[Key].push_back(M);
-        else
+          // Reverse index for the eager-update hook
+          // (relocateDependentMaterializes): keyed by the live InsertBefore
+          // instruction so an erase effect can find and re-aim every
+          // dependent Materialize before nulling the WeakTrackingVH.
+          InsertBeforeDependents[Key].push_back(M);
+        } else
           // Degenerate (InsertBefore already null at pre-scan): the effect is
           // its own singleton tail and replays its own stores in its own
           // MatCont.
@@ -1116,9 +1213,18 @@ PartialEscapeTransform::run(Function &F, FunctionAnalysisManager &FAM) {
   // apply(graph, obsoleteNodes, cfgKills=false)). isCfgKill() partitions the
   // two passes; EliminateAllocation is the only cfgKill, so it is skipped here.
   // -------------------------------------------------------------------------
-  jeandle::TransformContext Ctx{
-      F,       Result,        NewAllocFor,  MatPerBlock,   BlockRename, Defs,
-      Changed, CascadeGroups, CascadeKeyOf, IsCascadeTail, NewInvOf};
+  jeandle::TransformContext Ctx{F,
+                                Result,
+                                NewAllocFor,
+                                MatPerBlock,
+                                BlockRename,
+                                Defs,
+                                Changed,
+                                CascadeGroups,
+                                CascadeKeyOf,
+                                IsCascadeTail,
+                                NewInvOf,
+                                InsertBeforeDependents};
 
   for (BasicBlock *BB : RPOT) {
     auto It = Result.BlockEffects.find(BB);
