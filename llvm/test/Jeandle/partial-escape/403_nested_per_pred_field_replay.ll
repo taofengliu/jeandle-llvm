@@ -8,13 +8,14 @@
 ; then per-pred-materializes `inner` at the same pred.
 ;
 ; The field store replayed by outer's materialize at each pred must store THAT
-; pred's OWN inner-NewInv into that pred's outer-NewInv. With the OrigAlloc
-; field-replay (last-write-wins NewAllocFor[OrigAlloc_inner]) outer@left would
-; store right's inner-NewInv -> non-dominating SSA -> the transform's verifier
-; aborts. The per-pred-distinct placeholder resolves each pred's field to its
-; OWN inner-NewInv. This test crashes on the OrigAlloc field-replay and passes
-; once the placeholder is threaded through the recursive-prereq / sibling-sweep
-; (and the dominance gate skips placeholder values).
+; pred's OWN inner-NewInv into that pred's outer-NewInv. The field-replay value
+; is inner's OrigAlloc on both the live and per-pred paths; the transform's
+; point-sensitive resolution sub-pass (resolveMaterializedUses) rewrites each
+; replayed store to the inner NewInv that dominates it — left's store to left's
+; inner-NewInv, right's to right's — recovering per-pred distinctness via
+; dominance (Jeandle's analog of Graal getAliasAndResolve). No eager per-effect
+; substitution is used: it would be last-write-wins across the two per-pred
+; inner-NewInvs and miscompile this case.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)

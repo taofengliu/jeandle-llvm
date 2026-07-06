@@ -580,11 +580,6 @@ private:
   };
   std::unordered_map<PerPredPlaceholderKey, Value *, PerPredPlaceholderKeyHash>
       PerPredMatPlaceholderCache;
-  // All placeholder Value*s created by getOrCreatePerPredMatPlaceholder (the
-  // cache's value set, mirrored for O(1) membership). The per-field dominance
-  // gate in ensureMaterialized skips these: their eventual NewInv is materialized
-  // at the same predecessor, dominating SafeIP by construction.
-  DenseSet<Value *> PerPredMatPlaceholders;
 
   // Per-VO record of LLVM pointer-PHIs that processBlockPhis
   // aliased via Case-B (every incoming agrees on the same ObjectID).
@@ -1359,7 +1354,6 @@ Value *Analyzer::getOrCreatePerPredMatPlaceholder(BasicBlock *PH,
   PHINode *Placeholder = PHINode::Create(PtrTy, 0, "pea.perpred");
   Result.OwnedMatPlaceholders.emplace_back(Placeholder);
   PerPredMatPlaceholderCache[Key] = Placeholder;
-  PerPredMatPlaceholders.insert(Placeholder);
   Result.PerPredMatPlaceholders.insert(Placeholder);
   return Placeholder;
 }
@@ -4684,11 +4678,13 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
 
   // Recursive prerequisite materialization: for each field holding a VirtualRef
   // to an inner virtual, materialize the inner first, then rewrite the outer's
-  // FieldStates entry to a MaterializedRef at the inner's original allocation
-  // (the transform substitutes the live NewInv at apply time via NewAllocFor /
-  // MatPerBlock). NOTE: the field-replay value stays OrigAlloc (not the per-pred
-  // placeholder) so the per-field dominance check below sees a real, parented
-  // instruction. TODO: nested/sibling per-pred field precision is not tracked.
+  // FieldStates entry to a MaterializedRef at the inner's OrigAlloc. The
+  // field-replay value is OrigAlloc on both the live and per-pred paths (both
+  // MaterializedValue callbacks return OrigAlloc); the transform's point-
+  // sensitive resolution sub-pass (resolveMaterializedUses) rewrites each
+  // field-store use to the NewInv that dominates it, recovering per-pred
+  // distinctness via dominance — Jeandle's analog of Graal getAliasAndResolve
+  // (PartialEscapeClosure.java:1575).
   {
     auto FSIt = C.FieldStates.find(ID);
     if (FSIt != C.FieldStates.end()) {
@@ -4714,10 +4710,9 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
           Eligible[ID] = false;
           return;
         }
-        // Record the inner's materialized value for field-replay: OrigAlloc on
-        // the live path (single global-RAUW materialize) or the per-pred
-        // placeholder on the pred path (Graal's distinct AllocatedObjectNode),
-        // so the field resolves to the right NewInv at apply time.
+        // Record the inner's OrigAlloc for field-replay. resolveMaterializedUses
+        // resolves it to the dominating NewInv, giving each per-pred materialize
+        // its own inner-NewInv.
         Value *InnerVal = C.MaterializedValue(InnerID);
         C.FieldStates[ID][Off] =
             jeandle::FieldValue::materializedRef(InnerVal);
@@ -4735,9 +4730,9 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
   assert(SafeIP && "materialization requires a safe insertion point");
 
   // Per-field dominance check: after VirtualRef rewriting, every Scalar /
-  // MaterializedRef field value must dominate SafeIP. Per-pred placeholders are
-  // skipped: their eventual NewInv is materialized at the same predecessor
-  // (keyed {PH, ID}), which dominates SafeIP by construction.
+  // MaterializedRef field value must dominate SafeIP. Field values are OrigAlloc
+  // (or a scalar); OrigAlloc dominates SafeIP by SSA on both paths (the
+  // allocation precedes the materialize point).
   auto FSIt = C.FieldStates.find(ID);
   if (FSIt != C.FieldStates.end()) {
     for (auto &Kv : FSIt->second) {
@@ -4751,8 +4746,6 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
         continue;
       if (!V)
         continue;
-      if (PerPredMatPlaceholders.count(V))
-        continue; // placeholder NewInv dominates SafeIP (same pred).
       if (auto *VI = dyn_cast<Instruction>(V)) {
         if (!DT.dominates(VI, SafeIP)) {
           Eligible[ID] = false;
@@ -5295,10 +5288,17 @@ void Analyzer::materializeAtPredFromExitInfo(jeandle::ObjectID ID,
     captureMaterializedLocks(Stack, E);
   };
   auto DropInnerAliasesNop = [](jeandle::ObjectID) {};
-  // Field-replay value: the per-pred placeholder (Graal's distinct
-  // AllocatedObjectNode) — resolves the field to this pred's own NewInv.
+  // Field-replay value: OrigAlloc, identical to the live path. Graal uses a
+  // distinct AllocatedObjectNode per predecessor as the field value
+  // (PartialEscapeBlockState.java:317); LLVM's analysis/transform split forbids
+  // creating the concrete node during analysis, so OrigAlloc stands in and the
+  // transform's point-sensitive resolution sub-pass (resolveMaterializedUses)
+  // picks the per-pred NewInv that dominates each field store — recovering
+  // Graal's per-pred distinctness via dominance. A per-pred placeholder here
+  // would leak into the replayed field store before it is resolved to a real
+  // NewInv.
   auto MaterializedValue = [&](jeandle::ObjectID Oid) {
-    return getOrCreatePerPredMatPlaceholder(PH, TargetMerge, Oid);
+    return Result.VirtualObjects[Oid]->AllocationCall;
   };
   // NOTE: every callback is a named local (not a temporary) so each outlives C
   // — function_ref does not own its callable; a temporary would dangle after the

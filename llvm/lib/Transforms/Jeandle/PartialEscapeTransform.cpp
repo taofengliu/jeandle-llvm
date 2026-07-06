@@ -337,17 +337,22 @@ static void applyMaterialize(Function &F, const jeandle::PEAResult &Result,
     if (FE.Value.isScalar()) {
       V = FE.Value.getScalar();
     } else if (FE.Value.isMaterializedRef()) {
+      // Field value is an inner virtual's OrigAlloc (the analyzer records
+      // OrigAlloc on both the live and per-pred paths). Emit OrigAlloc here;
+      // the point-sensitive resolution sub-pass (resolveMaterializedUses) then
+      // rewrites this store's value to the NewInv that dominates it (Jeandle's
+      // analog of Graal getAliasAndResolve). This handles self-referential and
+      // forward nested fields. Eager substitution via NewAllocFor would be
+      // last-write-wins and miscompile multi-materialization cases.
+      // TODO(cyclic-field-materialize): a back-edge field (p.g = o when o is
+      // materialized later in the same cascade) has no dominating NewInv — each
+      // invoke is a block terminator, so a cascade's NewInvs chain across blocks
+      // and the later NewInv cannot dominate the earlier field store.
+      // resolveMaterializedUses then leaves the OrigAlloc use and Pass 2 turns
+      // it to poison. Graal commits every object at a point in one
+      // CommitAllocationNode; fixing this needs a two-phase transform that
+      // creates every cascade NewInv before emitting any field store.
       V = FE.Value.getMaterialized();
-      // Recursive nested-virtual materialization: if V is the original
-      // allocation Instruction of an inner object whose Materialize effect
-      // already ran (lower SeqNo), substitute the new materialized invoke so
-      // we store the live materialized pointer rather than the soon-to-be-
-      // erased OrigAlloc.
-      if (auto *VI = dyn_cast<Instruction>(V)) {
-        auto It = NewAllocFor.find(VI);
-        if (It != NewAllocFor.end())
-          V = It->second;
-      }
     } else {
       // The analyzer rewrites every VirtualRef into MaterializedRef during
       // recursive prerequisite materialization. Unknown entries are filtered
