@@ -165,32 +165,39 @@ Type *llvmElementTypeFor(JBasicType Kind, LLVMContext &Ctx) {
 // which laundered pointers are transparent: an `inttoptr` that is NOT a clean
 // round-trip is opaque to both (identity -> nullopt, offset -> stop walking).
 static Value *getIntToPtrRoundTripInner(Value *V, const DataLayout &DL) {
-  auto *I2P = dyn_cast<IntToPtrInst>(V);
-  if (!I2P)
+  // IntToPtr has no Operator subclass in this fork (only PtrToIntOperator
+  // exists), so recognize the inttoptr case via a generic Operator + opcode
+  // match. This covers both Instruction (IntToPtrInst) and ConstantExpr
+  // (ConstantExprIntToPtr), keeping identity (resolveVirtualRefImpl case 7)
+  // and offset (stripPointerCastsAndOffsets) wrapper-stripping symmetric for
+  // the round-trip (Trap 4).
+  auto *I2P = dyn_cast<Operator>(V);
+  if (!I2P || I2P->getOpcode() != Instruction::IntToPtr)
     return nullptr;
   Value *Inner = I2P->getOperand(0);
   // Peel `add X, 0` / `or X, 0` chains between PtrToInt and IntToPtr; some
   // frontends emit these as part of constant-folded address arithmetic and
-  // they are transparent (offset-neutral) to the round-trip.
+  // they are transparent (offset-neutral) to the round-trip. Use Operator +
+  // opcode so ConstantExpr `add`/`or` is peeled too.
   for (unsigned StripDepth = 0; StripDepth < 8; ++StripDepth) {
-    if (auto *BO = dyn_cast<BinaryOperator>(Inner)) {
-      if (BO->getOpcode() == Instruction::Add ||
-          BO->getOpcode() == Instruction::Or) {
-        if (auto *RHS = dyn_cast<ConstantInt>(BO->getOperand(1));
-            RHS && RHS->isZero()) {
-          Inner = BO->getOperand(0);
-          continue;
-        }
-        if (auto *LHS = dyn_cast<ConstantInt>(BO->getOperand(0));
-            LHS && LHS->isZero() && BO->getOpcode() == Instruction::Add) {
-          Inner = BO->getOperand(1);
-          continue;
-        }
+    auto *BO = dyn_cast<Operator>(Inner);
+    if (BO && (BO->getOpcode() == Instruction::Add ||
+               BO->getOpcode() == Instruction::Or)) {
+      if (auto *RHS = dyn_cast<ConstantInt>(BO->getOperand(1));
+          RHS && RHS->isZero()) {
+        Inner = BO->getOperand(0);
+        continue;
+      }
+      if (auto *LHS = dyn_cast<ConstantInt>(BO->getOperand(0));
+          LHS && LHS->isZero() && BO->getOpcode() == Instruction::Add) {
+        Inner = BO->getOperand(1);
+        continue;
       }
     }
     break;
   }
-  auto *P2I = dyn_cast<PtrToIntInst>(Inner);
+  // PtrToIntOperator covers both PtrToIntInst and ConstantExprPtrToInt.
+  auto *P2I = dyn_cast<PtrToIntOperator>(Inner);
   if (!P2I)
     return nullptr;
   Type *PtrTy = P2I->getPointerOperand()->getType();
@@ -269,6 +276,9 @@ Value *stripPointerCastsAndOffsets(Value *Ptr, const DataLayout &DL,
     // x so any GEP inside the round-trip contributes its offset. A non-round-
     // trip inttoptr is opaque — stop here. (resolveVirtualRef would not have
     // resolved such a pointer to a virtual, so the offset is unused there.)
+    // getIntToPtrRoundTripInner uses Operator-form casts so a ConstantExpr
+    // round-trip is peeled the same as an Instruction-form one — keeping this
+    // offset path symmetric with the identity path (Trap 4).
     if (Value *Inner = getIntToPtrRoundTripInner(V, DL)) {
       V = Inner;
       continue;
@@ -390,8 +400,12 @@ resolveVirtualRefImpl(Value *V, const PEABlockState &State,
   // (7) IntToPtr(PtrToInt(x)) round-trip with matching widths is a legal
   // laundering pattern (see getIntToPtrRoundTripInner); tagged-pointer
   // encodings (with masking/shifting) must escape. A non-round-trip inttoptr
-  // is opaque — return nullopt so the caller materializes.
-  if (isa<IntToPtrInst>(V)) {
+  // is opaque — return nullopt so the caller materializes. The gate uses an
+  // Operator + opcode match (no IntToPtrOperator exists in this fork) so a
+  // ConstantExpr inttoptr is recognized the same as an IntToPtrInst, keeping
+  // identity resolution symmetric with offset resolution (Trap 4).
+  if (auto *I2P = dyn_cast<Operator>(V);
+      I2P && I2P->getOpcode() == Instruction::IntToPtr) {
     if (Value *Inner = getIntToPtrRoundTripInner(V, DL))
       return resolveVirtualRefImpl(Inner, State, Aliases, DL, Visited,
                                    Depth + 1);
@@ -472,12 +486,13 @@ std::optional<ObjectID> resolveVirtualRef(Value *V, const PEABlockState &State,
 std::optional<int64_t> resolveFieldOffset(Value *Ptr, const DataLayout &DL) {
   if (!Ptr)
     return std::nullopt;
-  // Delegate to the shared offset accumulator so identity- and offset-resolution
-  // peel the same set of wrappers (GEP constant offsets, bitcast, JavaHeap
-  // addrspacecast, freeze, launder/strip.invariant.group, inttoptr(ptrtoint(x))
-  // round-trip): a pointer that resolves to a virtual base yields its true byte
-  // offset here. A non-constant GEP -> nullopt (caller materializes); a non-GEP
-  // base (the object itself, a whole-object Case-B PHI/Select) -> 0.
+  // Delegate to the shared offset accumulator so identity- and
+  // offset-resolution peel the same set of wrappers (GEP constant offsets,
+  // bitcast, JavaHeap addrspacecast, freeze, launder/strip.invariant.group,
+  // inttoptr(ptrtoint(x)) round-trip): a pointer that resolves to a virtual
+  // base yields its true byte offset here. A non-constant GEP -> nullopt
+  // (caller materializes); a non-GEP base (the object itself, a whole-object
+  // Case-B PHI/Select) -> 0.
   int64_t Off = 0;
   bool NonConst = false;
   stripPointerCastsAndOffsets(Ptr, DL, &Off, &NonConst);
