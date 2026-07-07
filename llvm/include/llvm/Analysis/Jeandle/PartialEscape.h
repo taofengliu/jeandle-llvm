@@ -64,15 +64,19 @@ static constexpr ObjectID InvalidObjectID = ~0u;
 // Identity of a virtual monitorenter, carried per element of an
 // ObjectState's live lock stack. EnterCall is the original
 // jeandle.monitorenter call site (the effects-side anchor used when
-// un-eliding the call on materialisation); BytecodeDepth is the
-// Java-bytecode-level monitor depth at the enter site, taken from the
-// `!jeandle.lock_depth` metadata when the JDK frontend supplies it, or
-// falling back to the analyzer's monotonic NextLockEnterOrder proxy in
-// lit tests that omit the metadata (then an Analyzer-run-monotonic id,
-// NOT the true bytecode depth). The analyzer-side mirror struct LockEnter
-// (PartialEscapeAnalysis.cpp) additionally carries an Order tag for
-// loop-fixpoint convergence checks, which compare CallBase identity only
-// since Order is refreshed on every re-push.
+// un-eliding the call on materialisation); BytecodeDepth is the lock-nesting
+// ordering key at the enter site, sourced from the analyzer's monotonic
+// NextLockEnterOrder (cached per call site in the analyzer's LockDepthCache,
+// see PartialEscapeAnalysis.cpp). It is NOT the true Java-bytecode monitor
+// depth — the frontend no longer attaches that — but an RPO-order proxy that
+// is sound for every load-bearing use here (cascade `<`, re-emit sort,
+// merge-time stack identity, strict-increasing assert): under the
+// structured-locking assumption PEA relies on, "lock X acquired before Y
+// while both live" <=> "X's enter dominates Y's" <=> "RPO visits X before Y".
+// The analyzer-side mirror struct LockEnter (PartialEscapeAnalysis.cpp)
+// additionally carries an Order tag for loop-fixpoint convergence checks,
+// which compare CallBase identity only since Order is refreshed on every
+// re-push.
 struct MonitorIdRef {
   CallBase *EnterCall;
   uint32_t BytecodeDepth;
@@ -311,12 +315,12 @@ public:
   bool hasLocks() const { return !Locks.empty(); }
   // Element-wise lock-stack comparison used by the depth-aware merge-time
   // stack-identity check (mergeStates) and the pre-cascade in
-  // foldMonitorEnter. Compares both EnterCall and BytecodeDepth. When
-  // !jeandle.lock_depth metadata is absent, BytecodeDepth holds the
-  // Analyzer's NextLockEnterOrder proxy, which is stable within a single
-  // processBlock walk but refreshed on every loop-fixpoint re-push — which
-  // is why the analyzer-side BlockExitData snapshot identity compares only
-  // EnterCall (see blockExitInfoEquivalent).
+  // foldMonitorEnter. Compares both EnterCall and BytecodeDepth. BytecodeDepth
+  // is the Analyzer's NextLockEnterOrder proxy (cached per call site in
+  // LockDepthCache, stable across loop-fixpoint iterations); the analyzer-side
+  // BlockExitData snapshot identity (blockExitInfoEquivalent) compares only
+  // EnterCall, since BytecodeDepth's underlying Order is refreshed on every
+  // loop-fixpoint re-push.
   bool locksEqual(const ObjectState &Other) const {
     if (Locks.size() != Other.Locks.size())
       return false;

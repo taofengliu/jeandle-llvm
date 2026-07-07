@@ -22,9 +22,9 @@ entry:
        to label %n unwind label %u
 n:
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-                  ptr addrspace(1) %a, ptr %l0), !jeandle.lock_depth !{i32 0}
+                  ptr addrspace(1) %a, ptr %l0)
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-                  ptr addrspace(1) %a, ptr %l0), !jeandle.lock_depth !{i32 1}
+                  ptr addrspace(1) %a, ptr %l0)
   call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
                   ptr addrspace(1) %a, ptr %l0)
   call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(

@@ -1,13 +1,13 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Lit coverage for narrow cascade with explicit mixed depths.
-; Three locks; B (the middle one) escapes. With metadata depths
+; Lit coverage for narrow cascade with mixed depths on the proxy path.
+; Three locks; B (the middle one) escapes. With RPO-order proxy depths
 ;   A.depth = 0, B.depth = 1, C.depth = 2
 ; the narrow rule
 ;   other.front().BytecodeDepth < this.back().BytecodeDepth
 ; selects A (A.minDepth=0 < B.maxDepth=1) but NOT C (C.minDepth=2,
 ; NOT < 1). A and B materialise; C stays virtual. Mirrors test
-; 192_narrow_lock_cascade_three_deep.ll but explicitly metadata-driven.
+; 192_narrow_lock_cascade_three_deep.ll, proxy-driven (no metadata).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
@@ -33,11 +33,11 @@ nb:
        to label %nc unwind label %u
 nc:
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-                  ptr addrspace(1) %a, ptr %lock_a), !jeandle.lock_depth !{i32 0}
+                  ptr addrspace(1) %a, ptr %lock_a)
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-                  ptr addrspace(1) %b, ptr %lock_b), !jeandle.lock_depth !{i32 1}
+                  ptr addrspace(1) %b, ptr %lock_b)
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-                  ptr addrspace(1) %c, ptr %lock_c), !jeandle.lock_depth !{i32 2}
+                  ptr addrspace(1) %c, ptr %lock_c)
   ; Middle B escapes.
   call void @sink(ptr addrspace(1) %b)
   call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(

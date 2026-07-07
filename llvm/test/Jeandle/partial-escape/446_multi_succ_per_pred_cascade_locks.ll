@@ -10,12 +10,12 @@
 ; cascade fires on BOTH (right, merge1) and (right, merge2) edges — both
 ; critical -> the pre-pass splits each into its own `pea.crit.split` and re-aims
 ; the per-pred Materialize effects there. The unified merged-emit then fires
-; once per split edge, depth-sorted (a@2, b@3), each lock's receiver resolved
+; once per split edge, depth-sorted (a@0, b@1), each lock's receiver resolved
 ; per-effect via NewInvOf[SourceEffect].
 ;
 ; Without the §1.2 fix (per-pred effects skipped by computeEscapePointLocks +
-; per-effect re-emit), each split edge would re-emit in SeqNo order (b@3 then
-; a@2 = 3,2) — mis-ordered.
+; per-effect re-emit), each split edge would re-emit in SeqNo order (b@1 then
+; a@0 = 1,0) — mis-ordered.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
@@ -44,11 +44,11 @@ left:
   ; right locked).
   br i1 %c3, label %merge1, label %merge2
 right:
-  ; Unbalanced enters on a (depth 2) and b (depth 3); two successors.
+  ; Unbalanced enters on a (depth 0) and b (depth 1); two successors.
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-      ptr addrspace(1) %a, ptr %la), !jeandle.lock_depth !{i32 2}
+      ptr addrspace(1) %a, ptr %la)
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-      ptr addrspace(1) %b, ptr %lb), !jeandle.lock_depth !{i32 3}
+      ptr addrspace(1) %b, ptr %lb)
   br i1 %c2, label %merge1, label %merge2
 merge1:
   call void @sink(ptr addrspace(1) %a)
@@ -71,8 +71,8 @@ u:
 ; CHECK-LABEL: define void @test_multi_succ_per_pred_cascade_locks
 ; CHECK-COUNT-4: pea.crit.split
 ; On each right split, the two re-emitted enters appear strictly depth-increasing
-; (a@2 with %la, then b@3 with %lb) — the per-effect (SeqNo) order would be
-; b@3 then a@2 = 3,2. Two right splits => four enters, in la,lb,la,lb order.
+; (a@0 with %la, then b@1 with %lb) — the per-effect (SeqNo) order would be
+; b@1 then a@0 = 1,0. Two right splits => four enters, in la,lb,la,lb order.
 ; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %{{.*}}, ptr %la)
 ; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %{{.*}}, ptr %lb)
 ; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %{{.*}}, ptr %la)

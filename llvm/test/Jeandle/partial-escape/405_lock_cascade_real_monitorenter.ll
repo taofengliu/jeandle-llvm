@@ -31,11 +31,11 @@ entry:
 n1:
   ; Elided virtual lock on %obj at depth 0.
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-                  ptr addrspace(1) %obj, ptr %lo), !jeandle.lock_depth !{i32 0}
+                  ptr addrspace(1) %obj, ptr %lo)
   ; REAL monitorenter on a non-virtual receiver at depth 1 — triggers the
   ; cascade that materializes %obj here.
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-                  ptr addrspace(1) %otherObj, ptr %lpo), !jeandle.lock_depth !{i32 1}
+                  ptr addrspace(1) %otherObj, ptr %lpo)
   call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
                   ptr addrspace(1) %otherObj, ptr %lpo)
   call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(

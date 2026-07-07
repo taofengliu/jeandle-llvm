@@ -30,15 +30,17 @@ entry:
 dispatch:
   br i1 %cond, label %t, label %e
 t:
-  ; Then-arm enter on its own call site, depth 0.
+  ; Then-arm enter on its own call site (proxy depth 0 — RPO visits %t first).
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-                  ptr addrspace(1) %o, ptr %lock_t), !jeandle.lock_depth !{i32 0}
+                  ptr addrspace(1) %o, ptr %lock_t)
   br label %merge
 e:
-  ; Else-arm enter on a DIFFERENT call site, also depth 0. Call identity
-  ; differs from the then-arm's enter, so locksEqual = false at the merge.
+  ; Else-arm enter on a DIFFERENT call site (proxy depth 1 — %e is visited
+  ; after %t). Call identity differs from the then-arm's enter, so locksEqual
+  ; = false at the merge (the depth difference is incidental — the EnterCall
+  ; mismatch alone routes to per-pred materialise).
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-                  ptr addrspace(1) %o, ptr %lock_e), !jeandle.lock_depth !{i32 0}
+                  ptr addrspace(1) %o, ptr %lock_e)
   br label %merge
 merge:
   ; Both preds hold one lock on %o; downstream observes the merged pointer.

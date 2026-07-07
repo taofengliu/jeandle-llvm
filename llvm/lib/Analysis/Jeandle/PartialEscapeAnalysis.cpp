@@ -182,10 +182,12 @@ namespace {
 // A live (still-unbalanced) monitorenter on a virtual object.
 //   * Call is the original jeandle.monitorenter call site (used by
 //     materializeAt to undo the ReplaceCall elision).
-//   * BytecodeDepth is the Java-bytecode monitor depth, read from the
-//     `!jeandle.lock_depth` metadata on the call when present; otherwise it
-//     falls back to a per-run-monotonic Order proxy. Both are unstable across
-//     loop-fixpoint iterations, so the convergence check compares Call only.
+//   * BytecodeDepth is the lock-nesting ordering key used by the strict-lock
+//     cascade and the merge-time stack-identity comparison. It is sourced from
+//     the analyzer's monotonic NextLockEnterOrder, cached per call site in
+//     LockDepthCache (stable across loop-fixpoint iterations). Order is a
+//     separate per-push tag that DOES advance on every re-push; the loop
+//     fixpoint convergence check therefore compares Call identity only.
 // Cascade decisions and merge-time stack-identity compare BytecodeDepth.
 struct LockEnter {
   llvm::CallBase *Call;
@@ -413,8 +415,7 @@ private:
   // ordering of stale entries.
   uint32_t NextLockEnterOrder = 0;
 
-  // Stable-across-iterations BytecodeDepth fallback. When a
-  // monitorenter call lacks the `!jeandle.lock_depth` metadata, we need a
+  // Stable-across-iterations BytecodeDepth source. We need a per-call-site
   // depth value that (a) is a meaningful proxy for cascade decisions within
   // a single processBlock walk, AND (b) does NOT change across loop-fixpoint
   // re-pushes of the same call. The Analyzer-run-monotonic NextLockEnterOrder
@@ -426,8 +427,12 @@ private:
   // Solution: cache the FIRST NextLockEnterOrder value ever assigned to each
   // call site and reuse it on subsequent visits. The cache survives loop
   // snapshot/restore (it's an Analyzer-run-wide property of the call site,
-  // not per-block state) and is only consulted in the metadata-absent path.
-  DenseMap<CallBase *, uint32_t> FallbackBytecodeDepth;
+  // not per-block state). This RPO-order proxy is sound for every load-bearing
+  // use of BytecodeDepth (cascade `<`, re-emit sort, locksEqual, strict-
+  // increasing assert): under the structured-locking assumption PEA already
+  // relies on, "lock X acquired before Y while both live" <=> "X's enter
+  // dominates Y's" <=> "RPO visits X before Y" <=> proxy(X) < proxy(Y).
+  DenseMap<CallBase *, uint32_t> LockDepthCache;
 
   // Per-path "this object has already been materialized somewhere upstream"
   // set. Materialization is recorded at most once per ObjectID per pred path
@@ -931,10 +936,10 @@ private:
   bool foldInstanceOf(CallBase *CB);
   bool foldMonitorEnter(CallBase *CB);
   bool foldMonitorExit(CallBase *CB);
-  // Resolve the bytecode lock depth of a monitorenter call site: the
-  // !jeandle.lock_depth metadata if present, else the FIRST NextLockEnterOrder
-  // value cached in FallbackBytecodeDepth (stable across loop-fixpoint
-  // iterations). Shared by foldMonitorEnter and materializeVirtualLocksBefore.
+  // Resolve the bytecode lock depth of a monitorenter call site: the FIRST
+  // NextLockEnterOrder value cached in LockDepthCache (stable across
+  // loop-fixpoint iterations). Shared by foldMonitorEnter and
+  // materializeVirtualLocksBefore.
   uint32_t getOrCreateLockDepth(CallBase *CB);
   // Graal materializeVirtualLocksBefore (PartialEscapeClosure.java:641-652):
   // before a REAL (non-virtualized) monitorenter whose depth is D, materialize
@@ -3862,28 +3867,6 @@ bool Analyzer::foldInstanceOf(CallBase *CB) {
   return true;
 }
 
-// Read the `!jeandle.lock_depth` i32 metadata node from a
-// monitorenter call site. The JDK frontend
-// (JeandleAbstractInterpreter::shared_lock) attaches this on every emitted
-// jeandle.monitorenter_with_* call; lit tests can attach it directly to
-// exercise the depth-aware paths. Returns std::nullopt when the metadata is
-// absent or malformed — caller falls back to the analyzer's Order proxy.
-static std::optional<uint32_t> readBytecodeLockDepth(llvm::CallBase *CB) {
-  llvm::MDNode *MD = CB->getMetadata("jeandle.lock_depth");
-  if (!MD || MD->getNumOperands() == 0)
-    return std::nullopt;
-  if (auto *CAM = llvm::dyn_cast<llvm::ConstantAsMetadata>(MD->getOperand(0))) {
-    if (auto *CI = llvm::dyn_cast<llvm::ConstantInt>(CAM->getValue())) {
-      uint64_t V = CI->getZExtValue();
-      // Sanity: depth fits in uint32 (realistic upper bound is the JVM
-      // monitor-stack limit, far below 2^32). Larger values are clamped to
-      // UINT32_MAX so the comparison still behaves monotonically.
-      return static_cast<uint32_t>(std::min<uint64_t>(V, UINT32_MAX));
-    }
-  }
-  return std::nullopt;
-}
-
 // FOLD a monitorenter against a virtual receiver (Graal
 // MonitorEnterNode.virtualize): record the lock on the VO's state (addLock) and
 // emit a ReplaceCall(null) so the transform DELETES the original monitorenter
@@ -3899,19 +3882,17 @@ static std::optional<uint32_t> readBytecodeLockDepth(llvm::CallBase *CB) {
 // See ensureMaterialized's lock-capture block and applyMaterialize's re-emit
 // loop for the capture + re-emit mechanism.
 uint32_t Analyzer::getOrCreateLockDepth(CallBase *CB) {
-  // !jeandle.lock_depth metadata (the true Java-bytecode monitor depth) wins
-  // when present. Otherwise cache the FIRST NextLockEnterOrder value for this
-  // call site in FallbackBytecodeDepth and reuse it on every subsequent visit
-  // — using NextLockEnterOrder directly is unsound across loop-fixpoint
-  // iterations (the counter advances on every re-push, mutating
-  // ObjectState::Locks[i].BytecodeDepth and breaking equivalentTo).
-  if (auto Depth = readBytecodeLockDepth(CB))
-    return *Depth;
-  auto FIt = FallbackBytecodeDepth.find(CB);
-  if (FIt != FallbackBytecodeDepth.end())
+  // Cache the FIRST NextLockEnterOrder value for this call site in LockDepthCache
+  // and reuse it on every subsequent visit — using NextLockEnterOrder directly is
+  // unsound across loop-fixpoint iterations (the counter advances on every
+  // re-push, mutating ObjectState::Locks[i].BytecodeDepth and breaking
+  // equivalentTo). The cached RPO-order value is sound for every load-bearing
+  // use of BytecodeDepth (see LockDepthCache's comment).
+  auto FIt = LockDepthCache.find(CB);
+  if (FIt != LockDepthCache.end())
     return FIt->second;
   uint32_t D = NextLockEnterOrder;
-  FallbackBytecodeDepth[CB] = D;
+  LockDepthCache[CB] = D;
   return D;
 }
 
@@ -3957,11 +3938,12 @@ bool Analyzer::foldMonitorEnter(CallBase *CB) {
   ++LockCounts[*BaseID];
   // Push the elided enter onto the live stack so materializeAt can undo
   // only the unbalanced enters along this path if the object later escapes.
-  // Tag every push with the next monotonic Order so the narrow cascade
-  // rule (other.minOrder < this.maxOrder) can be evaluated against the live
-  // stack at materialization time.
-  // Also record the bytecode depth so the (depth-aware) cascade and
-  // merge-time stack-identity comparisons use the JDK-supplied value.
+  // Tag every push with the next monotonic Order; Order is excluded from the
+  // loop-fixpoint convergence comparison (Call identity only) because it
+  // advances on every re-push.
+  // Also record BytecodeDepth (sourced from LockDepthCache, see
+  // getOrCreateLockDepth) so the depth-aware cascade and merge-time
+  // stack-identity comparisons use a stable, per-call-site ordering key.
   uint32_t MyOrder = NextLockEnterOrder++;
   auto &Stack = LiveLockEnters[*BaseID];
   // Depth monotonicity invariant (mirrors Graal ObjectState.java:212 and the

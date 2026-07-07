@@ -1,14 +1,14 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Narrow cascade keyed by !jeandle.lock_depth metadata. Mirrors
-; partial-escape/190_narrow_lock_cascade_nested.ll but with explicit depth
-; metadata on each monitorenter. Outer A (depth=0), inner B (depth=1).
-; Inner B escapes; the cascade rule
+; Narrow cascade driven by the lock-depth proxy. Mirrors
+; partial-escape/190_narrow_lock_cascade_nested.ll with the depth sourced from
+; the analyzer's RPO-order proxy (no `!jeandle.lock_depth` metadata). Outer A
+; (depth=0), inner B (depth=1). Inner B escapes; the cascade rule
 ;   other.front().BytecodeDepth < this.back().BytecodeDepth
 ; selects A (A.minDepth=0 < B.maxDepth=1), so A also materialises.
 ;
 ; The behaviour is identical to test 190 — the point here is to drive the
-; depth-aware rule end-to-end with metadata present.
+; depth-aware rule end-to-end on the proxy path.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
@@ -29,9 +29,9 @@ na:
        to label %nb unwind label %u
 nb:
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-                  ptr addrspace(1) %a, ptr %lock_a), !jeandle.lock_depth !{i32 0}
+                  ptr addrspace(1) %a, ptr %lock_a)
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-                  ptr addrspace(1) %b, ptr %lock_b), !jeandle.lock_depth !{i32 1}
+                  ptr addrspace(1) %b, ptr %lock_b)
   call void @sink(ptr addrspace(1) %b)
   call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
                   ptr addrspace(1) %b, ptr %lock_b)

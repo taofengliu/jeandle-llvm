@@ -1,13 +1,13 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; materializeVirtualLocksBefore pre-cascade keyed on bytecode depth
-; metadata. We have two virtuals %a and %b. Enter A at depth=0 (outer).
-; Then enter B at depth=1 (inner). The pre-cascade fires when we are
-; ABOUT to push B's enter: A's front depth (0) < new depth (1), so A
-; must be materialised at B's enter site BEFORE the lock counter for B
-; is bumped. Without the pre-cascade, an escape of A downstream would
-; materialise A alone — leaving B's enter on the virtual lock stack
-; corrupted because A's real monitorenter wouldn't be present in IR.
+; materializeVirtualLocksBefore pre-cascade keyed on the lock-depth proxy.
+; We have two virtuals %a and %b. Enter A at depth=0 (outer). Then enter B
+; at depth=1 (inner). The pre-cascade fires when we are ABOUT to push B's
+; enter: A's front depth (0) < new depth (1), so A must be materialised at
+; B's enter site BEFORE the lock counter for B is bumped. Without the
+; pre-cascade, an escape of A downstream would materialise A alone — leaving
+; B's enter on the virtual lock stack corrupted because A's real monitorenter
+; wouldn't be present in IR.
 ;
 ; A materialises at B's enter; both A's enter and the un-elide
 ; ReplaceInput emit a real call site for A. B stays virtual until the
@@ -33,10 +33,10 @@ na:
        to label %nb unwind label %u
 nb:
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-                  ptr addrspace(1) %a, ptr %lock_a), !jeandle.lock_depth !{i32 0}
+                  ptr addrspace(1) %a, ptr %lock_a)
   ; The next enter is at depth=1; pre-cascade selects A (A.front=0 < 1).
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-                  ptr addrspace(1) %b, ptr %lock_b), !jeandle.lock_depth !{i32 1}
+                  ptr addrspace(1) %b, ptr %lock_b)
   ; A leaks; B is unused downstream so B has no sink, but its narrow
   ; cascade would also fire here if anything escapes B.
   call void @sink(ptr addrspace(1) %a)

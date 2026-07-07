@@ -20,7 +20,7 @@ entry:
   %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 7)
          to label %n unwind label %u
 n:
-  call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %o, ptr %lo), !jeandle.lock_depth !{i32 0}
+  call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %o, ptr %lo)
   br i1 %c, label %then, label %else
 then:
   br label %merge

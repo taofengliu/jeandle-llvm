@@ -6,18 +6,20 @@
 ; A forward field chain a.f = b, b.g = c (so per-pred materializing `a` cascades
 ; prerequisites `b` then `c`). `a`, `b`, `c` are distinct new_instance klasses
 ; (11111/22222/33333). Branch left (no locks) / right with FOUR unbalanced
-; jeandle.monitorenter_with_lightweight_lock calls at depths 2,3,4,5 — re-entrant
-; on `a` (depths 2 and 4). NO monitorexits (unbalanced). The lock mismatch (right
-; locks these objects, left does not) drives per-pred materialize of `a` (cascading
-; `b`, `c`) on the RIGHT edge; all three per-pred Materialize effects share one
-; escape point (the right pred's terminator), so they form one cascade group.
+; jeandle.monitorenter_with_lightweight_lock calls. The depth comes from the
+; analyzer's RPO-order proxy (no `!jeandle.lock_depth` metadata): the four
+; right-block enters get proxy depths 0,1,2,3 — re-entrant on `a` (depths 0 and 2).
+; NO monitorexits (unbalanced). The lock mismatch (right locks these objects,
+; left does not) drives per-pred materialize of `a` (cascading `b`, `c`) on the
+; RIGHT edge; all three per-pred Materialize effects share one escape point
+; (the right pred's terminator), so they form one cascade group.
 ;
 ; Cascade SeqNo order (field-prereq recursion): c (deepest prereq, lowest SeqNo)
 ; -> b -> a (tail, highest SeqNo). Per-effect emit (the BUG) emits each effect's
-; own Locks in SeqNo order: c's [c@5], b's [b@3], a's [a@2, a@4] => depths
-; 5,3,2,4 — NOT strictly increasing, violating the lightweight-lock thread-stack
+; own Locks in SeqNo order: c's [c@3], b's [b@1], a's [a@0, a@2] => depths
+; 3,1,0,2 — NOT strictly increasing, violating the lightweight-lock thread-stack
 ; contract. The fix merges the group's locks and globally depth-sorts them, then
-; emits once from the tail (a): 2,3,4,5.
+; emits once from the tail (a): 0,1,2,3.
 ;
 ; Graal analog: one CommitAllocationNode per materialize point flattens every
 ; object's locks and lowers them globally depth-sorted
@@ -32,10 +34,10 @@ declare i32 @__gxx_personality_v0(...)
 define void @per_pred_cascade_interleaved_locks(i1 %c)
     gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
+  %la0 = alloca i64, align 8
+  %lb1 = alloca i64, align 8
   %la2 = alloca i64, align 8
-  %lb3 = alloca i64, align 8
-  %la4 = alloca i64, align 8
-  %lc5 = alloca i64, align 8
+  %lc3 = alloca i64, align 8
   %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
               ptr inttoptr (i64 11111 to ptr), i32 32)
            to label %na unwind label %u
@@ -59,13 +61,13 @@ left:
   br label %merge
 right:
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-              ptr addrspace(1) %a, ptr %la2), !jeandle.lock_depth !{i32 2}
+              ptr addrspace(1) %a, ptr %la0)
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-              ptr addrspace(1) %b, ptr %lb3), !jeandle.lock_depth !{i32 3}
+              ptr addrspace(1) %b, ptr %lb1)
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-              ptr addrspace(1) %a, ptr %la4), !jeandle.lock_depth !{i32 4}
+              ptr addrspace(1) %a, ptr %la2)
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-              ptr addrspace(1) %c_obj, ptr %lc5), !jeandle.lock_depth !{i32 5}
+              ptr addrspace(1) %c_obj, ptr %lc3)
   br label %merge
 merge:
   call void @sink(ptr addrspace(1) %a)
@@ -81,13 +83,13 @@ u:
 
 ; CHECK-LABEL: define void @per_pred_cascade_interleaved_locks
 ; The four re-emitted monitorenters must appear in strictly increasing lock
-; depth on the right materialization path: a@2 (la2), b@3 (lb3), a@4 (la4,
-; re-entrant on the SAME object as la2), c@5 (lc5). Before the fix each VO's
-; locks were re-emitted together per-effect in SeqNo order (c@5, b@3, a@2,
-; a@4 => depths 5,3,2,4), violating the lightweight-lock thread-stack contract.
+; depth on the right materialization path: a@0 (la0), b@1 (lb1), a@2 (la2,
+; re-entrant on the SAME object as la0), c@3 (lc3). Before the fix each VO's
+; locks were re-emitted together per-effect in SeqNo order (c@3, b@1, a@0,
+; a@2 => depths 3,1,0,2), violating the lightweight-lock thread-stack contract.
 ; Sequential CHECK is order-sensitive — this IS the increasing-order assertion.
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %{{[^,]+}}, ptr %la0)
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %{{[^,]+}}, ptr %lb1)
 ; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %{{[^,]+}}, ptr %la2)
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %{{[^,]+}}, ptr %lb3)
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %{{[^,]+}}, ptr %la4)
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %{{[^,]+}}, ptr %lc5)
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %{{[^,]+}}, ptr %lc3)
 ; CHECK-NOT: poison

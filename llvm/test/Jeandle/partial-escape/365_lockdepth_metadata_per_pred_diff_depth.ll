@@ -1,13 +1,13 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Lock-stack identity mismatch where the SAME enter call site is
-; reached by two preds but each pred carries a DIFFERENT bytecode depth
-; via metadata. This is only possible because the test attaches distinct
-; `!jeandle.lock_depth` metadata at two distinct IR call sites that
-; ultimately hold the same virtual; the per-element compare
+; Lock-stack identity mismatch at a diamond where each arm enters the SAME
+; virtual %o via a DISTINCT call site, so the two arms carry DIFFERENT
+; proxy depths (RPO visits %t before %e, so lock_t gets depth 0 and lock_e
+; depth 1). The per-element compare
 ;   S[i].Call == RefStack[i].Call && S[i].BytecodeDepth == RefStack[i].BytecodeDepth
-; sees Call agreement but BytecodeDepth mismatch and routes to per-pred
-; materialise.
+; sees a Call mismatch (lock_t vs lock_e) — and a BytecodeDepth mismatch
+; (0 vs 1) — and routes to per-pred materialise. (The Call mismatch alone
+; suffices; the depth difference is incidental.)
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
@@ -25,16 +25,16 @@ entry:
 dispatch:
   br i1 %cond, label %t, label %e
 t:
-  ; Then-arm: this enter is the only one on %o, so its bytecode depth is 0.
+  ; Then-arm: this enter is the only one on %o on this path. RPO visits %t
+  ; first, so the proxy assigns it depth 0.
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-                  ptr addrspace(1) %o, ptr %lock_t), !jeandle.lock_depth !{i32 0}
+                  ptr addrspace(1) %o, ptr %lock_t)
   br label %merge
 e:
-  ; Else-arm: a hypothetical outer synchronized region in the Java source
-  ; meant THIS enter would be at depth=1. Different call site, different
-  ; depth.
+  ; Else-arm: a DISTINCT call site on %o. RPO visits %e after %t, so the
+  ; proxy assigns it depth 1. Different call site, different depth.
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-                  ptr addrspace(1) %o, ptr %lock_e), !jeandle.lock_depth !{i32 1}
+                  ptr addrspace(1) %o, ptr %lock_e)
   br label %merge
 merge:
   call void @sink(ptr addrspace(1) %o)

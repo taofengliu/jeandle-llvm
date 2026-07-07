@@ -40,13 +40,13 @@ nb:
   to label %nc unwind label %u
 nc:
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-  ptr addrspace(1) %a, ptr %la), !jeandle.lock_depth !{i32 0}
+  ptr addrspace(1) %a, ptr %la)
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-  ptr addrspace(1) %b, ptr %lb), !jeandle.lock_depth !{i32 1}
+  ptr addrspace(1) %b, ptr %lb)
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-  ptr addrspace(1) %a, ptr %la2), !jeandle.lock_depth !{i32 2}
+  ptr addrspace(1) %a, ptr %la2)
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-  ptr addrspace(1) %c, ptr %lc), !jeandle.lock_depth !{i32 3}
+  ptr addrspace(1) %c, ptr %lc)
   call void @sink(ptr addrspace(1) %c)
   call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
   ptr addrspace(1) %c, ptr %lc)

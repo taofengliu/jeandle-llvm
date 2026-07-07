@@ -1,12 +1,13 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Lock-depth metadata smoke test: a single virtual whose monitorenter carries the
-; `!jeandle.lock_depth` metadata. The fold-elide path must still fire (the
-; alloc, enter, exit and field stores all eliminate). This exercises the
-; readBytecodeLockDepth() path on a positive case and confirms the
-; metadata-supplied depth flows through ObjectState::Locks and the
-; analyzer-side LiveLockEnters without disturbing the unlocked / no-escape
-; behaviour exercised by partial-escape/12_monitorenter_exit_elided.ll.
+; Lock-depth proxy smoke test: a single virtual whose monitorenter carries NO
+; `!jeandle.lock_depth` metadata (the frontend no longer attaches it). The
+; fold-elide path must still fire (the alloc, enter, exit and field stores all
+; eliminate). This exercises the LockDepthCache proxy path
+; (getOrCreateLockDepth) on a positive case and confirms the RPO-order depth
+; flows through ObjectState::Locks and the analyzer-side LiveLockEnters without
+; disturbing the unlocked / no-escape behaviour exercised by
+; partial-escape/12_monitorenter_exit_elided.ll.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
@@ -21,7 +22,7 @@ entry:
        to label %n unwind label %u
 n:
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
-                  ptr addrspace(1) %o, ptr %lock), !jeandle.lock_depth !{i32 0}
+                  ptr addrspace(1) %o, ptr %lock)
   call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
                   ptr addrspace(1) %o, ptr %lock)
   ret void
