@@ -4,6 +4,9 @@ add_llvm_component_library(LLVMJeandleTransforms
   JavaOperationLower.cpp
   PartialEscapeIterative.cpp
   PartialEscapeTransform.cpp
+  JeandleDevirtualization.cpp
+  JeandleInlineDriver.cpp
+  JeandleInliner.cpp
   RepeatedConstantFolding.cpp
   TLSPointerRewrite.cpp
   TypeCheckElimination.cpp
@@ -16,6 +19,7 @@ add_llvm_component_library(LLVMJeandleTransforms
   Analysis
   Core
   InstCombine
+  IRReader
   Scalar
   TransformUtils
   )
