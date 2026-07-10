@@ -12,11 +12,14 @@
 #include "llvm/Analysis/Jeandle/PartialEscapeAnalysis.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Jeandle/ConstantFieldFolding.h"
+#include "llvm/Transforms/Jeandle/ExpandNarrowOopCast.h"
 #include "llvm/Transforms/Jeandle/InsertGCBarriers.h"
+#include "llvm/Transforms/Jeandle/JavaOperationDeletion.h"
 #include "llvm/Transforms/Jeandle/JavaOperationLower.h"
 #include "llvm/Transforms/Jeandle/PartialEscapeIterative.h"
 #include "llvm/Transforms/Jeandle/PartialEscapeTransform.h"
 #include "llvm/Transforms/Jeandle/JeandleInliner.h"
+#include "llvm/Transforms/Jeandle/JeandleNarrowOopMarker.h"
 #include "llvm/Transforms/Jeandle/RepeatedConstantFolding.h"
 #include "llvm/Transforms/Jeandle/TLSPointerRewrite.h"
 #include "llvm/Transforms/Jeandle/TypeCheckElimination.h"
@@ -50,6 +53,7 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
                                                  OptimizationLevel level,
                                                  PipelineOptions Options) {
   ModulePassManager PM;
+  PM.addPass(JavaOperationLower(0));
   // JeandleInlineDriver owns the inline-specific loop. Devirtualization
   // refinement between inline rounds should be wired inside the driver so
   // inline-scope state can be preserved across IR rewrites.
@@ -89,15 +93,17 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   // `-jeandle-pea-iterations=N` (default 2).
   //
   // Pipeline position decision.
-  //   Jeandle runs PEA at exactly ONE position. The slot is BEFORE
-  //   JavaOperationLower(0), InstSimplify, TypeCheckElimination, and the
-  //   standard O2 pipeline. Every downstream pass either (a) leaves the
-  //   named alloc intrinsics `jeandle.new_instance` / `jeandle.new_array`
-  //   untouched (both carry `"lower-phase"="1"`, while JavaOperationLower(0)
-  //   only inlines phase-0 helpers like load_klass/instanceof/arraylength/
-  //   idiv), or (b) preserves addrspace(1) pointer types. The intrinsics
-  //   survive until JavaOperationLower(1) below, and addrspace(1) survives
-  //   until RewriteStatepointsForGC rewrites it to gc-managed pointers.
+  //   Jeandle runs PEA at exactly ONE position. JavaOperationLower(0) is
+  //   hoisted above the inline driver (so phase-0 helpers like
+  //   load_klass/instanceof/arraylength/idiv are inlined before inlining
+  //   runs); PEA runs after the driver and the pre-PEA cleanup, before
+  //   InstSimplify, TypeCheckElimination, and the standard O2 pipeline.
+  //   PEA still sees every allocation site: the named alloc intrinsics
+  //   `jeandle.new_instance` / `jeandle.new_array` carry `"lower-phase"="1"`
+  //   and are left untouched by JavaOperationLower(0) (phase-0 only) and by
+  //   every pass downstream of PEA, surviving until JavaOperationLower(1)
+  //   below. addrspace(1) survives until RewriteStatepointsForGC rewrites it
+  //   to gc-managed pointers.
   //
   //   Considered and rejected: a second `PartialEscapeIterative` after the
   //   O2 pipeline. The named intrinsics and addrspace(1) survive through
@@ -114,8 +120,6 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   //       materializations exposed by InstCombine+SimplifyCFG+ADCE between
   //       rounds.
   PM.addPass(createModuleToFunctionPassAdaptor(PartialEscapeIterative()));
-
-  PM.addPass(JavaOperationLower(0));
   PM.addPass(createModuleToFunctionPassAdaptor(InstSimplifyPass()));
   PM.addPass(createModuleToFunctionPassAdaptor(TypeCheckElimination()));
   PM.addPass(createModuleToFunctionPassAdaptor(RepeatedConstantFolding()));
@@ -127,7 +131,9 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   PM.addPass(createModuleToFunctionPassAdaptor(InsertGCBarriers()));
   PM.addPass(JavaOperationLower(1));
   PM.addPass(std::move(PB.buildPerModuleDefaultPipeline(level)));
+  PM.addPass(ExpandNarrowOopCast());
   PM.addPass(RewriteStatepointsForGC());
+  PM.addPass(createModuleToFunctionPassAdaptor(JeandleNarrowOopMarker()));
   // Phase 9 is reserved for JavaOps that must be lowered after O3/RS4GC.
   //
   // JavaOperationLower(9) lowers GC barriers only after O3/RS4GC. Lowered G1
@@ -143,6 +149,11 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   // optimization opportunities while keeping raw derived addresses local to the
   // final barrier code.
   PM.addPass(JavaOperationLower(9));
+  // Erase JavaOp definitions that have been fully lowered (user-empty) and are
+  // no longer referenced. This must run after the inline driver and all
+  // JavaOperationLower phases: every JavaOp must stay alive while replayed
+  // callee bodies may still resolve them by name during inlining.
+  PM.addPass(JavaOperationDeletion());
   PM.addPass(createModuleToFunctionPassAdaptor(TLSPointerRewrite()));
   PM.addPass(createModuleToFunctionPassAdaptor(InstSimplifyPass()));
   return PM;
