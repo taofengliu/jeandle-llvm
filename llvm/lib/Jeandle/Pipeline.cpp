@@ -10,10 +10,12 @@
 
 #include "llvm/Jeandle/Pipeline.h"
 #include "llvm/Transforms/Jeandle/ConstantFieldFolding.h"
+#include "llvm/Transforms/Jeandle/ExpandNarrowOopCast.h"
 #include "llvm/Transforms/Jeandle/InsertGCBarriers.h"
 #include "llvm/Transforms/Jeandle/JavaOperationDeletion.h"
 #include "llvm/Transforms/Jeandle/JavaOperationLower.h"
 #include "llvm/Transforms/Jeandle/JeandleInliner.h"
+#include "llvm/Transforms/Jeandle/JeandleNarrowOopMarker.h"
 #include "llvm/Transforms/Jeandle/RepeatedConstantFolding.h"
 #include "llvm/Transforms/Jeandle/TLSPointerRewrite.h"
 #include "llvm/Transforms/Jeandle/TypeCheckElimination.h"
@@ -69,7 +71,9 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   PM.addPass(createModuleToFunctionPassAdaptor(InsertGCBarriers()));
   PM.addPass(JavaOperationLower(1));
   PM.addPass(std::move(PB.buildPerModuleDefaultPipeline(level)));
+  PM.addPass(ExpandNarrowOopCast());
   PM.addPass(RewriteStatepointsForGC());
+  PM.addPass(createModuleToFunctionPassAdaptor(JeandleNarrowOopMarker()));
   // Phase 9 is reserved for JavaOps that must be lowered after O3/RS4GC.
   //
   // JavaOperationLower(9) lowers GC barriers only after O3/RS4GC. Lowered G1
