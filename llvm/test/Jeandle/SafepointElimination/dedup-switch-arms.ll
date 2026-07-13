@@ -47,4 +47,4 @@ exit:
 ; CHECK:       arm.b:
 ; CHECK-NEXT:    br label %loop.latch
 ; CHECK:       loop.latch:
-; CHECK-NEXT:    call hotspotcc void @jeandle.safepoint_poll(){{.*}}!jeandle.poll_coverage
+; CHECK-NEXT:    call hotspotcc void @jeandle.safepoint_poll(){{.*}}!poll-coverage

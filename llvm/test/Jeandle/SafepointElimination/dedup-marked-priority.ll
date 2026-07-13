@@ -13,7 +13,7 @@ entry:
 
 loop.header:
   %iv = phi i64 [ 0, %entry ], [ %iv.next, %loop.latch ]
-  call hotspotcc void @jeandle.safepoint_poll(), !jeandle.poll_coverage !0
+  call hotspotcc void @jeandle.safepoint_poll(), !poll-coverage !0
   %exit.cond = icmp slt i64 %iv, %n
   br i1 %exit.cond, label %loop.latch, label %exit
 
@@ -31,7 +31,7 @@ exit:
 
 ; CHECK-LABEL: @marked_priority(
 ; CHECK:       loop.header:
-; CHECK:         call hotspotcc void @jeandle.safepoint_poll(){{.*}}!jeandle.poll_coverage
+; CHECK:         call hotspotcc void @jeandle.safepoint_poll(){{.*}}!poll-coverage
 ; CHECK:       loop.latch:
 ; CHECK-NOT:     call hotspotcc void @jeandle.safepoint_poll
 ; CHECK:         br label %loop.header

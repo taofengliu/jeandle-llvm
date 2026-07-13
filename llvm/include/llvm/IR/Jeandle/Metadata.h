@@ -31,6 +31,18 @@ public:
   static constexpr const char *JavaKlassExact = "java-klass-exact";
 
   static constexpr const char *InlineScopeID = "inline-scope-id";
+
+  // Set by SafepointElimination on a poll that is its loop's required coverage;
+  // the keep-one/collapse rules must not delete the last one so tagged.
+  static constexpr const char *PollCoverage = "poll-coverage";
+
+  // Set by strip mining on the inner latch to identify a poll-free inner loop
+  // whose bound must be validated structurally by the coverage verifier. Branch
+  // metadata is droppable by later passes (e.g. SimplifyCFG folding the latch),
+  // so this marker is only useful between SafepointElimination and the verifier
+  // that immediately follows it — do not move the verifier later in the
+  // pipeline expecting this to survive.
+  static constexpr const char *StripMined = "strip-mined";
 };
 
 enum AddrSpace : unsigned {

@@ -558,7 +558,6 @@ FUNCTION_PASS("redundant-dbg-inst-elim", RedundantDbgInstEliminationPass())
 FUNCTION_PASS("replace-with-veclib", ReplaceWithVeclib())
 FUNCTION_PASS("reg2mem", RegToMemPass())
 FUNCTION_PASS("safe-stack", SafeStackPass(*TM))
-FUNCTION_PASS("safepoint-elimination", SafepointElimination())
 FUNCTION_PASS("sandbox-vectorizer", SandboxVectorizerPass())
 FUNCTION_PASS("scalarize-masked-mem-intrin", ScalarizeMaskedMemIntrinPass())
 FUNCTION_PASS("sccp", SCCPPass())
@@ -717,6 +716,11 @@ FUNCTION_PASS_WITH_PARAMS(
     "separate-const-offset-from-gep", "SeparateConstOffsetFromGEPPass",
     [](bool LowerGEP) { return SeparateConstOffsetFromGEPPass(LowerGEP); },
     parseSeparateConstOffsetFromGEPPassOptions, "lower-gep")
+FUNCTION_PASS_WITH_PARAMS(
+    "safepoint-elimination", "SafepointElimination",
+    [](SafepointEliminationMode Mode) { return SafepointElimination(Mode); },
+    parseSafepointEliminationOptions,
+    "early;inclusive-loop-versioning;strip-mining;cleanup;loop-deletion-prep")
 FUNCTION_PASS_WITH_PARAMS(
     "simplifycfg", "SimplifyCFGPass",
     [](SimplifyCFGOptions Opts) { return SimplifyCFGPass(Opts); },

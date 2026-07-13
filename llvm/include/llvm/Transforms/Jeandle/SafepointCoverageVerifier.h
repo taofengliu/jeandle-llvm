@@ -15,11 +15,11 @@
 
 namespace llvm {
 
-/// Checks that every loop in a compiled Java method either contains a
-/// safepoint poll dominating its latch or has a provably small trip count —
-/// the invariant SafepointElimination must preserve. Like SafepointIRVerifier
-/// this checks a sufficient (not necessary) condition and is meant as a
-/// diagnostic gate, not part of the main IR verifier.
+/// Checks that every loop in a compiled Java method either has each latch
+/// dominated by a safepoint poll or has a provably small trip count — the
+/// invariant SafepointElimination must preserve. Like SafepointIRVerifier this
+/// checks a sufficient (not necessary) condition and is meant as a diagnostic
+/// gate, not part of the main IR verifier.
 class SafepointCoverageVerifier
     : public PassInfoMixin<SafepointCoverageVerifier> {
 public:

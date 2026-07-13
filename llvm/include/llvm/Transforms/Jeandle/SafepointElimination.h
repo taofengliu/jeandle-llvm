@@ -17,6 +17,14 @@ namespace llvm {
 
 class Instruction;
 
+enum class SafepointEliminationMode {
+  Early,
+  InclusiveLoopVersioning,
+  StripMining,
+  Cleanup,
+  LoopDeletionPrep,
+};
+
 /// Removes redundant `jeandle.safepoint_poll` calls. Polls are created by the
 /// frontend only — each carries the deopt JVM state of its bci, which no LLVM
 /// pass can synthesize — so this pass deletes or relocates polls but never
@@ -24,7 +32,14 @@ class Instruction;
 /// of the planned cleanups act outside loop scopes.
 class SafepointElimination : public PassInfoMixin<SafepointElimination> {
 public:
+  explicit SafepointElimination(
+      SafepointEliminationMode Mode = SafepointEliminationMode::Early)
+      : Mode(Mode) {}
+
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
+
+private:
+  SafepointEliminationMode Mode;
 };
 
 namespace jeandle {
@@ -34,6 +49,15 @@ bool isSafepointPoll(const Instruction &I);
 /// Iteration budget shared by the trip-count-based poll deletion and the
 /// safepoint coverage verifier (-jeandle-safepoint-chunk-iters).
 uint64_t getSafepointChunkIters();
+
+/// Whether strip mining is enabled (-jeandle-enable-strip-mining). The pipeline
+/// only runs the EarlyCSE/InstCombine canonicalization that feeds strip mining
+/// when this is on, so the default build is unaffected.
+bool isStripMiningEnabled();
+
+/// Whether runtime inclusive-loop versioning is enabled
+/// (-jeandle-enable-inclusive-loop-versioning).
+bool isInclusiveLoopVersioningEnabled();
 } // namespace jeandle
 
 } // namespace llvm

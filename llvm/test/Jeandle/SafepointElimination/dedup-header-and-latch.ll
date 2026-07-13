@@ -30,4 +30,4 @@ exit:
 ; CHECK:       loop.header:
 ; CHECK-NOT:     call hotspotcc void @jeandle.safepoint_poll
 ; CHECK:       loop.latch:
-; CHECK-NEXT:    call hotspotcc void @jeandle.safepoint_poll(){{.*}}!jeandle.poll_coverage
+; CHECK-NEXT:    call hotspotcc void @jeandle.safepoint_poll(){{.*}}!poll-coverage

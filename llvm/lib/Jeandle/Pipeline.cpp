@@ -29,6 +29,8 @@
 #include "llvm/Transforms/Scalar/InstSimplifyPass.h"
 #include "llvm/Transforms/Scalar/RewriteStatepointsForGC.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
+#include "llvm/Transforms/Utils/LCSSA.h"
+#include "llvm/Transforms/Utils/LoopSimplify.h"
 
 namespace llvm::jeandle {
 
@@ -82,16 +84,45 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   PM.addPass(createModuleToFunctionPassAdaptor(TypeCheckElimination()));
   PM.addPass(createModuleToFunctionPassAdaptor(RepeatedConstantFolding()));
   PM.addPass(createModuleToFunctionPassAdaptor(TypeCheckElimination()));
-  // Clean up redundant safepoint polls before JavaOperationLower(1) inlines
-  // them away and before the default optimization pipeline.
-  PM.addPass(createModuleToFunctionPassAdaptor(SafepointElimination()));
+  // Strip mining needs SCEV to see each loop's trip count, which means hoisting
+  // jeandle.arraylength out of the loop (EarlyCSE) and collapsing the
+  // frontend's lcmp/iflt chain into a single icmp (InstCombine). Only pay for
+  // these when strip mining is enabled, so the default build is unchanged.
+  if (isStripMiningEnabled()) {
+    PM.addPass(createModuleToFunctionPassAdaptor(EarlyCSEPass()));
+    PM.addPass(createModuleToFunctionPassAdaptor(InstCombinePass()));
+    // Strip mining requires its target loop in LoopSimplify + LCSSA form (it
+    // checks for them but does not form them); real frontend loops are in
+    // neither, so form them here or the transform never fires.
+    PM.addPass(createModuleToFunctionPassAdaptor(LoopSimplifyPass()));
+    PM.addPass(createModuleToFunctionPassAdaptor(LCSSAPass()));
+  }
+  // First remove polls already proven redundant. Strip mining runs as a
+  // separate invocation so it sees a freshly rebuilt MemorySSA.
+  PM.addPass(createModuleToFunctionPassAdaptor(
+      SafepointElimination(SafepointEliminationMode::Early)));
   if (getSafepointCoverageCheck() != SafepointCoverageCheck::Off)
     PM.addPass(createModuleToFunctionPassAdaptor(SafepointCoverageVerifier()));
+  if (isStripMiningEnabled()) {
+    PM.addPass(createModuleToFunctionPassAdaptor(
+        SafepointElimination(SafepointEliminationMode::StripMining)));
+    if (getSafepointCoverageCheck() != SafepointCoverageCheck::Off)
+      PM.addPass(
+          createModuleToFunctionPassAdaptor(SafepointCoverageVerifier()));
+  }
   // TODO: InsertGCBarriers currently inserts high-level barrier calls before
   // O3 because it cannot handle O3 generated memory intrinsics and vector
   // instructions. But the uninlined barrier calls can still block useful
   // optimizations.
   PM.addPass(createModuleToFunctionPassAdaptor(InsertGCBarriers()));
+
+  // Clean up redundant polls exposed by the transformed loop shape before
+  // phase-1 lowering consumes jeandle.safepoint_poll calls.
+  PM.addPass(createModuleToFunctionPassAdaptor(
+      SafepointElimination(SafepointEliminationMode::Cleanup)));
+  if (getSafepointCoverageCheck() != SafepointCoverageCheck::Off)
+    PM.addPass(createModuleToFunctionPassAdaptor(SafepointCoverageVerifier()));
+
   PM.addPass(JavaOperationLower(1));
   PM.addPass(std::move(PB.buildPerModuleDefaultPipeline(level)));
   PM.addPass(ExpandNarrowOopCast());

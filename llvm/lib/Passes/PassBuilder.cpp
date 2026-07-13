@@ -1762,6 +1762,27 @@ Expected<int> parseJavaOperationLowerOptions(StringRef Params) {
   return Result;
 }
 
+Expected<SafepointEliminationMode>
+parseSafepointEliminationOptions(StringRef Params) {
+  if (Params.empty())
+    return SafepointEliminationMode::Early;
+  std::optional<SafepointEliminationMode> Mode =
+      StringSwitch<std::optional<SafepointEliminationMode>>(Params)
+          .Case("early", SafepointEliminationMode::Early)
+          .Case("inclusive-loop-versioning",
+                SafepointEliminationMode::InclusiveLoopVersioning)
+          .Case("strip-mining", SafepointEliminationMode::StripMining)
+          .Case("cleanup", SafepointEliminationMode::Cleanup)
+          .Case("loop-deletion-prep",
+                SafepointEliminationMode::LoopDeletionPrep)
+          .Default(std::nullopt);
+  if (Mode)
+    return *Mode;
+  return make_error<StringError>(
+      formatv("invalid SafepointElimination mode: '{0}'", Params).str(),
+      inconvertibleErrorCode());
+}
+
 } // namespace
 
 /// Tests whether registered callbacks will accept a given pass name.
