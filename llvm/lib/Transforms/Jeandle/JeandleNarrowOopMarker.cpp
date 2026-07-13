@@ -86,8 +86,19 @@ PreservedAnalyses JeandleNarrowOopMarker::run(Function &F,
       // deopt bundle, and JeandleCompiledCode::resolve_reloc_info treats
       // routine call sites as bci == -1. Remove this path once routine
       // calls carry real deopt bundles.
+      //
+      // JeandleCompiledCode::parse_stackmap always reads a leading
+      // should_reexecute flag before the duplicated-bci pair. A synthetic
+      // bundle must include it too, or the reader misinterprets this bci
+      // as should_reexecute and desyncs every value after it.
+      //
+      // should_reexecute is i64 (see JeandleAbstractInterpreter::deopt_args)
+      // so it can't be mistaken for one half of the duplicated-bci i32 pair.
+      Value *SyntheticShouldReexecute =
+          ConstantInt::get(Type::getInt64Ty(Ctx), 0);
       Value *SyntheticBci = ConstantInt::get(Type::getInt32Ty(Ctx), -1);
-      DeoptInputs.insert(DeoptInputs.begin(), {SyntheticBci, SyntheticBci});
+      DeoptInputs.insert(DeoptInputs.begin(), {SyntheticShouldReexecute,
+                                               SyntheticBci, SyntheticBci});
     }
 
     OperandBundleDef NewDeopt("deopt", DeoptInputs);
