@@ -194,9 +194,9 @@ enum class VMCallbackValueType : uint8_t {
 ///   IsUnverifiedInterface
 ///                       — Returns true if the klass is an interface type whose
 ///                         type the bytecode verifier does not enforce. Covers
-///                         interface instance klasses and objArray klasses whose
-///                         bottom element is such an interface. Type info must
-///                         not be attached to values of these types.
+///                         interface instance klasses and objArray klasses
+///                         whose bottom element is such an interface. Type info
+///                         must not be attached to values of these types.
 ///   IsEffectivelyFinal  — Returns true if no subclass can exist at runtime.
 ///   GetConstantFieldValue
 ///                       — Returns the constant field value as int64_t.

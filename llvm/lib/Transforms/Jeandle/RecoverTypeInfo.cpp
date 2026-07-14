@@ -239,13 +239,13 @@ PreservedAnalyses RecoverTypeInfo::run(Function &F,
   auto klassFromAttr = [&](const AttributeList &AL, unsigned Index) -> Lattice {
     if (!AL.hasAttributeAtIndex(Index, jeandle::Attribute::JavaKlass))
       return Lattice::bottom();
-    StringRef S =
-        AL.getAttributeAtIndex(Index, jeandle::Attribute::JavaKlass)
-            .getValueAsString();
+    StringRef S = AL.getAttributeAtIndex(Index, jeandle::Attribute::JavaKlass)
+                      .getValueAsString();
     uintptr_t Klass = 0;
     if (S.getAsInteger(10, Klass) || Klass == 0)
       return Lattice::bottom();
-    bool Exact = AL.hasAttributeAtIndex(Index, jeandle::Attribute::JavaKlassExact);
+    bool Exact =
+        AL.hasAttributeAtIndex(Index, jeandle::Attribute::JavaKlassExact);
     return Lattice::known(Klass, Exact);
   };
 
@@ -273,8 +273,8 @@ PreservedAnalyses RecoverTypeInfo::run(Function &F,
   // accumulated past int range). Uses stripAndAccumulateConstantOffsets so the
   // base is reached across nested constant GEPs, bitcasts, addrspacecasts and
   // invariant-group intrinsics.
-  auto stripBaseOffset = [&](Value *Ptr)
-      -> std::pair<Value *, std::optional<int>> {
+  auto stripBaseOffset =
+      [&](Value *Ptr) -> std::pair<Value *, std::optional<int>> {
     unsigned IdxBits = DL.getIndexTypeSizeInBits(Ptr->getType());
     APInt Off(IdxBits, 0, /*isSigned=*/true);
     Value *Base = Ptr->stripAndAccumulateConstantOffsets(
@@ -324,7 +324,8 @@ PreservedAnalyses RecoverTypeInfo::run(Function &F,
       // Call / invoke with java-klass return attribute.
       if (isa<CallBase>(&I)) {
         auto *CB2 = cast<CallBase>(&I);
-        seed(&I, klassFromAttr(CB2->getAttributes(), AttributeList::ReturnIndex));
+        seed(&I,
+             klassFromAttr(CB2->getAttributes(), AttributeList::ReturnIndex));
         continue;
       }
 
@@ -411,7 +412,8 @@ PreservedAnalyses RecoverTypeInfo::run(Function &F,
       return Lattice::bottom(); // base is opaque
     uintptr_t FK = getField(BL.Klass, Off);
     if (FK == 0 || isUnvIface(FK))
-      return Lattice::bottom(); // no such field, or interface-typed (unverifiable)
+      return Lattice::bottom(); // no such field, or interface-typed
+                                // (unverifiable)
     return Lattice::known(FK, isEffFinal(FK));
   };
 
@@ -478,20 +480,24 @@ PreservedAnalyses RecoverTypeInfo::run(Function &F,
       if (LI->getMetadata(jeandle::Metadata::JavaKlass))
         continue; // already typed (frontend or a prior run) — leave untouched
       if (!FieldLoadBaseOff.count(LI))
-        continue; // not a tracked field load (seed / opaque / non-constant base)
+        continue; // not a tracked field load (seed / opaque / non-constant
+                  // base)
       Lattice L = getLattice(LI);
       if (!L.isKnown())
         continue;
 
       ConstantAsMetadata *KlassCMD = ConstantAsMetadata::get(
           ConstantInt::get(Type::getInt64Ty(Ctx), L.Klass));
-      LI->setMetadata(jeandle::Metadata::JavaKlass, MDNode::get(Ctx, {KlassCMD}));
+      LI->setMetadata(jeandle::Metadata::JavaKlass,
+                      MDNode::get(Ctx, {KlassCMD}));
       if (L.Exact)
-        LI->setMetadata(jeandle::Metadata::JavaKlassExact, MDNode::get(Ctx, {}));
+        LI->setMetadata(jeandle::Metadata::JavaKlassExact,
+                        MDNode::get(Ctx, {}));
       ++NumRecovered;
       Changed = true;
       LLVM_DEBUG(dbgs() << "recover-type-info: attached klass " << L.Klass
-                        << (L.Exact ? " (exact)" : "") << " to " << *LI << "\n");
+                        << (L.Exact ? " (exact)" : "") << " to " << *LI
+                        << "\n");
     }
   }
 
