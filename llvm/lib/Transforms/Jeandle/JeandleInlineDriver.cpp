@@ -37,8 +37,9 @@
 #include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Transforms/Jeandle/CHADevirtualization.h"
 #include "llvm/Transforms/Jeandle/JavaOperationLower.h"
-#include "llvm/Transforms/Jeandle/JeandleDevirtualization.h"
+#include "llvm/Transforms/Jeandle/RepeatedConstantFolding.h"
 #include "llvm/Transforms/Jeandle/TypeCheckElimination.h"
 #include "llvm/Transforms/Scalar/ADCE.h"
 #include "llvm/Transforms/Scalar/EarlyCSE.h"
@@ -156,6 +157,8 @@ static PreservedAnalyses runRootInstSimplify(Module &M,
   //   - InstSimplify: cheap local instruction folding, no CFG rewrite.
   //   - TypeCheckElimination: fold jeandle.check_instanceof to constants,
   //     exposing monomorphic call sites for the next devirtualization round.
+  //   - RepeatedConstantFolding: fold constant fields to a fixed point,
+  //     pruning newly dead paths between iterations.
   //   - EarlyCSE: common-subexpression elimination (also load CSE), removes
   //     redundant computation.
   //   - InstCombine: instruction simplification + constant folding/
@@ -165,6 +168,7 @@ static PreservedAnalyses runRootInstSimplify(Module &M,
   FunctionPassManager FPM;
   FPM.addPass(InstSimplifyPass());
   FPM.addPass(TypeCheckElimination());
+  FPM.addPass(RepeatedConstantFolding());
   FPM.addPass(EarlyCSEPass());
   FPM.addPass(InstCombinePass());
   FPM.addPass(SimplifyCFGPass());
@@ -197,9 +201,10 @@ PreservedAnalyses JeandleInlineDriver::run(Module &M,
   } ReplayScope(M);
 
   JeandleInliner Inliner(InlineAccessorsOnly);
-  JeandleDevirtualization Devirtualization;
+  CHADevirtualization Devirtualization;
   SmallVector<JeandleInlineScope, 16> InlineScopes;
   PreservedAnalyses DriverPA = PreservedAnalyses::all();
+  Function *RootFunction = getRootJavaMethodFunction(M);
   bool Changed = false;
 
   // The driver owns the inline/devirtualization loop. Keeping InlineScopes here
@@ -251,10 +256,17 @@ PreservedAnalyses JeandleInlineDriver::run(Module &M,
       break;
     }
 
-    PreservedAnalyses DevirtPA = Devirtualization.runDevirtualization(M, MAM);
+    FunctionAnalysisManager &FAM =
+        MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
+    PreservedAnalyses DevirtPA = Devirtualization.run(*RootFunction, FAM);
     bool AddedMonomorphicTargets = !DevirtPA.areAllPreserved();
     Changed |= AddedMonomorphicTargets;
-    updateDriverPreservedAnalyses(M, MAM, DriverPA, std::move(DevirtPA));
+    FAM.invalidate(*RootFunction, DevirtPA);
+    PreservedAnalyses DevirtModulePA = PreservedAnalyses::all();
+    DevirtModulePA.intersect(std::move(DevirtPA));
+    DevirtModulePA.preserveSet<AllAnalysesOn<Function>>();
+    DevirtModulePA.preserve<FunctionAnalysisManagerModuleProxy>();
+    updateDriverPreservedAnalyses(M, MAM, DriverPA, std::move(DevirtModulePA));
 
     // Devirtualization may rewrite the root IR and replace CallBase objects
     // exposed by the inline round. Do not carry a cross-step worklist through
@@ -278,7 +290,6 @@ PreservedAnalyses JeandleInlineDriver::run(Module &M,
   if (!Changed)
     return PreservedAnalyses::all();
 
-  Function *RootFunction = getRootJavaMethodFunction(M);
   FunctionAnalysisManager &FAM =
       MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
 
