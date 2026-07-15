@@ -62,6 +62,7 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   PreCHACleanup.addPass(InstCombinePass());
   PreCHACleanup.addPass(SimplifyCFGPass());
   PreCHACleanup.addPass(ADCEPass());
+  PM.addPass(createModuleToFunctionPassAdaptor(RecoverTypeInfo()));
   PM.addPass(createModuleToFunctionPassAdaptor(std::move(PreCHACleanup)));
   PM.addPass(createModuleToFunctionPassAdaptor(CHADevirtualization()));
   // JeandleInlineDriver owns the inline-specific loop. Devirtualization
@@ -84,7 +85,6 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   PM.addPass(createModuleToFunctionPassAdaptor(RecoverTypeInfo()));
   PM.addPass(createModuleToFunctionPassAdaptor(TypeCheckElimination()));
   PM.addPass(createModuleToFunctionPassAdaptor(RepeatedConstantFolding()));
-  PM.addPass(createModuleToFunctionPassAdaptor(RecoverTypeInfo()));
   PM.addPass(createModuleToFunctionPassAdaptor(TypeCheckElimination()));
   // TODO: InsertGCBarriers currently inserts high-level barrier calls before
   // O3 because it cannot handle O3 generated memory intrinsics and vector
