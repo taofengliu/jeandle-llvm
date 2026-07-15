@@ -10,8 +10,10 @@
 
 #include "llvm/Transforms/Jeandle/JeandleTransformUtils.h"
 #include "llvm/Analysis/DomTreeUpdater.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Jeandle/Deoptimization.h"
 #include "llvm/IR/Jeandle/Metadata.h"
+#include "llvm/IR/Jeandle/VMCallback.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
@@ -191,6 +193,17 @@ OperandBundleDef createPreCallDeoptBundle(InvokeInst &CB) {
     Args.push_back(Deopt.Inputs[I].get());
 
   return OperandBundleDef("deopt", Args);
+}
+
+LoadInst *createConstOopLoad(Module &M, IRBuilder<> &Builder, int OopId) {
+  LLVMContext &Ctx = M.getContext();
+  Type *OopTy = PointerType::get(Ctx, jeandle::AddrSpace::JavaHeapAddrSpace);
+  const auto *CB = jeandle::getVMCallbacks();
+  assert(CB && CB->GetOopHandleName && "GetOopHandleName callback required");
+  std::string Name = CB->GetOopHandleName(OopId);
+  GlobalVariable *GV = cast<GlobalVariable>(M.getOrInsertGlobal(Name, OopTy));
+  GV->setDSOLocal(true);
+  return Builder.CreateLoad(OopTy, GV, "folded.oop");
 }
 
 } // namespace llvm

@@ -44,6 +44,7 @@ bool isJeandleNewArray(const CallBase *CB);
 bool isJeandleAllocation(const CallBase *CB); // either of the above
 bool isJeandleArrayLength(const CallBase *CB);
 bool isJeandleLoadKlass(const CallBase *CB);
+bool isJeandleGetClass(const CallBase *CB);
 bool isJeandleCheckCast(const CallBase *CB);
 bool isJeandleInstanceOf(const CallBase *CB);
 bool isJeandleCheckInstanceOf(const CallBase *CB);

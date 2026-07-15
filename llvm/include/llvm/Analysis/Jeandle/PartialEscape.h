@@ -566,6 +566,13 @@ class ReplaceCallEffect : public Effect {
 public:
   Instruction *Target = nullptr;
   Value *Replacement = nullptr;
+  // When >= 0, the transform ignores `Replacement` and instead builds a GC-safe
+  // oop-handle load (see createConstOopLoad) of the constant Java oop named by
+  // this id, inserting it before `Target` and using it as the replacement. Used
+  // by foldGetClass: the analyzer cannot build the load itself without creating
+  // a module-level GlobalVariable during analysis, so it defers to the
+  // transform. -1 means "use Replacement as-is" (the normal path).
+  int OopHandleId = -1;
 
   Kind getKind() const override { return Kind::ReplaceCall; }
   static bool classof(const Effect *E) { return E->getKind() == Kind::ReplaceCall; }

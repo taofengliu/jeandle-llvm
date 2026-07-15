@@ -175,6 +175,9 @@ enum class JeandleInlineReason : int {
   def(GetOopKlass, uintptr_t, Uintptr,                                           \
       (int a1), (a1),                                                            \
       (VMCallbackValueType::Int), 1)                                             \
+  def(GetJavaMirror, int, Int,                                               \
+      (uintptr_t a1), (a1),                                                  \
+      (VMCallbackValueType::Uintptr), 1)                                     \
   def(IsOkToInline, bool, Bool,                                                  \
       (int a1, int a2, uintptr_t a3), (a1, a2, a3),                              \
       (VMCallbackValueType::Int, VMCallbackValueType::Int,                       \
@@ -308,6 +311,12 @@ enum class JeandleInlineReason : int {
 ///   GetOopKlass         — Returns the actual runtime klass pointer of the
 ///                         constant oop with the given oop id, or 0 if it is
 ///                         unavailable. Pure (id -> klass).
+///   GetJavaMirror       — Given a VM Klass pointer, returns the oop id of its
+///                         Java mirror (the java.lang.Class object), or -1 if
+///                         unavailable. Used by PEA's foldGetClass to fold
+///                         jeandle.get_class on a virtual receiver (whose exact
+///                         klass is statically known) to the constant Class
+///                         mirror. Pure (Klass -> mirror oop id).
 ///   IsOkToInline        — Given an inline scope id, call-site BCI, and callee
 ///                         Java method pointer, returns whether the VM allows
 ///                         this inline attempt.

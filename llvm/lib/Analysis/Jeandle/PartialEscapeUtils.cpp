@@ -68,6 +68,10 @@ bool isJeandleLoadKlass(const CallBase *CB) {
   return isJeandleCallNamed(CB, "jeandle.load_klass");
 }
 
+bool isJeandleGetClass(const CallBase *CB) {
+  return isJeandleCallNamed(CB, "jeandle.get_class");
+}
+
 bool isJeandleCheckCast(const CallBase *CB) {
   return isJeandleCallNamed(CB, "jeandle.checkcast");
 }

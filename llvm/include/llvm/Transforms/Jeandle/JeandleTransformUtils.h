@@ -130,6 +130,22 @@ inline bool getUIntFnAttr(const CallBase &CB, StringRef Name, uint64_t &Out) {
 /// \returns Pre called deoptimization operand bundle.
 OperandBundleDef createPreCallDeoptBundle(InvokeInst &CB);
 
+/// Build a GC-safe load of a constant JavaHeap oop from its oop-handle global
+/// `@oop_handle_<klass>_<id>`.
+///
+/// The global is addrspace(0) storage holding an addrspace(1) pointer; the
+/// loaded value is a managed pointer that downstream RewriteStatepointsForGC
+/// relocates across safepoints. The JVM resolves the `oop_handle_*` name via
+/// oop relocation (jeandleCompiledCode / jeandleReloc). Used by
+/// ConstantFieldFolding (constant object/array fields) and PEA's foldGetClass
+/// (the `java.lang.Class` mirror of a virtual object's exact klass).
+///
+/// \param M Module used to look up or create the oop-handle global.
+/// \param Builder IR builder positioned where the load should be inserted.
+/// \param OopId The constant oop's id (from the VM callback contract).
+/// \returns The newly inserted load of the oop-handle global.
+LoadInst *createConstOopLoad(Module &M, IRBuilder<> &Builder, int OopId);
+
 } // namespace llvm
 
 #endif // LLVM_TRANSFORMS_JEANDLE_JEANDLEUTILS_H

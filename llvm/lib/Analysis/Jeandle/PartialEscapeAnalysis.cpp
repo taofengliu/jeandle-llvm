@@ -932,6 +932,7 @@ private:
   bool foldICmpEquality(llvm::ICmpInst *ICmp);
   bool foldArrayLength(CallBase *CB);
   bool foldLoadKlass(CallBase *CB);
+  bool foldGetClass(CallBase *CB);
   bool foldCheckCast(CallBase *CB);
   bool foldInstanceOf(CallBase *CB);
   bool foldMonitorEnter(CallBase *CB);
@@ -3077,17 +3078,15 @@ void Analyzer::processInstruction(Instruction *I) {
     //   - TODO: ObjectClone / FinalFieldBarrier / EnsureVirtualized — no
     //     jeandle.clone / final_field_barrier / ensure_virtualized JavaOp
     //     exists in the frontend inventory.
-    //   - TODO(get_class): the frontend DOES emit jeandle.get_class
-    //     (jeandleIntrinsicLowering.cpp _getClass), but the Graal fold
-    //     (GetClassNode.virtualize:91-99 — replaceWithValue(constant Class via
-    //     constantReflection.asJavaClass(type))) is NOT implemented. It needs
-    //     (a) a new GetJavaMirror(Klass)->uintptr_t VMCallback and (b) the
-    //     ability to embed a GC'd JavaHeap oop constant in IR — every existing
-    //     fold emits only a primitive or a CHeap Klass pointer
-    //     (foldLoadKlass), so there is no precedent for an embedded GC oop
-    //     (statepoint/barrier treatment). Until then a virtual receiver of
-    //     jeandle.get_class hits this fall-through and materializes (sound,
-    //     conservative).
+    //   - get_class: IMPLEMENTED (foldGetClass). The frontend emits
+    //     jeandle.get_class for vmIntrinsic _getClass
+    //     (jeandleIntrinsicLowering.cpp). A virtual receiver of known klass
+    //     folds to a GC-safe load of its java.lang.Class mirror: the GetJavaMirror
+    //     VMCallback maps the klass to a mirror oop id, and the transform builds
+    //     the oop-handle load (createConstOopLoad) recorded via
+    //     ReplaceCallEffect::OopHandleId. When the callback is unavailable
+    //     (offline tests without a callback log) or returns -1, foldGetClass
+    //     bails and this fall-through materializes (sound, conservative).
     //
     // Current frontend JavaOp inventory (grep `jeandle.[a-z_]+` in
     // jeandle-jdk/src/hotspot/share/jeandle/): array_store_check, arraylength,
@@ -3821,6 +3820,42 @@ bool Analyzer::foldLoadKlass(CallBase *CB) {
   return true;
 }
 
+bool Analyzer::foldGetClass(CallBase *CB) {
+  // jeandle.get_class(oop) -> ptr addrspace(1) (the java.lang.Class mirror).
+  // For a virtual receiver whose exact klass is statically known, the Class
+  // mirror is a compile-time constant, so fold the call instead of forcing the
+  // receiver to materialize (the conservative fall-through). Graal analog:
+  // GetClassNode.virtualize. The GC-safe mirror load is built at transform time
+  // (ReplaceCallEffect::OopHandleId, see createConstOopLoad); the analyzer
+  // records only the mirror's oop id so it stays side-effect-free. No scalar
+  // alias is needed: no downstream JavaOp consumes a Class mirror (JavaHeap)
+  // operand, and a virtual's getClass() result is a constant, not a virtual.
+  if (CB->arg_size() < 1)
+    return false;
+  auto BaseID = jeandle::pea::resolveVirtualRef(CB->getArgOperand(0),
+                                                CurrentState, Aliases, DL);
+  if (!BaseID)
+    return false;
+  jeandle::VirtualObject &VObj = *Result.VirtualObjects[*BaseID];
+  if (VObj.Klass == 0)
+    return false;
+  const jeandle::VMCallbacks *VMCB = jeandle::getVMCallbacks();
+  if (!VMCB || !VMCB->GetJavaMirror)
+    return false; // offline (no callback log) or unsupported: bail (sound).
+  int MirrorOopId = VMCB->GetJavaMirror(VObj.Klass);
+  if (MirrorOopId < 0)
+    return false;
+  auto E = std::make_unique<jeandle::ReplaceCallEffect>();
+  E->Block = CB->getParent();
+  E->Target = CB;
+  E->Replacement = nullptr; // built in apply() from OopHandleId.
+  E->OopHandleId = MirrorOopId;
+  E->SeqNo = Result.nextSeqNo();
+  E->ObjID = *BaseID;
+  Result.addBlockEffect(std::move(E));
+  return true;
+}
+
 bool Analyzer::foldCheckCast(CallBase *CB) {
   if (CB->arg_size() < 2)
     return false;
@@ -4333,6 +4368,8 @@ bool Analyzer::processJavaOp(CallBase *CB) {
     return foldArrayLength(CB);
   if (isJeandleLoadKlass(CB))
     return foldLoadKlass(CB);
+  if (isJeandleGetClass(CB))
+    return foldGetClass(CB);
   if (isJeandleCheckCast(CB))
     return foldCheckCast(CB);
   if (isJeandleCheckInstanceOf(CB))

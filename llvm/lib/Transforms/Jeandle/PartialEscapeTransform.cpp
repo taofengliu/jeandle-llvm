@@ -68,6 +68,7 @@
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
+#include "llvm/Transforms/Jeandle/JeandleTransformUtils.h"
 
 using namespace llvm;
 
@@ -717,8 +718,19 @@ void jeandle::ReplaceCallEffect::apply(jeandle::TransformContext &Ctx) {
   // terminators cleaned up by ConstantFoldTerminator in run().
   if (!Target)
     return;
-  if (Replacement) {
-    Target->replaceAllUsesWith(Replacement);
+  // foldGetClass records the constant Class mirror by oop id rather than as an
+  // LLVM value: building the GC-safe oop-handle load here (instead of during
+  // analysis) keeps the analyzer side-effect-free. RS4GC, which runs downstream
+  // of PEA, treats the loaded addrspace(1) value as a managed pointer and
+  // inserts relocates. The load is inserted before Target so it dominates every
+  // use after the RAUW below.
+  Value *Repl = Replacement;
+  if (OopHandleId >= 0) {
+    IRBuilder<> Builder(Target);
+    Repl = createConstOopLoad(*Ctx.F.getParent(), Builder, OopHandleId);
+  }
+  if (Repl) {
+    Target->replaceAllUsesWith(Repl);
   } else if (!Target->use_empty()) {
     return;
   }
