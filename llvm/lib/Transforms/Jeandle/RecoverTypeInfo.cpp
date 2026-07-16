@@ -74,8 +74,7 @@ STATISTIC(NumRecovered, "Number of field loads with recovered java-klass");
 // TestRecoverTypeInfoEnablesChaDevirt to prove RecoverTypeInfo is a
 // prerequisite for CHA devirtualization of field-load receivers.
 static cl::opt<bool> DisableRecoverTypeInfo(
-    "jeandle-disable-recover-type-info",
-    cl::init(false), cl::Hidden,
+    "jeandle-disable-recover-type-info", cl::init(false), cl::Hidden,
     cl::desc("Skip RecoverTypeInfo (do not re-attach !java-klass metadata). "
              "Test hook for proving downstream passes depend on recovered "
              "type metadata; not for production use."));
