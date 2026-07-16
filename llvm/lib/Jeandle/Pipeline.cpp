@@ -56,6 +56,7 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   PM.addPass(JavaOperationLower(0));
   FunctionPassManager PreCHACleanup;
   PreCHACleanup.addPass(InstSimplifyPass());
+  PreCHACleanup.addPass(RecoverTypeInfo());
   PreCHACleanup.addPass(TypeCheckElimination());
   PreCHACleanup.addPass(RepeatedConstantFolding());
   PreCHACleanup.addPass(EarlyCSEPass());
