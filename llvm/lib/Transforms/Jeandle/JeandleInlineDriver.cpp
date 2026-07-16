@@ -154,6 +154,7 @@ static PreservedAnalyses runRootInstSimplify(Module &M,
   FPM.addPass(InstCombinePass());
   FPM.addPass(SimplifyCFGPass());
   FPM.addPass(ADCEPass());
+  FPM.addPass(RecoverTypeInfo()); // Recover type information in the end.
 
   PreservedAnalyses RootPA = FPM.run(*RootFunction, FAM);
   Changed |= !RootPA.areAllPreserved();

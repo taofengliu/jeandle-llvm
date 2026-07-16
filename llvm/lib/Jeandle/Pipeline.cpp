@@ -62,8 +62,8 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   PreCHACleanup.addPass(InstCombinePass());
   PreCHACleanup.addPass(SimplifyCFGPass());
   PreCHACleanup.addPass(ADCEPass());
-  PM.addPass(createModuleToFunctionPassAdaptor(RecoverTypeInfo()));
   PM.addPass(createModuleToFunctionPassAdaptor(std::move(PreCHACleanup)));
+  PM.addPass(createModuleToFunctionPassAdaptor(RecoverTypeInfo()));
   PM.addPass(createModuleToFunctionPassAdaptor(CHADevirtualization()));
   // JeandleInlineDriver owns the inline-specific loop. Devirtualization
   // refinement between inline rounds should be wired inside the driver so

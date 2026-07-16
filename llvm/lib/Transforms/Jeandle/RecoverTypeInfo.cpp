@@ -48,6 +48,7 @@
 #include "llvm/IR/Jeandle/VMCallback.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Operator.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 
 #include <climits>
@@ -63,6 +64,21 @@ using llvm::jeandle::isJavaOopType;
 using llvm::jeandle::isRootJavaMethodFunction;
 
 STATISTIC(NumRecovered, "Number of field loads with recovered java-klass");
+
+// Hidden test hook: when set (via -XX:JeandleLLVMOptions=--jeandle-disable-
+// recover-type-info), RecoverTypeInfo becomes a no-op, so the
+// !java-klass metadata stripped by load CSE (EarlyCSE/InstCombine) is NOT
+// re-attached. Downstream consumers that learn a loaded oop's klass only from
+// that metadata (notably CHADevirtualization, see CHADevirtualization.cpp:115)
+// then cannot resolve the receiver type and bail — used by the jtreg test
+// TestRecoverTypeInfoEnablesChaDevirt to prove RecoverTypeInfo is a
+// prerequisite for CHA devirtualization of field-load receivers.
+static cl::opt<bool> DisableRecoverTypeInfo(
+    "jeandle-disable-recover-type-info",
+    cl::init(false), cl::Hidden,
+    cl::desc("Skip RecoverTypeInfo (do not re-attach !java-klass metadata). "
+             "Test hook for proving downstream passes depend on recovered "
+             "type metadata; not for production use."));
 
 namespace {
 
@@ -137,6 +153,12 @@ PreservedAnalyses RecoverTypeInfo::run(Function &F,
                                        FunctionAnalysisManager &FAM) {
   Module *M = F.getParent();
   if (!M->getNamedMetadata(jeandle::Metadata::JavaMethodCompilation))
+    return PreservedAnalyses::all();
+
+  // Test hook (see DisableRecoverTypeInfo above): become a no-op so the
+  // stripped !java-klass metadata is not re-attached, exercising downstream
+  // passes without recovered type metadata.
+  if (DisableRecoverTypeInfo)
     return PreservedAnalyses::all();
 
   // RecoverTypeInfo is intra-procedural and only the root Java method is ever
