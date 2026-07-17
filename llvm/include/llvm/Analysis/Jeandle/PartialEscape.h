@@ -108,9 +108,12 @@ struct MaterializedLock {
 // depth-sorted. SourceEffect is the per-effect receiver-lookup key (Jeandle's
 // analog of Graal's `allocations[commit.getObjectIndex(monitorId)]`) —
 // strictly more precise than an OrigAlloc key, which would be last-write-wins
-// across per-pred materializations of the same object (see applyMaterialize's
-// NewAllocFor comment in PartialEscapeTransform.cpp). See
-// PEAResult::EscapePointLocks.
+// across per-pred materializations of the same object. The transform resolves
+// the receiver via the single map `NewInvOf[SourceEffect]` (set once per
+// effect to OrigAlloc in applyMaterialize, read by the lock-cascade re-emit
+// path); reuse-OrigAlloc materialization never spawns a per-pred invoke, so
+// the per-effect key disambiguates cascade members without any fallback chain.
+// See PEAResult::EscapePointLocks.
 class MaterializeEffect;
 struct MergedLock {
   Function *Callee = nullptr;
@@ -147,12 +150,17 @@ public:
   // resolves uses through the point-sensitive `aliases` map; there is no
   // persistent "OrigAlloc". Jeandle's Analysis pass cannot mutate IR (LLVM's
   // Analysis/Transform split), so OrigAlloc persists as a real invoke until the
-  // Transform, where it is either eliminated (NeverEscapes) or resolved per-
-  // point to the materialized value (PartialEscapeTransform's
-  // resolveMaterializedUses — the DT-driven analog of Graal's alias resolution,
-  // computed at transform time because the analysis cannot mutate). Behaviorally
-  // equivalent: OrigAlloc's role is a pure identity token, never a real
-  // allocation in the final IR.
+  // Transform, where it is either eliminated (NeverEscapes) or KEPT and reused
+  // as the materialized value itself for PartiallyEscapes. The analysis rewrites
+  // every VirtualRef → MaterializedRef(OrigAlloc) during prerequisite
+  // materialization (see processLoad/processStore/resolveVirtualRef), so the
+  // transform only replays field stores and re-emits locks onto OrigAlloc — no
+  // per-use DT alias resolution pass runs, because OrigAlloc dominates every
+  // escape point by the SSA invariant (see applyMaterialize's assert that the
+  // materialized value equals VObj.AllocationCall).
+  // Behaviorally equivalent: OrigAlloc's role is a pure identity token / the
+  // single sound SSA materialized value, never a fresh allocation in the final
+  // IR.
   CallBase *AllocationCall = nullptr;
 
   uintptr_t Klass = 0;
@@ -624,8 +632,12 @@ public:
   }
 };
 
-// Emit a real allocation invoke before an escape point, replay tracked field
-// stores, and re-emit surviving monitorenters. Non-cfgKill (Pass 1).
+// Materialize an escape point by replaying tracked field stores and re-emitting
+// surviving monitorenters ONTO OrigAlloc (VObj.AllocationCall), which dominates
+// every escape point — reuse-OrigAlloc materialization does NOT emit a fresh
+// allocation invoke. OrigAlloc is the materialized value itself (see
+// applyMaterialize: `MatVal = cast<CallBase>(OrigAlloc)`, recorded in
+// `NewInvOf[&E]`). Non-cfgKill (Pass 1).
 // Graal analog: the one `Effect("materializeBefore")` appended by
 // PartialEscapeBlockState.materializeBefore.
 class MaterializeEffect : public Effect {
@@ -638,7 +650,14 @@ public:
   };
 
   // WeakTrackingVH so erasing the insertion-point instruction auto-nulls the
-  // handle; applyMaterialize recomputes a fresh IP in that case.
+  // handle. applyMaterialize ASSERTS this is non-null — the eager-update hook
+  // relocateDependentMaterializes re-aims every dependent Materialize's
+  // InsertBefore to the dying instruction's in-block successor BEFORE the
+  // instruction is erased (Pass 1 runs effects in RPO, so an erase in an
+  // earlier block re-aims dependents before they reach apply — see the
+  // InsertBeforeDependents pre-scan built in the TransformContext). The
+  // handle is NOT recomputed at apply time; WeakTrackingVH is only there to
+  // fail loudly rather than dangling.
   WeakTrackingVH InsertBefore;
   Instruction *Target = nullptr; // the original allocation (OrigAlloc)
   SmallVector<FieldEntry, 8> FieldEntries;
@@ -649,17 +668,22 @@ public:
   Instruction *DeoptBundleSource = nullptr;
   bool IsPerPred = false;
   Value *PerPredPlaceholder = nullptr;
-  // The target merge block this per-pred materialize is destined for (the merge
-  // whose `MergeProcessor::BB` was in scope when this effect was emitted), or
-  // null for the Case-A / global path (mat placed at the pred's terminator end,
-  // whose NewInv dominates all successors — Graal-aligned, benign shared flip).
-  // IR-form divergence: Graal places the CommitAllocationNode before the pred's
-  // control split so its materialized value dominates every successor; Jeandle
-  // emits a real invoke with a single normal dest on one critical edge, so the
-  // NewInv dominates only that edge. The transform's critical-edge pre-pass keys
-  // `PHRename`/`BlockRename` by (PH, TargetMergeBB) so two per-pred mats from the
-  // same PH to different merges do not collide, and `MatPerBlock`/`BlockRename`
-  // chain walks route each merge's CreatePHI incoming through its own edge.
+  // The target merge block this per-pred materialize is destined for (the
+  // merge whose `MergeProcessor::BB` was in scope at emission), or null for the
+  // Case-A / global path. Used ONLY as the leading dimension of the per-pred
+  // placeholder cache key (PH, TargetMergeBlock, ID) inside
+  // getOrCreatePerPredMatPlaceholder — it does NOT route per-pred materializes
+  // through a per-edge SSA value. Today every per-pred materialize's
+  // InsertBefore is the analysis-time SafeIP = PH->getTerminator()
+  // (ComputeSafeIP returns the PH terminator for both the per-pred and
+  // Case-A paths), shared by Case-A and per-pred alike, and at apply the
+  // materialized-object merge PHI that would have consumed a per-edge value
+  // is SKIPPED (CreatePHIEffect::apply Case 1 — OrigAlloc is the single SSA
+  // value on every path and would trivially fold), so per-pred distinctness
+  // survives only via the analysis-side cache key and per-effect
+  // NewInvOf[SourceEffect] receiver lookup in the lock-cascade path.
+  // IsPerPred + PerPredPlaceholder are the live flags, set in
+  // materializeAtPredFromExitInfo via SetEffectFlags.
   BasicBlock *TargetMergeBB = nullptr;
 
   Kind getKind() const override { return Kind::Materialize; }
@@ -669,9 +693,16 @@ public:
   std::unique_ptr<Effect> clone() const override {
     return std::make_unique<MaterializeEffect>(*this);
   }
-  // Critical-edge pre-pass re-aims a per-pred Materialize onto the split edge
-  // block (IR-form divergence: Graal routes per-pred materialize to the pred's
-  // block directly during analysis; Jeandle re-aims at transform time).
+  // Setter for the effect's home block. Currently UNUSED — Block is assigned
+  // directly at emission (E->Block = SafeIP->getParent() in materializeAt,
+  // PartialEscapeAnalysis.cpp), where SafeIP = PH->getTerminator() for per-pred
+  // or the escape-point instruction for the live path, and is NEVER re-aimed at
+  // apply. reuse-OrigAlloc needs no per-edge carve-out: OrigAlloc dominates
+  // every escape point by SSA (see applyMaterialize's assert that the
+  // materialized value equals VObj.AllocationCall). (IR-form divergence from
+  // Graal: Graal routes the per-pred CommitAllocationNode to the pred's block
+  // directly during analysis; Jeandle places it once and lets OrigAlloc
+  // dominate.) Retained for symmetry with the other Effect subclasses.
   void setBlock(BasicBlock *BB) { Block = BB; }
   // Defined out-of-line: assigning to the WeakTrackingVH needs Instruction to
   // be a complete type (Instruction* → Value* derived-to-base), which it is
@@ -698,28 +729,33 @@ public:
   }
 };
 
-// Re-derive a loop/merge-carried DERIVED pointer (GEP/bitcast of a virtual
-// object) at the per-predecessor materialization point and rewire the carrying
-// PHI's incoming to it. This is Jeandle's extension of Graal
+// Structural marker for a loop/merge-carried DERIVED pointer (GEP/bitcast of a
+// virtual object). This would have been Jeandle's extension of Graal
 // getAliasAndResolve + setPhiInput (PartialEscapeClosure.java) to LLVM derived
 // pointers, which have no Graal analog: Graal only ever carries object-identity
 // aliases, so its merge re-derivation hands back the materialized object
 // directly; LLVM can carry a field address (a GEP with a byte offset), so the
-// re-derivation must replay that offset over the freshly-materialized base.
-// Non-cfgKill (Pass 1); must sort strictly after the per-pred Materialize in
-// the same block bucket so NewInv is recorded before apply.
+// re-derivation would replay that offset over the freshly-materialized base.
+//
+// UNDER REUSE-OrigAlloc, apply() is a NO-OP (see RewritePhiIncomingEffect::apply,
+// "Nothing to re-derive"): OrigAlloc is KEPT for PartiallyEscapes and
+// dominates the body GEP, so the GEP stays valid as-is and the carrying PHI's
+// incoming is left unchanged. The effect is retained as a structural marker
+// (emitted only by the Case-A path in processBlockPhis) for the day a future
+// reuse-OrigAlloc-undoing model needs to re-derive the carry; today the fields
+// below are diagnostic only. Non-cfgKill (Pass 1).
 class RewritePhiIncomingEffect : public Effect {
 public:
   PHINode *Phi = nullptr;              // the existing carrying PHI (already in IR)
   BasicBlock *Pred = nullptr;          // analyzer-recorded predecessor (e.g. latch)
-  Value *PerPredPlaceholder = nullptr; // resolves to this pred's NewInv at apply
-  int64_t ByteOffset = 0;   // constant byte offset of the carry from OrigAlloc
-                            // (0 = bitcast/identity -> reuse NewInv directly)
+  Value *PerPredPlaceholder = nullptr; // diagnostic: the pred's placeholder (nop at apply)
+  int64_t ByteOffset = 0;   // diagnostic: constant byte offset of the carry from
+                            // OrigAlloc (unused: GEP stays valid, no replay)
   // Always null for this effect: RewritePhiIncoming is created only by the
-  // Case-A path (processBlockPhis, SkipGlobalRAUW=false), whose mat is placed at
-  // the pred's terminator end (NewInv dominates all successors, shared flip). The
-  // transform's `BlockRename` chain walk keys by (LivePred, TargetMergeBB); null
-  // here routes through the single shared MatCont (no critical-edge split).
+  // Case-A path (processBlockPhis). Under reuse-OrigAlloc the Case-A mat is
+  // placed at the pred's terminator end (SafeIP = PH->getTerminator()) and
+  // apply does nothing, so there is no per-edge value to key or route — the
+  // field stays null and is diagnostic only.
   BasicBlock *TargetMergeBB = nullptr;
 
   Kind getKind() const override { return Kind::RewritePhiIncoming; }
@@ -739,17 +775,33 @@ public:
 // reference. Non-cfgKill (Pass 1). A field whose value is ANOTHER in-scope VO
 // is emitted as a VORef FIELD (vo-id) so the descriptor graph can be cyclic /
 // transitive (mirrors C2/Graal nested ObjectValue + id back-ref). Scope of
-// the current implementation: instance objects (no arrays), not synthetic,
-// referenced as the OrigAlloc (not a derived pointer), with fields that are
-// either plain scalars or VORefs to other describable VOs. A reference field
-// pointing at a non-VO/materialized value, arrays, long/double two-slot
-// encoding, and multi-scope/inlinee bundles are still intentionally deferred
-// (TODO(pea-deopt-deferred)) — the analyzer bails those (and contagiously
-// bails any VO referencing a bailed VO, so no dangling VORef is ever emitted).
-// A VO HOLDING A LOCK at the safepoint IS described: its PEA-eliminated lock
-// is reconstructed at deopt by rewriting the bundle's monitor entry to
+// the current implementation: instance objects AND arrays (whose element kind
+// the VMCallback could classify — ArrayElementType != nullptr &&
+// ArrayIndexScale != 0), not synthetic, referenced as the OrigAlloc (not a
+// derived bundle operand), with fields/elements that are plain scalars,
+// VORefs to other describable VOs, or describable wide-oop (addrspace-1)
+// reference values to non-VO (argument/null/materialized-external) oops. A
+// touched long/double field is described with ONE wire entry carrying the
+// full i64/f64 value; the HotSpot parser's fill_one_scope_value T_LONG/
+// T_DOUBLE branch expands it to the two field_values slots. A VO HOLDING A
+// LOCK at the safepoint IS described: its PEA-eliminated lock is
+// reconstructed at deopt by rewriting the bundle's monitor entry to
 // eliminated=true with a VORef owner (the transform handles monitor-object
 // OrigAlloc slots in step 3).
+//
+// Intentionally deferred — the analyzer bails these (and contagiously bails
+// any VO referencing a bailed VO, so no dangling VORef is ever emitted):
+//   - a DERIVED bundle operand (V != AllocationCall, not a virtual alias;
+//     see the Banned set built in recordDeoptBundleMappings);
+//   - an array whose element kind the VMCallback could not classify
+//     (ArrayElementType == nullptr || ArrayIndexScale == 0);
+//   - a narrow-oop (addrspace-3) reference field (CompressedOops,
+//     TODO(compressed-oop));
+//   - a non-null constant oop field (would trip HotSpot
+//     fill_one_scope_value);
+//   - multi-scope/inlinee deopt bundles: the flat Inputs walk does not
+//     split by scope today (see docs/Jeandle-PEA-Review.md §3 #7 for the
+//     residual soundness gap, deferred).
 //
 // Graal analog: addVirtualMapping (PartialEscapeClosure.java) records a
 // FrameState's reference to a still-virtual object as a virtual mapping
@@ -826,8 +878,9 @@ public:
   Effect &operator[](size_t I) { return *Effects[I]; }
   const Effect &operator[](size_t I) const { return *Effects[I]; }
 
-  // IR-form extension: remove and return ownership of element I (critical-edge
-  // bucket move in the transform pre-pass).
+  // IR-form extension: remove and return ownership of element I. Used by
+  // processBlock's PendingMergePhis drain to move synthesized Case-B PHI
+  // effects into BlockEffects in SeqNo order.
   std::unique_ptr<Effect> spliceOut(size_t I) {
     auto E = std::move(Effects[I]);
     Effects.erase(Effects.begin() + I);
@@ -893,23 +946,59 @@ public:
 
   DenseMap<BasicBlock *, EffectList> BlockEffects;
 
-  // Locks to re-emit at each escape point (the shared InsertBefore of a
-  // materialize / cascade group), globally sorted ascending by BytecodeDepth,
-  // and the highest MaterializeEffect SeqNo at each escape point. Graal
-  // flattens every lock materialized at one point into a single
+  // Locks to re-emit at each escape point, globally depth-sorted ascending by
+  // BytecodeDepth, plus the highest MaterializeEffect SeqNo at each escape
+  // point. Graal flattens every lock materialized at one point into a single
   // CommitAllocationNode and lowers them globally depth-sorted with a strict-
   // increase guarantee (DefaultJavaLoweringProvider). Jeandle's per-VO
-  // MaterializeEffect model otherwise re-emits per-effect, which mis-orders
-  // re-entrant interleaved cascades (e.g. [a@0,b@1,a@2,c@3] re-emitting as
-  // 0,2,1,3). The transform emits each escape point's merged list once, from
-  // its highest-SeqNo effect (by then every sibling's NewInv exists), each
-  // lock's receiver resolved via NewInvOf[SourceEffect] (with NewAllocFor
-  // / NewInv fallbacks). Both live-path and per-pred cascades are merged:
-  // per-pred effects sharing a (PH,S) edge are re-aimed onto one split-edge
-  // block by the critical-edge pre-pass (or already share the single-succ
-  // pred's terminator), so they group under one InsertBefore identically to a
-  // live-path cascade. Populated by computeEscapePointLocks(), called once
-  // before the transform applies Pass 1.
+  // MaterializeEffect model otherwise would re-emit per-effect, which
+  // mis-orders re-entrant interleaved cascades (e.g. [a@0,b@1,a@2,c@3]
+  // re-emitting as 0,2,1,3).
+  //
+  // The transform's tail-effect path emits an escape point's merged list once,
+  // from the highest-SeqNo MaterializeEffect among those SHARING the SAME
+  // analysis-time InsertBefore Instruction* pointer (the locked re-emit loop
+  // in applyMaterialize/processEscapePointLocks, gated on
+  // E.SeqNo == MaxSeqForEscapePoint[Key]). Each lock's receiver is resolved
+  // via the single map NewInvOf[ML.SourceEffect], asserted non-empty — NO
+  // fallback chain.
+  //
+  // GROUPING RULE (live today — there is NO critical-edge pre-pass): grouping
+  // is purely by the MaterializeEffect::InsertBefore Instruction*.
+  // computeEscapePointLocks only merges effects that share the SAME
+  // analysis-time InsertBefore pointer; effects whose Count[InsertBefore] < 2
+  // are silently routed to per-effect emit (the Count<2 early-out in
+  // computeEscapePointLocks).
+  //
+  // For per-pred materializations, SafeIP = PH->getTerminator() (analysis
+  // time, returned by ComputeSafeIP), so every per-pred materialize emitted
+  // FROM THE SAME predecessor PH shares one InsertBefore pointer and a
+  // single-PH per-pred cascade therefore groups under one InsertBefore
+  // exactly like a live-path cascade. Two distinct edge targets from the same
+  // PH ALSO share that same terminator key — there is NO per-merge
+  // bucketing; this is sound only because the materialized-object merge PHI
+  // is SKIPPED at apply (CreatePHIEffect::apply Case 1), so cross-merge
+  // placeholder identity has no observable lock effect.
+  //
+  // CROSS-PH per-pred cascades — multiple per-pred materializes from different
+  // PHs feeding the same escape point or merge — do NOT merge today: they
+  // fall through the Count<2 early-out to per-effect emit, where only
+  // intra-effect self-sort (by BytecodeDepth in captureMaterializedLocks) is
+  // guaranteed. Cross-object interleaved-lock ordering is therefore NOT
+  // preserved by EscapePointLocks today — see docs/Jeandle-PEA-Review.md
+  // §3 #3/#4 for the residual soundness gap (out of scope for the §7
+  // documentation pass that corrected this comment; the bug itself is
+  // deferred).
+  //
+  // OrigInsertBefore (captured by the TransformContext in run() before Pass 1)
+  // records the analysis-time InsertBefore before any eager-update re-aim by
+  // relocateDependentMaterializes; the lock key is exactly this captured
+  // pointer (looked up via OrigInsertBefore.lookup(&E) — a re-aimed
+  // E.InsertBefore could otherwise miss the key and fall to per-effect emit,
+  // mis-ordering the runtime lock stack).
+  //
+  // Populated by computeEscapePointLocks(), called once before Pass 1 from
+  // the TransformContext setup in run().
   DenseMap<Instruction *, SmallVector<MergedLock, 4>> EscapePointLocks;
   DenseMap<Instruction *, uint32_t> MaxSeqForEscapePoint;
   void computeEscapePointLocks();
@@ -954,12 +1043,16 @@ public:
 
   // Per-pred materialization placeholder Value*s synthesized by the analyzer
   // (one per (predecessor-block, ObjectID) materialization). Distinct
-  // unparented instructions that stand in for the per-pred NewInv the
-  // transform creates; resolved away (never inserted into IR) at apply time
-  // via MatPerBlock / NewAllocFor. Same ownership rules as OwnedPhis: the
-  // transform never inserts them, so the destructor deletes any handle still
-  // non-null and unparented at teardown. WeakTrackingVH guards against a UAF
-  // if a placeholder is ever erased. See Effect::PerPredPlaceholder.
+  // unparented instructions that mark which predecessor a per-pred
+  // materialize belongs to for the lock-cascade key. Under reuse-OrigAlloc
+  // they are resolved away (never inserted into IR) at apply time: the
+  // materialized-object merge PHI that would have carried them is SKIPPED
+  // (CreatePHIEffect::apply Case 1), so a placeholder never becomes a PHI
+  // incoming — it is flushed here at teardown.
+  // Same ownership rules as OwnedPhis: the transform never inserts them, so
+  // the destructor deletes any handle still non-null and unparented at
+  // teardown. WeakTrackingVH guards against a UAF if a placeholder is ever
+  // erased. See MaterializeEffect::PerPredPlaceholder.
   SmallVector<WeakTrackingVH, 4> OwnedMatPlaceholders;
 
   // Membership view of OwnedMatPlaceholders for O(1) "is this Value a per-pred

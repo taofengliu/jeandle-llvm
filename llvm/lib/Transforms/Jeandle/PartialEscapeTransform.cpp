@@ -11,9 +11,9 @@
 // Graal's EffectList.apply(graph, obsoleteNodes, cfgKills)).
 //
 //   Pass 1 (non-cfgKill): ReplaceLoad, ReplaceCall, EliminateStore,
-//   Materialize, CreatePHI — applied per-block in RPO via EffectList::apply,
-//   which sorts by SeqNo and dispatches each effect's apply() through
-//   TransformContext.
+//   Materialize, CreatePHI, RewriteDeoptBundle, RewritePhiIncoming — applied
+//   per-block in RPO via EffectList::apply, which sorts by SeqNo and
+//   dispatches each effect's apply() through TransformContext.
 //
 //   Pass 2 (cfgKill): EliminateAllocation — rewrites a NeverEscapes invoke
 //   alloc into an unconditional branch (dropping the unwind edge) or plain-

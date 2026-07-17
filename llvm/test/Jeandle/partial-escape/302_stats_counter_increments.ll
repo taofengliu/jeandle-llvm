@@ -52,8 +52,16 @@ u:
 ; counter, formatted as `<count> <DEBUG_TYPE> - <description>`. We match on
 ; the descriptions defined in PartialEscapeAnalysis.cpp's STATISTIC macros.
 ; CHECK-DAG: partial-escape-analysis - Number of virtual objects PEA created
-; CHECK-DAG: partial-escape-analysis - Number of allocations eliminated by PEA
+; CHECK-DAG: partial-escape-analysis - Number of allocations eliminated (erased) by PEA
 ; CHECK-DAG: partial-escape-analysis - Number of materializations emitted by PEA
 ; CHECK-DAG: partial-escape-analysis - Materializations for unhandled instruction (escape point)
+;
+; JeandlePEAEliminated counts ONLY NeverEscapes allocations (= erased): here
+; t_stats_virt's allocation is fully eliminated (count 1), while t_stats_mat's
+; allocation PartiallyEscapes and OrigAlloc is KEPT alive by the transform
+; (count 0) — so the total eliminated count is 1, matching what -stats prints.
+; The PartiallyEscapes case is suppressed by
+; EliminateAllocationEffect::apply (see PartialEscapeTransform.cpp:541-542) and
+; MUST NOT be counted, only NeverEscapes are erased.
 
 !java-method-compilation = !{}

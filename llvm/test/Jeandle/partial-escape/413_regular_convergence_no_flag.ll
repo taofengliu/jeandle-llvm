@@ -54,7 +54,7 @@ u:
 
 ; The Regular fixpoint converged: the allocation is eliminated and the load
 ; folded to the stored constant 99.
-; CHECK-DAG: partial-escape-analysis - Number of allocations eliminated by PEA
+; CHECK-DAG: partial-escape-analysis - Number of allocations eliminated (erased) by PEA
 ; The escalation counter must be ZERO (absent from -stats), i.e. Regular mode
 ; converged without falling back to MATERIALIZE_ALL.
 ; CHECK-NOT: Regular -> MaterializeAll mode flips

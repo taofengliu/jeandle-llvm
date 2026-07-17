@@ -259,15 +259,18 @@ enum class JeandleInlineReason : int {
 ///                         autobox wrapper classes (java.lang.Boolean,
 ///                         Byte, Character, Short, Integer, Long, Float,
 ///                         Double); returns JBasicType::Count (9) for any
-///                         other klass or null input. Used by partial
-///                         escape analysis to mark a virtual Instance VO
-///                         as a "boxed primitive" so the icmp eq fold can
-///                         perform a structural value comparison
-///                         (mirroring Graal's VirtualBoxingNode +
-///                         ObjectEqualsNode boxed path), and so
-///                         materialization can route through the
-///                         box-cache valueOf entry point rather than a
-///                         fresh allocation.
+///                         other klass or null input. Currently UNUSED by
+///                         partial escape analysis (the frontend does not
+///                         inline the valueOf intrinsic that a boxing fold
+///                         would depend on, per the "no special-
+///                         optimization unsupported by the frontend" rule).
+///                         It is wired into the callback table and recorded
+///                         by the .cblog fixtures in anticipation of a
+///                         future structural icmp-eq boxed-primitive fold
+///                         mirroring Graal's VirtualBoxingNode +
+///                         ObjectEqualsNode boxed path; until that lands it
+///                         must stay conservatively "not boxed" for every
+///                         PEA query.
 ///   HasFinalizer         — Returns true iff the klass has a non-trivial
 ///                         finalize() method (HotSpot's
 ///                         InstanceKlass::has_finalizer()). Mirrors
