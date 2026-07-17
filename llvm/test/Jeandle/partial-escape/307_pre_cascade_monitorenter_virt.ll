@@ -43,14 +43,16 @@ u:
   resume i64 %lp
 }
 
-; Both A and B must be materialised. Each materialize re-emits its surviving
-; monitorenter then the sink consumes it (per-object grouping).
+; Both A and B are retained (OrigAlloc reused). Each object's surviving
+; monitorenter is re-emitted onto its OrigAlloc then the sink consumes OrigAlloc
+; (per-object grouping, source order A before B).
 ; CHECK-LABEL: define void @pre_cascade
-; CHECK: %[[MATA:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MATA]],
-; CHECK: call void @sink(ptr addrspace(1) %[[MATA]])
-; CHECK: %[[MATB:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MATB]],
-; CHECK: call void @sink(ptr addrspace(1) %[[MATB]])
+; CHECK: %a = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
+; CHECK: %b = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %a,
+; CHECK: call void @sink(ptr addrspace(1) %a)
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %b,
+; CHECK: call void @sink(ptr addrspace(1) %b)
+; CHECK-NOT: invoke hotspotcc{{.*}}@jeandle.new_instance
 
 !java-method-compilation = !{}

@@ -4,24 +4,15 @@
 ; §1.4 deepest/nearest-dominating-def selection in resolveMaterializedUses.
 ;
 ; A loop-local object %X is allocated in the loop body and escapes on BOTH arms
-; of an in-body diamond (@sink on each), so each arm materializes its OWN NewInv
-; (pea.mat / pea.mat2) and the arm-merge synthesizes a materialized-ptr PHI
-; (pea.materialized.phi, RAUWOrigToPHI). The object is then carried across the
-; back-edge by the header PHI %px. Defs[%X] therefore holds THREE defs: the
-; arm-merge pea.materialized.phi and the two per-arm NewInvs. The surviving
-; in-body @use must resolve to the NEAREST dominating def — the arm-merge
-; pea.materialized.phi — never to an arm NewInv that dominates only its own arm,
-; and never to a stale earlier-in-RPO def.
-;
-; The §1.4 miscompile IS reachable today: tests 130/133/176 exercise the
-; header-carried materializedValuePhi + a body/global NewInv co-dominating a
-; surviving use, where the old "first dominating def" picked the wrong (earlier)
-; def. This test adds a distinct shape — a multi-arm in-body diamond whose
-; arm-merge materialized.phi is the nearest dominating def of the post-merge
-; @use, with two per-arm NewInvs that each dominate only their own arm. The
-; deepest-def selection binds @use to the arm-merge phi (the dominator-tree
-; leaf), never to an arm NewInv, never to a stale earlier-in-RPO def. See
-; docs/Jeandle-PEA-Review.md §1.4.
+; of an in-body diamond (@sink on each). Under the reuse-OrigAlloc model the
+; ORIGINAL allocation %X dominates both arms and the post-merge use, so it is
+; the single sound SSA def: each arm's sink AND the in-body @use all bind to
+; OrigAlloc %X. No per-arm materialization invoke is emitted and no
+; materialized-object PHI is synthesized, so there is no multi-def ambiguity
+; for resolveMaterializedUses to resolve — @use cannot be mis-bound to a
+; non-dominating or stale def, and no poison is introduced. (The object is
+; still carried across the back-edge by the header PHI %px, which is unrelated
+; to materialization.)
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -63,14 +54,15 @@ u:
   resume i64 %lp
 }
 
-; The arm-merge builds a materialized-ptr PHI over the two per-arm NewInvs, and
-; the post-merge in-body @use must bind to THAT phi (the nearest dominating def),
-; not to either arm NewInv.
+; The single OrigAlloc %X dominates both arms and the post-merge @use; every
+; sink and the in-body @use bind to %X — no PHI, no poison.
 ; CHECK-LABEL: define void @test_414_deepest_def
-; CHECK: %[[MAT1:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance
-; CHECK: %[[MAT2:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance
-; CHECK: %[[PHI:pea\.materialized\.phi[0-9]*]] = phi ptr addrspace(1)
-; CHECK: call void @use(ptr addrspace(1) %[[PHI]])
+; CHECK: %X = invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK-NOT: invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK: call void @sink(ptr addrspace(1) %X)
+; CHECK: call void @sink(ptr addrspace(1) %X)
+; CHECK-NOT: = phi ptr addrspace(1)
+; CHECK: call void @use(ptr addrspace(1) %X)
 ; CHECK-NOT: poison
 
 !java-method-compilation = !{}

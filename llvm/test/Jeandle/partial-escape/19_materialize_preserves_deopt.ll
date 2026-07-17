@@ -1,13 +1,15 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA is intentionally deopt-agnostic until the Jeandle deopt refactor
-; lands: the materialization invoke must NOT carry any "deopt" operand
-; bundle, regardless of whether the bundle was on the allocation or on
-; the escape sink. The DeoptBundleSource field on the analyzer's Effect
-; is still set (so the deopt refactor can re-engage it later), but the
-; transform drops "deopt" when copying bundles onto NewInv. Here the
-; allocation carries a "deopt" bundle and the sink does not; the
-; materialization invoke must end up with no operand bundles at all.
+; reuse-OrigAlloc model: a PartiallyEscapes object materializes by replaying
+; its field stores onto its ORIGINAL allocation (OrigAlloc), which is kept
+; alive. No fresh materialization invoke is emitted, so there is no question
+; of "dropping" a deopt bundle from a new invoke — the original allocation's
+; own deopt operand bundle is preserved verbatim (the whole point of the
+; model: a freshly-emitted jeandle.new_instance at a materialization point
+; could not get the right deopt state, but the original allocation site
+; already carries it). Here the allocation carries a "deopt" bundle and the
+; sink does not; after PEA the original invoke (with its bundle) is retained
+; and the sink receives OrigAlloc directly.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -28,8 +30,10 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_mat_deopt
-; CHECK: %pea.mat = invoke {{.*}}@jeandle.new_instance(ptr {{.*}}, i32 16)
-; CHECK-NEXT: to label %{{.*}} unwind label %{{.*}}
-; CHECK: call void @sink
+; The original allocation invoke is RETAINED with its deopt bundle intact.
+; CHECK: = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr {{.*}}, i32 16) [ "deopt"(i32 42) ]
+; CHECK: to label %{{.*}} unwind label %{{.*}}
+; The sink receives the original allocation directly (no pea.mat).
+; CHECK: call void @sink(ptr addrspace(1) %o)
 
 !java-method-compilation = !{}

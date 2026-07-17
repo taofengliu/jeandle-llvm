@@ -2,11 +2,11 @@
 
 ; Alloc-dominates fast path with escapes on BOTH arms via DIFFERENT
 ; sink calls. The mergeStates "AllMaterialized" branch fires (every incoming
-; has the object Materialized). Because every incoming's MaterializedValue
-; resolves to the same OrigAlloc placeholder, no ptr addrspace(1) PHI is
-; needed at the merge; RAUW makes both materializations point at the live
-; invoke. (This exercises the AllMaterialized fast path alongside the
-; alloc-dominates invariant.)
+; has the object Materialized). Under the reuse-OrigAlloc model every
+; incoming's MaterializedValue resolves to the same ORIGINAL allocation
+; (OrigAlloc), which dominates both arms and the merge, so no fresh
+; materialization invoke is emitted and no ptr addrspace(1) PHI is needed at
+; the merge: both sinks and the return consume OrigAlloc.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink1(ptr addrspace(1))
@@ -35,12 +35,13 @@ u:
 }
 
 ; CHECK-LABEL: define ptr addrspace(1) @test_both_arms_escape
-; Each arm escapes and materializes at its own sink; the merge builds a PHI.
+; Exactly one allocation invoke (the original, retained); each arm's sink and
+; the return consume OrigAlloc; no materialized-object PHI at the merge.
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
-; CHECK: call void @sink1
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
-; CHECK: call void @sink2
-; CHECK: = phi ptr addrspace(1)
-; CHECK: ret ptr addrspace(1)
+; CHECK-NOT: invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK: call void @sink1(ptr addrspace(1) %o)
+; CHECK: call void @sink2(ptr addrspace(1) %o)
+; CHECK-NOT: = phi ptr addrspace(1)
+; CHECK: ret ptr addrspace(1) %o
 
 !java-method-compilation = !{}

@@ -1,13 +1,21 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; findOrSynthesizeUnwindDest PHI reuse. %uw has TWO invoke
-; predecessors (the alloc %o and a second invoke) and a USED PHI over them.
-; When %o escapes it is materialized; the materialization invoke's unwind dest
-; is chosen by findOrSynthesizeUnwindDest. Before the fix, Strategy 1 reused %uw
-; verbatim without checking phis().empty(), so the new invoke made its block a
-; predecessor of %uw with no matching PHI incoming — a PHI/predecessor mismatch
-; the verifier rejects (the PHI is used, so it is not DCE'd). After the fix, a
-; PHI-carrying unwind dest is not reused: a synthesized pea.unwind block is.
+; findOrSynthesizeUnwindDest PHI reuse under the reuse-OrigAlloc model. %uw
+; has TWO invoke predecessors (the alloc %o and a second may_throw invoke)
+; and a USED PHI (`%sel`) over them.
+;
+; Historically, when %o escaped and was materialized, the fresh materialization
+; invoke needed an unwind dest; Strategy 1 reused %uw verbatim without
+; checking phis().empty(), making its block a predecessor of %uw with no
+; matching PHI incoming -- a PHI/predecessor mismatch the verifier rejects.
+; After the fix, a PHI-carrying unwind dest was not reused; a synthesized
+; pea.unwind block was.
+;
+; Under reuse-OrigAlloc there is NO fresh materialization invoke -- the
+; original allocation %o is retained with its ORIGINAL unwind dest %uw -- so
+; no unwind-dest choice is made at all. %uw keeps exactly its two original
+; predecessors (entry, cont) and its `%sel` PHI is intact; no pea.unwind block
+; is synthesized. The escape consumes %o directly.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @may_throw()
@@ -33,11 +41,17 @@ uw:
 }
 
 ; CHECK-LABEL: define void @test_unwind_dest_phi_reuse
-; The materialization invoke must unwind to a synthesized pea.unwind block
-; (not the PHI-carrying %uw), so the module verifies and %uw's PHI is not
-; corrupted by a path-wrong incoming.
+; The original allocation invoke is retained with its original unwind dest
+; %uw (no fresh materialize invoke, so no unwind-dest choice is made).
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
-; CHECK: to label %mat.cont unwind label %pea.unwind
-; CHECK: call void @sink(ptr addrspace(1)
+; CHECK: to label %cont unwind label %uw
+; The escape consumes OrigAlloc %o directly (no materialize invoke inserted).
+; CHECK: call void @sink(ptr addrspace(1) %o)
+; %uw's PHI is intact with exactly its two original predecessors (entry, cont)
+; -- no synthesized pea.unwind block was needed and the PHI was not corrupted
+; by a path-wrong incoming.
+; CHECK: %sel = phi i32 [ 0, %entry ], [ 1, %cont ]
+; CHECK-NOT: pea.unwind
+; CHECK-NOT: pea.mat = invoke
 
 !java-method-compilation = !{}

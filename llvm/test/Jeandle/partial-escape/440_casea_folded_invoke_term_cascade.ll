@@ -2,13 +2,15 @@
 
 ; Case-A CASCADE: two objects %o1 (array) and %o2 (instance), both virtual on
 ; `else` and absent on `then`, both Case-A-materialized at `else`'s terminator
-; — a folded jeandle.arraylength invoke on %o1. The eager-update hook re-aims
-; BOTH cascade members' InsertBefore off the erased invoke onto the `br`
-; replacement (re-indexing each into the `br`'s bucket). The two materialize
-; invokes then chain at the `br` (the `br` is reparented by successive
-; splitBasicBlock calls, never erased): else -> pea.mat -> mat.cont ->
-; pea.mat2 -> mat.cont1 -> br merge. Without the eager update, both members'
-; InsertBefore null and applyMaterialize's assert fires.
+; — a folded jeandle.arraylength invoke on %o1. The eager-update hook
+; (`relocateDependentMaterializes`) re-aims BOTH cascade members' InsertBefore
+; off the erased invoke onto the in-block successor. Without the eager update,
+; both members' InsertBefore would be null and applyMaterialize's assert fires.
+;
+; Under reuse-OrigAlloc neither object is re-materialized: the ORIGINAL
+; allocation invokes (OrigAlloc %o1 and OrigAlloc %o2) are both KEPT (no fresh
+; pea.mat invokes). The folded arraylength invoke is erased, and `else`
+; becomes a plain br to %merge. The merge PHIs and sink calls are preserved.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
@@ -50,17 +52,18 @@ u2:
 !java-method-compilation = !{}
 
 ; CHECK-LABEL: define void @casea_folded_invoke_term_cascade
+; The folded arraylength invoke is erased.
 ; CHECK-NOT: @jeandle.arraylength
-; The two materializations chain at the `br` (re-aimed off the erased
-; arraylength-invoke terminator): else -> pea.mat -> mat.cont -> pea.mat2.
+; Both ORIGINAL allocation invokes are RETAINED (no fresh materialization).
+; CHECK: %o1 = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 7, i32 44, i32 16, i32 1048576)
+; CHECK: %o2 = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
+; No pea.mat materialization invoke is emitted.
+; CHECK-NOT: pea.mat = invoke
+; The else block is now just a plain br to merge (no mat.cont chaining).
 ; CHECK: else:
-; CHECK-NEXT: %{{.*}} = invoke hotspotcc{{.*}}@jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 7, i32 44, i32 16, i32 1048576)
-; CHECK-NEXT: to label %mat.cont unwind label %u1
-; CHECK: mat.cont:
-; CHECK-NEXT: %{{.*}} = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
-; CHECK-NEXT: to label %mat.cont{{.*}} unwind label %u2
-; CHECK: mat.cont{{.*}}:
 ; CHECK-NEXT: br label %merge
-; CHECK: merge:
-; CHECK: %p1 = phi ptr addrspace(1) [ null, %{{.*}} ], [ %{{.*}}, %mat.cont{{.*}} ]
-; CHECK: %p2 = phi ptr addrspace(1) [ null, %{{.*}} ], [ %{{.*}}, %mat.cont{{.*}} ]
+; The merge PHIs and sink calls are preserved.
+; CHECK: %p1 = phi ptr addrspace(1) [ null, %then ], [ %o1, %else ]
+; CHECK: %p2 = phi ptr addrspace(1) [ null, %then ], [ %o2, %else ]
+; CHECK: call void @sink(ptr addrspace(1) %p1)
+; CHECK: call void @sink(ptr addrspace(1) %p2)

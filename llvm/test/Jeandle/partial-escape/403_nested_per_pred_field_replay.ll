@@ -1,21 +1,22 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Nested per-pred materialization. `outer` is virtual on both merge preds with
-; lock counts 0 (left) / 1 (right) — a lock mismatch — AND outer.field (offset
-; 8) holds a SECOND virtual object `inner`. At the merge, the lock mismatch
-; drives materializeAndBuildPhi(outer), which per-pred-materializes outer at
-; left and right; the recursive prerequisite inside each per-pred materialize
-; then per-pred-materializes `inner` at the same pred.
+; Nested per-pred materialization under the reuse-OrigAlloc model. `outer`
+; (11111) is virtual on both merge preds with lock counts 0 (left) / 1
+; (right) -- a lock mismatch -- AND outer.field (offset 8) holds a SECOND
+; virtual object `inner` (22222).
 ;
-; The field store replayed by outer's materialize at each pred must store THAT
-; pred's OWN inner-NewInv into that pred's outer-NewInv. The field-replay value
-; is inner's OrigAlloc on both the live and per-pred paths; the transform's
-; point-sensitive resolution sub-pass (resolveMaterializedUses) rewrites each
-; replayed store to the inner NewInv that dominates it — left's store to left's
-; inner-NewInv, right's to right's — recovering per-pred distinctness via
-; dominance (Jeandle's analog of Graal getAliasAndResolve). No eager per-effect
-; substitution is used: it would be last-write-wins across the two per-pred
-; inner-NewInvs and miscompile this case.
+; Historically the lock mismatch drove per-pred materialization of outer at
+; each pred, recursively per-pred-materializing inner at the same pred, with
+; each pred's field store replaying that pred's OWN inner-NewInv into its
+; outer-NewInv, reconciled by materializedValuePhis.
+;
+; Under reuse-OrigAlloc the ORIGINAL allocation invokes (%outer, %inner) are
+; both KEPT and dominate every escape. The lock mismatch no longer allocates
+; fresh invokes: the right-arm monitorenter is re-emitted onto %outer in
+; `right`, and the outer.f=inner field store is replayed onto %outer (with
+; %inner as the value) at each materialization point (left and right). No
+; %pea.mat, no materialized-object PHI, no critical-edge split. The escape
+; consumes %outer directly.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
@@ -53,14 +54,19 @@ u:
   resume i64 %lp
 }
 
-; outer (11111) and inner (22222) each materialize per-pred; a materializedValuePhi
-; selects outer's per-pred NewInvs; the un-elided enter on right snaps to right's
-; outer-NewInv; sink consumes the PHI. Verifier-clean (no abort).
 ; CHECK-LABEL: define void @test_nested_per_pred_field_replay
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr)
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr)
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %{{[^,]+}}, ptr %lock)
-; CHECK: %[[PHI:[A-Za-z0-9._]+]] = phi ptr addrspace(1)
-; CHECK: call void @sink(ptr addrspace(1) %[[PHI]])
+; Both original allocation invokes are retained (outer, then inner).
+; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
+; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
+; No fresh materialization invokes and no critical-edge splits anywhere.
+; CHECK-NOT: pea.mat = invoke
+; CHECK-NOT: pea.crit.split
+; The outer.f=inner field store is replayed onto OrigAlloc %outer with %inner
+; as the value, and the right-arm lock is re-emitted on %outer.
+; CHECK: getelementptr inbounds i8, ptr addrspace(1) %outer, i64 8
+; CHECK: store atomic ptr addrspace(1) %inner, ptr addrspace(1) %{{.*}} unordered, align 8
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %outer, ptr %lock)
+; The escape (merge sink) consumes OrigAlloc %outer directly.
+; CHECK: call void @sink(ptr addrspace(1) %outer)
 
 !java-method-compilation = !{}

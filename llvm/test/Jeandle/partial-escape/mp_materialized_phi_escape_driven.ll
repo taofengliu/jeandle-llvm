@@ -1,21 +1,15 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; MergeProcessor / mergeObjectState AllMaterialized with a UNIQUE pointer
-; (escape-driven, NO materializedValuePhi).
+; MergeProcessor / mergeObjectState AllMaterialized under the reuse-OrigAlloc
+; model (escape-driven, NO materializedValuePhi).
 ;
-; Both arms escape the same virtual object via a sink call. Each escape
-; triggers a materialization hoisted to the common dominator (the branch),
-; so at the merge EVERY predecessor reports the object Materialized with the
-; SAME pointer. mergeObjectState therefore takes the uniqueMaterializedValue
-; branch (Graal PartialEscapeClosure.java:982-983) and installs the state
-; directly — NO ptr addrspace(1) materializedValuePhi is synthesized.
-;
-; This is the structural CONTRAST to 254/363 (lock-driven): a lock-count
-; mismatch forces PER-PRED materialization (distinct NewInvs) and builds a
-; materializedValuePhi, whereas escape-driven materialization shares one
-; pointer and installs directly. Pinning the no-PHI outcome here guards the
-; refactor's materializeAndBuildPhi routing: escapes must NOT be misrouted
-; into the PHI-synthesis else-branch.
+; Both arms escape the same virtual object via a sink call. Under reuse-OrigAlloc
+; the ORIGINAL allocation dominates both arms and the merge, so it is the single
+; sound SSA value kept alive; no fresh materialization invoke is emitted and no
+; ptr addrspace(1) materializedValuePhi is synthesized at the merge. Both sinks
+; and the return consume OrigAlloc directly. Pinning the no-PHI outcome here
+; guards the refactor's routing: escapes must NOT be misrouted into the
+; PHI-synthesis else-branch.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -42,15 +36,15 @@ u:
   resume i64 %lp
 }
 
-; Both arms escape, so each materializes at its own escape point and the merge
-; builds a materializedValuePhi over the two per-arm pointers; the return
-; consumes the PHI. (Under the former dominating-hoist placement both arms
-; shared one dominating NewInv and no PHI was needed; escape-point placement
-; gives each arm its own NewInv, so the PHI is required.)
+; Both arms escape, but OrigAlloc dominates both arms and the merge, so it is
+; the single SSA value: both sinks and the return consume OrigAlloc and no
+; materialized-object PHI is built.
 ; CHECK-LABEL: define ptr addrspace(1) @test_escape_driven_matphi
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
-; CHECK: = phi ptr addrspace(1)
-; CHECK: ret ptr addrspace(1)
+; CHECK-NOT: invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK: call void @sink(ptr addrspace(1) %o)
+; CHECK: call void @sink(ptr addrspace(1) %o)
+; CHECK-NOT: = phi ptr addrspace(1)
+; CHECK: ret ptr addrspace(1) %o
 
 !java-method-compilation = !{}

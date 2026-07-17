@@ -1,12 +1,11 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; (§8.1.13): Cyclic nested virtuals. Two virtuals A and B form a cycle —
-; A.f = B and B.g = A. Returning A escapes A; transitive materialization must
-; materialize B (because A.f references B) and then, when materializing B,
-; must NOT recurse back into A indefinitely because A is already in the
-; Materialized set (idempotency in materializeAt). Both materialization
-; invokes appear; A's MatCont stores the new B at offset 8; B's MatCont
-; stores the new A at offset 8.
+; A.f = B and B.g = A. Returning A escapes A; B escapes transitively (A.f
+; references it). Under reuse-OrigAlloc both OrigAllocs are KEPT (each
+; dominates the single escape point), so every field store replays directly
+; onto its OrigAlloc and the cycle resolves through the peer's OrigAlloc — no
+; cascade coordination, no fresh pea.mat invoke, no materialized-object PHI.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare i32 @__gxx_personality_v0(...)
@@ -34,15 +33,17 @@ u2:
   resume i64 %lp2
 }
 
-; Cycle prevention works: both A (klass 11111) and B (klass 22222) materialize.
+; Both OrigAllocs (klass 11111 = A, klass 22222 = B) are retained.
 ; CHECK-LABEL: define ptr addrspace(1) @test_cyclic_nested
 ; CHECK-DAG: invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
 ; CHECK-DAG: invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
-; Both replayed stores use real NewInvs — the back edge B.g = A (A materialized
-; after B in the cascade) resolves instead of lowering to poison.
-; CHECK: store atomic ptr addrspace(1) %pea.mat{{[0-9]*}}, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
-; CHECK: store atomic ptr addrspace(1) %pea.mat{{[0-9]*}}, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
+; No fresh materialization invoke is emitted.
+; CHECK-NOT: pea.mat = invoke
+; Both replayed field stores use OrigAlloc values — the back edge B.g = A
+; resolves through A's OrigAlloc (kept alive), never poison.
+; CHECK: store atomic ptr addrspace(1) %a, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
+; CHECK: store atomic ptr addrspace(1) %b, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
 ; CHECK-NOT: poison
-; CHECK: ret ptr addrspace(1) %{{.*}}
+; CHECK: ret ptr addrspace(1) %a
 
 !java-method-compilation = !{}

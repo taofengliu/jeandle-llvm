@@ -1,17 +1,13 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Self-referential field (o.f = o) materialized PER-PRED at a merge.
+; Self-referential field (o.f = o) across a mixed merge.
 ;
 ; `else` keeps o virtual and stores o into its own field (offset 8); `then`
-; escapes o via sink. At `merge` (mixed: then materialized, else virtual) o is
-; per-pred materialized at else's terminator. The replayed field store (o.f = o)
-; must store the per-pred NewInv into ITS OWN field.
-;
-; Before the fix the field-replay value was the per-pred placeholder (an
-; unparented PHINode); the transform emitted it unresolved as the store value
-; (<badref>) and the verifier aborted. The fix records OrigAlloc as the
-; field-replay value and resolveMaterializedUses rewrites the store to the
-; per-pred NewInv that dominates it.
+; escapes o via sink. Under reuse-OrigAlloc the single OrigAlloc dominates
+; both arms and the merge, so o is kept alive as the one SSA value: the
+; self-referential field replays onto OrigAlloc (storing %o into its own
+; field), both sink calls receive OrigAlloc directly, and NO materialized-
+; object PHI is needed at the merge (no per-pred NewInv, no pea.mat).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -40,12 +36,14 @@ u:
 !java-method-compilation = !{}
 
 ; CHECK-LABEL: define void @self_field_perpred
-; Two per-pred materializations of o (then path + else path).
+; Exactly one allocation invoke (the original OrigAlloc, retained).
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 12345 to ptr)
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 12345 to ptr)
-; The self-referential field store: value operand is a real per-pred NewInv
-; (pea.mat), never <badref>.
-; CHECK: store atomic ptr addrspace(1) %pea.mat{{[0-9]*}}, ptr addrspace(1) %pea.matslot unordered, align 8
-; merge combines the two per-pred NewInvs in a PHI consumed by sink.
-; CHECK: phi ptr addrspace(1)
+; CHECK-NOT: pea.mat = invoke
+; The self-referential field store replays onto OrigAlloc — value operand is
+; the live OrigAlloc %o, never <badref>.
+; CHECK: store atomic ptr addrspace(1) %o, ptr addrspace(1) %pea.matslot unordered, align 8
+; No materialized-object PHI at the merge: OrigAlloc is the single SSA value
+; consumed by both sink calls.
+; CHECK-NOT: phi
+; CHECK: call void @sink(ptr addrspace(1) %o)
 ; CHECK: ret void

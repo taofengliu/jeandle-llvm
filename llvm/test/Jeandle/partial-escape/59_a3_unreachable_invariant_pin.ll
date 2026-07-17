@@ -58,14 +58,14 @@ u:
   resume i64 %lp
 }
 
-; Mat fires at the escape point in %t1, RAUWs %o to the new invoke. Both
-; downstream merges (m1, m2) see the single materialized pointer.
+; Under reuse-OrigAlloc the original allocation %o is kept alive and dominates
+; both downstream merges (m1, m2); the escape in %t1 consumes OrigAlloc and no
+; materialized-object PHI is built.
 ; CHECK-LABEL: define ptr addrspace(1) @test_a3_invariant_pin
-; Per-arm materialize + materializedValuePhi (the collapse).
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
-; CHECK: call void @sink(ptr addrspace(1) %{{[A-Za-z0-9._]+}})
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
-; CHECK: = phi ptr addrspace(1)
-; CHECK: ret ptr addrspace(1) %{{[A-Za-z0-9._]+}}
+; CHECK-NOT: invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK: call void @sink(ptr addrspace(1) %o)
+; CHECK-NOT: = phi ptr addrspace(1)
+; CHECK: ret ptr addrspace(1) %o
 
 !java-method-compilation = !{}

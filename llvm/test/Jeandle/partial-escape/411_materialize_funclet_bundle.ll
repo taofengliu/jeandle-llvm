@@ -1,22 +1,23 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; §2.1: when a virtual object is materialized at an escape point that sits
-; inside a Windows-EH funclet, the materialization invoke MUST carry a
-; `[ "funclet"(token %pad) ]` operand bundle naming the ENCLOSING funclet pad,
-; or the verifier rejects it. The pad is found via colorEHFunclets keyed on the
-; invoke's actual host block (the post-split Origin), NOT MatCont->getFirstNonPHI
-; (the materialize invoke is emitted at the end of Origin, so it belongs to
-; Origin's funclet; a pad never sits at an arbitrary block head).
+; Windows-EH funclet materialization under the reuse-OrigAlloc model. The
+; object %o is allocated in `entry` (OUTSIDE any funclet) but only escapes
+; (via @sink) INSIDE the cleanup funclet.
 ;
-; Jeandle does not currently target Windows; this is the IR-defensiveness rule
-; (review requirement #6 — PEA must tolerate any legal IR).
+; Historically PEA virtualized %o in entry and emitted a fresh materialization
+; invoke INSIDE the funclet, which had to carry a `[ "funclet"(token %pad) ]`
+; operand bundle naming the enclosing funclet pad (synthesized via
+; colorEHFunclets) or the verifier rejected it.
 ;
-; Critical shape: the object %o is allocated in `entry` (OUTSIDE any funclet, so
-; the original allocation carries NO funclet bundle) but only escapes (via
-; @sink) INSIDE the cleanup funclet. PEA therefore virtualizes %o in entry and
-; materializes it at the escape inside the funclet — the materialize invoke has
-; no source funclet bundle to copy, so the colorEHFunclets synthesis path is the
-; only thing that can supply the required bundle.
+; Under reuse-OrigAlloc there is no materialization invoke: the original
+; allocation %o (allocated outside the funclet, so it correctly carries no
+; funclet bundle) is KEPT and dominates the escape. The tracked field store
+; is replayed onto %o inside the funclet (a gep + store atomic onto %o), and
+; @sink receives %o directly. The funclet bundle lives on the @sink call
+; (where the IR author placed it), not on any new invoke.
+;
+; Jeandle does not currently target Windows; this is the IR-defensiveness
+; rule (review requirement #6 -- PEA must tolerate any legal IR).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @may_throw()
@@ -49,8 +50,16 @@ ehalloc:
 }
 
 ; CHECK-LABEL: define void @test_funclet_bundle
+; The original allocation invoke is retained (allocated outside the funclet,
+; so it carries no funclet bundle).
+; CHECK: = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 7 to ptr), i32 16)
+; Inside the cleanup funclet, the field store is replayed onto OrigAlloc %o.
 ; CHECK: %[[CP:[A-Za-z0-9._]+]] = cleanuppad within none []
-; The materialization invoke (inside the funclet) carries the enclosing pad.
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 7 to ptr), i32 16){{.*}}[ "funclet"(token %[[CP]]) ]
+; CHECK: %{{.*}} = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
+; CHECK: store atomic i32 42, ptr addrspace(1) %{{.*}} unordered, align 4
+; The escape consumes OrigAlloc %o directly; the funclet bundle stays on the
+; @sink call (where the IR author placed it). No materialization invoke.
+; CHECK: call void @sink(ptr addrspace(1) %o) [ "funclet"(token %[[CP]]) ]
+; CHECK-NOT: pea.mat = invoke
 
 !java-method-compilation = !{}

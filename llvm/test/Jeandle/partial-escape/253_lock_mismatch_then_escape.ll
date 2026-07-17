@@ -1,18 +1,17 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Lock in one branch, escape (sink) at the merge after
-; the lock-cascade has materialized at both preds.
+; Lock-count mismatch with a post-merge escape, under the reuse-OrigAlloc model.
 ;
-; Sequence:
-;   then: monitorenter(o) → LC[o]=1, enter is folded.
-;   else: no lock → LC[o]=0.
-;   merge: counts disagree → lock-cascade fires. Both preds materialize:
-;     * then-pred: un-elides the enter (its receiver is rewritten to the
-;       then-pred's NewInv via the PH-tagged ReplaceInput).
-;     * else-pred: no live locks, just emits the alloc invoke.
-;   merge retry: AllMaterialized branch builds a ptr addrspace(1) PHI of
-;     the two per-pred NewInvs.
-;   sink(o) at the merge uses the PHI as its receiver.
+;   then: monitorenter(o) tracked virtually — LockCount[o]=1.
+;   else: no lock — LockCount[o]=0.
+;   merge: counts disagree; the object escapes via sink(o).
+;
+; Under reuse-OrigAlloc the lock-count mismatch no longer drives a per-pred
+; materialization cascade. The ORIGINAL allocation (OrigAlloc %o) is kept
+; alive (it dominates the escape point), the single surviving monitorenter
+; stays in its original block with receiver OrigAlloc, and the post-merge sink
+; receives OrigAlloc directly. No fresh materialization invoke is emitted, no
+; PHI is built at the merge.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
@@ -42,13 +41,16 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_lock_mismatch_then_escape
-; Two per-pred materializations and one surviving un-elided enter.
-; CHECK: %[[MAT1:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %[[MAT1]],
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
-; merge: ptr addrspace(1) PHI threads both per-pred NewInvs.
-; CHECK: %[[PHI:[A-Za-z0-9._]+]] = phi ptr addrspace(1)
-; CHECK: call void @sink(ptr addrspace(1) %[[PHI]])
+; The original allocation invoke is RETAINED (no fresh materialization).
+; CHECK: %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
+; No pea.mat materialization invoke is emitted.
+; CHECK-NOT: pea.mat = invoke
+; The single surviving monitorenter stays in its original block, receiver
+; OrigAlloc %o.
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %o, ptr %lock)
+; No PHI is synthesized at the merge; sink receives OrigAlloc directly.
+; CHECK-NOT: phi ptr addrspace(1)
+; CHECK: call void @sink(ptr addrspace(1) %o)
 ; No second enter (else side had none).
 ; CHECK-NOT: call hotspotcc void @jeandle.monitorenter_with_thin_lock
 

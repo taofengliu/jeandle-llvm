@@ -1,21 +1,23 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Multi-successor per-pred cascade with merged lock re-emit (review §1.2 F2).
+; Multi-successor per-pred cascade with lock re-emit under the reuse-OrigAlloc
+; model (review S1.2 F2 analog).
 ;
-; 442 exercises a SINGLE-succ per-pred cascade (right -> merge only); the
-; critical-edge pre-pass guard `getNumSuccessors() <= 1` then skips the split,
-; so the split-edge re-aim + merged-emit interaction is NOT reached. This test
-; makes `right` have TWO successor merges (merge1, merge2), both mixed (left
-; arm virtual, right arm locked) so per-pred materialization of the `a.f=b`
-; cascade fires on BOTH (right, merge1) and (right, merge2) edges — both
-; critical -> the pre-pass splits each into its own `pea.crit.split` and re-aims
-; the per-pred Materialize effects there. The unified merged-emit then fires
-; once per split edge, depth-sorted (a@0, b@1), each lock's receiver resolved
-; per-effect via NewInvOf[SourceEffect].
+; `right` (locked) has TWO successor merges (merge1, merge2), both mixed
+; (left arm virtual, right arm locked). The a.f=b field store is tracked, and
+; materializing a per-pred cascades b (forward prerequisite). Each merge is an
+; escape point for both a and b.
 ;
-; Without the §1.2 fix (per-pred effects skipped by computeEscapePointLocks +
-; per-effect re-emit), each split edge would re-emit in SeqNo order (b@1 then
-; a@0 = 1,0) — mis-ordered.
+; Historically each (right, merge) critical edge was split into its own
+; pea.crit.split, re-aiming the per-pred Materialize effects there, and the
+; unified merged-emit fired once per split edge with locks depth-sorted
+; (a@0, b@1) per split -- four enters in la,lb,la,lb order.
+;
+; Under reuse-OrigAlloc no edge is split: the original allocations %a, %b are
+; retained, the a.f=b store is replayed onto %a (with %b) at each pred, and
+; the right-arm locks are re-emitted onto %a/%b directly in `right` (two
+; enters per merge: %a then %b, giving la,la,lb,lb). Both merges sink %a and
+; %b directly. No %pea.mat, no pea.crit.split.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
@@ -63,19 +65,22 @@ u:
   resume i64 %lp
 }
 
-!java-method-compilation = !{}
-
-; Four critical-edge split blocks: `left` (no locks) splits to both merges,
-; `right` (locked) splits to both merges. Only the two `right` splits carry
-; re-emitted monitorenters.
 ; CHECK-LABEL: define void @test_multi_succ_per_pred_cascade_locks
-; CHECK-COUNT-4: pea.crit.split
-; On each right split, the two re-emitted enters appear strictly depth-increasing
-; (a@0 with %la, then b@1 with %lb) — the per-effect (SeqNo) order would be
-; b@1 then a@0 = 1,0. Two right splits => four enters, in la,lb,la,lb order.
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %{{.*}}, ptr %la)
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %{{.*}}, ptr %lb)
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %{{.*}}, ptr %la)
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %{{.*}}, ptr %lb)
+; Both original allocation invokes are retained (a, then b).
+; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
+; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
+; No fresh materialization invokes anywhere.
+; CHECK-NOT: pea.mat = invoke
+; The a.f=b field store is replayed onto OrigAlloc %a with OrigAlloc %b.
+; CHECK: store atomic ptr addrspace(1) %b, ptr addrspace(1) %{{.*}} unordered, align 8
+; The right arm re-emits its unbalanced enters onto OrigAlloc %a/%b directly
+; (two enters per merge: %a with %la, then %b with %lb).
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %a, ptr %la)
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %a, ptr %la)
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %b, ptr %lb)
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %b, ptr %lb)
 ; CHECK-NOT: poison
+; CHECK-NOT: pea.crit.split
 ; CHECK: ret void
+
+!java-method-compilation = !{}

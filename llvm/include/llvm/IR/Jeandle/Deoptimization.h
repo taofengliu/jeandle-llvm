@@ -136,19 +136,85 @@ public:
     LocalType = 0,
     StackType = 1,
     ArgumentType = 2,
+    // A monitor (lock) entry in the "monitor" section of a deopt scope. On the
+    // wire a monitor is a 3-location tuple consumed by the HotSpot parser:
+    //   <enc(MonitorType, index=K, T_OBJECT), object, basic_lock>
+    // where `object` is the locked oop and `basic_lock` is the BasicLock stack
+    // slot. The Index field is a monitor-kind discriminant (the frontend, which
+    // emits only REAL locks, always uses index=0; the HotSpot parser ignores
+    // Index for real locks):
+    //   index=0  REAL (non-eliminated) lock. `object` is a live oop (a stack/
+    //            register location, or a null constant). MonitorValue is built
+    //            with eliminated=false — the lock is genuinely held (e.g. a
+    //            re-emitted monitorenter on a materialized VO's OrigAlloc), so
+    //            HotSpot relock_objects leaves it alone.
+    //   index=1  PEA-ELIMINATED lock on a VIRTUAL object. `object` is the owner
+    //            VO's vo-id as an i32 CONSTANT (NOT a live oop) — the parser
+    //            resolves it through vo_map to the owner's ObjectValue*, and
+    //            builds the MonitorValue with eliminated=true so relock_objects
+    //            re-acquires the monitor on the realloc'd owner (C2/Graal
+    //            MonitorValue{owner=ObjectValue, eliminated=true} analog). The
+    //            basic_lock slot is preserved verbatim;
+    //            ObjectSynchronizer::enter initializes it. The PEA transform
+    //            emits this form (RewriteDeoptBundleEffect).
     MonitorType = 3,
+    // ScalarValueType encodes a PEA virtual-object (VO) descriptor inside a
+    // "deopt" operand bundle so HotSpot can reallocate the object at deopt
+    // (C2/Graal scalar-replacement analog). It is emitted once per in-scope VO
+    // in a per-scope VO section placed AFTER the duplicated-BCI marker and
+    // BEFORE locals (so every VO is described before any slot references it,
+    // avoiding forward references — mirrors C2 dumping its object pool first).
+    //
+    // On the wire, a ScalarValueType entry is the header of a multi-location
+    // sequence read by the HotSpot parser:
+    // clang-format off
+    //   [enc: ScalarValueType, index=vo_id, basic_type=T_OBJECT(instance)|T_ARRAY]
+    //   [klass]        ; i64 constant = raw InstanceKlass/ArrayKlass identity
+    //   [field_count]  ; i32 constant = number of (enc,value) field pairs that
+    //                   ; follow (non-static fields in InstanceKlass declaration
+    //                   ; order; long/double occupy TWO pairs)
+    //   [field 0]      ; (enc(LocalType/StackType, basic_type), value) — parsed
+    //   ...            ;   by the existing fill_one_scope_value, so a field's
+    //   [field N-1]    ;   value may itself be a VORef referencing another VO
+    //                   ;   (cycle/transitive closure) or a live materialized
+    //                   ;   oop (OrigAlloc).
+    // A field whose value is ANOTHER in-scope VO is encoded as a VORef FIELD:
+    //   [field_enc]    DeoptValueEncoding(offset, VORefLocalType, T_OBJECT)
+    //   [field_value]  i32 constant = the referenced VO's vo-id
+    // The parser consumes (3 + 2*field_count) locations for one descriptor.
+    // clang-format on
+    //
+    // The HotSpot parser routes a VORefLocalType FIELD to vo_map (NOT
+    // fill_one_scope_value, which would trip ShouldNotReachHere on the non-oop
+    // vo-id constant) and uses the referenced VO's ObjectValue as the field's
+    // ScopeValue. A scalar field stays enc(LocalType, basic_type) + concrete
+    // Value*. Do NOT encode a VO field as a constant oop.
     ScalarValueType = 4,
     OrigPcSlotType = 5,
     MethodType = 6,
     NarrowOopMarkerType = 7,
-    LastType = NarrowOopMarkerType + 1
+    // VORefLocalType / VORefStackType mark a locals / stack slot that holds a
+    // VO already described by a ScalarValueType descriptor earlier in this
+    // scope. The trailing location is the i32 vo_id; the slot's ScopeValue is
+    // the ObjectValue built from that descriptor. TWO distinct types (not one
+    // VORefType) so the HotSpot parser can route the slot to the correct
+    // interpreter array (locals vs expression stack) — the parser routes every
+    // entry by encoding type, so collapsing them would misroute a VO-ref that
+    // lives in a stack slot (a structural guarantee, not a position proxy).
+    // Used so a VO referenced from N slots is described once and referenced by
+    // id elsewhere.
+    VORefLocalType = 8,
+    VORefStackType = 9,
+    LastType = VORefStackType + 1
   };
   DeoptValueEncoding(int I, DeoptValueType VT, HotspotBasicType BT)
       : Index(I), ValueTy(VT), BasicTy(BT) {
     // Standard assert.
     assert((ValueTy == LocalType || ValueTy == StackType ||
-            ValueTy == MonitorType || ValueTy == OrigPcSlotType ||
-            ValueTy == MethodType || ValueTy == NarrowOopMarkerType) &&
+            ValueTy == MonitorType || ValueTy == ScalarValueType ||
+            ValueTy == OrigPcSlotType || ValueTy == MethodType ||
+            ValueTy == NarrowOopMarkerType || ValueTy == VORefLocalType ||
+            ValueTy == VORefStackType) &&
            "Unsupported value type");
   }
 

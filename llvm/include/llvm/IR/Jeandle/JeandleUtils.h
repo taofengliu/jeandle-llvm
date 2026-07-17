@@ -64,6 +64,13 @@ inline HotspotBasicType LLVM2JavaComputational(Type *Ty) {
     return jeandle::T_INT;
   if (Ty->isIntegerTy(64))
     return jeandle::T_LONG;
+  // Sub-int integer types (i1/i8/i16) widen to the T_INT computational type:
+  // JVM boolean/byte/char/short are all promoted to int on the operand stack,
+  // so their deopt descriptor slots are T_INT. Needed so a touched or default
+  // byte/boolean/char/short array element (or instance field) maps to T_INT
+  // rather than tripping the T_ILLEGAL guard in the emit path.
+  if (Ty->isIntegerTy(1) || Ty->isIntegerTy(8) || Ty->isIntegerTy(16))
+    return jeandle::T_INT;
   if (Ty->isFloatTy())
     return jeandle::T_FLOAT;
   if (Ty->isDoubleTy())

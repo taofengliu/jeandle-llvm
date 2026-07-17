@@ -1,8 +1,10 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 ;
 ; TWO header PHIs each carry a different DERIVED pointer of the same loop-body
-; object: %sf1 = gep %X, 8 and %sf2 = gep %X, 16. Each carried incoming is
-; re-derived independently at its own byte offset over the materialized base.
+; object: %sf1 = gep %X, 8 and %sf2 = gep %X, 16. Under the reuse-OrigAlloc
+; model the body alloc %X is retained, so both body GEPs stay valid and each
+; carried PHI keeps its original incoming. Both tracked field stores are
+; replayed onto %X at their own byte offset at the latch.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -45,9 +47,16 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_152_carried_multiple
-; Both offsets are re-derived over the materialized base.
-; CHECK: getelementptr inbounds i8, ptr addrspace(1) %pea.mat, i64 8
-; CHECK: getelementptr inbounds i8, ptr addrspace(1) %pea.mat, i64 16
+; Both carrying PHIs keep their original body-GEP incomings.
+; CHECK: %psf1 = phi ptr addrspace(1) [ null, %entry ], [ %sf1, %latch ]
+; CHECK: %psf2 = phi ptr addrspace(1) [ null, %entry ], [ %sf2, %latch ]
+; CHECK: %X = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
+; CHECK-NOT: pea.mat = invoke
+; Both tracked field stores are replayed onto %X at offsets 8 and 16.
+; CHECK: %pea.matslot = getelementptr inbounds i8, ptr addrspace(1) %X, i64 8
+; CHECK: store atomic i32 %i, ptr addrspace(1) %pea.matslot unordered, align 4
+; CHECK: %pea.matslot1 = getelementptr inbounds i8, ptr addrspace(1) %X, i64 16
+; CHECK: store atomic i32 %i, ptr addrspace(1) %pea.matslot1 unordered, align 4
 ; CHECK: call void @sink(ptr addrspace(1) %psf1)
 ; CHECK: call void @sink(ptr addrspace(1) %psf2)
 ; CHECK-NOT: poison

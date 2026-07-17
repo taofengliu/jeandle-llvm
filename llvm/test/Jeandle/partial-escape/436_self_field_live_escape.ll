@@ -1,10 +1,11 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Self-referential field (o.f = o) on the LIVE (single escape-point) path. This
-; path already used OrigAlloc as the field-replay value and worked before; it is
-; a regression guard that removing the transform's eager substitution (now
-; resolved by resolveMaterializedUses) keeps the live self-referential case
-; correct.
+; Self-referential field (o.f = o) on the LIVE (single escape-point) path.
+; Under reuse-OrigAlloc the single OrigAlloc is kept, the self-referential
+; store replays onto OrigAlloc (%o into its own field), and the sink receives
+; OrigAlloc directly. Regression guard that the live self-referential case
+; stays correct with OrigAlloc as both the field-replay value and the escape
+; argument (no <badref>, no pea.mat).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -26,9 +27,11 @@ u:
 !java-method-compilation = !{}
 
 ; CHECK-LABEL: define void @self_field_live_escape
-; One materialization (live escape, no merge).
+; Exactly one allocation invoke (the original OrigAlloc, retained).
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 12345 to ptr)
-; The self-referential store uses the live NewInv (no <badref>).
-; CHECK: store atomic ptr addrspace(1) %pea.mat{{[0-9]*}}, ptr addrspace(1) %pea.matslot unordered, align 8
-; CHECK: call void @sink(ptr addrspace(1) %pea.mat{{[0-9]*}})
+; CHECK-NOT: pea.mat = invoke
+; The self-referential store uses the live OrigAlloc %o (no <badref>).
+; CHECK: store atomic ptr addrspace(1) %o, ptr addrspace(1) %pea.matslot unordered, align 8
+; The sink receives OrigAlloc directly (not a fresh pea.mat).
+; CHECK: call void @sink(ptr addrspace(1) %o)
 ; CHECK: ret void

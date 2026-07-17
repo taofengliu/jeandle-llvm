@@ -1,18 +1,22 @@
 ; REQUIRES: asserts
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Issue-1 regression guard: `merge` is a mixed merge for o (then arm materialized
-; via sink, else arm virtual) -> per-pred materialize of o at `else` for `merge`
-; (IsPerPred, on the else->merge split edge). `merge` ALSO has an explicit LLVM
-; pointer PHI `%p` mixing null (then) and o (else) -> processBlockPhis Case A
-; would, WITHOUT the per-merge clone threading, see o as STILL VIRTUAL in the
-; shared BlockExits[else] (the per-pred mat flipped only the clone) and re-fire
-; a SECOND Case-A materialize at `else`'s terminator end (PH end) for the same
-; (else, merge, o). That duplicates the invoke and exposes the OOM on every
-; else->* edge. With the clone fix, processBlockPhis reads the clone (flipped by
-; the per-pred mat) -> sees o materialized -> does NOT re-fire Case A. Assert:
-; exactly ONE materialize invoke at `else` for `merge` (the per-pred split), and
-; a `pea.crit.split` block (NOT a Case-A PH-end placement).
+; Per-pred + Case-A dedup regression guard under the reuse-OrigAlloc model.
+; `merge` is a mixed merge for o (then arm materialized via sink, else arm
+; virtual) and ALSO has an explicit LLVM pointer PHI `%p` mixing null (then)
+; and o (else) -- a Case-A candidate.
+;
+; Historically the per-pred materialize at `else` for `merge` (on the
+; else->merge split edge) had to win over Case-A: without per-merge clone
+; threading, processBlockPhis would re-fire a SECOND Case-A materialize at
+; `else`'s terminator end for the same (else, merge, o), duplicating the
+; invoke. The test asserted exactly ONE materialize invoke (the per-pred
+; split) and no Case-A PH-end placement.
+;
+; Under reuse-OrigAlloc there is NO materialize at all -- the original %o is
+; the single value -- so the dedup concern is trivially satisfied: exactly
+; one allocation invoke (the retained original), no pea.mat, no split. The
+; merge PHI's else-incoming stays OrigAlloc %o directly.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -48,17 +52,21 @@ u:
   resume i64 %lp
 }
 
-!java-method-compilation = !{}
-
-; CHECK: define void @repro
-; Exactly ONE critical-edge split off `else` (the per-pred mat for merge).
-; CHECK: pea.crit.split:
-; CHECK: pea.mat{{[0-9]*}} = invoke hotspotcc {{.*}}@jeandle.new_instance
-; The merge PHI's else-incoming is the per-pred NewInv routed through the split.
+; CHECK-LABEL: define void @repro
+; Exactly one allocation invoke (the original, retained) -- no duplication.
+; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK-NOT: invoke hotspotcc{{.*}}@jeandle.new_instance
+; The then arm replays the tracked field store onto OrigAlloc %o and escapes.
+; CHECK: getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
+; CHECK: call void @sink(ptr addrspace(1) %o)
+; `else` retains its original two-successor branch (no per-pred split, no
+; Case-A mat at PH end).
+; CHECK: else:
+; CHECK-NEXT: br i1 %c2, label %merge, label %S
+; The merge PHI's else-incoming is OrigAlloc %o directly.
 ; CHECK: merge:
-; CHECK: %p = phi ptr addrspace(1) [ null, %{{.*}} ], [ %pea.mat, %mat.cont ]
-; CHECK: call void @sink
-; No SECOND split (would be pea.crit.split1) and no Case-A mat at `else` end
-; (a Case-A placement would put the invoke directly in `else`, not a split).
-; CHECK-NOT: pea.crit.split{{[0-9]+}}
+; CHECK-NEXT: %p = phi ptr addrspace(1) [ null, %then ], [ %o, %else ]
+; CHECK: call void @sink(ptr addrspace(1) %p)
 ; CHECK: ret void
+
+!java-method-compilation = !{}

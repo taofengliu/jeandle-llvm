@@ -2,14 +2,13 @@
 ;
 ; A loop-LOCAL object %X allocated in the body is carried across the back-edge
 ; by the header pointer-PHI %px and escapes at the loop exit (@sink). The field
-; stored is a live SSA value (%i), so materialization is straightforward.
+; stored is a live SSA value (%i).
 ;
-; This is the Graal-aligned outcome: %X is virtualized within the iteration and
-; MATERIALISED AT THE BACK-EDGE (the latch's end node) -- Graal's
-; ensureMaterialized at predecessor.getEndNode() (PartialEscapeClosure.java
-; :996/1504), effects kept on convergence (EffectsClosure.java:472-474). The
-; carried PHI %px is rewired to the materialized value; the original body alloc
-; is eliminated. No poison.
+; Under the reuse-OrigAlloc model the original body alloc %X is KEPT (it
+; dominates the back-edge latch and the loop exit), so no fresh materialization
+; invoke is emitted. The tracked field store is replayed onto %X at the
+; back-edge (the latch), and the carried PHI's back-edge incoming stays %X.
+; The exit @sink receives the carried pointer directly. No poison.
 ;
 ; The header has a single forward predecessor (entry), so this exercises the
 ; fixpoint path's post-body merge directly (no loop-simplify needed).
@@ -50,12 +49,15 @@ u:
   resume i64 %lp
 }
 
-; The carried object is materialised at the back-edge (a pea.mat invoke), and the
-; carried PHI's back-edge incoming is rewired to that materialised value (not
-; poison, not the eliminated original alloc). No poison anywhere.
+; The original body alloc is RETAINED (no pea.mat materialization invoke); the
+; carried PHI's back-edge incoming stays %X, and the tracked field store is
+; replayed onto %X at the back-edge (latch). No poison anywhere.
 ; CHECK-LABEL: define void @test_143_inbody_carried
-; CHECK: %px = phi ptr addrspace(1) [ null, %entry ], [ %pea.mat, %mat.cont ]
-; CHECK: %pea.mat = invoke
+; CHECK: %px = phi ptr addrspace(1) [ null, %entry ], [ %X, %latch ]
+; CHECK: %X = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
+; CHECK-NOT: pea.mat = invoke
+; CHECK: %pea.matslot = getelementptr inbounds i8, ptr addrspace(1) %X, i64 8
+; CHECK: store atomic i32 %i, ptr addrspace(1) %pea.matslot unordered, align 4
 ; CHECK: call void @sink(ptr addrspace(1) %px)
 ; CHECK-NOT: poison
 

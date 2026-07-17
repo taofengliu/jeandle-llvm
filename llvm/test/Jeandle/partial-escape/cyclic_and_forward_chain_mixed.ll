@@ -1,10 +1,11 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Mixed forward and back edges among three objects: A.f = B and B.g = C are
-; forward (B, C materialized before their referrers), while C.h = A is a back
-; edge (A materialized last). Returning A escapes the whole cascade. All three
-; replayed stores use real NewInvs; the back edge C.h = A resolves to A's NewInv
-; because every store sits in the cascade tail, dominated by all three NewInvs.
+; forward, while C.h = A is a back edge. Returning A escapes the whole group.
+; Under reuse-OrigAlloc all three OrigAllocs are KEPT (each dominates the single
+; escape point), so every field store replays directly onto its OrigAlloc and
+; the back edge C.h = A resolves through A's OrigAlloc — no cascade
+; coordination, no fresh pea.mat invoke, no materialized-object PHI.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare i32 @__gxx_personality_v0(...)
@@ -42,6 +43,12 @@ u3:
 ; CHECK-DAG: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr)
 ; CHECK-DAG: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr)
 ; CHECK-DAG: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 33333 to ptr)
-; CHECK-COUNT-3: store atomic ptr addrspace(1) %pea.mat{{[0-9]*}}, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
+; No fresh materialization invoke is emitted.
+; CHECK-NOT: pea.mat = invoke
+; All three replayed field stores use OrigAlloc values — the back edge C.h = A
+; resolves through A's OrigAlloc (kept alive), never poison.
+; CHECK: store atomic ptr addrspace(1) %a, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
+; CHECK: store atomic ptr addrspace(1) %c, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
+; CHECK: store atomic ptr addrspace(1) %b, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
 ; CHECK-NOT: poison
-; CHECK: ret ptr addrspace(1) %{{.*}}
+; CHECK: ret ptr addrspace(1) %a

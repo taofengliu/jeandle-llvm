@@ -1,4 +1,4 @@
-# R12.P4b: processAllocation queries CanVirtualize for every Instance
+# processAllocation queries CanVirtualize for every Instance
 # allocation. Klass 7777 represents a Reference / Thread subtype (or
 # any other identity-sensitive class) whose CanVirtualize returns
 # false. processAllocation refuses virtualization — the alloc survives in

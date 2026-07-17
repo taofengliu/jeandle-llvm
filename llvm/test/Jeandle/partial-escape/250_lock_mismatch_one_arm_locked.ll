@@ -1,19 +1,18 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Lock-count mismatch cascade at merge.
+; Lock-count mismatch at a merge, under the reuse-OrigAlloc model.
 ;
 ; entry: alloc o (virtual). branch on %c.
-; then: monitorenter(o) — folded, LockCount[o]=1 at then exit.
+; then: monitorenter(o) — tracked virtually, LockCount[o]=1 at then exit.
 ; else: nothing — LockCount[o]=0 at else exit.
-; merge: counts disagree → lock-cascade fires.
+; merge: counts disagree.
 ;
-; Expected outcome:
-; each pred materializes the VO with its OWN lock list. The then-pred
-; materialize cascades through the un-elide so the original monitorenter
-; survives in IR with its first operand snapped to the then-pred's new
-; materialized invoke. The else-pred materialize has no live locks and
-; just emits a fresh allocation invoke. The original entry alloc is
-; eliminated; downstream uses of %o resolve through the per-pred MatConts.
+; Under reuse-OrigAlloc the lock-count mismatch no longer drives a per-pred
+; materialization cascade. The ORIGINAL allocation (OrigAlloc %o) dominates
+; every escape point and every use, so it is kept verbatim and the surviving
+; monitorenter stays in its original position with its receiver pointing at
+; OrigAlloc. No fresh materialization invoke (pea.mat) is emitted, no PHI is
+; built at the merge, and the entry allocation is not eliminated.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
@@ -41,16 +40,14 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_lock_mismatch_one_arm_locked
-; The original entry alloc is eliminated; the lock-cascade materializes a fresh
-; allocation invoke at each pred. The first one we see comes from one
-; pred; the un-elided monitorenter in that pred's MatCont references its
-; per-pred NewInv (with the SSA-correct receiver). The second invoke
-; comes from the other pred. We don't rely on a specific RPO ordering of
-; then/else — we only need to see (a) a materialized invoke, (b) a
-; surviving monitorenter on a per-pred NewInv, and (c) a second
-; materialized invoke for the other pred.
-; CHECK: %[[MAT1:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %[[MAT1]],
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
+; The original allocation invoke is RETAINED (no fresh materialization).
+; CHECK: %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
+; No pea.mat materialization invoke is emitted.
+; CHECK-NOT: pea.mat = invoke
+; The single surviving monitorenter stays in its original block, receiver
+; OrigAlloc %o.
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %o, ptr %lock)
+; Exactly one monitorenter (no per-pred duplication, no synthesized enters).
+; CHECK-NOT: call hotspotcc void @jeandle.monitorenter_with_thin_lock
 
 !java-method-compilation = !{}

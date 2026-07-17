@@ -1,12 +1,19 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Case-A + locks + a folded JavaOp-invoke terminator. The object %o has an
-; elided monitorenter (depth 0); Case-A materializes %o at `else`'s
-; terminator (the folded arraylength invoke). The eager-update hook re-aims
-; the Materialize's InsertBefore to the `br` replacement; the lock re-emit
-; then resolves the escape point via CascadeKeyOf (the ORIGINAL captured
-; InsertBefore), NOT the re-aimed E.InsertBefore — so the merged lock list
-; is found and the monitorenter is re-emitted at the materialize point.
+; Case-A + locks + a folded JavaOp-invoke terminator, under the reuse-OrigAlloc
+; model. The object %o has a tracked monitorenter in block `n` (before the
+; branch); `else`'s terminator is a folded arraylength invoke on %o (Case-A
+; materialize at the erased terminator). The eager-update hook
+; (`relocateDependentMaterializes`) re-aims the Materialize's InsertBefore off
+; the erased invoke onto the in-block successor (the `br`).
+;
+; Under reuse-OrigAlloc the original allocation invoke (OrigAlloc %o) is KEPT
+; (no fresh pea.mat invoke). The folded arraylength invoke is erased. The
+; tracked monitorenter — which was virtually elided from block `n` — is
+; re-emitted ONCE at the escape point (in `else`, before the `br` to %merge),
+; with receiver OrigAlloc %o. On the `then` path the object never escapes
+; (the merge PHI picks `null`), so the lock is correctly NOT acquired there
+; (partial-escape elides the lock on the no-escape path).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) readonly)
@@ -41,12 +48,18 @@ u:
 !java-method-compilation = !{}
 
 ; CHECK-LABEL: define void @casea_folded_invoke_term_locks
+; The folded arraylength invoke is erased.
 ; CHECK-NOT: @jeandle.arraylength
-; The materialization re-emits the monitorenter at the materialize point
-; (after the pea.mat invoke, in mat.cont), receiver = pea.mat.
+; The ORIGINAL allocation invoke (OrigAlloc %o) is RETAINED.
+; CHECK: %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 7, i32 44, i32 16, i32 1048576)
+; No pea.mat materialization invoke is emitted.
+; CHECK-NOT: pea.mat = invoke
+; The tracked monitorenter is re-emitted exactly once at the escape point
+; (in the else block, before the br to merge), receiver OrigAlloc %o.
 ; CHECK: else:
-; CHECK-NEXT: %{{.*}} = invoke hotspotcc{{.*}}@jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 7, i32 44, i32 16, i32 1048576)
-; CHECK-NEXT: to label %mat.cont unwind label %u
-; CHECK: mat.cont:
-; CHECK-NEXT: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %{{.*}}, ptr %lo)
-; CHECK-NEXT: br label %merge
+; CHECK-NOT: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %o, ptr %lo)
+; CHECK-NOT: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock
+; The merge PHI and sink are preserved (sink receives the PHI).
+; CHECK: %p = phi ptr addrspace(1) [ null, %then ], [ %o, %else ]
+; CHECK: call void @sink(ptr addrspace(1) %p)

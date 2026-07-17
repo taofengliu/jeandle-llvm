@@ -1,4 +1,4 @@
-# R12.P4a: processAllocation queries HasFinalizer (and CanVirtualize) for
+# processAllocation queries HasFinalizer (and CanVirtualize) for
 # every Instance allocation BEFORE registering a VirtualObject. Klass
 # 6666 represents a class whose Klass->has_finalizer() is true (e.g.
 # any class that overrides finalize()). The callback returning true

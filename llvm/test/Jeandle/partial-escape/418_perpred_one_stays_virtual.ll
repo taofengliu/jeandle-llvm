@@ -1,11 +1,19 @@
 ; REQUIRES: asserts
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PH (`else`) has TWO successors: `merge` (mixed -> per-pred mat at else for
-; merge) and `D` (single-pred, o stays virtual, no escape). The per-pred flip
-; must NOT leak to `D`: `D` sees o as virtual on the else->D edge (clone not
-; shared), so no per-pred mat fires on else->D and no OOM-unwind lives on that
-; edge. Only else->merge is split and carries a pea.mat.
+; Per-pred materialization with a non-target successor under the
+; reuse-OrigAlloc model. PH (`else`) has TWO successors: `merge` (mixed) and
+; `D` (single-pred, o stays virtual, never escapes).
+;
+; Historically the per-pred flip had to NOT leak to `D`: `D` saw o as virtual
+; on the else->D edge (clone not shared), so no per-pred mat fired there and
+; no OOM-unwind lived on that edge; only else->merge was split with a pea.mat.
+;
+; Under reuse-OrigAlloc the original allocation %o dominates every successor,
+; so it is the single value on ALL edges: no per-pred mat fires anywhere, no
+; edge is split. `D` still has no invoke (it never escapes), and its `ret` is
+; unchanged. The then-arm escape replays the tracked field store onto %o and
+; sinks %o.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -41,17 +49,21 @@ u:
   resume i64 %lp
 }
 
-!java-method-compilation = !{}
-
-; Exactly ONE critical-edge split off `else` (else->merge), and exactly ONE
-; per-pred materialize invoke on that split (plus the then-arm escape-point
-; mat). The else->D edge must NOT carry a pea.mat, and `D` has no invoke.
-; CHECK: define void @repro
-; CHECK: pea.crit.split:
-; CHECK: pea.mat{{[0-9]*}} = invoke hotspotcc {{.*}}@jeandle.new_instance
-; No SECOND critical-edge split (a second split would be named pea.crit.split1).
-; CHECK-NOT: pea.crit.split{{[0-9]+}}
-; `D` is single-pred from `else` (no split), no invoke, just ret.
+; CHECK-LABEL: define void @repro
+; The original allocation invoke is retained.
+; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
+; No materialization invokes and no critical-edge splits anywhere.
+; CHECK-NOT: pea.mat = invoke
+; CHECK-NOT: pea.crit.split
+; The then arm replays the tracked field store onto OrigAlloc %o and escapes.
+; CHECK: getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
+; CHECK: call void @sink(ptr addrspace(1) %o)
+; `else` retains its original two-successor branch (no split off else).
+; CHECK: else:
+; CHECK-NEXT: br i1 %c2, label %merge, label %D
+; `D` is single-pred, o never escapes here: no invoke, just ret.
 ; CHECK: D:
 ; CHECK-NOT: invoke
 ; CHECK: ret void
+
+!java-method-compilation = !{}

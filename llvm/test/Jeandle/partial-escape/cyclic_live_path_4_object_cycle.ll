@@ -1,10 +1,11 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Four-object cycle: A.f = B, B.g = C, C.h = D, D.i = A. Returning A escapes the
-; whole cascade (4 objects, one shared escape point). The back edge D.i = A (A
-; materialized last) resolves to A's NewInv because every replayed store sits in
-; the cascade tail, dominated by all four NewInvs. Larger cascade size than the
-; 2-/3-object cyclic tests.
+; whole group (4 objects, one shared escape point). Under reuse-OrigAlloc all
+; four OrigAllocs are KEPT (each dominates the escape point), so every field
+; store replays directly onto its OrigAlloc and the back edge D.i = A resolves
+; through A's OrigAlloc — no cascade coordination, no fresh pea.mat invoke, no
+; materialized-object PHI. Larger group than the 2-/3-object cyclic tests.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare i32 @__gxx_personality_v0(...)
@@ -50,8 +51,13 @@ u4:
 ; CHECK-DAG: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr)
 ; CHECK-DAG: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 33333 to ptr)
 ; CHECK-DAG: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 44444 to ptr)
-; All four replayed stores use real NewInvs (no poison): the back edge D.i = A
-; (A materialized last) resolves to A's NewInv.
-; CHECK-COUNT-4: store atomic ptr addrspace(1) %pea.mat{{[0-9]*}}, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
+; No fresh materialization invoke is emitted.
+; CHECK-NOT: pea.mat = invoke
+; All four replayed field stores use OrigAlloc values (no poison): the back edge
+; D.i = A resolves through A's OrigAlloc (kept alive).
+; CHECK: store atomic ptr addrspace(1) %a, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
+; CHECK: store atomic ptr addrspace(1) %d, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
+; CHECK: store atomic ptr addrspace(1) %c, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
+; CHECK: store atomic ptr addrspace(1) %b, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
 ; CHECK-NOT: poison
-; CHECK: ret ptr addrspace(1) %{{.*}}
+; CHECK: ret ptr addrspace(1) %a

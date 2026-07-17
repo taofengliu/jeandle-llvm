@@ -1,9 +1,10 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 ;
 ; A DERIVED pointer carried across the back-edge where the derivation is a
-; bitcast (offset 0): %sf = bitcast %X. The re-derivation replays offset 0, so
-; the carried PHI's back-edge incoming reuses the materialized object directly
-; (no extra GEP). The body bitcast is dead-code swept away.
+; bitcast (offset 0): %sf = bitcast %X. Under the reuse-OrigAlloc model the
+; body alloc %X is retained, so the body bitcast %sf stays valid and the
+; carried PHI's back-edge incoming stays %sf (no materialized base, no extra
+; GEP). The tracked field store is replayed onto %X at offset 0 at the latch.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -42,8 +43,15 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_150_carried_bitcast
-; CHECK: %psf = phi ptr addrspace(1) [ null, %entry ], [ %pea.mat, %mat.cont ]
-; CHECK: %pea.mat = invoke
+; The carried PHI's back-edge incoming stays the body bitcast %sf.
+; CHECK: %psf = phi ptr addrspace(1) [ null, %entry ], [ %sf, %latch ]
+; CHECK: %X = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
+; CHECK-NOT: pea.mat = invoke
+; The body bitcast of the retained OrigAlloc is kept.
+; CHECK: %sf = bitcast ptr addrspace(1) %X to ptr addrspace(1)
+; The tracked field store is replayed onto %X at offset 0 at the back-edge.
+; CHECK: %pea.matslot = getelementptr inbounds i8, ptr addrspace(1) %X, i64 0
+; CHECK: store atomic i32 %i, ptr addrspace(1) %pea.matslot unordered, align 4
 ; CHECK: call void @sink(ptr addrspace(1) %psf)
 ; CHECK-NOT: poison
 

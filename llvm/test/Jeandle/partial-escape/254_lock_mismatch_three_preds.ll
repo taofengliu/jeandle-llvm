@@ -1,24 +1,20 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Three preds joining at the same merge with lock counts
-; 0 / 1 / 2 on the same virtual object.
+; Three preds joining at the same merge with lock counts 0 / 1 / 2 on the
+; same virtual object, under the reuse-OrigAlloc model.
 ;
-;   c0: no enter         → LC=0, no live enters.
-;   c1: 1 enter          → LC=1, one live enter call.
-;   c2: 2 enters         → LC=2, two live enter calls.
+;   c0: no enter         — LockCount=0.
+;   c1: 1 enter          — LockCount=1.
+;   c2: 2 enters         — LockCount=2.
 ;
-; Lock-cascade fires (counts disagree). Materialize at every pred:
-;   c0: no live locks → just emit the new alloc invoke.
-;   c1: un-elide its one enter (operand snapped to c1's NewInv).
-;   c2: un-elide its two enters (operand snapped to c2's NewInv).
-;
-; After all three materialize, the retry sees AllMaterialized with
-; per-pred-placeholder MaterializedValues; the lock-cascade fix detects the
-; placeholders and builds a ptr addrspace(1) PHI of the three per-pred
-; NewInvs, then RAUWs OrigAlloc → PHI for the post-merge sink user.
-;
-; User semantics preserved exactly: 0 enters on c0, 1 enter on c1, 2
-; enters on c2, no synthesized enters anywhere.
+; Under reuse-OrigAlloc the mismatch no longer drives a per-pred
+; materialization cascade. The ORIGINAL allocation (OrigAlloc %o) dominates
+; every use and is kept verbatim; each pred's surviving monitorenters stay in
+; their original blocks with receivers pointing at OrigAlloc. No fresh
+; materialization invoke is emitted, no enters are synthesized, and no PHI is
+; built at the merge — the post-merge sink receives OrigAlloc directly.
+; User semantics preserved exactly: 0 enters on c0, 1 enter on c1, 2 enters
+; on c2.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
@@ -55,23 +51,19 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_lock_mismatch_three_preds
-; Walk the IR in RPO order. c0 (zero locks) materializes with no enter:
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
+; The original allocation invoke is RETAINED (no fresh materialization).
+; CHECK: %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
+; No pea.mat materialization invoke is emitted.
+; CHECK-NOT: pea.mat = invoke
+; c1's single enter stays in its original block, receiver OrigAlloc %o.
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %o, ptr %lock)
+; c2's two enters stay in their original block, receiver OrigAlloc %o.
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %o, ptr %lock)
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %o, ptr %lock)
+; Exactly three monitorenters total — no synthesized enters anywhere.
 ; CHECK-NOT: call hotspotcc void @jeandle.monitorenter_with_thin_lock
-; c1 (one lock) materializes and un-elides one enter:
-; CHECK: %[[MAT1:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %[[MAT1]],
-; CHECK-NOT: call hotspotcc void @jeandle.monitorenter_with_thin_lock
-; c2 (two locks) materializes and un-elides two enters:
-; CHECK: %[[MAT2:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %[[MAT2]],
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %[[MAT2]],
-; No more enters or new-instance invokes after this.
-; CHECK-NOT: call hotspotcc void @jeandle.monitorenter_with_thin_lock
-; CHECK-NOT: invoke hotspotcc{{.*}}@jeandle.new_instance
-; ptr addrspace(1) PHI at merge wires the three per-pred NewInvs, then
-; sink consumes the PHI value.
-; CHECK: %[[PHI:[A-Za-z0-9._]+]] = phi ptr addrspace(1)
-; CHECK: call void @sink(ptr addrspace(1) %[[PHI]])
+; No PHI is synthesized at the merge; sink receives OrigAlloc directly.
+; CHECK-NOT: phi ptr addrspace(1)
+; CHECK: call void @sink(ptr addrspace(1) %o)
 
 !java-method-compilation = !{}

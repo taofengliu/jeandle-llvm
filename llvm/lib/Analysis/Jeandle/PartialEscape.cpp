@@ -372,14 +372,11 @@ PEABlockState::getArrayForModification() {
     ObjectStates =
         std::make_shared<SmallVector<std::optional<ObjectState>, 8>>();
   } else if (ObjectStates.use_count() > 1) {
-    // Defensive copy-on-write detach. NOTE: in the current architecture this
-    // branch is unreachable — the analyzer's processBlock() resets CurrentState
-    // to a fresh PEABlockState at every block header (resetPerBlockState), so
-    // the one producer of shared state, the loop snapshot (takeLoopSnapshot),
-    // never leaves CurrentState shared at a mutation point (use_count() is
-    // always 1 here). It is retained as insurance: if that per-block-reset
-    // invariant ever changes, mutating a shared vector in place would silently
-    // corrupt the snapshot, and this detach is what prevents it.
+    // Defensive copy-on-write detach. Unreachable today: processBlock() resets
+    // CurrentState to a fresh PEABlockState at every block header, so the loop
+    // snapshot (the sole producer of shared state) never leaves CurrentState
+    // shared at a mutation point. Retained as a guard against silent snapshot
+    // corruption if that per-block-reset invariant ever changes.
     ObjectStates = std::make_shared<SmallVector<std::optional<ObjectState>, 8>>(
         *ObjectStates);
     assert(ObjectStates.use_count() == 1 &&
@@ -634,6 +631,9 @@ void Effect::dump(raw_ostream &OS) const {
     break;
   case Kind::RewritePhiIncoming:
     OS << "RewritePhiIncoming";
+    break;
+  case Kind::RewriteDeoptBundle:
+    OS << "RewriteDeoptBundle";
     break;
   }
   if (ObjID != InvalidObjectID)

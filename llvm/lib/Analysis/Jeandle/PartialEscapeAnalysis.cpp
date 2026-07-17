@@ -302,7 +302,7 @@ public:
   static constexpr unsigned MaxLoopFixpointIters = 10;
 
   // Loop-nest execution mode. Mirrors Graal's EffectsClosureMode
-  // (EffectsClosure.java:331-345), a single closure-global field:
+  // (Graal EffectsClosure), a single closure-global field:
   //   Regular            (REGULAR_VIRTUALIZATION) — processAllocation registers
   //                        virtuals normally.
   //   StopNewInLoopNest  (STOP_NEW_VIRTUALIZATIONS_LOOP_NEST) —
@@ -311,8 +311,8 @@ public:
   //                        nest, but already-virtual objects, loads/stores,
   //                        merges, locks, and exits all continue to be tracked
   //                        exactly as in Regular. Graal flips this per-loop in
-  //                        stripKilledLoopLocations when loop.depth > cutoff
-  //                        (PClosure:675); Jeandle flips it nest-wide at the
+  //                        stripKilledLoopLocations when loop.depth > cutoff;
+  //                        Jeandle flips it nest-wide at the
   //                        outermost processLoop when the nest's max depth
   //                        exceeds JeandlePEALoopCutoff (conservative analog).
   //                        In this mode, ensureMaterialized on a (necessarily
@@ -323,9 +323,9 @@ public:
   //                        for the new VO (virtualize-then-materialise), so
   //                        intra-block folds survive. Reached on the first
   //                        non-convergence or overflow (Graal
-  //                        EClosure:550-561); the mode persists through the
+  //                        EffectsClosure); the mode persists through the
   //                        rest of the nest and is reset to Regular only at
-  //                        depth==1 convergence (EClosure:482-488).
+  //                        depth==1 convergence (Graal EffectsClosure).
   enum class Mode : uint8_t { Regular, StopNewInLoopNest, MaterializeAll };
 
 private:
@@ -388,6 +388,17 @@ private:
   // nested-virtual store/load, opaque consumer, incompatible multi-pred
   // merge). Once false, commit() drops every recorded effect for the object.
   DenseMap<jeandle::ObjectID, bool> Eligible;
+
+  // ObjectIDs whose OrigAlloc appears in the CURRENTLY-processed
+  // instruction's "deopt" bundle AND was recorded as a scoped virtual
+  // mapping by recordDeoptBundleMappings (a RewriteDeoptBundleEffect was
+  // emitted for it). The generic escape path skips these deopt-bundle
+  // operands so describing an object in a deopt bundle does not, by itself,
+  // force a materialization (Graal addVirtualMapping semantics). Per-
+  // instruction: cleared and repopulated by recordDeoptBundleMappings at the
+  // top of the call dispatch, consumed by materializeAllVirtualOperands /
+  // markVirtualOperandsIneligible in the same dispatch.
+  DenseSet<jeandle::ObjectID> DeoptBundleHandled;
 
   // Per-object monitor lock counter. Incremented on a folded monitorenter,
   // decremented on a folded monitorexit. Any object with LockCount != 0 at
@@ -486,7 +497,7 @@ private:
   // immediately when it is already set (propagation, matching Graal's
   // re-throw), and the outermost (depth==1) processLoop catches it, restores
   // the snapshot, drains the preheader, and redoes the nest in MATERIALIZE_ALL
-  // (EffectsClosure.java:533-551). Cleared on every top-level processLoop entry
+  // (Graal EffectsClosure). Cleared on every top-level processLoop entry
   // and consumed (cleared) immediately before the MATERIALIZE_ALL retry.
   bool OverflowFlag = false;
 
@@ -652,8 +663,8 @@ private:
 
   // Returns a stable PHI for the given (in-loop merge block, ID, offset)
   // tuple, creating one (and registering it in OwnedLoopFieldPhis) on first
-  // use. Falls back to createUnparentedPhi (i.e. the legacy OwnedPhis path)
-  // when BB is not inside any loop (LI.getLoopFor(BB) == nullptr). Inside a
+  // use. Falls back to createUnparentedPhi when BB is not inside any loop
+  // (LI.getLoopFor(BB) == nullptr). Inside a
   // loop — including non-header in-loop merge blocks — the PHI must be cached
   // so its Value* survives restoreLoopSnapshot (which preserves BlockExits[BB]
   // for loop blocks but truncates OwnedPhis).
@@ -802,8 +813,10 @@ private:
   // At every exit block of L, force-materialise still-virtual VOs
   // when the exit successor is an EH-pad block (landingpad / catchpad /
   // cleanuppad), to keep exception handlers from observing a
-  // partially-materialised state. TODO: downstream "deopt-bundle within
-  // reach" detection is deferred (Jeandle currently has no deopt machinery).
+  // partially-materialised state. TODO(deopt-within-reach): the downstream
+  // "deopt-bundle within reach" pre-scan is not yet implemented — Jeandle's
+  // PEA deopt machinery exists, but reachability info from deopt bundles is
+  // not yet fed into this exit-force decision.
   // Called from processLoop after convergence.
   void processLoopExit(Loop *L);
   // SkipGlobalRAUW=true marks the emitted Materialize as IsPerPred, attaching a
@@ -822,8 +835,8 @@ private:
   // includes its sub-loops; nested loops are dispatched recursively when
   // their header is encountered in the RPO walk). On convergence, all blocks
   // of L have their BlockExits populated and the outer RPO walk continues.
-  // On failure, restores to the pre-loop snapshot, then runs the legacy
-  // pessimistic path: force-materialize at preheader (drains every virtual)
+  // On failure, restores to the pre-loop snapshot, then runs the pessimistic
+  // recovery: force-materialize at preheader (drains every virtual)
   // and process the body once in MATERIALIZE_ALL mode (no new VOs created
   // inside).
   void processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO);
@@ -890,7 +903,7 @@ private:
 
   // Structural equivalence of the BlockExitData base (the per-object
   // book-keeping). The loop fixpoint's single-state B-vs-B' convergence test
-  // (paper §5.2.5 / Graal EClosure:472 equivalentTo).
+  // (Graal's loop fixpoint equivalentTo).
   static bool exitDataEquivalent(const BlockExitData &A,
                                  const BlockExitData &B);
 
@@ -942,11 +955,11 @@ private:
   // loop-fixpoint iterations). Shared by foldMonitorEnter and
   // materializeVirtualLocksBefore.
   uint32_t getOrCreateLockDepth(CallBase *CB);
-  // Graal materializeVirtualLocksBefore (PartialEscapeClosure.java:641-652):
+  // Graal materializeVirtualLocksBefore (Graal PartialEscapeClosure):
   // before a REAL (non-virtualized) monitorenter whose depth is D, materialize
   // every still-virtual VO holding an elided lock with a strictly shallower
   // min depth. Fired from processInstruction on the not-deleted monitorenter
-  // branch (Graal PClosure:263-264), distinct from foldMonitorEnter's
+  // branch, distinct from foldMonitorEnter's
   // elide-path pre-cascade.
   void materializeVirtualLocksBefore(CallBase *MonEnter);
   bool foldArrayStoreCheck(CallBase *CB);
@@ -959,13 +972,34 @@ private:
   std::optional<bool> evalSubtypeRelation(uintptr_t SubKlass,
                                           uintptr_t SuperKlass);
   void emitReplaceCall(CallBase *CB, Value *Replacement, jeandle::ObjectID ID);
+  // PEA deopt support. Scan CB's "deopt" operand bundle for
+  // references to still-virtual OrigAllocs and, for each that meets the
+  // scoped criteria (single never-escaping instance, scalar fields, no
+  // locks, not synthetic, OrigAlloc-not-derived), record a
+  // RewriteDeoptBundleEffect snapshotting the per-offset scalar FieldValues
+  // and add the ObjectID to DeoptBundleHandled. Graal analog: addVirtualMapping
+  // — a deopt-state reference to a virtual object is recorded as a virtual
+  // mapping (re-emitted as an ObjectValue at deopt), NOT an escape. The
+  // generic escape path (materializeAllVirtualOperands /
+  // markVirtualOperandsIneligible) consults DeoptBundleHandled to skip the
+  // handled deopt-bundle operands so the bundle alone does not force a
+  // materialization. Out-of-scope shapes (reference fields, locks, arrays,
+  // derived pointers, multi-scope bundles) are conservatively left
+  // unrecorded so they fall through to the existing escape/materialization
+  // behavior.
+  void recordDeoptBundleMappings(CallBase *CB);
+  // True iff \p U is an input of I's "deopt" operand bundle whose resolved
+  // ObjectID was recorded as a scoped virtual mapping at this instruction
+  // (present in DeoptBundleHandled). Used by the generic escape path to skip
+  // deopt-state operands.
+  bool isHandledDeoptBundleOperand(const Use &U, Instruction *I);
   void materializeAllVirtualOperands(Instruction *I);
   // Sound analog of materializeAllVirtualOperands: materialize only when no
   // operand is a DERIVED pointer of a still-virtual object (a derived operand
   // computed before I would resolve to poison, since pea.mat at I cannot
   // dominate its def); otherwise mark every virtual operand's object ineligible
   // so derived pointers stay valid. Graal's processNodeInputs
-  // (PartialEscapeClosure.java:433-451) always materializes — Jeandle diverges
+  // (Graal PartialEscapeClosure) always materializes — Jeandle diverges
   // to markIneligible only because LLVM represents field access as derived
   // address computations, which Graal's identity-based alias model does not.
   void materializeVirtualOperandsSafely(Instruction *I);
@@ -1370,7 +1404,7 @@ Value *Analyzer::getOrCreatePerPredMatPlaceholder(BasicBlock *PH,
 PHINode *Analyzer::getOrCreateLoopFieldPhi(BasicBlock *BB, jeandle::ObjectID ID,
                                            int64_t Offset, Type *Ty, unsigned N,
                                            const Twine &Name) {
-  // Outside any loop (LI.getLoopFor(BB) == nullptr), fall back to the legacy
+  // Outside any loop (LI.getLoopFor(BB) == nullptr), fall back to the
   // single-shot OwnedPhis path. Inside a loop — including NON-HEADER in-loop
   // merge blocks — the PHI is cached so its Value* stays stable across
   // fixpoint iterations: restoreLoopSnapshot preserves BlockExits[BB] for
@@ -1564,7 +1598,7 @@ void Analyzer::MergeProcessor::run() {
   }
 
   // identicalExitData fast path (Graal's identicalObjectStates,
-  // PartialEscapeClosure.java:935-936) runs INSIDE the do/while below — see
+  // Graal PartialEscapeClosure) runs INSIDE the do/while below — see
   // the comment there. It is sound there because per-pred materialization
   // gives each pred a DISTINCT materialized value, so the deep-value
   // equivalence check does not false-positive post-cascade.
@@ -1629,11 +1663,10 @@ void Analyzer::MergeProcessor::run() {
     Changed = false;
 
     // identicalExitData fast path (Graal's identicalObjectStates,
-    // PartialEscapeClosure.java:935-936), re-evaluated each iteration. If every
+    // Graal PartialEscapeClosure), re-evaluated each iteration. If every
     // predecessor's BlockExitData is byte-equivalent, the merge is degenerate:
     // inherit preds[0] directly and skip the O(|preds|*|virtuals|*|offsets|)
-    // per-VO merge. processBlockPhis still runs (Graal runs getPhis() at
-    // :1041-1046) to alias any pointer PHIs.
+    // per-VO merge. processBlockPhis still runs (Graal runs getPhis()) to alias any pointer PHIs.
     //
     // SOUNDNESS (why this is safe inside the loop, matching Graal): Graal uses
     // a reference-identity compare on the ObjectState[] array — a materialize
@@ -1742,8 +1775,8 @@ bool Analyzer::MergeProcessor::mergeObjectState(jeandle::ObjectID ID) {
   if (AllMaterialized) {
     // Every incoming path already materialized the object. If every pred
     // shares one real (non-placeholder) materialized pointer, install it
-    // directly (Graal uniqueMaterializedValue,
-    // PartialEscapeClosure.java:982). Otherwise (differing pointers, or the
+    // directly (Graal uniqueMaterializedValue).
+    // Otherwise (differing pointers, or the
     // per-pred OrigAlloc placeholder) build a ptr addrspace(1)
     // materializedValuePhi. No pred is virtual here, so materializeAndBuildPhi
     // materializes nothing and just builds the PHI.
@@ -1791,7 +1824,7 @@ bool Analyzer::MergeProcessor::mergeObjectState(jeandle::ObjectID ID) {
       return false;
 
     // Mixed virtual+materialized merge — Graal's per-pred+PHI else-branch
-    // (PartialEscapeClosure.java:984-1002): materialize each still-virtual pred
+    // (Graal PartialEscapeClosure): materialize each still-virtual pred
     // at its predecessor-end and build a materializedValuePhi over the per-pred
     // materialized pointers. This is sound because (a) each pred's materialize
     // is placed at its own predecessor-end (self-contained, not a dominating
@@ -1846,7 +1879,7 @@ bool Analyzer::MergeProcessor::mergeObjectState(jeandle::ObjectID ID) {
   if (AllVirtual && LocksMatch && StacksMatch)
     return mergeFieldStates(ID);
 
-  // else (Graal else-branch, PartialEscapeClosure.java:984-1002): a lock-count
+  // else (Graal else-branch): a lock-count
   // or live-enter-stack mismatch forces per-pred materialization. Do it in a
   // SINGLE pass and build the materializedValuePhi here (each pred carries its
   // OWN lock list, so the alloc-commit emits exactly that pred's monitorenter
@@ -1856,12 +1889,12 @@ bool Analyzer::MergeProcessor::mergeObjectState(jeandle::ObjectID ID) {
   return materializeAndBuildPhi(ID);
 }
 
-// Graal else-branch (PartialEscapeClosure.java:984-1002) / the incompatible
-// tail of mergeObjectStates (PartialEscapeBlockState.java:1312-1331):
+// Graal else-branch / the incompatible
+// tail of mergeObjectStates (Graal PartialEscapeBlockState):
 // materialize every still-virtual pred and build a ptr addrspace(1)
 // materializedValuePhi over the per-pred materialized pointers, installing a
 // materialized ObjectState. Reached for the mixed `!AllVirtual` case (Graal's
-// else-branch, PartialEscapeClosure.java:984-1002), for
+// else-branch), for
 // AllMaterialized-differing-pointers (no virtuals to materialize — just builds
 // the PHI), and for lock/stack mismatch (every virtual pred materialized).
 // Returns true if a per-pred materialize emitted an Effect this iteration (the
@@ -1950,7 +1983,7 @@ bool Analyzer::MergeProcessor::materializeAndBuildPhi(jeandle::ObjectID ID) {
   return Mat;
 }
 
-// Graal mergeObjectStates (PartialEscapeClosure.java:1102-1331), COMPATIBLE
+// Graal mergeObjectStates (Graal PartialEscapeClosure), COMPATIBLE
 // branch: per-offset field-PHI synthesis for a virtual object whose locks agree
 // across all predecessors. Identical entries flow straight into the merged
 // state; disagreements synthesize a per-offset PHI. (The INCOMPATIBLE tail of
@@ -1960,8 +1993,8 @@ bool Analyzer::MergeProcessor::materializeAndBuildPhi(jeandle::ObjectID ID) {
 //
 // TODO(mergeObjectStates-two-slot-and-bytearray): mirror Graal's
 // virtualByteCount / twoSlotKinds compatibility pre-scan
-// (PartialEscapeClosure.java:1110-1253) and widened-PHI synthesis
-// (:1256-1283). The integer-widening zext below is guarded so a narrow pred
+// (Graal PartialEscapeClosure) and widened-PHI synthesis.
+// The integer-widening zext below is guarded so a narrow pred
 // with a conflicting non-default scalar in the wide type's byte span bails
 // instead of discarding adjacent-byte contributions. Today that widening is
 // unreachable — processStore's getOrCreateFieldIndex bails on a width
@@ -2124,13 +2157,13 @@ bool Analyzer::MergeProcessor::mergeFieldStates(jeandle::ObjectID ID) {
           // narrower than PhiType. Other mismatches (scalar at pointer slot,
           // etc.) still LocalBail. Constants are the overwhelming common case
           // (loop-invariant 0/1 stores); non-const zext would need a per-pred
-          // CreatePHI shim (deferred).
+          // CreatePHI shim (TODO(non-const-zext-phi): deferred).
           if (V->getType()->isIntegerTy() && PhiType->isIntegerTy() &&
               V->getType()->getIntegerBitWidth() <
                   PhiType->getIntegerBitWidth()) {
             if (auto *CI = dyn_cast<ConstantInt>(V)) {
-              // Graal isEntryDefaults mirror (PartialEscapeClosure.java:1110-
-              // 1253): the narrow pred must have NO conflicting non-default
+              // Graal isEntryDefaults mirror (Graal PartialEscapeClosure):
+              // the narrow pred must have NO conflicting non-default
               // scalar in the wide type's byte span [Off+1, Off+WideBytes),
               // or the zext would discard adjacent-byte contributions.
               unsigned WideBytes = PhiType->getIntegerBitWidth() / 8;
@@ -2949,7 +2982,7 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
 
 void Analyzer::processInstruction(Instruction *I) {
   // Graal correspondence: PartialEscapeClosure.processNode /
-  // processNodeInternal (PartialEscapeClosure.java:214-276). Graal dispatches
+  // processNodeInternal (Graal PartialEscapeClosure). Graal dispatches
   // in three stages; this function mirrors them, adapted to LLVM's opcode-
   // keyed IR (Graal uses a Virtualizable interface + graph nodes):
   //
@@ -2964,7 +2997,7 @@ void Analyzer::processInstruction(Instruction *I) {
   //       processIntrinsic (LLVM intrinsics), foldICmpEquality
   //       (IsNullNode/UnaryOpLogicNode), processJavaOp (ArrayLength/LoadHub/
   //       InstanceOf/Monitor/MonitorExit/ArrayStoreCheck/...).
-  //   (3) processNodeInputs STAGE (Graal:433-451):
+  //   (3) processNodeInputs STAGE (Graal PartialEscapeClosure):
   //   materializeAllVirtualOperands
   //       — materializes every virtual operand the specific fold did not itself
   //       account for.
@@ -3014,8 +3047,8 @@ void Analyzer::processInstruction(Instruction *I) {
   // atomicrmw/cmpxchg falls through to the generic-escape path below,
   // materializing conservatively.
 
-  // Graal materializeVirtualLocksBefore (PartialEscapeClosure.java:263-264,
-  // 641-652): under strict lock order, a REAL (non-virtualized) monitorenter
+  // Graal materializeVirtualLocksBefore (Graal PartialEscapeClosure):
+  // under strict lock order, a REAL (non-virtualized) monitorenter
   // must first materialize every still-virtual object holding a shallower live
   // lock, so each such object's re-emitted lock lands below this real lock on
   // the lightweight-locking thread lock stack (preserving lexical nesting).
@@ -3067,7 +3100,7 @@ void Analyzer::processInstruction(Instruction *I) {
         return;
       // default: fall through to the ICmp / JavaOp / generic-escape path.
     }
-    // Deferred virtualization handlers — NOT WIRED yet:
+    // TODO(deferred-virtualizers): deferred virtualization handlers — NOT WIRED yet:
     //   - TODO: processArrayCopy / processMemSet — llvm.memcpy/memmove
     //     (System.arraycopy) and llvm.memset (Arrays.fill). The only
     //     llvm.memset producer today is jeandle.new_instance's lower-phase=1
@@ -3114,6 +3147,17 @@ void Analyzer::processInstruction(Instruction *I) {
     // handled (whether by folding to a constant or by being a known-safe
     // non-escaping shape that needs no transform).
     if (auto *CB = dyn_cast<CallBase>(I)) {
+      // PEA deopt support: record VO descriptors for any still-
+      // virtual OrigAlloc referenced in CB's "deopt" bundle. This must run for
+      // EVERY call carrying a deopt bundle, INCLUDING JavaOps that
+      // processJavaOp handles (e.g. safepoint polls) — those safepoints survive
+      // in the IR and their bundle operands would otherwise be left for Pass
+      // 2's EliminateAllocation poison-RAUW. (recordDeoptBundleMappings checks
+      // hasDeoptBundle and populates DeoptBundleHandled for THIS call, consumed
+      // by materializeVirtualOperandsSafely below; the transform's apply no-ops
+      // if the call/bundle was later folded away, so scanning handled calls is
+      // safe.)
+      recordDeoptBundleMappings(CB);
       if (processJavaOp(CB))
         return;
       // Fall through to the generic-escape path for unrecognised calls.
@@ -3121,6 +3165,8 @@ void Analyzer::processInstruction(Instruction *I) {
     // Any other consumer of a virtual operand. Materialize when sound; if a
     // derived-GEP virtual operand is present, markIneligible instead so it
     // doesn't resolve to poison (see materializeVirtualOperandsSafely).
+    // Deopt-bundle operands whose ObjectID is in DeoptBundleHandled are
+    // skipped (recordDeoptBundleMappings described them).
     materializeVirtualOperandsSafely(I);
     return;
   }
@@ -3129,7 +3175,7 @@ void Analyzer::processInstruction(Instruction *I) {
 }
 
 // Allocation virtualization. Graal correspondence:
-// VirtualizerToolImpl.createVirtualObject (VirtualizerToolImpl.java:345-369) —
+// VirtualizerToolImpl.createVirtualObject (Graal VirtualizerToolImpl) —
 // build the VirtualObject (VirtualInstanceNode/VirtualArrayNode in Graal), give
 // it an ObjectState (presence marker + lock list), add the virtual alias
 // (virtual <-> itself), and record the EliminateAllocation effect. Jeandle's
@@ -3146,13 +3192,13 @@ void Analyzer::processAllocation(CallBase *CB) {
   //
   // TODO(ensure-virtualized): GRAAL DIVERGENCE — the refusal below is
   // unconditional, but Graal's processVirtualizable
-  // (PartialEscapeClosure.java:287-303) exempts allocations whose usages
+  // (Graal PartialEscapeClosure) exempts allocations whose usages
   // contain an EnsureVirtualizedNode (the mayEnsureVirtualized scan): such
   // an allocation is still virtualised PAST EscapeAnalysisLoopCutoff
   // (default 20). The marker is produced only by GraalDirectives
   // .ensureVirtualized / ensureVirtualizedHere, lowered by the graph
-  // builder to an EnsureVirtualizedNode (EnsureVirtualizedNode.java:50-110;
-  // StandardGraphBuilderPlugins.java:2082-2095). Jeandle's frontend has no
+  // builder to an EnsureVirtualizedNode (Graal EnsureVirtualizedNode /
+  // StandardGraphBuilderPlugins). Jeandle's frontend has no
   // ensure_virtualized JavaOp / intrinsic, so mayEnsureVirtualized would be
   // uniformly false here — there is currently nothing to override.
   //
@@ -3162,7 +3208,7 @@ void Analyzer::processAllocation(CallBase *CB) {
   //      plus an EnsureVirtualized bit on ObjectState (serialised through
   //      clone / takeLoopSnapshot / restoreLoopSnapshot).
   //  (2) Materialisation guard — Graal's ensureMaterialized
-  //      (PartialEscapeClosure.java:538-562) throws RetryableBailoutException
+  //      (Graal PartialEscapeClosure) throws RetryableBailoutException
   //      (a non-permanent bailout: retry the whole compilation without PEA)
   //      when an ensure-virtualised object must be materialised inside a
   //      deep nest, which is what keeps the override from going exponential
@@ -3171,8 +3217,8 @@ void Analyzer::processAllocation(CallBase *CB) {
   //      matching note in ensureMaterialized below.
   //  (3) Flag bookkeeping — AND-reduce the bit across merge predecessors
   //      with setEnsureVirtualized(false) where not all preds agree
-  //      (PartialEscapeClosure.java:991-995, 1321-1324, 1500-1503) and
-  //      propagate it transitively in stripKilledLoopLocations (:685-714).
+  //      (Graal PartialEscapeClosure) and
+  //      propagate it transitively in stripKilledLoopLocations.
   //      Jeandle's ObjectState has no such bit, so the per-pred materialisation
   //      sites that route through materializeAtPredFromExitInfo currently do no
   //      downgrade either — tagged TODO(ensure-virtualized) at their entry
@@ -3272,7 +3318,7 @@ void Analyzer::processAllocation(CallBase *CB) {
   // finalizers, and HotSpot's finalizer / Reference / Thread machinery
   // is keyed on InstanceKlass identity). Lit tests without a cblog
   // continue to virtualize as before because both pointers are
-  // nullptr and we fall through to the legacy default-virtualize path.
+  // nullptr and we fall through to the default-virtualize path.
   if (IsInstance) {
     if (const jeandle::VMCallbacks *VMCB = jeandle::getVMCallbacks()) {
       if (VMCB->HasFinalizer && VMCB->HasFinalizer(Klass))
@@ -3344,8 +3390,8 @@ void Analyzer::processAllocation(CallBase *CB) {
     }
   }
 
-  // Graal VirtualizerToolImpl.createVirtualObject (345-369) +
-  // replaceWithVirtual (293-300): assign the object id, install a virtual
+  // Graal VirtualizerToolImpl.createVirtualObject +
+  // replaceWithVirtual: assign the object id, install a virtual
   // ObjectState, register the virtual alias, "delete" the original allocation,
   // and account the delta. Jeandle's virtualize is structurally the same; the
   // only differences are forced by the deferred-transform design (no IR
@@ -3357,16 +3403,16 @@ void Analyzer::processAllocation(CallBase *CB) {
   //   - the per-field FieldValue tracking lives in the analyzer-side
   //     FieldStates map (Jeandle's counterpart to Graal ObjectState.entries;
   //     the on-VO ObjectState carries no field state) — see the class comment.
-  jeandle::ObjectID ID = Result.createVirtualObject(std::move(VO)); // :354-359
+  jeandle::ObjectID ID = Result.createVirtualObject(std::move(VO));
   AllocSiteToVO[CB] = ID; // Jeandle: stable id per site (loop fixpoint).
-  Aliases.addVirtualAlias(CB, ID); // addVirtualAlias :361
+  Aliases.addVirtualAlias(CB, ID); // Graal addVirtualAlias
   // Register a Virtual ObjectState — a presence marker carrying only Kind ==
-  // Virtual (addObject :360). resolveVirtualRef only needs the slot present;
+  // Virtual (Graal addObject). resolveVirtualRef only needs the slot present;
   // the per-field FieldValue tracking lives in FieldStates (see class comment).
   CurrentState.addObject(ID, jeandle::ObjectState());
   Eligible[ID] = true;
 
-  // replaceWithVirtual analog (Graal effects.deleteNode :362). Deferred: emit
+  // replaceWithVirtual analog (Graal effects.deleteNode). TODO: emit
   // an EliminateAllocation effect the transform applies to erase the alloc.
   auto E = std::make_unique<jeandle::EliminateAllocationEffect>();
   E->Block = CB->getParent();
@@ -3375,7 +3421,7 @@ void Analyzer::processAllocation(CallBase *CB) {
   E->ObjID = ID;
   Result.addBlockEffect(std::move(E));
 
-  ++Result.VirtualizationDelta; // effects.addVirtualizationDelta(1) :362-363
+  ++Result.VirtualizationDelta; // Graal effects.addVirtualizationDelta(1)
   --Result.AllocationDelta;
   // A new virtual object was registered.
   ++JeandlePEAVirtualized;
@@ -3445,6 +3491,20 @@ bool Analyzer::processStore(StoreInst *SI) {
   Value *Ptr = SI->getPointerOperand();
   Value *Val = SI->getValueOperand();
 
+  // Volatile fields: a Java volatile store reaches PEA as an atomic seq_cst
+  // store. It is intentionally virtualized like a plain field, dropping the
+  // release/seq_cst fence. This is sound, not a bug: PEA only keeps an object
+  // virtual while it is NoEscape (thread-local), and the JMM's volatile
+  // semantics are cross-thread visibility/ordering guarantees, which are
+  // vacuous for a reference no other thread can observe. Graal and C2 rely on
+  // the same argument — Graal's StoreFieldNode.virtualize / LoadFieldNode.
+  // virtualize never consult isVolatile(), and C2's escape analysis has no
+  // volatile gate. At deopt the reallocated object's fields are written with
+  // plain field_put too, but the object is unpublished until the
+  // OrderAccess::storestore() publication barrier (deoptimization.cpp), so
+  // ordering holds there as well. Correctness therefore rests on the
+  // escape-analysis invariant (NoEscape == thread-local), not on a per-field
+  // bail; no bail is added here or in processLoad.
   auto BaseID = jeandle::pea::resolveVirtualRef(Ptr, CurrentState, Aliases, DL);
   if (!BaseID)
     return false;
@@ -3526,6 +3586,32 @@ void Analyzer::processLoad(LoadInst *LI) {
     return;
 
   jeandle::VirtualObject &VObj = *Result.VirtualObjects[*BaseID];
+
+  // Array length load (e.g. a bounds check): the length lives in the array
+  // header at ArrayLengthOffset, which resolveAccess's header guard rejects as
+  // a non-Java-field offset, so the load would otherwise hit markIneligible and
+  // drop the whole array's virtualization (every array access has a bounds
+  // check, so without this fold no array could ever stay virtual). Fold the
+  // length load to the known ArrayLength constant. Sound even if the array
+  // later materializes: a materialized array is allocated with exactly
+  // ArrayLength elements, so the constant matches the real header length.
+  if (VObj.isArray() && LI->getType()->isIntegerTy(32)) {
+    if (auto LenOff = jeandle::pea::resolveFieldOffset(Ptr, DL)) {
+      const jeandle::VMConstants VMConsts =
+          jeandle::VMConstants::fromModule(*F.getParent());
+      if (*LenOff == VMConsts.arrayLengthOffset()) {
+        auto E = std::make_unique<jeandle::ReplaceLoadEffect>();
+        E->Block = LI->getParent();
+        E->Target = LI;
+        E->Replacement =
+            ConstantInt::get(LI->getType(), (uint64_t)VObj.ArrayLength);
+        E->SeqNo = Result.nextSeqNo();
+        E->ObjID = *BaseID;
+        Result.addBlockEffect(std::move(E));
+        return;
+      }
+    }
+  }
 
   // Shared offset resolution (array-element GEP fast path + constant-offset
   // resolver + header guard). See resolveAccess.
@@ -3933,8 +4019,8 @@ uint32_t Analyzer::getOrCreateLockDepth(CallBase *CB) {
 
 void Analyzer::materializeVirtualLocksBefore(CallBase *MonEnter) {
   // Graal PartialEscapeClosure.materializeVirtualLocksBefore
-  // (PartialEscapeClosure.java:641-652), fired from processNodeInternal
-  // (PClosure:263-264) on the not-deleted MonitorEnter branch under strict
+  // (Graal PartialEscapeClosure), fired from processNodeInternal
+  // on the not-deleted MonitorEnter branch under strict
   // lock order. Before a REAL monitorenter whose bytecode depth is D,
   // materialize every still-virtual VO holding an elided lock with a strictly
   // shallower min depth (LiveLockEnters[id].front() = outermost/min depth,
@@ -3981,7 +4067,7 @@ bool Analyzer::foldMonitorEnter(CallBase *CB) {
   // stack-identity comparisons use a stable, per-call-site ordering key.
   uint32_t MyOrder = NextLockEnterOrder++;
   auto &Stack = LiveLockEnters[*BaseID];
-  // Depth monotonicity invariant (mirrors Graal ObjectState.java:212 and the
+  // Depth monotonicity invariant (mirrors Graal ObjectState and the
   // assert in ObjectState::addLock): nested monitorenters acquire strictly
   // increasing bytecode depth, so a newly pushed enter must be strictly
   // deeper than the current innermost (back) live enter on this VO.
@@ -4431,6 +4517,392 @@ void Analyzer::propagatePointerAlias(Instruction *I) {
   Aliases.addVirtualAlias(I, *BaseID);
 }
 
+bool Analyzer::isHandledDeoptBundleOperand(const Use &U, Instruction *I) {
+  auto *CB = dyn_cast<CallBase>(I);
+  if (!CB)
+    return false;
+  unsigned OpIdx = U.getOperandNo();
+  if (!CB->isBundleOperand(OpIdx))
+    return false;
+  if (!CB->getOperandBundleForOperand(OpIdx).isDeoptOperandBundle())
+    return false;
+  auto ID = jeandle::pea::resolveVirtualRef(U.get(), CurrentState, Aliases, DL);
+  return ID && DeoptBundleHandled.count(*ID);
+}
+
+// Defined below (near the materialize-placement helpers); forward-declared
+// here so recordDeoptBundleMappings can gate on it.
+static bool hasDeoptBundle(CallBase *CB);
+
+void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
+  DeoptBundleHandled.clear();
+  if (!hasDeoptBundle(CB))
+    return;
+
+  auto Deopt = CB->getOperandBundle(LLVMContext::OB_deopt);
+  assert(Deopt && "hasDeoptBundle lied");
+
+  // A VO described in a deopt bundle may have a FIELD whose value is itself
+  // another in-scope VO (virtual at this safepoint). Such a field is emitted as
+  // a VORef (reference by vo-id) to the other VO's descriptor, not as a scalar
+  // or constant oop — mirrors C2/Graal's nested ObjectValue + id back-ref. This
+  // requires:
+  //   1. a transitive closure so every referenced VO is described once;
+  //   2. a greatest-fixpoint "contagious bail" so a VO referencing an
+  //      undescribable VO (arrays/ref-to-non-VO/materialized) is itself not
+  //      described (a dangling VORef is never emitted).
+  // A VO that HOLDS A LOCK at this safepoint is describable too — its
+  // (PEA-eliminated) lock is reconstructed at deopt via a monitor entry with
+  // eliminated=true whose owner is a VORef to this VO (mirrors C2/Graal
+  // MonitorValue{eliminated} + collectLockedVirtualObjects). So locks are not a
+  // bail here; the transform rewrites the monitor's OrigAlloc owner in place.
+  // The sound single-VO bails (derived bundle operand, ref-to-non-VO/
+  // materialized, array of unknown element kind) are clean falls-through;
+  // long/double fields are described (one wire entry, expanded to two slots on
+  // the parse side); arrays of known element kind are described with a T_ARRAY
+  // header and all elements emitted; multi-scope/inlinee bundles remain TODO.
+
+  // Per-cell plan: a touched field/element is either a plain scalar, a VORef to
+  // another in-scope VO (by id), or Bad (this VO cannot be described). For an
+  // ARRAY, untouched elements are synthesized as the Java default (0 / null) so
+  // field_count == ArrayLength (see structurallyEligible).
+  struct Cell {
+    int64_t Offset;
+    enum K : uint8_t { Scalar, VORef, Bad } Kind;
+    Value *ScalarV = nullptr;                             // valid when Scalar
+    jeandle::ObjectID VORefID = jeandle::InvalidObjectID; // valid when VORef
+  };
+  struct Plan {
+    bool Eligible = false;
+    bool Bad = false; // greatest-fixpoint "cannot describe" flag
+    SmallVector<Cell, 8> Cells;
+  };
+  DenseMap<jeandle::ObjectID, Plan> Plans;
+  SmallVector<jeandle::ObjectID, 4> Order; // insertion order for stable emit
+
+  // Basic structural eligibility (instance, not synthetic, klass). Locks are
+  // not a bail: a VO holding a lock at this safepoint is still described,
+  // and its PEA-eliminated lock is reconstructed at deopt as a monitor entry
+  // (eliminated=true, owner=VORef). isVirtualHere (checked in the worklist) is
+  // the virtual-at-safepoint gate; commit()'s end-of-analysis LockCounts!=0
+  // gate separately drops genuinely unbalanced-lock VOs.
+  auto structurallyEligible = [&](jeandle::ObjectID ID) -> bool {
+    if (ID >= Result.VirtualObjects.size())
+      return false;
+    jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
+    if (VObj.AllocationCall == nullptr)
+      return false;
+    if (VObj.IsSynthetic)
+      return false; // synthetic (merge-aliased) VO out of scope.
+    if (VObj.Klass == 0)
+      return false; // no klass identity — cannot describe.
+    if (VObj.isArray()) {
+      // Array VO descriptors use a T_ARRAY header and emit one wire entry per
+      // element 0..ArrayLength-1 (field_count == ArrayLength, including
+      // untouched defaults — HotSpot derives the array length from
+      // field_values.size(), so emitting only touched elements would
+      // miscompile the length). Building this requires a known element type
+      // (to synthesize per-element defaults and the element's computational
+      // basicType), so an array whose element kind the VMCallback could not
+      // identify (ArrayElementType == nullptr / ArrayIndexScale == 0) bails
+      // and is left materialized.
+      if (!VObj.ArrayElementType || VObj.ArrayIndexScale == 0)
+        return false;
+    }
+    return true;
+  };
+
+  // Whether ID is still VIRTUAL at this safepoint (per-block ObjectState
+  // present & virtual). resolveVirtualRef on a bundle operand returns the ID
+  // iff this holds; for transitive members we re-check it here.
+  auto isVirtualHere = [&](jeandle::ObjectID ID) -> bool {
+    auto *OS = CurrentState.getObjectStateOptional(ID);
+    return OS && OS->isVirtual();
+  };
+
+  // Compute the per-field Cell plan for one eligible VO. A Cell is:
+  //   - VORef(InnerID) if the field value is VirtualRef(InnerID) OR a scalar
+  //     whose backing Value* resolves to a virtual InnerID (the inner VO is
+  //     referenced by identity);
+  //   - Scalar(V) if the field is a plain primitive scalar (incl. a touched
+  //     long/double field), OR a reference field holding a REAL (non-
+  //     virtual) wide oop (addrspace 1) that is not a non-null constant —
+  //     emitted as a live-oop field value that RS4GC keeps GC-live/relocatable
+  //     and HotSpot's fill_one_scope_value T_OBJECT non-constant branch reads
+  //     back as LocationValue(Location::oop);
+  //   - Bad otherwise: a MaterializedRef/Unknown whose value fails the
+  //     describable-oop test, a narrow-oop (addrspace 3) reference field
+  //     (CompressedOops deferred), or a non-null constant oop (would trip
+  //     fill_one_scope_value's ShouldNotReachHere on a stackmap constant; null
+  //     is fine). A VO with any Bad cell is wholly undescribable.
+  // A describable oop field value's def dominates the safepoint for free under
+  // reuse-OrigAlloc: a MaterializedRef carries OrigAlloc or a merge-PHI over
+  // OrigAllocs (both dominate), and an external oop's def dominates its store
+  // which dominates the safepoint (analyzer per-field dominance invariant).
+  auto describeMaterializedOop = [&](Value *V) -> bool {
+    auto *PT = dyn_cast<PointerType>(V->getType());
+    if (!PT || PT->getAddressSpace() != jeandle::AddrSpace::JavaHeapAddrSpace)
+      return false; // narrow-oop (addrspace 3) deferred, or not a managed oop.
+    Value *Stripped = V->stripPointerCasts();
+    if (isa<Constant>(Stripped) && !isa<ConstantPointerNull>(Stripped))
+      return false; // non-null constant oop -> would trip fill_one_scope_value.
+    return true;
+  };
+
+  // Classify a TOUCHED FieldValue into a Cell. Shared by the instance
+  // touched-field walk and the array touched-element walk so the two agree on
+  // scalar / VORef / Bad routing (a VORef to an undescribed VO, or a
+  // non-describable oop, makes the whole VO Bad).
+  auto classifyFieldValue = [&](int64_t Offset,
+                                const jeandle::FieldValue &FV) -> Cell {
+    Cell C;
+    C.Offset = Offset;
+    if (FV.isVirtualRef()) {
+      C.Kind = Cell::VORef;
+      C.VORefID = FV.getVirtualRef();
+    } else if (FV.isScalar()) {
+      Value *SV = FV.getScalar();
+      if (auto InnerID = jeandle::pea::resolveVirtualRef(SV, CurrentState,
+                                                         Aliases, DL)) {
+        // A scalar field whose value resolves to a virtual VO -> VORef by
+        // identity (emitted as vo-id, no Value* in the bundle).
+        // For an object array this is how an element holding another in-scope
+        // virtual VO becomes a VORef FIELD (transitive closure through an
+        // array element).
+        C.Kind = Cell::VORef;
+        C.VORefID = *InnerID;
+      } else if (FV.getDeclaredType() &&
+                 FV.getDeclaredType()->isPointerTy() &&
+                 describeMaterializedOop(SV)) {
+        // Reference field holding a non-VO wide oop (argument/null/
+        // materialized external oop): describe it as a Scalar field whose
+        // value is the live oop (RS4GC keeps it relocatable).
+        C.Kind = Cell::Scalar;
+        C.ScalarV = SV;
+      } else if (FV.getDeclaredType() &&
+                 FV.getDeclaredType()->isPointerTy()) {
+        // Narrow-oop (addrspace 3) reference field, or a non-null constant
+        // oop: not describable. TODO(compressed-oop): narrow-oop reference
+        // fields are explicitly deferred (do NOT add handling).
+        C.Kind = Cell::Bad;
+      } else {
+        // Plain primitive scalar (int/float/long/double; also byte/char/short
+        // elements, whose LLVM type widens to T_INT on the emit side). A
+        // touched long/double is described with ONE wire entry carrying the
+        // full i64/f64 value; the HotSpot parser's fill_one_scope_value
+        // T_LONG/T_DOUBLE branch expands it to the two field_values slots
+        // reassign_fields_by_klass consumes.
+        C.Kind = Cell::Scalar;
+        C.ScalarV = SV;
+      }
+    } else if (FV.isMaterializedRef()) {
+      // Field holds a reference to a materialized VO (value = its OrigAlloc
+      // or a merge-PHI over OrigAllocs). Flatten to a Scalar field whose
+      // value is that live oop; bail if it is not a describable wide oop.
+      Value *MV = FV.getMaterialized();
+      if (describeMaterializedOop(MV)) {
+        C.Kind = Cell::Scalar;
+        C.ScalarV = MV;
+      } else {
+        C.Kind = Cell::Bad;
+      }
+    } else {
+      // Unknown: ref-to-unknown -> bail.
+      C.Kind = Cell::Bad;
+    }
+    return C;
+  };
+
+  auto planFields = [&](jeandle::ObjectID ID, Plan &P) {
+    jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
+    auto ItFS = FieldStates.find(ID);
+
+    if (VObj.isArray()) {
+      // Arrays emit ALL elements 0..ArrayLength-1 in offset order
+      // (field_count == ArrayLength). A touched element uses its recorded
+      // FieldValue (routed through the shared classifier, so a VORef element
+      // reaches the transitive closure exactly like a VORef instance field);
+      // an untouched element is synthesized as the Java default. HotSpot's
+      // realloc_objects derives the array length from field_values.size()
+      // (typeArray: len = field_size()/type2size; objArray: len =
+      // field_size()), so omitting untouched elements would miscompile the
+      // length. The element offset is ArrayBaseOffset + idx*ArrayIndexScale
+      // (uniform stride; offset order == index order). NOTE: we deliberately
+      // do NOT take the JVMCI JavaKind.Illegal packed-write micro-optimization
+      // for byte/boolean arrays — each element is one normal T_INT slot.
+      const DenseMap<int64_t, jeandle::FieldValue> *Touched =
+          (ItFS != FieldStates.end()) ? &ItFS->second : nullptr;
+      bool IsObjectArray = VObj.ArrayElementType->isPointerTy();
+      Constant *Default =
+          IsObjectArray
+              ? cast<Constant>(ConstantPointerNull::get(
+                    cast<PointerType>(VObj.ArrayElementType)))
+              : ConstantInt::get(VObj.ArrayElementType, 0);
+      for (uint32_t Idx = 0; Idx < VObj.ArrayLength; ++Idx) {
+        int64_t Off = static_cast<int64_t>(VObj.ArrayBaseOffset) +
+                      static_cast<int64_t>(Idx) *
+                          static_cast<int64_t>(VObj.ArrayIndexScale);
+        if (Touched) {
+          auto It = Touched->find(Off);
+          if (It != Touched->end()) {
+            P.Cells.push_back(classifyFieldValue(Off, It->second));
+            continue;
+          }
+        }
+        // Untouched element: synthesize the Java default (0 for primitive
+        // arrays, null for object arrays). The emit side derives the
+        // computational basicType from the constant's type.
+        Cell C;
+        C.Offset = Off;
+        C.Kind = Cell::Scalar;
+        C.ScalarV = Default;
+        P.Cells.push_back(C);
+      }
+      return;
+    }
+
+    // Instance: emit only TOUCHED fields (the parser pads untouched fields with
+    // defaults via the InstanceKlass layout walk, so they need no wire entry).
+    if (ItFS == FieldStates.end())
+      return; // no touched fields -> field_count=0 descriptor (all defaults).
+    for (const auto &OffKV : ItFS->second)
+      P.Cells.push_back(classifyFieldValue(OffKV.first, OffKV.second));
+  };
+
+  // ---- Step 1: collect roots. A root is a "deopt" bundle operand that
+  // resolves to a VO virtual-at-this-safepoint. A root whose bundle operand is
+  // a DERIVED pointer (V != AllocationCall) is banned: its bundle slot cannot
+  // be rewritten to a VORef without losing the derived shape, and the derived
+  // operand would otherwise be left for Pass-2 poison-RAUW. Resolve V to a
+  // virtual ObjectID that is STILL VIRTUAL AT THIS SAFEPOINT.
+  // Roots are collected in bundle-operand ENCOUNTER ORDER (not DenseSet hash
+  // order) so the SeqNo assignment — and thus the transform's descriptor emit
+  // order — is deterministic.
+  SmallVector<jeandle::ObjectID, 4> Roots;
+  DenseSet<jeandle::ObjectID> RootSeen;
+  DenseSet<jeandle::ObjectID> OrigAllocInBundle;
+  DenseSet<jeandle::ObjectID> Banned;
+  for (Value *V : Deopt->Inputs) {
+    if (!V)
+      continue;
+    auto ID = jeandle::pea::resolveVirtualRef(V, CurrentState, Aliases, DL);
+    if (!ID)
+      continue;
+    if (!isVirtualHere(*ID))
+      continue;
+    jeandle::VirtualObject &VObj = *Result.VirtualObjects[*ID];
+    // V is a describable root iff it is the VO's OrigAlloc OR an alias-map
+    // virtual-alias entry for this VO (object identity, e.g. the result of a
+    // load-through-virtual-ref folded by processLoad). A byte-offset DERIVED
+    // pointer (GEP/bitcast of a VO) is resolved by structural peeling inside
+    // resolveVirtualRef but is NEVER registered in the alias map, so it is
+    // still banned — its bundle slot cannot become a VORef without losing the
+    // derived shape, and it would be left for Pass-2 poison-RAUW. (identity !=
+    // address: every addVirtualAlias site registers identity, never a derived
+    // pointer, so an alias-map hit is safe to treat as the OrigAlloc itself.)
+    bool IsIdentityAlias = (Aliases.getVirtualAlias(V) == *ID);
+    if (V != VObj.AllocationCall && !IsIdentityAlias) {
+      Banned.insert(*ID); // genuinely derived bundle operand — do not describe.
+      continue;
+    }
+    // At transform time a ReplaceLoad has RAUW'd an identity alias to OrigAlloc
+    // (Pass-1 SeqNo order runs processLoad before this safepoint), so the
+    // slot-rewrite (V == OrigAlloc) in RewriteDeoptBundleEffect::apply fires for
+    // it. Mark it OrigAllocInBundle so the transform's root guard still holds
+    // (bail if, unexpectedly, the RAUW left OrigAlloc absent from the bundle).
+    OrigAllocInBundle.insert(*ID);
+    if (RootSeen.insert(*ID).second)
+      Roots.push_back(*ID);
+  }
+
+  // ---- Step 2: transitive closure (Graal collectReferencedVirtualObjects:
+  // worklist + identity-set, cycle-safe). Expand from the roots through VORef
+  // cells so every referenced eligible VO is planned once (dedup by id).
+  SmallVector<jeandle::ObjectID, 8> Work;
+  for (jeandle::ObjectID R : Roots)
+    Work.push_back(R);
+  while (!Work.empty()) {
+    jeandle::ObjectID ID = Work.pop_back_val();
+    if (Plans.count(ID))
+      continue;
+    if (Banned.count(ID) || !isVirtualHere(ID) || !structurallyEligible(ID))
+      continue;
+    Plan &P = Plans[ID];
+    P.Eligible = true;
+    Order.push_back(ID);
+    planFields(ID, P);
+    for (const Cell &C : P.Cells)
+      if (C.Kind == Cell::VORef && !Plans.count(C.VORefID))
+        Work.push_back(C.VORefID);
+  }
+
+  // ---- Step 3: greatest fixpoint (never emit a VORef to an
+  // undescribed/undescribable VO). A VO is describable iff NONE of its cells
+  // is Bad AND every VORef cell points to a planned, eligible, non-Bad VO. A
+  // VORef to a non-planned VO (Banned / not virtual here / structurally
+  // ineligible) makes this VO Bad. Iterate to a fixpoint so cycles
+  // (a.f=b, b.g=a) and transitive failure both propagate.
+  bool Changed = true;
+  while (Changed) {
+    Changed = false;
+    for (jeandle::ObjectID ID : Order) {
+      Plan &P = Plans[ID];
+      if (P.Bad)
+        continue;
+      for (const Cell &C : P.Cells) {
+        if (C.Kind == Cell::Bad) {
+          P.Bad = true;
+          Changed = true;
+          break;
+        }
+        if (C.Kind == Cell::VORef) {
+          auto It = Plans.find(C.VORefID);
+          if (It == Plans.end() || !It->second.Eligible || It->second.Bad) {
+            P.Bad = true;
+            Changed = true;
+            break;
+          }
+        }
+      }
+    }
+  }
+
+  // ---- Step 4: record one RewriteDeoptBundleEffect per describable VO.
+  // Each Scalar cell's backing def dominates the safepoint (the
+  // analyzer only snapshots dominating stores). VORef cells carry no Value*
+  // — only the vo-id — so they are inherently transform-safe.
+  for (jeandle::ObjectID ID : Order) {
+    Plan &P = Plans[ID];
+    if (P.Bad)
+      continue;
+    SmallVector<jeandle::MaterializeEffect::FieldEntry, 8> Snap;
+    for (const Cell &C : P.Cells) {
+      if (C.Kind == Cell::VORef) {
+        // Reconstruct a VirtualRef FieldValue the transform recognizes as a
+        // VORef field. AllocationCall's type is the managed-oop pointer type,
+        // so LLVM2JavaComputational yields T_OBJECT on the transform side.
+        Snap.push_back(
+            {C.Offset,
+             jeandle::FieldValue::virtualRef(
+                 C.VORefID,
+                 Result.VirtualObjects[C.VORefID]->AllocationCall->getType())});
+      } else {
+        Snap.push_back({C.Offset, jeandle::FieldValue::scalar(C.ScalarV)});
+      }
+    }
+
+    auto E = std::make_unique<jeandle::RewriteDeoptBundleEffect>();
+    E->Block = CB->getParent();
+    E->SeqNo = Result.nextSeqNo();
+    E->ObjID = ID;
+    E->Safepoint = CB;
+    E->Fields = std::move(Snap);
+    E->OrigAllocInBundle = OrigAllocInBundle.count(ID) > 0;
+    Result.addBlockEffect(std::move(E));
+    DeoptBundleHandled.insert(ID);
+  }
+}
+
 void Analyzer::materializeAllVirtualOperands(Instruction *I) {
   // Trigger materialization for every distinct virtual ObjectID that I uses.
   // After materializeAt, the per-object state in CurrentState flips to
@@ -4445,6 +4917,14 @@ void Analyzer::materializeAllVirtualOperands(Instruction *I) {
   for (Use &U : I->operands()) {
     Value *V = U.get();
     if (!V)
+      continue;
+    // PEA deopt support: a "deopt" operand-bundle input that
+    // recordDeoptBundleMappings described as a virtual mapping is deopt STATE,
+    // not an escape (Graal addVirtualMapping). Skip it so describing a VO in a
+    // deopt bundle does not, by itself, force a materialization. A VO ALSO
+    // referenced as a real call argument still escapes via that argument's
+    // (non-bundle) Use.
+    if (isHandledDeoptBundleOperand(U, I))
       continue;
     if (auto MaybeID =
             jeandle::pea::resolveVirtualRef(V, CurrentState, Aliases, DL)) {
@@ -4499,6 +4979,11 @@ void Analyzer::markVirtualOperandsIneligible(Instruction *I) {
     Value *V = U.get();
     if (!V)
       continue;
+    // Same deopt-mapping skip as materializeAllVirtualOperands: a described
+    // "deopt" bundle input is not an escape and must not factor into the
+    // bail-all derived-pointer decision either.
+    if (isHandledDeoptBundleOperand(U, I))
+      continue;
     if (auto MaybeID =
             jeandle::pea::resolveVirtualRef(V, CurrentState, Aliases, DL)) {
       if (Seen.insert(*MaybeID).second)
@@ -4510,12 +4995,12 @@ void Analyzer::markVirtualOperandsIneligible(Instruction *I) {
   // derived, this bails EVERY virtual operand's object (including operands
   // that are themselves the OrigAlloc, i.e. V == AllocationCall, for which
   // materializing at I WOULD be sound: pea.mat@I dominates that OrigAlloc use
-  // at I). Graal's processNodeInputs (PartialEscapeClosure.java:433-451) has no
+  // at I). Graal's processNodeInputs (Graal PartialEscapeClosure) has no
   // derived pointers and always materializes per-input at the use, so it
   // keeps such objects virtual on non-escaping paths. The bail-all is a
   // deliberate soundness net: materializing one operand's object at I could
   // poison a derived GEP of the SAME object on another path that the I-point
-  // materialize does not dominate (the e4f0a55f class of traps). Recovering
+  // materialize does not dominate. Recovering
   // the lost scalar-replacement here means proving, per-object, that none of
   // its live uses across all paths is an undominated derived address — bail
   // only the derived operand's object, materialize the OrigAlloc operands at
@@ -4616,7 +5101,7 @@ static void captureMaterializedLocks(ArrayRef<LockEnter> Stack,
 }
 
 // Graal PartialEscapeClosure.ensureMaterialized -> materializeBefore ->
-// materializeWithCommit (PartialEscapeBlockState.java:208-343): the single
+// materializeWithCommit (Graal PartialEscapeBlockState): the single
 // materialization algorithm shared by the escape-point path (materializeAt) and
 // the merge-driven per-predecessor path (materializeAtPredFromExitInfo). The
 // per-path differences are supplied via MaterializeContext C (operative state
@@ -4635,7 +5120,7 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
   jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
 
   // Overflow detection (Graal-aligned). Graal's ensureMaterialized
-  // (PartialEscapeClosure.java:541-562) throws EffecsClosureOverflowException
+  // (Graal PartialEscapeClosure) throws EffecsClosureOverflowException
   // when currentMode == STOP_NEW_VIRTUALIZATIONS_LOOP_NEST and a virtual
   // object is about to be materialized. In STOP_NEW no new virtualizations
   // occur (processAllocation refuses them), so every virtual object still in
@@ -4648,10 +5133,10 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
   // (depth==1) processLoop catches the flag, restores the snapshot, drains the
   // preheader via processStateBeforeLoopOnOverflow, and redoes the nest in
   // MATERIALIZE_ALL — exactly Graal's catch block
-  // (EffectsClosure.java:533-551). No dominance check is needed: in STOP_NEW
+  // (Graal EffectsClosure). No dominance check is needed: in STOP_NEW
   // *any* virtual object reaching materialization is outer-scope by
   // construction. The ensureVirtualized -> RetryableBailoutException branch
-  // (PClosure:542-551) is intentionally deferred (deopt-adjacent); see TODO in
+  // (Graal PartialEscapeClosure) is intentionally deferred (deopt-adjacent); see TODO in
   // processAllocation.
   if (CurrentMode == Mode::StopNewInLoopNest) {
     OverflowFlag = true;
@@ -4664,7 +5149,7 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
   //
   // GRAAL DIVERGENCE: Graal materializes a synthetic Case-C VO by materializing
   // each per-pred source VO (mergeObjectEntry / the processPhi fallback,
-  // PartialEscapeClosure.java:1340-1365 & 1493-1514) and reusing the existing
+  // Graal PartialEscapeClosure) and reusing the existing
   // materializedValuePhi as the materialized value. Jeandle bails instead.
   // TODO(cascade-materialize): implement (a) per-pred-source materialization
   // that threads each pred's NewInv through the Case-C PHI and reuses the
@@ -4684,7 +5169,7 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
   // too.
   C.MaterializedSet.insert(ID);
 
-  // Strict-lock-order cascade (Graal materializeWithCommit:323-333): when this
+  // Strict-lock-order cascade (Graal materializeWithCommit): when this
   // VO has live locks and the runtime requires strict nesting, materialize
   // every other still-locked virtual whose OUTERMOST live lock was acquired
   // strictly before this VO's INNERMOST live lock. LiveLockEnters[id].front()
@@ -4692,8 +5177,8 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
   //
   // ORDERING DIVERGENCE from Graal: Jeandle runs this lock cascade BEFORE the
   // recursive entry-prerequisite cascade (below); Graal's materializeWithCommit
-  // runs the entry cascade first (PartialEscapeBlockState.java:309-321) then
-  // the lock cascade (323-333). This is behavior-preserving in Jeandle: each
+  // runs the entry cascade first (Graal PartialEscapeBlockState) then
+  // the lock cascade. This is behavior-preserving in Jeandle: each
   // materialize is an independent Effect with its own SeqNo / SafeIP /
   // dominance check, the two cascades share no writable state (the lock cascade
   // reads LiveLockEnters, the entry cascade reads FieldStates), and the final
@@ -4744,7 +5229,7 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
   // sensitive resolution sub-pass (resolveMaterializedUses) rewrites each
   // field-store use to the NewInv that dominates it, recovering per-pred
   // distinctness via dominance — Jeandle's analog of Graal getAliasAndResolve
-  // (PartialEscapeClosure.java:1575).
+  // (Graal PartialEscapeClosure).
   {
     auto FSIt = C.FieldStates.find(ID);
     if (FSIt != C.FieldStates.end()) {
@@ -5002,7 +5487,7 @@ void Analyzer::commit() {
   // every recording path (processStore + the merge/per-pred propagators).
   // Graal has no analog: it materializes in place at the escape point, so
   // the recursive entry cascade (materializeWithCommit,
-  // PartialEscapeBlockState.java:293-343) runs at the very point the outer
+  // Graal PartialEscapeBlockState) runs at the very point the outer
   // is committed; Jeandle's analysis/transform split defers classification
   // to here. Visited defends cycles (a.f=b, b.g=a).
   {
@@ -5162,8 +5647,8 @@ void Analyzer::processLoopExit(Loop *L) {
   // (and exception handlers reading them) wired to stale OrigAlloc
   // placeholders; the forced drain ensures every still-virtual VO has a real
   // allocation by the time the EH handler executes.
-  // Graal runs processLoopExit unconditionally (PartialEscapeClosure.java:737-
-  // 766) and force-materializes loop-local virtuals at any exception-handling
+  // Graal runs processLoopExit unconditionally (Graal PartialEscapeClosure)
+  // and force-materializes loop-local virtuals at any exception-handling
   // exit. Jeandle preserves the common OOM-cleanup optimization by skipping
   // only a pure-resume 0-clause cleanup (isPureResumeCleanup), which provably
   // cannot observe; every other EH-pad successor forces materialization.
@@ -5180,7 +5665,7 @@ void Analyzer::processLoopExit(Loop *L) {
         continue;
       // Graal runs processLoopExit unconditionally for every LoopExitNode and
       // force-materializes every loop-local virtual whose exit reaches an
-      // exception-handling context (PartialEscapeClosure.java:737-766, gated
+      // exception-handling context (Graal PartialEscapeClosure, gated
       // only by isExceptionHandlingBCI). Any EH-pad successor counts —
       // catchswitch, catchpad, cleanuppad, or landingpad: a 0-clause cleanup
       // handler is NOT guaranteed to only `resume`; legal IR may read a
@@ -5341,7 +5826,7 @@ void Analyzer::materializeAtPredFromExitInfo(
   };
   auto ComputeSafeIP = [&]() -> Instruction * {
     // Per-predecessor placement (Graal predecessor.getEndNode(),
-    // PartialEscapeClosure.java merge ~996): materialize at the predecessor's
+    // Graal PartialEscapeClosure merge): materialize at the predecessor's
     // terminator. The allocation (in PH or a dominator) precedes the terminator
     // by SSA, so this is a valid IP. Synthetic VOs (borrowed AllocationCall)
     // bail to ineligible in ensureMaterialized before reaching here.
@@ -5384,7 +5869,7 @@ void Analyzer::materializeAtPredFromExitInfo(
   auto DropInnerAliasesNop = [](jeandle::ObjectID) {};
   // Field-replay value: OrigAlloc, identical to the live path. Graal uses a
   // distinct AllocatedObjectNode per predecessor as the field value
-  // (PartialEscapeBlockState.java:317); LLVM's analysis/transform split forbids
+  // (Graal PartialEscapeBlockState); LLVM's analysis/transform split forbids
   // creating the concrete node during analysis, so OrigAlloc stands in and the
   // transform's point-sensitive resolution sub-pass (resolveMaterializedUses)
   // picks the per-pred NewInv that dominates each field store — recovering
@@ -5415,7 +5900,7 @@ void Analyzer::materializeAtPredFromExitInfo(
 }
 
 // ===========================================================================
-// Real loop fixpoint  (Graal EffectsClosure.processLoop, EClosure.java:364-566)
+// Real loop fixpoint  (Graal EffectsClosure.processLoop)
 // ===========================================================================
 //
 // Structure mirrors Graal: an OUTER retry loop wraps an INNER fixpoint (up to
@@ -5431,14 +5916,14 @@ void Analyzer::materializeAtPredFromExitInfo(
 //
 // On non-convergence OR overflow (OverflowFlag, latched in ensureMaterialized
 // under Mode::StopNewInLoopNest), escalate to Mode::MaterializeAll ONCE and
-// retry the whole inner fixpoint (Graal EClosure:550-561). The escalation
+// retry the whole inner fixpoint (Graal EffectsClosure). The escalation
 // restores the snapshot, wipes loop-block BlockExits, and drains preheader
 // virtuals (processStateBeforeLoopOnOverflow) so the redo starts with no live
 // virtuals on entry. A nested processLoop (depth>1) that observes overflow
 // does NOT recover locally — it returns so the outermost (depth==1) loop owns
 // the rollback + redo (Graal re-throws the overflow to depth==1,
-// EClosure:526-532). TooManyIterationsSeen is LOCAL per processLoop; a second
-// failure hard-bails (Graal throws GraalError, EClosure:563 — Jeandle falls
+// Graal EffectsClosure). TooManyIterationsSeen is LOCAL per processLoop; a second
+// failure hard-bails (Graal throws GraalError, Graal EffectsClosure — Jeandle falls
 // back soundly by marking still-virtual VOs ineligible).
 
 // Equality on BlockExitData (the per-object base data). Two payloads are
@@ -5774,7 +6259,7 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
     processLoopBodyOnePass(L, loopBlocksInRPO(L, FunctionRPO), FunctionRPO);
 
     // Post-body merge (Graal doMergeWithoutDead run AFTER the body,
-    // EffectsClosure.java:461-466). The in-pass header merge (header first in
+    // Graal EffectsClosure). The in-pass header merge (header first in
     // RPO) runs before any loop-body alloc is virtualized, so it cannot resolve
     // an object allocated INSIDE the loop and carried across the back-edge via
     // a header pointer-phi — the back-edge slot is nullopt and the PHI is
@@ -5783,7 +6268,7 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
     // populated lets processBlockPhis Case A fire and materialize such a
     // carried object at the back-edge pred's terminator (Graal
     // ensureMaterialized at predecessor.getEndNode(),
-    // PartialEscapeClosure.java:996/1504), matching the fixpoint path's
+    // Graal PartialEscapeClosure), matching the fixpoint path's
     // post-body merge. This is a one-shot merge (no convergence loop here), so
     // its effects simply persist to commit().
     resetPerBlockState();
@@ -5791,7 +6276,7 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
     PendingMergePhis[Header].clear();
 
     // Force-materialise at exits that flow into EH pads, matching the fixpoint
-    // path (processLoopExit at :5220 / PartialEscapeClosure.java:737-799), so
+    // path (Graal processLoopExit), so
     // exception handlers never see partially-materialised loop-internal
     // virtuals.
     processLoopExit(L);
@@ -5820,7 +6305,7 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
 
     // Graal flips STOP_NEW_VIRTUALIZATIONS_LOOP_NEST per-loop in
     // stripKilledLoopLocations when loop.depth > EscapeAnalysisLoopCutoff
-    // (PartialEscapeClosure.java:675). Jeandle sets it nest-wide at the
+    // (Graal PartialEscapeClosure). Jeandle sets it nest-wide at the
     // outermost loop when the nest's max depth exceeds the cutoff — a
     // conservative equivalent (shallower loops in the nest also run StopNew,
     // but StopNew only suppresses NEW virtualizations, which is harmless).
@@ -5841,7 +6326,7 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
     OverflowFlag = false;
   } else {
     // Nested-loop entry. Graal re-throws EffecsClosureOverflowException up
-    // to depth==1 (EffectsClosure.java:526-532); the polled equivalent is
+    // to depth==1 (Graal EffectsClosure); the polled equivalent is
     // to bail immediately if an outer overflow is already in progress.
     if (OverflowFlag)
       return;
@@ -5850,19 +6335,19 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
   // Snapshot pre-loop state once. The inner fixpoint and the MATERIALIZE_ALL
   // retry both restore from it (Jeandle snapshots per processLoop because
   // convergence is BlockExits-based and each loop level needs its own
-  // rollback record; Graal snapshots only at depth==1, EffectsClosure:406).
+  // rollback record; Graal snapshots only at depth==1).
   LoopSnapshot Pre;
   takeLoopSnapshot(L, LoopBlocks, Pre);
 
-  // Graal's outer retry loop (EffectsClosure.java:439-565): run the Regular
+  // Graal's outer retry loop (Graal EffectsClosure): run the Regular
   // inner fixpoint; on non-convergence OR overflow escalate to MATERIALIZE_ALL
   // once and retry the whole fixpoint; a second failure hard-bails.
   // TooManyIterationsSeen is LOCAL to each processLoop (one independent
-  // escalation per loop), matching Graal's per-call local (EClosure:439).
-  // Single-state B fixpoint context (Graal lastMergedState, paper §5.2.5) as
+  // escalation per loop), matching Graal's per-call local.
+  // Single-state B fixpoint context (Graal lastMergedState) as
   // LOCALS — each processLoop call is its own C++ stack frame, so nesting is
   // isolated without a shared member (the outer's locals are untouched while a
-  // recursive processLoop(inner) runs). B := A (EClosure:445): Jeandle has no
+  // recursive processLoop(inner) runs). B := A (Graal EffectsClosure): Jeandle has no
   // PEA-level killed-location strip (PEReadEliminationClosure machinery), so
   // the entry state is just the preheader's exit data, populated by the outer
   // RPO walk before processLoop is dispatched.
@@ -5873,7 +6358,7 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
   bool TooManyIterationsSeen = false;
   while (true) {
     // ---- inner fixpoint: up to MaxLoopFixpointIters body passes ----
-    // Single-state B convergence (paper §5.2.5 / Graal EClosure:439-524). B is
+    // Single-state B convergence (Graal's loop fixpoint). B is
     // the header's merged state (seeded := A, the preheader exit). Each pass
     // runs the body, then a post-body merge computes B' = merge(A, fresh latch
     // exits) (Graal doMergeWithoutDead); converge when B' == B. Because the
@@ -5893,16 +6378,16 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
       if (OverflowFlag)
         break;
 
-      // Post-body merge (Graal doMergeWithoutDead, EClosure:466): compute the
+      // Post-body merge (Graal doMergeWithoutDead): compute the
       // TRUE B' = merge(A, fresh latch end-states) AFTER the body pass. On
       // iteration 0 the in-pass header merge is just A — the latch BlockExits
       // is not yet populated when the header is processed — so only a post-body
       // merge sees this pass's latch exits, letting iteration 0 compare
-      // meaningfully and the loop converge in a single body pass (paper §5.2.5
-      // / Graal's structure).
+      // meaningfully and the loop converge in a single body pass
+      // (matching Graal's structure).
       //
       // This merge runs AFTER the body (Graal runs the LoopBegin merge after
-      // the body too, EffectsClosure.java:461-466), so it is the ONLY place
+      // the body too, Graal EffectsClosure), so it is the ONLY place
       // that can resolve an object allocated INSIDE the loop body and carried
       // across the back-edge via a header pointer-phi: the in-pass header merge
       // (header first in RPO) runs before that alloc is virtualized, so its
@@ -5910,10 +6395,10 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
       // Here the latch BlockExits is populated and the alias is known, so
       // processBlockPhis Case A fires and materializes the carried object at
       // the back-edge pred's terminator (Graal ensureMaterialized at
-      // predecessor.getEndNode(), PartialEscapeClosure.java:996/1504).
+      // predecessor.getEndNode(), Graal PartialEscapeClosure).
       //
       // The merge's effects are KEPT (Graal keeps blockEffects.get(predecessor)
-      // on convergence, EffectsClosure.java:472-474) — no snapshot/restore
+      // on convergence, Graal EffectsClosure) — no snapshot/restore
       // discard. A non-converged iteration's effects are cleared by the next
       // iteration's restoreLoopSnapshot(Pre) at the top of the loop (it
       // restores per-loop-block BlockEffects/MaterializedAtPred). The per-pred
@@ -5932,7 +6417,7 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
         snapshotExitStateInto(NewMergedState); // B'
         PendingMergePhis[Header].clear();
       }
-      // B' vs B (Graal EClosure:472). No iteration gate: with the post-body
+      // B' vs B (Graal's loop fixpoint equivalentTo). No iteration gate: with the post-body
       // merge, iteration 0 already has a true B' to compare against B := A.
       if (exitDataEquivalent(LastMergedState, NewMergedState)) {
         Converged = true;
@@ -5941,7 +6426,7 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
                           << " iters (B-based, post-body)\n");
         break;
       }
-      LastMergedState = NewMergedState; // B := B'   (Graal EClosure:512)
+      LastMergedState = NewMergedState; // B := B'   (Graal EffectsClosure)
     }
 
     if (Converged) {
@@ -5949,7 +6434,7 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
       // handlers never see partially-materialised loop-internal virtuals.
       processLoopExit(L);
       // Graal resets currentMode to REGULAR at depth==1 on success
-      // (EffectsClosure.java:482-488). Nested loops leave the mode as-is so
+      // (Graal EffectsClosure). Nested loops leave the mode as-is so
       // an escalation persists through the rest of the nest.
       if (L->getLoopDepth() == 1)
         CurrentMode = SavedModeForNest;
@@ -5963,7 +6448,7 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
     // Not converged: non-convergence (iteration cap) OR overflow.
     if (OverflowFlag && L->getLoopDepth() > 1) {
       // Graal: an inner loop re-throws the overflow until the outermost
-      // (depth==1) loop catches it (EffectsClosure.java:526-532). Propagate
+      // (depth==1) loop catches it (Graal EffectsClosure). Propagate
       // — do NOT recover locally; the outermost loop owns the rollback +
       // MATERIALIZE_ALL redo of the whole nest.
       return;
@@ -5971,8 +6456,8 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
 
     if (!TooManyIterationsSeen) {
       // First exhaustion/overflow: escalate to MATERIALIZE_ALL and retry the
-      // whole fixpoint (Graal EffectsClosure.java:550-561 for overflow,
-      // 553-561 for the iteration cap).
+      // whole fixpoint (Graal EffectsClosure for overflow,
+      // and the iteration cap).
       TooManyIterationsSeen = true;
       if (CurrentMode != Mode::MaterializeAll)
         ++JeandlePEAModeEscalations;
@@ -5986,7 +6471,7 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
         BlockExits.erase(BB);
       // Drain every still-virtual VO at the loop's forward end so the redo
       // starts with no live virtuals on entry — Graal's
-      // processStateBeforeLoopOnOverflow (PartialEscapeClosure.java:230-237).
+      // processStateBeforeLoopOnOverflow (Graal PartialEscapeClosure).
       processStateBeforeLoopOnOverflow(L);
       // Re-seed B := A: processStateBeforeLoopOnOverflow materializes pre-loop
       // virtuals at the loop's forward end, so BlockExits[Preheader] changed.
@@ -6002,11 +6487,10 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
     }
 
     // Second exhaustion: hard fail. Graal throws GraalError (fatal,
-    // EffectsClosure.java:563). MATERIALIZE_ALL is expected to always
+    // Graal EffectsClosure). MATERIALIZE_ALL is expected to always
     // converge, so this indicates a pathological-IR / invariant gap; fall
     // back SOUNDLY by marking every still-virtual VO in the loop ineligible
-    // (the original IR then survives unchanged — conservative, as in the
-    // prior 2-stage path).
+    // (the original IR then survives unchanged — a conservative fallback).
     LLVM_DEBUG(dbgs() << "PEA: loop @ " << Header->getName()
                       << " did NOT converge in MATERIALIZE_ALL; sound bail\n");
     for (BasicBlock *BB : LoopBlocks) {

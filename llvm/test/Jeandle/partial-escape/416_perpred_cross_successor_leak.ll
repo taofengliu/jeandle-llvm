@@ -1,24 +1,23 @@
 ; REQUIRES: asserts
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; per-pred materialize must NOT leak a per-block placeholder across successors.
+; Per-pred materialization across multiple successors under the reuse-OrigAlloc
+; model. `else` is the virtual predecessor of a mixed merge `merge` (then
+; escapes o, else keeps it virtual) and itself has TWO successors: `merge` and
+; `S`.
 ;
-; `else` is the virtual predecessor of a mixed merge `merge` (then escapes o,
-; else keeps it virtual) -> per-pred materialize of o at `else`'s terminator
-; destined for `merge`. `else` has TWO successors: `merge` and `S`. Before the
-; fix, the per-pred flip mutated the shared BlockExits[else], so `S` inherited
-; the placeholder (whose real NewInv only dominates the else->merge split edge)
-; and built a CreatePHI naming else; the transform's pre-pass split both
-; else->merge and else->S but keyed PHRename/BlockRename by PH alone, so the
-; second split overwrote the first -> CreatePHI incoming mis-routed to a
-; non-predecessor -> verifier abort.
+; Historically this required per-pred materialization of o at `else`'s
+; terminator destined for `merge`, and the per-pred flip had to be cloned per
+; (PH, target-merge) so it did NOT leak to `S` -- two distinct pea.crit.split
+; blocks and two pea.mat invokes were produced off `else`, each merge carrying
+; a materialized PHI.
 ;
-; With the fix (per-merge pred-state clone + (PH, target-merge) keying), `S`
-; sees o as virtual on the else->S edge (clone not shared), triggers its OWN
-; per-pred mat on the else->S split edge, and the two split edges route
-; independently. The result is well-formed: two `pea.crit.split` blocks (one
-; per target merge), two distinct `pea.mat` invokes at `else`, and both merge
-; PHIs have correct predecessors.
+; Under reuse-OrigAlloc the original allocation %o dominates BOTH successors
+; of `else`, so it is the single SSA value everywhere: no per-pred
+; materialization fires, no critical edge is split, and `else`'s original
+; two-successor branch is retained verbatim. The tracked field store is
+; replayed onto %o on the escaping arm (then), and both escapes (then, S)
+; consume %o directly. No %pea.mat, no materialized-object PHI.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -54,26 +53,20 @@ u:
   resume i64 %lp
 }
 
-!java-method-compilation = !{}
-
-; CHECK: define void @repro
-; Two distinct critical-edge split blocks off `else` (one per target merge).
-; CHECK: pea.crit.split
-; CHECK: pea.crit.split
-; Two distinct per-pred materialize invokes at `else` (one per split edge).
-; CHECK: pea.mat{{[0-9]*}} = invoke hotspotcc {{.*}}@jeandle.new_instance
-; CHECK: pea.mat{{[0-9]*}} = invoke hotspotcc {{.*}}@jeandle.new_instance
-; The `merge` block is a predecessor of `S` and carries a materialized PHI
-; whose incomings are the then-arm NewInv and the else->merge split NewInv.
-; CHECK: merge:
-; CHECK-NEXT: %pea.materialized.phi{{[0-9]*}} = phi ptr addrspace(1)
-; CHECK-SAME: %pea.mat
-; CHECK-SAME: %pea.mat
-; `S` merges the else->S split NewInv with `merge`'s materialized PHI; both
-; incoming blocks are real predecessors of S.
-; CHECK: S:
-; CHECK-NEXT: %pea.materialized.phi{{[0-9]*}} = phi ptr addrspace(1)
-; CHECK-SAME: %pea.materialized.phi
-; CHECK-SAME: %pea.mat
-; CHECK: call void @sink(ptr addrspace(1) %pea.materialized.phi
+; CHECK-LABEL: define void @repro
+; The original allocation invoke is retained.
+; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
+; No materialization invokes, no critical-edge splits.
+; CHECK-NOT: pea.mat = invoke
+; CHECK-NOT: pea.crit.split
+; The then arm replays the tracked field store onto OrigAlloc %o and escapes.
+; CHECK: getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
+; CHECK: call void @sink(ptr addrspace(1) %o)
+; `else` retains its original two-successor branch (no split off else).
+; CHECK: else:
+; CHECK-NEXT: br i1 %c2, label %merge, label %S
+; The cross-successor escape (S) consumes OrigAlloc %o directly.
+; CHECK: call void @sink(ptr addrspace(1) %o)
 ; CHECK: ret void
+
+!java-method-compilation = !{}

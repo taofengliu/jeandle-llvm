@@ -1,10 +1,19 @@
 ; REQUIRES: asserts
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
+; Three-successor per-pred materialization under the reuse-OrigAlloc model.
 ; PH (`else`) has THREE successors via a switch: merge1, merge2 (both mixed ->
-; per-pred mat at else) and D (o virtual, no escape). Two critical edges
-; (else->merge1, else->merge2) must be split with their own NewInv; the else->D
-; edge (D single-pred, not critical) is unchanged and carries no pea.mat.
+; per-pred mat at else) and D (o virtual, no escape, single-pred).
+;
+; Historically the two critical edges (else->merge1, else->merge2) had to be
+; split with their own per-pred NewInv, while the else->D edge (not critical)
+; stayed unchanged and carried no pea.mat.
+;
+; Under reuse-OrigAlloc the original allocation %o dominates all three
+; successors, so no per-pred mat fires and no edge is split: `else` retains
+; its original three-way switch verbatim. Both merge escapes consume %o
+; directly, and `D` still has no invoke (o never escapes there). No %pea.mat,
+; no pea.crit.split.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -43,18 +52,25 @@ u:
   resume i64 %lp
 }
 
-!java-method-compilation = !{}
-
-; CHECK: define void @repro
-; Two distinct critical-edge split blocks off `else` (named pea.crit.split and
-; pea.crit.split1), each carrying a per-pred materialize invoke.
-; CHECK: pea.crit.split{{[0-9]*}}:
-; CHECK: pea.mat{{[0-9]*}} = invoke hotspotcc {{.*}}@jeandle.new_instance
-; CHECK: pea.crit.split{{[0-9]*}}:
-; CHECK: pea.mat{{[0-9]*}} = invoke hotspotcc {{.*}}@jeandle.new_instance
-; No THIRD split (D is single-pred, no critical edge).
-; CHECK-NOT: pea.crit.split{{[0-9]+}}:
-; `D` has no invoke, just ret.
+; CHECK-LABEL: define void @repro
+; The original allocation invoke is retained.
+; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
+; No materialization invokes, no critical-edge splits.
+; CHECK-NOT: pea.mat = invoke
+; CHECK-NOT: pea.crit.split
+; `else` retains its original three-way switch verbatim.
+; CHECK: else:
+; CHECK-NEXT: switch i32 %c2, label %D
+; Both merge escapes consume OrigAlloc %o directly.
+; CHECK: merge1:
+; CHECK: call void @sink(ptr addrspace(1) %o)
+; CHECK: ret void
+; CHECK: merge2:
+; CHECK: call void @sink(ptr addrspace(1) %o)
+; CHECK: ret void
+; `D` is single-pred, o never escapes: no invoke, just ret.
 ; CHECK: D:
 ; CHECK-NOT: invoke
 ; CHECK: ret void
+
+!java-method-compilation = !{}

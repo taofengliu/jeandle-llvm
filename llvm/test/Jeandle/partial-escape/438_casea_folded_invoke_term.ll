@@ -1,16 +1,20 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Case-A (processBlockPhis, SkipGlobalRAUW=false, IsPerPred=false) materializes
-; %o at `else`'s TERMINATOR, which is a folded JavaOp invoke (jeandle.arraylength
-; on the virtual %o). The invoke's ReplaceCall erases it before the Case-A
-; Materialize applies. The eager-update hook (relocateDependentMaterializes,
-; called from ReplaceCallEffect::apply) re-aims the Materialize's InsertBefore
-; to the `br` that replaced the invoke (the normal successor in the SAME block)
-; before the erase nulls the WeakTrackingVH. The materialization must land at
-; the end of `else` (before `br merge`), NOT at %o's allocation normal-dest
-; (premature escape + SSA-dominance-unsound replay). Without the eager update,
-; applyMaterialize's InsertBefore-null assert fires (the old unsound fallback
-; hoisted to the normal-dest head).
+; Case-A (processBlockPhis, SkipGlobalRAUW=false, IsPerPred=false) with a
+; folded JavaOp invoke terminator, under the reuse-OrigAlloc model.
+;
+; %o is allocated via @jeandle.new_array. `else`'s terminator is an invoke of
+; @jeandle.arraylength on the virtual %o, which folds (ReplaceCall erases the
+; invoke; else's terminator becomes a plain branch). The eager-update hook
+; (relocateDependentMaterializes) re-aims any Case-A Materialize's InsertBefore
+; off the erased invoke onto the in-block successor before the WeakTrackingVH
+; is nulled, and the assert(InsertBefore) must not
+; fire.
+;
+; Under reuse-OrigAlloc there is no fresh materialization invoke: the original
+; allocation %o is retained, the arraylength is folded away, and the merge
+; PHI's else-incoming is OrigAlloc %o directly. (No field replay: %o has no
+; tracked field store.) No %pea.mat, no mat.cont, no split.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) readonly)
@@ -44,17 +48,20 @@ u:
   resume i64 %lpr
 }
 
-!java-method-compilation = !{}
-
 ; CHECK-LABEL: define void @casea_folded_invoke_term
-; The arraylength invoke is gone (folded).
+; The original allocation invoke is retained.
+; CHECK: invoke hotspotcc{{.*}}@jeandle.new_array
+; The arraylength invoke was folded away (absent from entry..merge, where it
+; sat in `else`).
 ; CHECK-NOT: @jeandle.arraylength
-; The materialization lands at the end of `else` (re-aimed off the erased
-; arraylength-invoke terminator onto the `br`), not at %o's alloc normal-dest.
-; CHECK: else:
-; CHECK-NEXT: %{{.*}} = invoke hotspotcc{{.*}}@jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 7, i32 44, i32 16, i32 1048576)
-; CHECK-NEXT: to label %mat.cont unwind label %u
-; CHECK: mat.cont:
-; CHECK-NEXT: br label %merge
+; No materialization invoke / mat.cont / split (reuse-OrigAlloc).
+; CHECK-NOT: pea.mat = invoke
+; CHECK-NOT: mat.cont
+; CHECK-NOT: pea.crit.split
 ; CHECK: merge:
-; CHECK: %p = phi ptr addrspace(1) [ null, %{{.*}} ], [ %{{.*}}, %mat.cont ]
+; The merge PHI's else-incoming is OrigAlloc %o directly.
+; CHECK-NEXT: %p = phi ptr addrspace(1) [ null, %then ], [ %o, %else ]
+; CHECK: call void @sink
+; CHECK: ret void
+
+!java-method-compilation = !{}

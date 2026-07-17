@@ -1,10 +1,12 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA mixed-state merge (Graal's per-pred+PHI else-branch): branch %left
-; escapes the object via a sink call, the other branch keeps it virtual until
-; the merge. The escape arm materializes at the escape point; the virtual arm
-; is materialized at its predecessor-end; a materializedValuePhi at the merge
-; reconciles them, and downstream uses (the return) consume the PHI.
+; PEA mixed-state merge under the reuse-OrigAlloc model: branch %left escapes
+; the object via a sink call, the other branch keeps it virtual until the
+; merge. Because the original allocation (OrigAlloc) dominates every escape
+; point and every use, it is the single sound SSA value kept alive; no fresh
+; materialization invoke is emitted and no materializedValuePhi is needed.
+; The escape arm keeps OrigAlloc (PEA replays any tracked field stores onto it
+; before the escape); the return consumes OrigAlloc directly.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -31,10 +33,11 @@ u:
 }
 
 ; CHECK-LABEL: define ptr addrspace(1) @test_mixed_merge
+; Exactly one allocation invoke (the original, retained), and no materialized-
+; object PHI at the merge.
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
-; CHECK: call void @sink(ptr addrspace(1) %{{[A-Za-z0-9._]+}})
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
-; CHECK: = phi ptr addrspace(1)
-; CHECK: ret ptr addrspace(1) %{{[A-Za-z0-9._]+}}
+; CHECK-NOT: invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK: call void @sink(ptr addrspace(1) %o)
+; CHECK: ret ptr addrspace(1) %o
 
 !java-method-compilation = !{}

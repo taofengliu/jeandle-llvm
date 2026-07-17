@@ -1,13 +1,10 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Mutual reference (o.f = p, p.g = o) on the per-pred path. Both edges must
-; resolve to real per-pred NewInvs: the transform emits every cascade NewInv
-; before any field store (the cascade tail replays the whole group's stores in
-; its MatCont, dominated by every NewInv — Jeandle's analog of Graal's single
-; CommitAllocationNode), so the back edge p.g = o (o materialized later in the
-; same cascade) resolves via the point-sensitive resolution sub-pass instead of
-; lowering to poison. See PartialEscapeTransform.cpp applyMaterialize (cyclic-
-; field-materialize).
+; Mutual reference (o.f = p, p.g = o) escaping at a shared merge. Under
+; reuse-OrigAlloc both OrigAllocs are KEPT (each dominates the escape point),
+; so every field store replays directly onto its OrigAlloc and the back edge
+; p.g = o resolves through o's OrigAlloc — no cascade coordination, no fresh
+; pea.mat invoke, no materialized-object PHI.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -41,13 +38,16 @@ u:
 !java-method-compilation = !{}
 
 ; CHECK-LABEL: define void @mutual_field_perpred
-; Both objects materialize once at the escape point (a live-path cascade of 2
-; sharing one InsertBefore).
+; Both OrigAllocs (klass 11111 = o, klass 22222 = p) are retained.
 ; CHECK-DAG: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr)
 ; CHECK-DAG: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr)
-; Replayed field stores use real NewInvs — the back edge p.g = o (o materialized
-; after p in the cascade) resolves instead of lowering to poison.
-; CHECK: store atomic ptr addrspace(1) %pea.mat{{[0-9]*}}, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
-; CHECK: store atomic ptr addrspace(1) %pea.mat{{[0-9]*}}, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
+; No fresh materialization invoke is emitted.
+; CHECK-NOT: pea.mat = invoke
+; Replayed field stores use OrigAlloc values — the back edge p.g = o resolves
+; through o's OrigAlloc (kept alive), never poison.
+; CHECK: store atomic ptr addrspace(1) %o, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
+; CHECK: store atomic ptr addrspace(1) %p, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
 ; CHECK-NOT: poison
+; CHECK: call void @sink(ptr addrspace(1) %o)
+; CHECK: call void @sink(ptr addrspace(1) %p)
 ; CHECK: ret void

@@ -39,6 +39,15 @@ struct DeoptScopeInfo {
 }
 
 DeoptScopeInfo findCurrentDeoptScope(const CallBase &CB) {
+  // TODO(robustness): this assumes a well-formed Jeandle deopt bundle — the
+  // frontend always emits an adjacent-equal i32 BCI pair per scope. The three
+  // report_fatal_error paths below (no bundle, mismatched pair, no pair) are
+  // not hit in practice but would crash the process on arbitrary LLVM IR.
+  // Making this bail gracefully (return an empty scope / skip the effect)
+  // would require threading std::optional<DeoptScopeInfo> through
+  // getDeoptScopeVOInsertPos + computeDeoptStackLayout and their callers;
+  // deferred as it is not cheap and the well-formed-bundle invariant is
+  // upheld by every Jeandle frontend path that reaches PEA.
   auto Deopt = CB.getOperandBundle(LLVMContext::OB_deopt);
   if (!Deopt)
     reportInvalidDeoptBundle(CB, "missing deopt bundle for bci");
@@ -204,6 +213,74 @@ LoadInst *createConstOopLoad(Module &M, IRBuilder<> &Builder, int OopId) {
   GlobalVariable *GV = cast<GlobalVariable>(M.getOrInsertGlobal(Name, OopTy));
   GV->setDSOLocal(true);
   return Builder.CreateLoad(OopTy, GV, "folded.oop");
+}
+
+void appendVirtualObjectDescriptor(SmallVectorImpl<Value *> &Args,
+                                   IRBuilder<> &B, uint64_t Klass,
+                                   unsigned VObjID, bool IsArray,
+                                   ArrayRef<VODescriptorField> Fields) {
+  // Single emit chokepoint for PEA deopt VO descriptors. See the contract on
+  // DeoptValueEncoding::ScalarValueType (include/llvm/IR/Jeandle/
+  // Deoptimization.h) and appendVirtualObjectDescriptor in the header. The
+  // parser consumes (3 + 2*field_count) locations for one descriptor.
+  LLVMContext &Ctx = B.getContext();
+
+  // [header] DeoptValueEncoding(VObjID, ScalarValueType, T_ARRAY|T_OBJECT).
+  // The header basicType tells the HotSpot parser whether to rebuild an array
+  // (T_ARRAY, uniform elements indexed by offset, field_count == length) or an
+  // instance (T_OBJECT, fields matched to an InstanceKlass layout walk).
+  jeandle::HotspotBasicType HeaderBT =
+      IsArray ? jeandle::T_ARRAY : jeandle::T_OBJECT;
+  uint64_t Header = jeandle::DeoptValueEncoding(
+                        VObjID, jeandle::DeoptValueEncoding::ScalarValueType,
+                        HeaderBT)
+                        .encode();
+  Args.push_back(ConstantInt::get(Type::getInt64Ty(Ctx), Header));
+
+  // [klass] raw InstanceKlass / ArrayKlass identity
+  Args.push_back(B.getInt64(Klass));
+
+  // [field_count]
+  Args.push_back(B.getInt32(Fields.size()));
+
+  // [field i] (DeoptValueEncoding(offset, LocalType/VORefLocalType, bt), value)
+  // The offset rides in the encoding's Index field so the HotSpot parser can
+  // match each emitted field to an InstanceKlass field (instance) or compute
+  // the element index (array) and pad the untouched fields with defaults
+  // (reassign_fields_by_klass consumes ALL non-static fields). Field order in
+  // the bundle is irrelevant — the parser keys by offset. A scalar field
+  // carries enc(offset, LocalType, BasicTy) + the concrete Value; a VORef
+  // field carries enc(offset, VORefLocalType, T_OBJECT) + the referenced VO's
+  // vo-id as an i32 constant (transitive VO references / cycles). For an
+  // array the caller has already expanded ALL elements (touched + default) into
+  // Fields, so field_count == ArrayLength.
+  for (const VODescriptorField &F : Fields) {
+    if (F.IsVORef) {
+      uint64_t FieldEnc =
+          jeandle::DeoptValueEncoding(
+              static_cast<int>(F.Offset),
+              jeandle::DeoptValueEncoding::VORefLocalType, jeandle::T_OBJECT)
+              .encode();
+      Args.push_back(ConstantInt::get(Type::getInt64Ty(Ctx), FieldEnc));
+      Args.push_back(B.getInt32(F.VORefID));
+    } else {
+      uint64_t FieldEnc = jeandle::DeoptValueEncoding(
+                              static_cast<int>(F.Offset),
+                              jeandle::DeoptValueEncoding::LocalType, F.BasicTy)
+                              .encode();
+      Args.push_back(ConstantInt::get(Type::getInt64Ty(Ctx), FieldEnc));
+      Args.push_back(F.V);
+    }
+  }
+}
+
+unsigned getDeoptScopeVOInsertPos(const CallBase &CB) {
+  // The VO section sits AFTER the duplicated-BCI marker of the current scope
+  // and BEFORE its locals section. findCurrentDeoptScope returns the index of
+  // the first BCI of the innermost adjacent-equal i32 pair; the insert
+  // position is immediately past the pair (BCIPairStart + 2). Mirrors the
+  // layout assumed by createPreCallDeoptBundle / computeDeoptStackLayout.
+  return findCurrentDeoptScope(CB).BCIPairStart + 2;
 }
 
 } // namespace llvm

@@ -1,16 +1,11 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; DeoptBundleSource prefers the escape-point CallBase when it carries a
-; "deopt" bundle. The analyzer's DeoptBundleSource still reflects this
-; preference (so the future Jeandle deopt refactor can engage with the
-; bundle properly), but the transform is intentionally deopt-agnostic:
-; it filters "deopt" out when copying bundles onto NewInv. So even
-; though the sink carries a rich "deopt" bundle and the allocation has
-; none, the materialization invoke must end up with no operand bundles
-; at all, and the sink's "deopt" operand referencing the
-; about-to-be-deleted OrigAlloc must be scrubbed to null before the
-; global RAUW (otherwise the verifier would see a self-reference once
-; OrigAlloc is replaced by NewInv).
+; reuse-OrigAlloc model. The old (fresh-NewInv) model scrubbed the escape
+; sink's "deopt" bundle and dropped bundles on copy to avoid self-reference /
+; non-dominance hazards. Under reuse-OrigAlloc no fresh invoke is emitted;
+; OrigAlloc is KEPT and dominates every use, so the sink's "deopt" bundle
+; (which carries only constant values here, no OrigAlloc reference) is
+; preserved as-is, and the sink receives OrigAlloc directly.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -23,7 +18,7 @@ entry:
             ptr inttoptr (i64 12345 to ptr), i32 16)
        to label %n unwind label %u
 n:
-  ; Rich "deopt" bundle on the sink — this is what must be carried over.
+  ; Rich "deopt" bundle on the sink — preserved verbatim (OrigAlloc kept).
   call void @sink(ptr addrspace(1) %o) [ "deopt"(i32 42) ]
   ret void
 u:
@@ -32,7 +27,10 @@ u:
 }
 
 ; CHECK-LABEL: define void @escape_with_bundle
-; CHECK: %pea.mat = invoke {{.*}}@jeandle.new_instance(ptr {{.*}}, i32 16)
-; CHECK-NEXT: to label %{{.*}} unwind label %{{.*}}
+; The original allocation invoke is RETAINED (no fresh pea.mat invoke).
+; CHECK: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr {{.*}}, i32 16)
+; CHECK-NOT: = invoke hotspotcc{{.*}}@jeandle.new_instance
+; The sink receives OrigAlloc and keeps its deopt bundle.
+; CHECK: call void @sink(ptr addrspace(1) %o) [ "deopt"(i32 42) ]
 
 !java-method-compilation = !{}

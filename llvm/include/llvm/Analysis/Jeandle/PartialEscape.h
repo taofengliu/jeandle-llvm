@@ -67,9 +67,8 @@ static constexpr ObjectID InvalidObjectID = ~0u;
 // un-eliding the call on materialisation); BytecodeDepth is the lock-nesting
 // ordering key at the enter site, sourced from the analyzer's monotonic
 // NextLockEnterOrder (cached per call site in the analyzer's LockDepthCache,
-// see PartialEscapeAnalysis.cpp). It is NOT the true Java-bytecode monitor
-// depth — the frontend no longer attaches that — but an RPO-order proxy that
-// is sound for every load-bearing use here (cascade `<`, re-emit sort,
+// see PartialEscapeAnalysis.cpp). It is an RPO-order proxy for nesting depth,
+// sound for every load-bearing use here (cascade `<`, re-emit sort,
 // merge-time stack identity, strict-increasing assert): under the
 // structured-locking assumption PEA relies on, "lock X acquired before Y
 // while both live" <=> "X's enter dominates Y's" <=> "RPO visits X before Y".
@@ -107,11 +106,10 @@ struct MaterializedLock {
 // MaterializeEffect so the transform can pick the right per-effect receiver
 // for each lock when a cascade group's locks are merged and globally
 // depth-sorted. SourceEffect is the per-effect receiver-lookup key (Jeandle's
-// analog of Graal's `allocations[commit.getObjectIndex(monitorId)]`,
-// DefaultJavaLoweringProvider.java:1152) — strictly more precise than an
-// OrigAlloc key, which would be last-write-wins across per-pred
-// materializations of the same object (see applyMaterialize NewAllocFor
-// comment, PartialEscapeTransform.cpp:374-377). See
+// analog of Graal's `allocations[commit.getObjectIndex(monitorId)]`) —
+// strictly more precise than an OrigAlloc key, which would be last-write-wins
+// across per-pred materializations of the same object (see applyMaterialize's
+// NewAllocFor comment in PartialEscapeTransform.cpp). See
 // PEAResult::EscapePointLocks.
 class MaterializeEffect;
 struct MergedLock {
@@ -340,25 +338,25 @@ public:
     assert(Ptr);
     Kind = Materialized;
     MaterializedValue = Ptr;
-    // Graal ObjectState.escape (ObjectState.java:195-202) retains the lock
-    // state across the virtual->materialized flip — the materialized state
-    // still reads locks for re-emit and the strict-lock cascade. We match
-    // that: escape() does NOT clear Locks. Callers that need the live lock
-    // state dropped (the live-path materializeAt, via ClearLockState ->
-    // clearLocks) do so explicitly before flipping; the analyzer-side
-    // LiveLockEnters/LockCounts maps remain the cross-block authority, so
-    // any retained on-VO locks are informational only.
+    // Graal ObjectState.escape retains the lock state across the
+    // virtual->materialized flip — the materialized state still reads locks
+    // for re-emit and the strict-lock cascade. We match that: escape() does
+    // NOT clear Locks. Callers that need the live lock state dropped (the
+    // live-path materializeAt, via ClearLockState -> clearLocks) do so
+    // explicitly before flipping; the analyzer-side LiveLockEnters/LockCounts
+    // maps remain the cross-block authority, so any retained on-VO locks are
+    // informational only.
   }
 
   void addLock(MonitorIdRef M) {
     assert(isVirtual());
     // Graal ObjectState.addLock guarantees strictly descending depth on the
-    // head (ObjectState.java:212): the new (innermost) lock's depth is
-    // strictly greater than the previous head. Jeandle's vector runs
-    // front=min(outermost)..back=max(innermost), so the invariant is that the
-    // pushed depth strictly exceeds the current back. Mirrors Graal's
-    // GraalError.guarantee; the lock cascade (ensureMaterialized /
-    // materializeVirtualLocksBefore) relies on front()=min / back()=max.
+    // head: the new (innermost) lock's depth is strictly greater than the
+    // previous head. Jeandle's vector runs front=min(outermost)..back=max
+    // (innermost), so the invariant is that the pushed depth strictly exceeds
+    // the current back. Mirrors Graal's GraalError.guarantee; the lock
+    // cascade (ensureMaterialized / materializeVirtualLocksBefore) relies on
+    // front()=min / back()=max.
     assert(Locks.empty() || M.BytecodeDepth > Locks.back().BytecodeDepth);
     Locks.push_back(M);
   }
@@ -488,6 +486,15 @@ public:
     Materialize,
     CreatePHI,
     RewritePhiIncoming,
+    // Rewrite a "deopt" operand bundle on a safepoint (call/invoke) so a PEA
+    // virtual object that is still virtual at the safepoint is described by a
+    // virtual-object (VO) descriptor instead of a (soon-to-be-poisoned)
+    // OrigAlloc reference. Non-cfgKill (Pass 1): it MUST run before Pass 2's
+    // EliminateAllocation RAUWs OrigAlloc to poison, otherwise the bundle
+    // operand would be poisoned. Graal analog: addVirtualMapping /
+    // processNodeWithState (the FrameState/deopt state is recorded as a
+    // virtual mapping rather than an escape).
+    RewriteDeoptBundle,
   };
 
   // --- common fields (read by commit/dropEffectsFor/the transform) ---
@@ -694,13 +701,13 @@ public:
 // Re-derive a loop/merge-carried DERIVED pointer (GEP/bitcast of a virtual
 // object) at the per-predecessor materialization point and rewire the carrying
 // PHI's incoming to it. This is Jeandle's extension of Graal
-// getAliasAndResolve + setPhiInput (PartialEscapeClosure.java:1575-1584 /
-// :1511) to LLVM derived pointers, which have no Graal analog: Graal only ever
-// carries object-identity aliases, so its merge re-derivation hands back the
-// materialized object directly; LLVM can carry a field address (a GEP with a
-// byte offset), so the re-derivation must replay that offset over the freshly-
-// materialized base. Non-cfgKill (Pass 1); must sort strictly after the per-pred
-// Materialize in the same block bucket so NewInv is recorded before apply.
+// getAliasAndResolve + setPhiInput (PartialEscapeClosure.java) to LLVM derived
+// pointers, which have no Graal analog: Graal only ever carries object-identity
+// aliases, so its merge re-derivation hands back the materialized object
+// directly; LLVM can carry a field address (a GEP with a byte offset), so the
+// re-derivation must replay that offset over the freshly-materialized base.
+// Non-cfgKill (Pass 1); must sort strictly after the per-pred Materialize in
+// the same block bucket so NewInv is recorded before apply.
 class RewritePhiIncomingEffect : public Effect {
 public:
   PHINode *Phi = nullptr;              // the existing carrying PHI (already in IR)
@@ -722,6 +729,63 @@ public:
   void apply(TransformContext &Ctx) override;
   std::unique_ptr<Effect> clone() const override {
     return std::make_unique<RewritePhiIncomingEffect>(*this);
+  }
+};
+
+// Rewrite the "deopt" operand bundle of a safepoint (CallBase) so that a
+// virtual object referenced in the bundle (and still virtual at the safepoint)
+// is described by a VO descriptor (ScalarValueType header + klass + per-offset
+// field values) and the bundle slot that held OrigAlloc becomes a VORefType
+// reference. Non-cfgKill (Pass 1). A field whose value is ANOTHER in-scope VO
+// is emitted as a VORef FIELD (vo-id) so the descriptor graph can be cyclic /
+// transitive (mirrors C2/Graal nested ObjectValue + id back-ref). Scope of
+// the current implementation: instance objects (no arrays), not synthetic,
+// referenced as the OrigAlloc (not a derived pointer), with fields that are
+// either plain scalars or VORefs to other describable VOs. A reference field
+// pointing at a non-VO/materialized value, arrays, long/double two-slot
+// encoding, and multi-scope/inlinee bundles are still intentionally deferred
+// (TODO(pea-deopt-deferred)) — the analyzer bails those (and contagiously
+// bails any VO referencing a bailed VO, so no dangling VORef is ever emitted).
+// A VO HOLDING A LOCK at the safepoint IS described: its PEA-eliminated lock
+// is reconstructed at deopt by rewriting the bundle's monitor entry to
+// eliminated=true with a VORef owner (the transform handles monitor-object
+// OrigAlloc slots in step 3).
+//
+// Graal analog: addVirtualMapping (PartialEscapeClosure.java) records a
+// FrameState's reference to a still-virtual object as a virtual mapping
+// (re-emitted as an ObjectValue at deopt) rather than an escape. Jeandle
+// cannot mutate the bundle during analysis, so it records this effect and
+// the transform rewrites the bundle in Pass 1.
+class RewriteDeoptBundleEffect : public Effect {
+public:
+  // The safepoint whose "deopt" bundle references the VO's OrigAlloc.
+  CallBase *Safepoint = nullptr;
+  // Per-offset snapshot of the object's field values at the safepoint (read
+  // from the analyzer's FieldStates keyed by (ObjectID, byte-offset)). Each
+  // entry's FieldValue is either Scalar (a plain scalar field) or VirtualRef
+  // (a field that references another in-scope VO, emitted as a VORef field).
+  // The analyzer only records this effect when it can prove that invariant at
+  // the safepoint. Each Scalar FieldValue's backing def must dominate the
+  // safepoint (any Value* reachable from surviving state must outlive the
+  // transform) — the analyzer only snapshots dominating scalar stores.
+  SmallVector<MaterializeEffect::FieldEntry, 8> Fields;
+  // True iff this VO's OrigAlloc is a direct "deopt" bundle operand at this
+  // safepoint (a ROOT, referenced from a locals/stack slot). The transform
+  // then REQUIRES OrigAlloc to still be in the bundle (bails if it was
+  // scrubbed, to avoid an orphan descriptor with no slot). False for a
+  // TRANSITIVE member — a VO referenced only via another VO's VORef field,
+  // whose OrigAlloc is never a bundle operand. The transform still emits its
+  // descriptor (referenced by id from the enclosing VO's VORef field) but
+  // skips the slot rewrite.
+  bool OrigAllocInBundle = true;
+
+  Kind getKind() const override { return Kind::RewriteDeoptBundle; }
+  static bool classof(const Effect *E) {
+    return E->getKind() == Kind::RewriteDeoptBundle;
+  }
+  void apply(TransformContext &Ctx) override;
+  std::unique_ptr<Effect> clone() const override {
+    return std::make_unique<RewriteDeoptBundleEffect>(*this);
   }
 };
 

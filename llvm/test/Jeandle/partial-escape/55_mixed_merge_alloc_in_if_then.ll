@@ -3,10 +3,10 @@
 ; PEA A3 (Mixed-merge non-dominating alloc): the alloc-dominates-merge
 ; fast path. Alloc happens in %entry (which dominates the merge); the if-then
 ; arm escapes the object via @sink, the if-else arm leaves it virtual.
-; mergeStates' mixed-state branch inherits Materialized at the merge using
-; the OrigAlloc placeholder; the transform's safe-IP-hoisted materializeAt
-; produces a single materialized invoke that dominates the merge, and RAUW
-; redirects every IR use of the original alloc onto the new invoke.
+; Under the reuse-OrigAlloc model the ORIGINAL allocation is the single SSA
+; value kept alive (it dominates every escape point and every use), so no
+; fresh materialization invoke is emitted and no materialized-object PHI is
+; needed at the merge: the escape arm and the return both consume OrigAlloc.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -32,15 +32,14 @@ u:
   resume i64 %lp
 }
 
-; The transform must produce exactly one materialization invoke (the alloc
-; dominates the merge so we don't need a per-pred PHI), and the @sink and
-; %ret must consume it.
+; The transform retains the single original allocation invoke (the alloc
+; dominates the merge, so OrigAlloc is the one sound SSA value), and both the
+; @sink and the return consume it; no materialized-object PHI is built.
 ; CHECK-LABEL: define ptr addrspace(1) @test_alloc_in_entry_mixed_merge
-; Per-arm materialize + materializedValuePhi (the collapse).
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
-; CHECK: call void @sink(ptr addrspace(1) %{{[A-Za-z0-9._]+}})
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
-; CHECK: = phi ptr addrspace(1)
-; CHECK: ret ptr addrspace(1) %{{[A-Za-z0-9._]+}}
+; CHECK-NOT: invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK: call void @sink(ptr addrspace(1) %o)
+; CHECK-NOT: = phi ptr addrspace(1)
+; CHECK: ret ptr addrspace(1) %o
 
 !java-method-compilation = !{}

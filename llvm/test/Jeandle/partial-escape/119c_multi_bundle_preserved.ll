@@ -1,12 +1,13 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Preserve all non-"deopt" operand bundles. PEA is intentionally
-; deopt-agnostic until the Jeandle deopt refactor lands (the transform
-; drops "deopt" when copying bundles onto NewInv), but every other tag
-; must survive. Here the allocation carries both a "deopt" and a
-; "cfguardtarget" bundle; only the "cfguardtarget" bundle survives on
-; the materialisation invoke. This guards against a bundle-copy loop
-; that breaks after the first bundle and silently drops subsequent ones.
+; Preserve all operand bundles on the original allocation. Under the
+; reuse-OrigAlloc model the ORIGINAL allocation invoke is kept verbatim (no
+; fresh materialization invoke is emitted), so every operand bundle it carries
+; survives untouched — there is no bundle-copy step that could drop or reorder
+; bundles. Here the allocation carries both a "deopt" and a "cfguardtarget"
+; bundle; BOTH must remain on the retained invoke. This guards against any
+; future code path that re-emits the allocation and mishandles multi-bundle
+; copies (e.g. a loop that breaks after the first bundle).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -27,10 +28,11 @@ u:
   resume i64 %lp
 }
 
-; The non-"deopt" bundle must survive on the materialisation invoke;
-; the "deopt" bundle must be dropped.
+; Both operand bundles must survive on the RETAINED original allocation
+; invoke; no second materialization invoke is emitted.
 ; CHECK-LABEL: define void @multi_bundle
-; CHECK: invoke {{.*}}@jeandle.new_instance{{.*}}[ "cfguardtarget"(ptr @cfg_target_fn) ]
-; CHECK-NOT: "deopt"
+; CHECK: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance{{.*}}[ "deopt"(i32 7), "cfguardtarget"(ptr @cfg_target_fn) ]
+; CHECK-NOT: invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK: call void @sink(ptr addrspace(1) %o)
 
 !java-method-compilation = !{}

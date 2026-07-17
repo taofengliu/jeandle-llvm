@@ -2,9 +2,10 @@
 
 ; PEA A3 (Mixed-merge alloc-dominates fast path) with field stores in the
 ; if-then arm. The alloc is in %entry; the if-then arm writes a field then
-; escapes; the if-else arm leaves the object virtual. The materialization
-; replays the field write and the merge inherits Materialized via OrigAlloc;
-; RAUW threads the live invoke into the return.
+; escapes; the if-else arm leaves the object virtual. Under the reuse-OrigAlloc
+; model the ORIGINAL allocation is kept alive and dominates every use, so the
+; tracked field write is replayed onto OrigAlloc before the escape and no
+; materialized-object PHI is needed at the merge; the return consumes OrigAlloc.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -32,17 +33,16 @@ u:
   resume i64 %lp
 }
 
-; Single materialization (alloc dominates merge). The field write at offset 8
-; is replayed at the top of the materialization continuation block, then the
-; sink and return consume the new invoke.
+; Single allocation invoke retained (alloc dominates merge). The field write
+; at offset 8 is replayed onto OrigAlloc before the escape; the sink and the
+; return consume OrigAlloc; no materialized-object PHI is built.
 ; CHECK-LABEL: define ptr addrspace(1) @test_mixed_merge_with_field_writes
-; The escape arm materializes (replaying the field write) and sinks; the virtual
-; arm materializes at its pred-end; the return consumes the merge PHI.
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
-; CHECK: store atomic i32 %v
-; CHECK: call void @sink(ptr addrspace(1) %{{[A-Za-z0-9._]+}})
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
-; CHECK: = phi ptr addrspace(1)
-; CHECK: ret ptr addrspace(1) %{{[A-Za-z0-9._]+}}
+; CHECK-NOT: invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK: %pea.matslot = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
+; CHECK: store atomic i32 %v, ptr addrspace(1) %pea.matslot unordered, align 4
+; CHECK: call void @sink(ptr addrspace(1) %o)
+; CHECK-NOT: = phi ptr addrspace(1)
+; CHECK: ret ptr addrspace(1) %o
 
 !java-method-compilation = !{}

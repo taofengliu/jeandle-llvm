@@ -1,13 +1,15 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; MergeProcessor / materializeAndBuildPhi lock-count mismatch (1 vs 2).
+; MergeProcessor / lock-count mismatch (1 vs 2), under the reuse-OrigAlloc model.
 ;
 ; Both arms lock the same virtual object but with different counts
-; (then=1 enter, else=2 enters). The counts disagree at the merge, so the
-; per-VO disposition routes to the materialize+materializedValuePhi path:
-; each pred is materialized with its OWN lock list, then a ptr addrspace(1)
-; PHI selects between the per-pred NewInvs at the merge and OrigAlloc is
-; RAUW'd onto the PHI for the post-merge sink user.
+; (then=1 enter, else=2 enters). The counts disagree at the merge, but under
+; reuse-OrigAlloc the mismatch no longer drives a per-pred materialization +
+; materializedValuePhi cascade. The ORIGINAL allocation (OrigAlloc %o) is kept
+; verbatim, each arm's surviving monitorenters stay in their original blocks
+; with receivers pointing at OrigAlloc, and the post-merge sink receives
+; OrigAlloc directly. No fresh materialization invoke is emitted and no PHI is
+; built at the merge.
 ;
 ; This is a regression anchor for the collapsed single-pass
 ; materializeAndBuildPhi (the pre-refactor code handled lock mismatch as a
@@ -46,17 +48,20 @@ u:
   resume i64 %lp
 }
 
-; The original entry alloc is eliminated; each pred materializes a fresh
-; allocation invoke carrying its own lock list (then=1 enter, else=2 enters),
-; and a ptr addrspace(1) PHI at the merge wires the two NewInvs for the sink.
-; We assume RPO visits `then` (1 enter) before `else` (2 enters).
 ; CHECK-LABEL: define void @test_lockmismatch_1v2
-; CHECK: %[[MAT1:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %[[MAT1]],
-; CHECK: %[[MAT2:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %[[MAT2]],
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %[[MAT2]],
-; CHECK: %[[PHI:[A-Za-z0-9._]+]] = phi ptr addrspace(1)
-; CHECK: call void @sink(ptr addrspace(1) %[[PHI]])
+; The original allocation invoke is RETAINED (no fresh materialization).
+; CHECK: %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
+; No pea.mat materialization invoke is emitted.
+; CHECK-NOT: pea.mat = invoke
+; then-arm's single enter stays in its original block, receiver OrigAlloc %o.
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %o, ptr %lock)
+; else-arm's two enters stay in their original block, receiver OrigAlloc %o.
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %o, ptr %lock)
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %o, ptr %lock)
+; Exactly three monitorenters total — no synthesized enters anywhere.
+; CHECK-NOT: call hotspotcc void @jeandle.monitorenter_with_thin_lock
+; No PHI at the merge; sink receives OrigAlloc directly.
+; CHECK-NOT: phi ptr addrspace(1)
+; CHECK: call void @sink(ptr addrspace(1) %o)
 
 !java-method-compilation = !{}

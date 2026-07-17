@@ -1,12 +1,11 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Self-referential field (o.f = o) per-pred materialized at TWO merges from the
-; same predecessor (multi-materialization). `else` is the shared PH: it branches
-; to `merge` and `S`, and o is virtual on both edges, so o is per-pred
-; materialized once per target merge (two split edges off `else`, two distinct
-; NewInvs — the f14a2011 topology). Each per-pred materialize carries the
-; self-referential field o.f=o; each replayed store must resolve to ITS OWN
-; NewInv (not the other merge's, and not <badref>).
+; Self-referential field (o.f = o) materialized at TWO escape edges from the
+; same virtual predecessor. `else` branches to `merge` and `S`, and o is
+; virtual on both edges, so under reuse-OrigAlloc the single OrigAlloc is kept
+; alive and the self-referential field replays ONCE PER escaping edge (two
+; replayed stores onto OrigAlloc). No per-pred NewInv, no pea.mat, and no
+; materialized-object PHI at either merge — OrigAlloc is the single SSA value.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -38,12 +37,14 @@ u:
 !java-method-compilation = !{}
 
 ; CHECK-LABEL: define void @self_field_perpred_two_merges
-; o materializes on every escaping path (then, plus the two per-pred split edges
-; off `else`).
+; Exactly one allocation invoke (the original OrigAlloc, retained).
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 12345 to ptr)
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 12345 to ptr)
-; Each per-pred materialize off `else` replays the self-referential store with a
-; real NewInv (no <badref>, no poison).
-; CHECK: store atomic ptr addrspace(1) %pea.mat{{[0-9]*}}, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
-; CHECK: store atomic ptr addrspace(1) %pea.mat{{[0-9]*}}, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
+; CHECK-NOT: pea.mat = invoke
+; The self-referential field replays once per escaping edge off `else` — two
+; stores, both with the live OrigAlloc %o as the value (no <badref>, no poison).
+; CHECK: store atomic ptr addrspace(1) %o, ptr addrspace(1) %pea.matslot unordered, align 8
+; CHECK: store atomic ptr addrspace(1) %o, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
+; No materialized-object PHI: OrigAlloc is the single SSA value.
+; CHECK-NOT: phi
+; CHECK: call void @sink(ptr addrspace(1) %o)
 ; CHECK: ret void

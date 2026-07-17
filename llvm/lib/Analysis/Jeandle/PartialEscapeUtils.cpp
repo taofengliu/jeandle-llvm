@@ -171,7 +171,7 @@ Type *llvmElementTypeFor(JBasicType Kind, LLVMContext &Ctx) {
 // Recognize an IntToPtr over both Instruction and ConstantExpr forms. LLVM
 // has `PtrToIntOperator` but no `IntToPtrOperator`, so match via the generic
 // Operator + opcode. Used at both call sites so identity and offset
-// wrapper-stripping stay symmetric for the round-trip (Trap 4).
+// wrapper-stripping stay symmetric for the round-trip.
 static bool isIntToPtrOp(const Value *V) {
   if (auto *Op = dyn_cast<Operator>(V))
     return Op->getOpcode() == Instruction::IntToPtr;
@@ -286,7 +286,7 @@ Value *stripPointerCastsAndOffsets(Value *Ptr, const DataLayout &DL,
     // resolved such a pointer to a virtual, so the offset is unused there.)
     // getIntToPtrRoundTripInner uses Operator-form casts so a ConstantExpr
     // round-trip is peeled the same as an Instruction-form one — keeping this
-    // offset path symmetric with the identity path (Trap 4).
+    // offset path symmetric with the identity path.
     if (Value *Inner = getIntToPtrRoundTripInner(V, DL)) {
       V = Inner;
       continue;
@@ -409,7 +409,8 @@ resolveVirtualRefImpl(Value *V, const PEABlockState &State,
   // laundering pattern (see getIntToPtrRoundTripInner); tagged-pointer
   // encodings (with masking/shifting) must escape. A non-round-trip inttoptr
   // is opaque — return nullopt so the caller materializes. isIntToPtrOp
-  // covers both Instruction and ConstantExpr forms (Trap 4 symmetry).
+  // covers both Instruction and ConstantExpr forms, keeping this symmetric
+  // with the identity-resolution path above.
   if (isIntToPtrOp(V)) {
     if (Value *Inner = getIntToPtrRoundTripInner(V, DL))
       return resolveVirtualRefImpl(Inner, State, Aliases, DL, Visited,

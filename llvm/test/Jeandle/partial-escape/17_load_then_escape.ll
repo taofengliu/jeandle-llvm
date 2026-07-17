@@ -1,14 +1,12 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA: alloc + store + load (folded to the stored constant) + use of
-; the load + escape. The load fold survives the escape: %v becomes the
-; constant 99 (so use_int gets a constant, consumed before the escape), and
-; the object is materialized at the ESCAPE POINT (the @sink call) — Graal's
-; materializeBefore=node — so the new invoke sits just before the sink. The
-; field store is replayed at the top of the materialization continuation,
-; ahead of the sink. (Escape-point placement: OrigAlloc uses are resolved
-; per-point by the transform, so the materialize need not dominate earlier
-; in-block references.)
+; PEA reuse-OrigAlloc model: alloc + store + load (folded to the stored
+; constant) + use of the load + escape. The load fold survives the escape:
+; %v becomes the constant 99 (so use_int gets a constant, consumed before the
+; escape). The ORIGINAL allocation (OrigAlloc) is kept alive; PEA replays the
+; tracked field store onto OrigAlloc immediately before the escape point (the
+; @sink call). No fresh materialization invoke is emitted; the sink consumes
+; OrigAlloc directly.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use_int(i32)
@@ -33,10 +31,16 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_load_then_escape
+; The original allocation invoke is RETAINED — exactly one new_instance, no
+; fresh pea.mat materialization invoke.
+; CHECK: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
+; CHECK-NOT: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
+; The load folds to the stored constant.
 ; CHECK: call void @use_int(i32 99)
-; CHECK: %[[MAT:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
-; CHECK-NEXT: to label %{{.*}} unwind label %{{.*}}
-; CHECK: store atomic i32 99, ptr addrspace(1) %{{.*}} unordered, align {{[0-9]+}}
-; CHECK: call void @sink(ptr addrspace(1) %[[MAT]])
+; The tracked field store is replayed onto OrigAlloc before the escape.
+; CHECK: %pea.matslot = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
+; CHECK: store atomic i32 99, ptr addrspace(1) %pea.matslot unordered, align 4
+; The sink consumes OrigAlloc directly.
+; CHECK: call void @sink(ptr addrspace(1) %o)
 
 !java-method-compilation = !{}
