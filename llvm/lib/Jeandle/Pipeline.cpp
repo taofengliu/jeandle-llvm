@@ -27,6 +27,8 @@
 #include "llvm/Transforms/Scalar/ADCE.h"
 #include "llvm/Transforms/Scalar/EarlyCSE.h"
 #include "llvm/Transforms/Scalar/InstSimplifyPass.h"
+#include "llvm/Transforms/Scalar/LICM.h"
+#include "llvm/Transforms/Scalar/LoopRotation.h"
 #include "llvm/Transforms/Scalar/RewriteStatepointsForGC.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/Transforms/Utils/LCSSA.h"
@@ -91,9 +93,9 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   if (isStripMiningEnabled()) {
     PM.addPass(createModuleToFunctionPassAdaptor(EarlyCSEPass()));
     PM.addPass(createModuleToFunctionPassAdaptor(InstCombinePass()));
-    // Strip mining requires its target loop in LoopSimplify + LCSSA form (it
-    // checks for them but does not form them); real frontend loops are in
-    // neither, so form them here or the transform never fires.
+    // Put real frontend loops in LoopSimplify + LCSSA form before Early and
+    // the canonicalization below. Strip mining restores this form after those
+    // passes because they can invalidate it.
     PM.addPass(createModuleToFunctionPassAdaptor(LoopSimplifyPass()));
     PM.addPass(createModuleToFunctionPassAdaptor(LCSSAPass()));
   }
@@ -103,7 +105,21 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
       SafepointElimination(SafepointEliminationMode::Early)));
   if (getSafepointCoverageCheck() != SafepointCoverageCheck::Off)
     PM.addPass(createModuleToFunctionPassAdaptor(SafepointCoverageVerifier()));
+
   if (isStripMiningEnabled()) {
+    // Expose mandatory array-length exits with the smallest canonicalization
+    // sequence required by strip mining.
+    PM.addPass(createModuleToFunctionPassAdaptor(SimplifyCFGPass()));
+    PM.addPass(createModuleToFunctionPassAdaptor(LoopSimplifyPass()));
+    PM.addPass(createModuleToFunctionPassAdaptor(LCSSAPass()));
+    LoopPassManager LPM;
+    LPM.addPass(LoopRotatePass(true, false));
+    LPM.addPass(LICMPass(LICMOptions()));
+    PM.addPass(createModuleToFunctionPassAdaptor(
+        createFunctionToLoopPassAdaptor(std::move(LPM), true)));
+    if (isInclusiveLoopVersioningEnabled())
+      PM.addPass(createModuleToFunctionPassAdaptor(SafepointElimination(
+          SafepointEliminationMode::InclusiveLoopVersioning)));
     PM.addPass(createModuleToFunctionPassAdaptor(
         SafepointElimination(SafepointEliminationMode::StripMining)));
     if (getSafepointCoverageCheck() != SafepointCoverageCheck::Off)
@@ -122,6 +138,14 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
       SafepointElimination(SafepointEliminationMode::Cleanup)));
   if (getSafepointCoverageCheck() != SafepointCoverageCheck::Off)
     PM.addPass(createModuleToFunctionPassAdaptor(SafepointCoverageVerifier()));
+
+  if (level == OptimizationLevel::O3) {
+    // Re-form LCSSA independently of strip mining, then atomically delete
+    // finite empty loops and the polls that prevent their deletion.
+    PM.addPass(createModuleToFunctionPassAdaptor(LCSSAPass()));
+    PM.addPass(createModuleToFunctionPassAdaptor(
+        SafepointElimination(SafepointEliminationMode::LoopDeletionPrep)));
+  }
 
   PM.addPass(JavaOperationLower(1));
   PM.addPass(std::move(PB.buildPerModuleDefaultPipeline(level)));

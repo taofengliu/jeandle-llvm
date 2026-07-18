@@ -36,6 +36,29 @@ public:
       SafepointEliminationMode Mode = SafepointEliminationMode::Early)
       : Mode(Mode) {}
 
+  void printPipeline(raw_ostream &OS,
+                     function_ref<StringRef(StringRef)> MapClassName2PassName) {
+    static_cast<PassInfoMixin<SafepointElimination> *>(this)->printPipeline(
+        OS, MapClassName2PassName);
+    switch (Mode) {
+    case SafepointEliminationMode::Early:
+      OS << "<early>";
+      break;
+    case SafepointEliminationMode::InclusiveLoopVersioning:
+      OS << "<inclusive-loop-versioning>";
+      break;
+    case SafepointEliminationMode::StripMining:
+      OS << "<strip-mining>";
+      break;
+    case SafepointEliminationMode::Cleanup:
+      OS << "<cleanup>";
+      break;
+    case SafepointEliminationMode::LoopDeletionPrep:
+      OS << "<loop-deletion-prep>";
+      break;
+    }
+  }
+
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &AM);
 
 private:
