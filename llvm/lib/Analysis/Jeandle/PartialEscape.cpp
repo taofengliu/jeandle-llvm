@@ -435,26 +435,6 @@ ObjectState &PEABlockState::getObjectStateForModification(ObjectID ID) {
   return *(*Arr)[ID];
 }
 
-std::optional<ObjectID>
-PEABlockState::resolveVirtualRef(Value *V, const AliasMap &Aliases) const {
-  // We need a DataLayout for the GEP-walking inside pea::resolveVirtualRef.
-  // Find it via V's parent Module if possible; otherwise we cannot resolve.
-  if (!V)
-    return std::nullopt;
-  Module *M = nullptr;
-  if (auto *I = dyn_cast<Instruction>(V)) {
-    if (BasicBlock *BB = I->getParent())
-      if (Function *F = BB->getParent())
-        M = F->getParent();
-  } else if (auto *A = dyn_cast<Argument>(V)) {
-    if (Function *F = A->getParent())
-      M = F->getParent();
-  }
-  if (!M)
-    return std::nullopt;
-  return pea::resolveVirtualRef(V, *this, Aliases, M->getDataLayout());
-}
-
 // ===========================================================================
 // AliasMap
 // ===========================================================================
@@ -677,9 +657,6 @@ void Effect::dump(raw_ostream &OS) const {
   case Kind::CreatePHI:
     OS << "CreatePHI";
     break;
-  case Kind::RewritePhiIncoming:
-    OS << "RewritePhiIncoming";
-    break;
   case Kind::RewriteDeoptBundle:
     OS << "RewriteDeoptBundle";
     break;
@@ -695,6 +672,12 @@ void Effect::dump(raw_ostream &OS) const {
 void MaterializeEffect::setInsertBefore(Instruction *I) { InsertBefore = I; }
 
 bool PEAResult::hasOptimizationOpportunity() const {
-  return VirtualizationDelta > 0 || AllocationDelta != 0 ||
-         !BlockEffects.empty();
+  // VirtualizationDelta and AllocationDelta are mutated in lockstep (each
+  // virtualization does ++VirtualizationDelta/--AllocationDelta, each
+  // de-virtualization the opposite), so AllocationDelta == -VirtualizationDelta
+  // always. VirtualizationDelta is never decremented below 0, so
+  // VirtualizationDelta > 0 implies AllocationDelta != 0 — the latter term is
+  // redundant and dropped. Kept: any virtualization, OR any escaped-materialize
+  // effect recorded (PartiallyEscapes / AlwaysEscapes need a transform pass).
+  return VirtualizationDelta > 0 || !BlockEffects.empty();
 }

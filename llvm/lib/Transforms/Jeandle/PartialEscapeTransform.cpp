@@ -11,9 +11,9 @@
 // Graal's EffectList.apply(graph, obsoleteNodes, cfgKills)).
 //
 //   Pass 1 (non-cfgKill): ReplaceLoad, ReplaceCall, EliminateStore,
-//   Materialize, CreatePHI, RewriteDeoptBundle, RewritePhiIncoming — applied
-//   per-block in RPO via EffectList::apply, which sorts by SeqNo and
-//   dispatches each effect's apply() through TransformContext.
+//   Materialize, CreatePHI, RewriteDeoptBundle — applied per-block in RPO via
+//   EffectList::apply, which sorts by SeqNo and dispatches each effect's
+//   apply() through TransformContext.
 //
 //   Pass 2 (cfgKill): EliminateAllocation — rewrites a NeverEscapes invoke
 //   alloc into an unconditional branch (dropping the unwind edge) or plain-
@@ -604,14 +604,6 @@ void jeandle::CreatePHIEffect::apply(jeandle::TransformContext &Ctx) {
   for (unsigned I = 0; I < PHIIncomingValues.size(); ++I)
     Phi->addIncoming(PHIIncomingValues[I], PHIIncomingBlocks[I]);
   Ctx.Changed = true;
-}
-
-void jeandle::RewritePhiIncomingEffect::apply(jeandle::TransformContext &Ctx) {
-  // No-op. This effect (emitted only by the Case-A path in processBlockPhis)
-  // historically re-derived a carried DERIVED pointer (GEP/bitcast of a virtual
-  // object) at the back-edge. OrigAlloc is KEPT (PartiallyEscapes), dominates
-  // the body GEP, and the GEP stays valid; the carrying PHI's incoming is left
-  // as the original IR value. Nothing to re-derive.
 }
 
 // Rewrite a safepoint's "deopt" operand bundle so a never-escaping virtual
