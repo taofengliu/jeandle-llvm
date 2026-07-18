@@ -86,6 +86,17 @@ std::optional<ObjectID> resolveVirtualRef(Value *V, const PEABlockState &State,
 // non-constant index, inttoptr, or unrecognised pattern).
 std::optional<int64_t> resolveFieldOffset(Value *Ptr, const DataLayout &DL);
 
+// Whether V denotes the object it resolves to WHOLE — at byte offset 0 on
+// every execution path. resolveVirtualRef returns object identity and
+// discards byte offsets, and resolveFieldOffset has no Select/PHI case (it
+// returns 0 for them), so a consumer that records a whole-object reference
+// (a VirtualRef field entry, a whole-object alias-forward) must check this:
+// a Select/PHI whose arms may carry different non-zero offsets resolves to
+// the object by identity without being address-equal to it. Recurses
+// through Select arms and PHI incomings (cycle-safe via depth cap); leaves
+// go through resolveFieldOffset.
+bool isWholeObjectReference(Value *V, const DataLayout &DL);
+
 // Find the start index (into the "deopt" bundle's Inputs) of the CURRENT
 // (innermost) deopt scope's duplicated-BCI pair. A Jeandle deopt bundle is
 // [root scope][inlinee scope]... with the innermost (current-method) scope

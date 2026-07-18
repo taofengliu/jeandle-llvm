@@ -6,11 +6,10 @@
 ; which encounters the PHI's self-incoming and must terminate via the
 ; on-stack Visited check rather than infinite-recursing.
 ;
-; The expected outcome: no analyzer crash. The alloc is preallocated
-; before the loop and materialized by materializeBeforeLoops; the loop
-; PHI sees the materialized pointer on the back-edge and behaves as a
-; regular real-pointer PHI. The test pins "no crash" + the alloc
-; survives as a real allocation.
+; The expected outcome: no analyzer crash, and — since a not-yet-visited
+; back-edge incoming is treated as unknown rather than as a divergence —
+; the iter-0 header merge takes Case B (the PHI aliases the VO), the VO
+; stays virtual across the loop, and the allocation is fully eliminated.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)
@@ -46,10 +45,12 @@ u:
   resume i64 %lp
 }
 
-; No crash; the alloc is real (materialized before the loop). Either
-; arm of the icmp may or may not be folded — the key property is that
-; the analyzer terminates and the function verifies.
+; No crash, and the loop-carried VO is fully virtualized: the allocation
+; is eliminated, the Case-B PHI is gone, and the identity icmp folds to
+; true so only the %same arm survives.
 ; CHECK-LABEL: define void @test_cycle
-; CHECK: @jeandle.new_instance
+; CHECK-NOT: call hotspotcc ptr addrspace(1) @jeandle.new_instance
+; CHECK: call void @use(i32 1)
+; CHECK-NOT: call void @use(i32 -1)
 
 !java-method-compilation = !{}

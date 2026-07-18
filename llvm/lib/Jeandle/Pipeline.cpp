@@ -109,23 +109,25 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   // Pipeline position decision.
   //   Jeandle runs PEA at exactly ONE position. JavaOperationLower(0) is
   //   hoisted above the inline driver (so phase-0 helpers like
-  //   load_klass/instanceof/arraylength/idiv are inlined before inlining
-  //   runs); PEA runs after the driver and the pre-PEA cleanup, before
-  //   InstSimplify, TypeCheckElimination, and the standard O2 pipeline.
-  //   PEA still sees every allocation site: the named alloc intrinsics
-  //   `jeandle.new_instance` / `jeandle.new_array` carry `"lower-phase"="1"`
-  //   and are left untouched by JavaOperationLower(0) (phase-0 only) and by
-  //   every pass downstream of PEA, surviving until JavaOperationLower(1)
-  //   below. addrspace(1) survives until RewriteStatepointsForGC rewrites it
-  //   to gc-managed pointers.
+  //   instanceof/idiv are inlined before inlining runs); PEA runs after the
+  //   driver and the pre-PEA cleanup, before InstSimplify,
+  //   TypeCheckElimination, and the standard O2 pipeline. Ops that PEA can
+  //   fold — allocations, monitors, and helpers whose expanded body would
+  //   expose a raw header/klass load that kills virtualization
+  //   (load_klass / arraylength / array_store_check / check_if_value_based)
+  //   — carry `"lower-phase"="1"` and are left untouched by
+  //   JavaOperationLower(0) (phase-0 only) and by every pass downstream of
+  //   PEA, surviving until JavaOperationLower(1) below. addrspace(1)
+  //   survives until RewriteStatepointsForGC rewrites it to gc-managed
+  //   pointers.
   //
   //   Considered and rejected: a second `PartialEscapeIterative` after the
   //   O2 pipeline. The named intrinsics and addrspace(1) survive through
   //   O2 + GC barriers, so it would be technically feasible. However:
-  //     - Phase-0 helpers (load_klass / instanceof / arraylength /
-  //       div/rem) do not allocate or escape; inlining them via
-  //       JavaOperationLower(0) cannot expose new allocation-virtualization
-  //       opportunities for a second PEA round to capture.
+  //     - Phase-0 helpers (instanceof / div/rem) do not allocate or escape;
+  //       inlining them via JavaOperationLower(0) cannot expose new
+  //       allocation-virtualization opportunities for a second PEA round to
+  //       capture.
   //     - O2's stock passes (InstCombine, SimplifyCFG, GVN, SROA, LICM,
   //       loop unroll) cannot SROA or fold addrspace(1) loads — they have
   //       no Java semantic model for the heap — so they neither destroy

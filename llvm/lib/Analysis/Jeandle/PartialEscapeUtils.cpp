@@ -15,6 +15,8 @@
 
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseSet.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -505,6 +507,33 @@ std::optional<int64_t> resolveFieldOffset(Value *Ptr, const DataLayout &DL) {
   if (NonConst)
     return std::nullopt;
   return Off;
+}
+
+bool isWholeObjectReference(Value *V, const DataLayout &DL) {
+  unsigned Depth = 0;
+  SmallVector<Value *, 8> Worklist(1, V);
+  SmallPtrSet<Value *, 8> Visited;
+  while (!Worklist.empty()) {
+    Value *Cur = Worklist.pop_back_val();
+    if (!Cur || !Visited.insert(Cur).second)
+      continue;
+    if (++Depth > 8)
+      return false; // pathological merge chain — conservative.
+    if (auto *Sel = dyn_cast<SelectInst>(Cur)) {
+      Worklist.push_back(Sel->getTrueValue());
+      Worklist.push_back(Sel->getFalseValue());
+      continue;
+    }
+    if (auto *PN = dyn_cast<PHINode>(Cur)) {
+      for (Value *Inc : PN->incoming_values())
+        Worklist.push_back(Inc);
+      continue;
+    }
+    auto Off = resolveFieldOffset(Cur, DL);
+    if (!Off || *Off != 0)
+      return false;
+  }
+  return true;
 }
 
 // ===========================================================================
