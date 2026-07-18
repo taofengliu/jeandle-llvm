@@ -679,6 +679,15 @@ private:
   // that end up NeverEscapes, so EliminateAllocation isn't left with
   // a dead-but-still-parented `phi [poison, ..., poison]` survivor
   // in the IR.
+  //
+  // Intentionally NOT snapshotted in LoopSnapshot/restoreLoopSnapshot: it is
+  // commit()-time-only state, and the loop fixpoint re-derives the Case-B
+  // alias decision each merge (resetAlias before every decision). Entries can
+  // therefore accumulate across iterations; that is benign because the
+  // consumer only acts for VOs that are NeverEscapes in the FINAL plan, and
+  // the populate site dedups by PHI identity so the erase list never contains
+  // a duplicate (which the transform's WeakTrackingVH null-check would in any
+  // case skip after the first erase).
   DenseMap<jeandle::ObjectID, SmallVector<llvm::PHINode *, 2>> CaseBPhiAliases;
 
   // Graal-aligned MergeProcessor (mirrors PartialEscapeClosure's inner
@@ -1233,6 +1242,13 @@ private:
 };
 
 void Analyzer::markIneligible(jeandle::ObjectID ID) {
+  // Fast marking only: clear Eligible and cascade through synthetic sources
+  // (a synthetic VO's real-allocation sources must also be kept real, else the
+  // merge PHI of a dropped synthetic would be left with all-OrigAlloc
+  // incomings — poison). The VirtualRef (outer-real -> inner-real) cascade is
+  // NOT walked here by design: it is commit()-time, where commit() seeds from
+  // every Eligible[ID]==false and walks the persistent VirtualRefEdges member
+  // to fixpoint, subsuming anything this fast marker would need to propagate.
   SmallVector<jeandle::ObjectID, 8> Worklist;
   DenseSet<jeandle::ObjectID> Visited;
   Worklist.push_back(ID);
@@ -1946,6 +1962,12 @@ bool Analyzer::MergeProcessor::mergeObjectState(jeandle::ObjectID ID) {
         break;
       }
     }
+    // `Preds.size() > 1` is load-bearing here: with a single predecessor the
+    // simple AllSame escape path above is the correct handling, and without
+    // this conjunct the single-pred case would fall through to
+    // materializeAndBuildPhi and build a one-incoming placeholder PHI. The
+    // per-pred placeholder machinery is only meaningful for genuine multi-pred
+    // merges.
     bool IsPerPredPlaceholder =
         AllSame && Preds.size() > 1 && Unique == VObj.AllocationCall;
     if (AllSame && !IsPerPredPlaceholder) {
@@ -2185,6 +2207,18 @@ bool Analyzer::MergeProcessor::materializeAndBuildPhi(jeandle::ObjectID ID) {
   // This covers AllMaterialized-differing (both arms live-path materialized,
   // no per-pred materialize in this call) as well as the per-pred / mixed
   // cases.
+  // If a lock hazard mid-loop markIneligible'd ID, PHIIncomingValues is shorter
+  // than Preds.size() (the loop-top gate broke before processing every pred).
+  // Do NOT commit the short-fan-in PHI: commit() drops all of ID's effects
+  // (ineligible -> AlwaysEscapes via dropEffectsFor) and resolveVirtualRef
+  // returns nullopt for ID at BB, so downstream sees the real OrigAlloc — the
+  // desired bail. Mat still carries whether an earlier pred materialized,
+  // driving the retry that re-enters this merge and breaks immediately at the
+  // loop-top gate. Skipping the commit also keeps ID out of CurrentState /
+  // Materialized, so no consumer relies on a PHI that transform would skip.
+  if (!Eligible.lookup(ID))
+    return Mat;
+
   PE->RAUWOrigToPHI = true;
   MergeEffects.add(std::move(PE));
 
@@ -2580,25 +2614,9 @@ void Analyzer::deleteOwnedSince(size_t PhiMark, size_t InstMark) {
   // iteration is still unparented when we discard it. In-loop-cached PHIs (loop
   // headers AND non-header in-loop merge blocks) live in OwnedLoopFieldPhis (a
   // separate bucket) and are intentionally preserved so they stay stable across
-  // fixpoint iterations and across per-merge retries.
-  while (Result.OwnedPhis.size() > PhiMark) {
-    WeakTrackingVH &VH = Result.OwnedPhis.back();
-    if (Value *V = VH) {
-      if (auto *P = dyn_cast<PHINode>(V))
-        if (!P->getParent())
-          delete P;
-    }
-    Result.OwnedPhis.pop_back();
-  }
-  while (Result.OwnedInsts.size() > InstMark) {
-    WeakTrackingVH &VH = Result.OwnedInsts.back();
-    if (Value *V = VH) {
-      if (auto *I = dyn_cast<Instruction>(V))
-        if (!I->getParent())
-          I->deleteValue();
-    }
-    Result.OwnedInsts.pop_back();
-  }
+  // fixpoint iterations and across per-merge retries. The truncation logic
+  // itself is shared with restoreLoopSnapshot via PEAResult::truncateOwnedTo.
+  Result.truncateOwnedTo(PhiMark, InstMark);
 }
 
 void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
@@ -2745,7 +2763,8 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
         // OrigAlloc, which EliminateAllocation RAUWs to poison; the PHI is then
         // dead and we erase it explicitly to avoid a `phi [poison, poison]`
         // artefact past PEA.
-        CaseBPhiAliases[*First].push_back(&Phi);
+        if (!llvm::is_contained(CaseBPhiAliases[*First], &Phi))
+          CaseBPhiAliases[*First].push_back(&Phi);
         continue;
       }
     }
@@ -3853,8 +3872,29 @@ std::optional<int64_t> Analyzer::resolveAccess(Value *Ptr,
     if (*Offset < VMConsts.instanceBaseOffset())
       return std::nullopt;
   } else if (VObj.isArray()) {
-    if (*Offset < static_cast<int64_t>(VObj.ArrayBaseOffset))
+    // Reject offsets outside the array's element byte-range [ArrayBaseOffset,
+    // ArrayBaseOffset + ArrayLength*scale). The lower bound guards the header;
+    // the upper bound rejects an out-of-bounds tail byte-GEP (e.g. `gep i8
+    // %arr, base + N*scale` with N >= ArrayLength) that matchArrayElementGEP
+    // already declined — without it the generic resolver would model the
+    // past-the-end offset as a phantom field that is never replayed (the emit
+    // loop walks only 0..ArrayLength-1), silently dropping the store.
+    //
+    // The upper bound is only enforceable (and only needed) when the element
+    // scale is known (ArrayIndexScale > 0, i.e. ArrayElementType was supplied
+    // via the VM callback log): that is the only case where the emit loop
+    // iterates elements and could drop a past-the-end slot. With an unknown
+    // scale the array is modeled as per-byte-offset field slots that are all
+    // replayed individually, so a tail offset is faithfully replayed, not lost.
+    int64_t BaseOff = static_cast<int64_t>(VObj.ArrayBaseOffset);
+    if (*Offset < BaseOff)
       return std::nullopt;
+    if (VObj.ArrayIndexScale > 0) {
+      int64_t EndOff = BaseOff + static_cast<int64_t>(VObj.ArrayLength) *
+                                   static_cast<int64_t>(VObj.ArrayIndexScale);
+      if (*Offset >= EndOff)
+        return std::nullopt; // out-of-bounds tail byte-GEP — bail
+    }
   }
 
   return Offset;
@@ -4269,6 +4309,13 @@ void Analyzer::processLoad(LoadInst *LI) {
 
 void Analyzer::emitReplaceCall(CallBase *CB, Value *Replacement,
                                jeandle::ObjectID ID) {
+  // PEA only folds Jeandle JavaOp intrinsics (CallInst/InvokeInst); every
+  // caller is gated on an isJeandle* name predicate, which a CallBrInst
+  // (inline-asm-with-goto, no called function) can never satisfy. Fail fast
+  // at the producer so a callbr can never become a ReplaceCall target whose
+  // successor edges ReplaceCallEffect::apply would mishandle.
+  assert(!isa<CallBrInst>(CB) && "PEA ReplaceCall targets are folded Jeandle "
+         "JavaOps (CallInst/InvokeInst); a CallBrInst cannot reach here");
   auto E = std::make_unique<jeandle::ReplaceCallEffect>();
   E->Block = CB->getParent();
   E->Target = CB;
@@ -4792,6 +4839,16 @@ bool Analyzer::processIntrinsic(IntrinsicInst *II) {
          II->getIntrinsicID() != Intrinsic::experimental_gc_result &&
          "PEA must not run after RewriteStatepointsForGC");
   switch (II->getIntrinsicID()) {
+  // assume: a non-escaping hint (returns void). Even when an operand bundle
+  // such as "align"(ptr %vo, N) references a virtual, the bundle is an
+  // informational claim about the pointer, not a real use that escapes it.
+  // If the VO is NeverEscapes and gets RAUW'd to poison, the bundle operand
+  // becomes poison too — but that is sound: assume returns void so poison
+  // cannot propagate out, and the poisoned pointer has no other meaningful
+  // use (any real use would have forced escape -> materialization -> a real,
+  // non-poisoned pointer). The "align"(poison, N) fact is therefore vacuous
+  // to every downstream pass. Kept as a no-op deliberately (see test
+  // 76_assume_noop.ll); do NOT escalate to materialization.
   case Intrinsic::assume:
   case Intrinsic::lifetime_start:
   case Intrinsic::lifetime_end:
@@ -4807,14 +4864,13 @@ bool Analyzer::processIntrinsic(IntrinsicInst *II) {
   // different identity than their argument, none mutate memory we care about,
   // and none cross the heap/abstract boundary — all safe to leave in IR
   // alongside a virtual without forcing escape.
-  // ptr.annotation/var.annotation: TBAA-style debug annotation. The call
-  //   returns nothing meaningful and its operand is purely informational.
+  // var.annotation: TBAA-style debug annotation on a GLOBAL; the call returns
+  //   void and its operand is a global pointer, never a heap virtual.
   // is.constant / expect / expect.with.probability: branch-prediction hints;
   //   their value-result is i1/iN derived from a primitive (the predicate or
   //   the comparison value), not from the virtual pointer's identity, so the
   //   virtual doesn't escape through them.
   // allow.runtime.check / allow.ubsan.check: similar — return i1.
-  case Intrinsic::ptr_annotation:
   case Intrinsic::var_annotation:
   case Intrinsic::is_constant:
   case Intrinsic::expect:
@@ -4822,12 +4878,19 @@ bool Analyzer::processIntrinsic(IntrinsicInst *II) {
   case Intrinsic::allow_runtime_check:
   case Intrinsic::allow_ubsan_check:
     return true;
-  // launder/strip invariant.group are pointer-identity-preserving.
-  // resolveVirtualRef does not recurse through CallInst, so
-  // propagatePointerAlias would fall through to materializeAllVirtualOperands.
-  // Directly forward the argument's virtual alias to the result instead.
+  // pointer-identity-preserving intrinsics: each returns its first argument
+  // (the same pointer, unchanged address). resolveVirtualRef does not recurse
+  // through CallInst, so without help propagatePointerAlias would fall through
+  // to materializeAllVirtualOperands and a downstream access through the
+  // result would be untracked (the VO could be eliminated while the call's
+  // result survives as a poison-derived pointer). Forward the argument's
+  // virtual alias to the result instead, exactly like Graal's alias model.
+  //   launder/strip.invariant.group: opaque identity barrier.
+  //   ptr.annotation: returns the annotated pointer verbatim (NOT void — the
+  //   var.annotation variant is the void one, handled above).
   case Intrinsic::launder_invariant_group:
-  case Intrinsic::strip_invariant_group: {
+  case Intrinsic::strip_invariant_group:
+  case Intrinsic::ptr_annotation: {
     Value *Arg = II->getArgOperand(0);
     if (auto BaseID =
             jeandle::pea::resolveVirtualRef(Arg, CurrentState, Aliases, DL))
@@ -6970,25 +7033,9 @@ void Analyzer::restoreLoopSnapshot(
   // Pop and delete unparented PHIs / insts created during the rolled-back
   // iteration. OwnedLoopFieldPhis are NOT touched — they're the per-loop
   // PHI cache, and the whole point of the cache is to keep them alive
-  // across iterations.
-  while (Result.OwnedPhis.size() > S.OwnedPhisSize) {
-    WeakTrackingVH &VH = Result.OwnedPhis.back();
-    if (Value *V = VH) {
-      if (auto *P = dyn_cast<PHINode>(V))
-        if (!P->getParent())
-          delete P;
-    }
-    Result.OwnedPhis.pop_back();
-  }
-  while (Result.OwnedInsts.size() > S.OwnedInstsSize) {
-    WeakTrackingVH &VH = Result.OwnedInsts.back();
-    if (Value *V = VH) {
-      if (auto *I = dyn_cast<Instruction>(V))
-        if (!I->getParent())
-          I->deleteValue();
-    }
-    Result.OwnedInsts.pop_back();
-  }
+  // across iterations. The truncation logic is shared with deleteOwnedSince
+  // via PEAResult::truncateOwnedTo.
+  Result.truncateOwnedTo(S.OwnedPhisSize, S.OwnedInstsSize);
   Result.NextSeqNo = S.NextSeqNo;
 
   // Roll back per-loop-block ledgers.
@@ -7053,11 +7100,23 @@ void Analyzer::processLoopBodyOnePass(Loop *L, ArrayRef<BasicBlock *> LoopRPO,
     if (Inner && Inner != L && Inner->getHeader() == BB) {
       // Found a sub-loop's header — recurse.
       processLoop(Inner, FunctionRPO);
+      // A nested loop that overflowed latches OverflowFlag; stop walking this
+      // nest immediately (Graal's overflow exception unwinds at once). The
+      // caller (processLoop) polls OverflowFlag on our return and will restore
+      // the snapshot + redo the nest in MATERIALIZE_ALL, so there is no point
+      // processing the remaining blocks just to discard them.
+      if (OverflowFlag)
+        return;
       for (BasicBlock *SB : Inner->blocks())
         Done.insert(SB);
       continue;
     }
     processBlock(BB);
+    // Defensive: processBlock does not currently latch OverflowFlag (it does
+    // not mutate STOP_NEW), but poll anyway so a future change cannot silently
+    // keep walking an overflowed nest.
+    if (OverflowFlag)
+      return;
     Done.insert(BB);
   }
 }
@@ -7147,6 +7206,11 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
     // exception handlers never see partially-materialised loop-internal
     // virtuals.
     processLoopExit(L);
+    // OverflowFlag is deliberately NOT cleared here: if processLoopBodyOnePass
+    // latched it (a nested loop overflowed), it propagates conservatively up so
+    // any enclosing loop context also bails. Every loop entry polls it (depth==1
+    // clears it, a nested entry short-circuits on it), so a stale flag can only
+    // make us more conservative, never unsound.
     return;
   }
 
@@ -7369,6 +7433,10 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
     }
     if (L->getLoopDepth() == 1)
       CurrentMode = SavedModeForNest;
+    // OverflowFlag is deliberately NOT cleared here: like the no-preheader
+    // path, a stale flag propagates conservatively up so any enclosing loop
+    // context also bails (every loop entry polls it). This hard-bail already
+    // marked every loop virtual ineligible, so the original IR survives.
     return;
   }
 }

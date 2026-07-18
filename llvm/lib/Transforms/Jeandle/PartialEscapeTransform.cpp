@@ -89,6 +89,9 @@ static bool eraseAllocation(Instruction *Target) {
     BasicBlock *Normal = II->getNormalDest();
     BasicBlock *Unwind = II->getUnwindDest();
     BasicBlock *Parent = II->getParent();
+    assert(Normal != Unwind && "PEA drops an allocation invoke's unwind edge; "
+           "normal and unwind dests must differ (a Jeandle allocation's unwind "
+           "is an OOM handler distinct from its normal successor)");
 
     // Null out any remaining uses before erasing.
     if (!II->use_empty())
@@ -146,7 +149,16 @@ static void relocateDependentMaterializes(
     DenseMap<Instruction *, SmallVector<jeandle::MaterializeEffect *, 4>>
         &Dependents,
     Instruction *Dying, Instruction *Next) {
-  if (!Next || Next == Dying)
+  // Callers always pass a non-null Next: a non-terminator load/store/call's
+  // getNextNode(), or the fresh `br` created immediately before erasing an
+  // invoke terminator (II->getNextNode() after BranchInst::Create). Assert the
+  // contract so a future caller that would pass null fails loudly instead of
+  // silently leaving a dependent Materialize keyed on a soon-null InsertBefore
+  // (which applyMaterialize would only catch later via its own assert).
+  assert(Next && "Next must be non-null: callers pass Target->getNextNode() "
+                 "(non-terminator load/store/call) or the fresh `br` created "
+                 "before erasing an invoke terminator");
+  if (Next == Dying) // defensive: identity case, nothing to relocate
     return;
   auto It = Dependents.find(Dying);
   if (It == Dependents.end())
@@ -203,7 +215,7 @@ static void spliceUnparentedAt(Instruction *IP, Value *V) {
       I->insertBefore(IP->getIterator());
 }
 
-static void applyMaterialize(
+static bool applyMaterialize(
     Function &F, const jeandle::PEAResult &Result,
     const jeandle::MaterializeEffect &E,
     DenseMap<const jeandle::MaterializeEffect *, CallBase *> &NewInvOf,
@@ -242,6 +254,15 @@ static void applyMaterialize(
   if (InsertBefore->getDebugLoc())
     SB.SetCurrentDebugLocation(InsertBefore->getDebugLoc());
   Type *I8 = Type::getInt8Ty(Ctx);
+
+  // Whether this apply actually mutated the IR (emitted at least one replay
+  // store or re-emitted at least one lock). MaterializeEffect::apply gates
+  // Ctx.Changed on this so an all-idle round (PartiallyEscapes VO with no
+  // field stores and no surviving locks) does not needlessly keep the
+  // iterative driver from converging. NewInvOf population below is not an IR
+  // mutation, and spliceUnparentedAt runs only inside the store loop (gated
+  // by a store), so store/lock creation is the complete set of mutations.
+  bool Emitted = false;
 
   // Replay this object's tracked field stores onto OrigAlloc, immediately
   // before the escape point, so the object's fields hold their current values
@@ -287,6 +308,7 @@ static void applyMaterialize(
     Align NaturalAlign(llvm::PowerOf2Ceil(StoreSz ? StoreSz : 1));
     StoreInst *S = SB.CreateAlignedStore(V, Slot, NaturalAlign);
     S->setAtomic(AtomicOrdering::Unordered); // Java heap stores are unordered
+    Emitted = true;
   }
 
   // Re-emit surviving monitorenters onto OrigAlloc. Locks from MULTIPLE objects
@@ -298,9 +320,9 @@ static void applyMaterialize(
   // lock's receiver resolves via NewInvOf[ML.SourceEffect]. A single-object
   // escape point (no entry in MaxSeqForEscapePoint) emits its own locks here.
   auto EmitLock = [&](Value *Recv, Function *Callee,
-                      ArrayRef<WeakTrackingVH> NonReceiverArgs) {
+                      ArrayRef<WeakTrackingVH> NonReceiverArgs) -> bool {
     if (!Callee)
-      return;
+      return false;
     SmallVector<Value *, 4> Args;
     Args.push_back(Recv);
     for (Value *A : NonReceiverArgs)
@@ -313,6 +335,7 @@ static void applyMaterialize(
     // double-counting it against the deopt-bundle monitor section.
     assert(!Enter->hasOperandBundles() &&
            "re-emitted monitorenter must be bare");
+    return true;
   };
   // Lock lookup uses the ORIGINAL escape-point InsertBefore (the pre-scan-
   // captured key computeEscapePointLocks used), NOT the possibly eager-update-
@@ -348,7 +371,7 @@ static void applyMaterialize(
           assert(NIt != NewInvOf.end() &&
                  "every sibling's OrigAlloc must be "
                  "recorded before the tail emits locks");
-          EmitLock(NIt->second, ML.Callee, ML.NonReceiverArgs);
+          Emitted |= EmitLock(NIt->second, ML.Callee, ML.NonReceiverArgs);
         }
       }
     }
@@ -366,12 +389,13 @@ static void applyMaterialize(
              "BytecodeDepth (Graal lastDepth < getLockDepth guarantee)");
       First = false;
       LastDepth = ML.BytecodeDepth;
-      EmitLock(MatVal, ML.Callee, ML.NonReceiverArgs);
+      Emitted |= EmitLock(MatVal, ML.Callee, ML.NonReceiverArgs);
     }
   }
 
   // Only NewInvOf (set above) is needed: it is consumed by the lock re-emit's
   // per-object receiver resolution at multi-object escape points.
+  return Emitted;
 }
 
 // Bundles the Function, the analysis result, and the shared per-apply state so
@@ -434,7 +458,11 @@ void jeandle::ReplaceLoadEffect::apply(jeandle::TransformContext &Ctx) {
   // closest analogue is the load-only metadata the original load may have
   // carried. Transfer those (only when both sides are LoadInsts and the
   // Replacement is missing the kind) so downstream LLVM passes do not lose the
-  // narrower-than-default knowledge after RAUW.
+  // narrower-than-default knowledge after RAUW. Only VALUE properties are
+  // transferable: invariant.load is intentionally excluded — it asserts a
+  // memory-LOCATION property of the original pointer, and the replacement
+  // reads a different location (possibly fully mutable), so carrying it would
+  // give downstream GVN/LICM a false invariance guarantee.
   if (auto *TargetLoad = dyn_cast<LoadInst>(Target)) {
     if (auto *ReplLoad = dyn_cast<LoadInst>(Repl)) {
       static constexpr unsigned PreservableKinds[] = {
@@ -442,7 +470,6 @@ void jeandle::ReplaceLoadEffect::apply(jeandle::TransformContext &Ctx) {
           LLVMContext::MD_dereferenceable,
           LLVMContext::MD_dereferenceable_or_null,
           LLVMContext::MD_align,
-          LLVMContext::MD_invariant_load,
           LLVMContext::MD_noundef,
       };
       for (unsigned K : PreservableKinds) {
@@ -503,6 +530,8 @@ void jeandle::ReplaceCallEffect::apply(jeandle::TransformContext &Ctx) {
     BasicBlock *Normal = II->getNormalDest();
     BasicBlock *Unwind = II->getUnwindDest();
     BasicBlock *Parent = II->getParent();
+    assert(Normal != Unwind && "PEA drops a folded JavaOp invoke's unwind "
+           "edge; normal and unwind dests must differ");
     Unwind->removePredecessor(Parent, /*KeepOneInputPHIs=*/true);
     BranchInst::Create(Normal, Parent);
     // Eager-update: re-aim any Materialize keyed on `II` to the freshly-created
@@ -564,10 +593,13 @@ void jeandle::EliminateAllocationEffect::apply(jeandle::TransformContext &Ctx) {
 
 void jeandle::MaterializeEffect::apply(jeandle::TransformContext &Ctx) {
   // Replay field stores and re-emit locks onto OrigAlloc (kept alive for
-  // PartiallyEscapes) — see applyMaterialize and the file header.
-  applyMaterialize(Ctx.F, Ctx.Result, *this, Ctx.NewInvOf,
-                   Ctx.OrigInsertBefore);
-  Ctx.Changed = true;
+  // PartiallyEscapes) — see applyMaterialize and the file header. Gate Changed
+  // on whether applyMaterialize actually emitted anything: an all-idle round
+  // (no field stores, no surviving locks) leaves the IR untouched, and marking
+  // it Changed would needlessly prevent the iterative driver from converging.
+  if (applyMaterialize(Ctx.F, Ctx.Result, *this, Ctx.NewInvOf,
+                       Ctx.OrigInsertBefore))
+    Ctx.Changed = true;
 }
 
 void jeandle::CreatePHIEffect::apply(jeandle::TransformContext &Ctx) {

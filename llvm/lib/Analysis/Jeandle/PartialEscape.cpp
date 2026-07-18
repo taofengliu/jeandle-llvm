@@ -364,8 +364,8 @@ bool FieldValue::shallowEquals(const FieldValue &O) const {
 // ===========================================================================
 
 // copy/move/assign/dtor are implicitly generated (rule of zero): they just
-// copy/move/destroy the ObjectStates shared_ptr, which keeps use_count exact,
-// and the plain `Dead` flag. No manual refcount is maintained.
+// copy/move/destroy the ObjectStates shared_ptr, which keeps use_count exact.
+// No manual refcount is maintained.
 
 PEABlockState::PEABlockState()
     : ObjectStates(
@@ -605,6 +605,27 @@ PEAResult::~PEAResult() {
         if (!I->getParent())
           I->deleteValue();
     }
+  }
+}
+
+void PEAResult::truncateOwnedTo(size_t PhisMark, size_t InstsMark) {
+  while (OwnedPhis.size() > PhisMark) {
+    WeakTrackingVH &VH = OwnedPhis.back();
+    if (Value *V = VH) {
+      if (auto *P = dyn_cast<PHINode>(V))
+        if (!P->getParent())
+          delete P;
+    }
+    OwnedPhis.pop_back();
+  }
+  while (OwnedInsts.size() > InstsMark) {
+    WeakTrackingVH &VH = OwnedInsts.back();
+    if (Value *V = VH) {
+      if (auto *I = dyn_cast<Instruction>(V))
+        if (!I->getParent())
+          I->deleteValue();
+    }
+    OwnedInsts.pop_back();
   }
 }
 

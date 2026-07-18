@@ -1048,6 +1048,17 @@ public:
   void addBlockEffect(std::unique_ptr<Effect> E);
 
   bool hasOptimizationOpportunity() const;
+
+  // Truncate OwnedPhis/OwnedInsts to the given marks, deleting each trailing
+  // entry that is still unparented (the transform only inserts these into a
+  // BasicBlock later, so anything added during a discarded merge iteration or
+  // loop-iteration is unparented at rollback time). OwnedLoopFieldPhis is
+  // intentionally NOT touched — it is the per-loop PHI cache whose stability
+  // across fixpoint iterations is the whole point. Shared by deleteOwnedSince
+  // (per-merge rollback) and restoreLoopSnapshot (loop-iteration rollback) so
+  // the WeakTrackingVH -> dyn_cast -> delete/deleteValue -> pop_back logic
+  // lives in exactly one place.
+  void truncateOwnedTo(size_t PhisMark, size_t InstsMark);
 };
 
 } // namespace jeandle
