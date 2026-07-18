@@ -72,6 +72,8 @@ static cl::opt<std::string> JeandleDumpPEAIR(
 // Hard upper bound guarding against non-converging inputs.
 static constexpr unsigned HardIterationCap = 16;
 
+bool llvm::jeandle::isPEAEnabled() { return JeandlePEAIterations != 0; }
+
 // Count `jeandle.new_instance` / `jeandle.new_array` CallBases in F — the
 // "allocations remaining" signal for convergence detection.
 static unsigned countJeandleAllocations(Function &F) {

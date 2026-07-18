@@ -5,6 +5,7 @@ add_llvm_component_library(LLVMJeandleTransforms
   InsertGCBarriers.cpp
   JavaOperationDeletion.cpp
   JavaOperationLower.cpp
+  JavaOpLengthFolding.cpp
   PartialEscapeIterative.cpp
   PartialEscapeTransform.cpp
   JeandleNarrowOopMarker.cpp
