@@ -538,4 +538,26 @@ std::optional<uint32_t> extractArrayLength(const CallBase *NewArray) {
   return static_cast<uint32_t>(CI->getZExtValue());
 }
 
+// ===========================================================================
+// Deopt bundle scope structure
+// ===========================================================================
+
+std::optional<unsigned>
+findInnermostDeoptScopeBCIPairStart(const CallBase &CB) {
+  auto Deopt = CB.getOperandBundle(LLVMContext::OB_deopt);
+  if (!Deopt)
+    return std::nullopt;
+  for (unsigned I = Deopt->Inputs.size(); I > 1; --I) {
+    auto *BCI0 = dyn_cast<ConstantInt>(Deopt->Inputs[I - 2].get());
+    auto *BCI1 = dyn_cast<ConstantInt>(Deopt->Inputs[I - 1].get());
+    if (!BCI0 || !BCI1 || !BCI0->getType()->isIntegerTy(32) ||
+        !BCI1->getType()->isIntegerTy(32))
+      continue;
+    if (BCI0->getSExtValue() != BCI1->getSExtValue())
+      return std::nullopt; // malformed pair — scope boundaries unknown.
+    return I - 2;
+  }
+  return std::nullopt;
+}
+
 } // namespace llvm::jeandle::pea

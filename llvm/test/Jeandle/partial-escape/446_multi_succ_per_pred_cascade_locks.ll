@@ -1,23 +1,23 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Multi-successor per-pred cascade with lock re-emit under the reuse-OrigAlloc
-; model (review S1.2 F2 analog).
+; Multi-successor lock-carrying pred under the reuse-OrigAlloc model
+; (review §3 #3). `right` holds UNBALANCED enters on %a (depth 0) and %b
+; (depth 1) and has TWO successor merges (merge1, merge2), both mixed (left
+; arm virtual, right arm locked). The a.f=b field store is tracked, and
+; materializing a cascades b (forward prerequisite).
 ;
-; `right` (locked) has TWO successor merges (merge1, merge2), both mixed
-; (left arm virtual, right arm locked). The a.f=b field store is tracked, and
-; materializing a per-pred cascades b (forward prerequisite). Each merge is an
-; escape point for both a and b.
-;
-; Historically each (right, merge) critical edge was split into its own
-; pea.crit.split, re-aiming the per-pred Materialize effects there, and the
-; unified merged-emit fired once per split edge with locks depth-sorted
-; (a@0, b@1) per split -- four enters in la,lb,la,lb order.
-;
-; Under reuse-OrigAlloc no edge is split: the original allocations %a, %b are
-; retained, the a.f=b store is replayed onto %a (with %b) at each pred, and
-; the right-arm locks are re-emitted onto %a/%b directly in `right` (two
-; enters per merge: %a then %b, giving la,la,lb,lb). Both merges sink %a and
-; %b directly. No %pea.mat, no pea.crit.split.
+; A per-pred materialize whose captured lock stack is NON-EMPTY takes the
+; shared-flip (Case-A) path: the first merge's processing flips
+; BlockExits[right] to materialized (Graal ensureMaterialized at
+; pred.endNode), so the second merge sees %a/%b already materialized and
+; does NOT re-capture the same lock stack. Pre-fix, MaterializedAtPred keyed
+; the dedup per (pred, TARGET MERGE), so each merge produced its own effect
+; capturing the SAME stack and the merged emit concatenated both — every
+; lock was re-acquired TWICE on every path out of `right` (la,la,lb,lb).
+; Now each lock is re-emitted exactly once (la then lb, strictly increasing
+; depth). The left arm (no locks) keeps the per-pred path; its two per-merge
+; effects replay the a.f=b store at left's terminator twice — idempotent,
+; harmless.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
@@ -71,14 +71,15 @@ u:
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
 ; No fresh materialization invokes anywhere.
 ; CHECK-NOT: pea.mat = invoke
-; The a.f=b field store is replayed onto OrigAlloc %a with OrigAlloc %b.
+; The a.f=b field store is replayed onto OrigAlloc %a with OrigAlloc %b (twice
+; on the lock-free left arm — idempotent per-merge replay — once on right).
 ; CHECK: store atomic ptr addrspace(1) %b, ptr addrspace(1) %{{.*}} unordered, align 8
-; The right arm re-emits its unbalanced enters onto OrigAlloc %a/%b directly
-; (two enters per merge: %a with %la, then %b with %lb).
+; The right arm re-emits each unbalanced enter EXACTLY ONCE onto OrigAlloc
+; %a/%b (shared-flip: the second merge sees the VO already materialized).
 ; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %a, ptr %la)
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %a, ptr %la)
+; CHECK-NOT: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %a, ptr %la)
 ; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %b, ptr %lb)
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %b, ptr %lb)
+; CHECK-NOT: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %b, ptr %lb)
 ; CHECK-NOT: poison
 ; CHECK-NOT: pea.crit.split
 ; CHECK: ret void

@@ -98,7 +98,7 @@ struct MonitorIdRef {
 // BytecodeDepth is the ascending re-emit sort key (Graal getLockDepth).
 struct MaterializedLock {
   Function *Callee = nullptr;
-  SmallVector<Value *, 2> NonReceiverArgs;
+  SmallVector<WeakTrackingVH, 2> NonReceiverArgs;
   uint32_t BytecodeDepth = 0;
 };
 
@@ -117,7 +117,7 @@ struct MaterializedLock {
 class MaterializeEffect;
 struct MergedLock {
   Function *Callee = nullptr;
-  SmallVector<Value *, 2> NonReceiverArgs;
+  SmallVector<WeakTrackingVH, 2> NonReceiverArgs;
   uint32_t BytecodeDepth = 0;
   const MaterializeEffect *SourceEffect = nullptr; // per-effect receiver key
 };
@@ -161,7 +161,11 @@ public:
   // Behaviorally equivalent: OrigAlloc's role is a pure identity token / the
   // single sound SSA materialized value, never a fresh allocation in the final
   // IR.
-  CallBase *AllocationCall = nullptr;
+  // WeakTrackingVH: RewriteDeoptBundleEffect::apply may clone the allocation
+  // invoke (when its deopt bundle gets a VO descriptor) and RAUW the
+  // original — the handle follows to the clone so transform-time uses
+  // (OrigAlloc slot scans, the applyMaterialize identity assert) stay valid.
+  WeakTrackingVH AllocationCall;
 
   uintptr_t Klass = 0;
   uint32_t SizeInBytes = 0;
@@ -192,8 +196,9 @@ public:
   SmallVector<ObjectID, 4> SyntheticSourceIDs;
   PHINode *SyntheticPhi = nullptr;
 
-  VirtualObject(ObjectID id, ClassKind k, CallBase *alloc)
-      : ID(id), Kind(k), AllocationCall(alloc) {}
+  // Defined out-of-line (PartialEscape.cpp): CallBase is incomplete here and
+  // the WeakTrackingVH assignment needs the CallBase* → Value* conversion.
+  VirtualObject(ObjectID id, ClassKind k, CallBase *alloc);
 
   ObjectID getID() const { return ID; }
   ClassKind getKind() const { return Kind; }
@@ -234,11 +239,16 @@ public:
 
 private:
   Tag T = Unknown;
-  union U {
-    Value *V;
-    ObjectID Ref;
-    U() : V(nullptr) {}
-  } U;
+  // Valid when T is Scalar or MaterializedRef. WeakTrackingVH (NOT a raw
+  // Value*): the snapshotted value may be RAUW'd during the transform — a
+  // folded load RAUW'd to its replacement, or a safepoint call cloned by
+  // RewriteDeoptBundleEffect::apply — and the handle follows the RAUW so the
+  // snapshot never dangles (review §3 #2: a raw Value* here was the
+  // production SIGSEGV root cause). A value DELETED without replacement
+  // nulls the handle; the transform asserts values are non-null and parented
+  // (or Constant/Argument) at use. Valid when T is VirtualRef: the vo-id.
+  WeakTrackingVH V;
+  ObjectID Ref = InvalidObjectID;
   Type *DeclaredType = nullptr;
 
 public:
@@ -257,15 +267,15 @@ public:
 
   Value *getScalar() const {
     assert(isScalar());
-    return U.V;
+    return V;
   }
   ObjectID getVirtualRef() const {
     assert(isVirtualRef());
-    return U.Ref;
+    return Ref;
   }
   Value *getMaterialized() const {
     assert(isMaterializedRef());
-    return U.V;
+    return V;
   }
   Type *getDeclaredType() const { return DeclaredType; }
 
@@ -563,12 +573,17 @@ public:
 // synthesized coercion / default). Non-cfgKill. Graal analog: replaceAtUsages.
 class ReplaceLoadEffect : public Effect {
 public:
-  Instruction *Target = nullptr;
-  Value *Replacement = nullptr;
+  // WeakTrackingVH: follows RAUW (e.g. a sibling RewriteDeoptBundleEffect
+  // cloning the safepoint that produced Target/Replacement); null on
+  // deletion-without-replacement (apply must no-op then).
+  WeakTrackingVH Target;
+  WeakTrackingVH Replacement;
 
   Kind getKind() const override { return Kind::ReplaceLoad; }
   static bool classof(const Effect *E) { return E->getKind() == Kind::ReplaceLoad; }
-  Instruction *getTarget() const override { return Target; }
+  Instruction *getTarget() const override {
+    return dyn_cast_or_null<Instruction>((Value *)Target);
+  }
   void apply(TransformContext &Ctx) override;
   std::unique_ptr<Effect> clone() const override {
     return std::make_unique<ReplaceLoadEffect>(*this);
@@ -579,8 +594,9 @@ public:
 // Non-cfgKill. Graal analog: replaceAtUsages / deleteNode.
 class ReplaceCallEffect : public Effect {
 public:
-  Instruction *Target = nullptr;
-  Value *Replacement = nullptr;
+  // WeakTrackingVH: see ReplaceLoadEffect.
+  WeakTrackingVH Target;
+  WeakTrackingVH Replacement;
   // When >= 0, the transform ignores `Replacement` and instead builds a GC-safe
   // oop-handle load (see createConstOopLoad) of the constant Java oop named by
   // this id, inserting it before `Target` and using it as the replacement. Used
@@ -591,7 +607,9 @@ public:
 
   Kind getKind() const override { return Kind::ReplaceCall; }
   static bool classof(const Effect *E) { return E->getKind() == Kind::ReplaceCall; }
-  Instruction *getTarget() const override { return Target; }
+  Instruction *getTarget() const override {
+    return dyn_cast_or_null<Instruction>((Value *)Target);
+  }
   void apply(TransformContext &Ctx) override;
   std::unique_ptr<Effect> clone() const override {
     return std::make_unique<ReplaceCallEffect>(*this);
@@ -618,14 +636,19 @@ public:
 // Graal analog: deleteNode (WithExceptionNode) / killIfBranch.
 class EliminateAllocationEffect : public Effect {
 public:
-  Instruction *Target = nullptr;
+  // WeakTrackingVH: the allocation may have been cloned by a
+  // RewriteDeoptBundleEffect on its deopt bundle (Pass 1); the handle follows
+  // so Pass 2 erases the CLONE, not freed memory.
+  WeakTrackingVH Target;
 
   Kind getKind() const override { return Kind::EliminateAllocation; }
   static bool classof(const Effect *E) {
     return E->getKind() == Kind::EliminateAllocation;
   }
   bool isCfgKill() const override { return true; }
-  Instruction *getTarget() const override { return Target; }
+  Instruction *getTarget() const override {
+    return dyn_cast_or_null<Instruction>((Value *)Target);
+  }
   void apply(TransformContext &Ctx) override;
   std::unique_ptr<Effect> clone() const override {
     return std::make_unique<EliminateAllocationEffect>(*this);
@@ -659,13 +682,16 @@ public:
   // handle is NOT recomputed at apply time; WeakTrackingVH is only there to
   // fail loudly rather than dangling.
   WeakTrackingVH InsertBefore;
-  Instruction *Target = nullptr; // the original allocation (OrigAlloc)
+  // The original allocation (OrigAlloc). WeakTrackingVH: follows the clone a
+  // RewriteDeoptBundleEffect makes of an allocation invoke whose deopt bundle
+  // is rewritten (Pass 1); the assert in applyMaterialize compares it against
+  // VObj.AllocationCall, which follows the same RAUW.
+  WeakTrackingVH Target;
   SmallVector<FieldEntry, 8> FieldEntries;
   // Surviving (unbalanced) monitorenters to re-emit at the materialize point
   // (Graal: synthetic MonitorEnterNodes at the CommitAllocationNode), sorted
   // ascending by BytecodeDepth.
   SmallVector<MaterializedLock, 2> Locks;
-  Instruction *DeoptBundleSource = nullptr;
   bool IsPerPred = false;
   Value *PerPredPlaceholder = nullptr;
   // The target merge block this per-pred materialize is destined for (the
@@ -688,7 +714,9 @@ public:
 
   Kind getKind() const override { return Kind::Materialize; }
   static bool classof(const Effect *E) { return E->getKind() == Kind::Materialize; }
-  Instruction *getTarget() const override { return Target; }
+  Instruction *getTarget() const override {
+    return dyn_cast_or_null<Instruction>((Value *)Target);
+  }
   void apply(TransformContext &Ctx) override;
   std::unique_ptr<Effect> clone() const override {
     return std::make_unique<MaterializeEffect>(*this);
@@ -716,7 +744,9 @@ public:
 class CreatePHIEffect : public Effect {
 public:
   Type *PHIType = nullptr;
-  SmallVector<Value *, 4> PHIIncomingValues;
+  // WeakTrackingVH: an incoming value may be a call result whose call is
+  // cloned by RewriteDeoptBundleEffect — the handle follows the RAUW.
+  SmallVector<WeakTrackingVH, 4> PHIIncomingValues;
   SmallVector<BasicBlock *, 4> PHIIncomingBlocks;
   PHINode *PhiInst = nullptr;
   bool RAUWOrigToPHI = false;
@@ -810,8 +840,25 @@ public:
 // the transform rewrites the bundle in Pass 1.
 class RewriteDeoptBundleEffect : public Effect {
 public:
-  // The safepoint whose "deopt" bundle references the VO's OrigAlloc.
+  // The safepoint whose "deopt" bundle references the VO's OrigAlloc. Used
+  // ONLY as an identity (DenseMap key + pointer equality) — never
+  // dereferenced post-erasure. SafepointVH is the WeakTrackingVH follower of
+  // the same value: apply resolves the live call via (a) the
+  // SafepointReplacements chain keyed on this raw pointer, or (b) SafepointVH
+  // when it still equals this raw pointer (a follow to a DIFFERENT value —
+  // e.g. a folded JavaOp's replacement — means the call and its bundle died,
+  // so the rewrite must no-op; see PartialEscapeTransform.cpp).
   CallBase *Safepoint = nullptr;
+  WeakTrackingVH SafepointVH;
+  // Every "deopt" bundle operand of the safepoint that denotes THIS VO by
+  // object identity (the OrigAlloc itself, or an alias-map virtual-alias such
+  // as a Case-B PHI / freeze / offset-0 select / offset-0 GEP / load-through
+  // result). The transform rewrites slots matching OrigAlloc OR any of these
+  // operands (a load-through alias is RAUW'd to OrigAlloc by its ReplaceLoad
+  // before this effect applies, so the OrigAlloc match covers it; the other
+  // shapes are never RAUW'd and are covered by RootOperands). WeakTrackingVH:
+  // follows any RAUW of the operand.
+  SmallVector<WeakTrackingVH, 2> RootOperands;
   // Per-offset snapshot of the object's field values at the safepoint (read
   // from the analyzer's FieldStates keyed by (ObjectID, byte-offset)). Each
   // entry's FieldValue is either Scalar (a plain scalar field) or VirtualRef

@@ -86,6 +86,20 @@ std::optional<ObjectID> resolveVirtualRef(Value *V, const PEABlockState &State,
 // non-constant index, inttoptr, or unrecognised pattern).
 std::optional<int64_t> resolveFieldOffset(Value *Ptr, const DataLayout &DL);
 
+// Find the start index (into the "deopt" bundle's Inputs) of the CURRENT
+// (innermost) deopt scope's duplicated-BCI pair. A Jeandle deopt bundle is
+// [root scope][inlinee scope]... with the innermost (current-method) scope
+// LAST, each scope opening with an adjacent pair of equal-valued i32
+// constants (the duplicated BCI marker; the root scope's pair is preceded by
+// an i64 should_reexecute slot, inlinee scopes by a MethodType marker pair).
+// The scan runs BACKWARD over the bundle inputs so inlinee scopes (appended
+// last) are found first. Returns std::nullopt for a missing bundle, a
+// malformed pair (mismatched adjacent values), or no pair at all — callers
+// must treat those as "scope boundaries unknown" and bail conservatively
+// (NEVER report_fatal_error on arbitrary IR: PEA may run on any legal LLVM
+// IR, not only frontend-produced bundles).
+std::optional<unsigned> findInnermostDeoptScopeBCIPairStart(const CallBase &CB);
+
 // Returns the klass pointer (as uintptr_t) attached to the allocation call's
 // klass argument, or 0 if not statically known.  Wraps
 // jeandle::extractKlassConstant for the allocation-specific operand index.

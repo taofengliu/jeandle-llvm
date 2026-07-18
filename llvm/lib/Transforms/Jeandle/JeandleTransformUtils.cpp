@@ -10,6 +10,7 @@
 
 #include "llvm/Transforms/Jeandle/JeandleTransformUtils.h"
 #include "llvm/Analysis/DomTreeUpdater.h"
+#include "llvm/Analysis/Jeandle/PartialEscapeUtils.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Jeandle/Deoptimization.h"
 #include "llvm/IR/Jeandle/Metadata.h"
@@ -39,33 +40,22 @@ struct DeoptScopeInfo {
 }
 
 DeoptScopeInfo findCurrentDeoptScope(const CallBase &CB) {
-  // TODO(robustness): this assumes a well-formed Jeandle deopt bundle — the
-  // frontend always emits an adjacent-equal i32 BCI pair per scope. The three
-  // report_fatal_error paths below (no bundle, mismatched pair, no pair) are
-  // not hit in practice but would crash the process on arbitrary LLVM IR.
-  // Making this bail gracefully (return an empty scope / skip the effect)
-  // would require threading std::optional<DeoptScopeInfo> through
-  // getDeoptScopeVOInsertPos + computeDeoptStackLayout and their callers;
-  // deferred as it is not cheap and the well-formed-bundle invariant is
-  // upheld by every Jeandle frontend path that reaches PEA.
-  auto Deopt = CB.getOperandBundle(LLVMContext::OB_deopt);
-  if (!Deopt)
+  // Built on the shared graceful finder (jeandle::pea::
+  // findInnermostDeoptScopeBCIPairStart, which PEA's analysis side also
+  // uses). The transform side keeps the hard failure: every Jeandle
+  // frontend path that reaches these transforms upholds the well-formed-
+  // bundle invariant, so a malformed bundle here is a genuine bug.
+  // TODO(robustness): thread std::optional<DeoptScopeInfo> through
+  // getDeoptScopeVOInsertPos + computeDeoptStackLayout and their callers
+  // instead; deferred as it is not cheap.
+  if (!CB.getOperandBundle(LLVMContext::OB_deopt))
     reportInvalidDeoptBundle(CB, "missing deopt bundle for bci");
-
-  for (unsigned I = Deopt->Inputs.size(); I > 1; --I) {
-    auto *BCI0 = dyn_cast<ConstantInt>(Deopt->Inputs[I - 2].get());
-    auto *BCI1 = dyn_cast<ConstantInt>(Deopt->Inputs[I - 1].get());
-    if (!BCI0 || !BCI1 || !BCI0->getType()->isIntegerTy(32) ||
-        !BCI1->getType()->isIntegerTy(32))
-      continue;
-
-    if (BCI0->getSExtValue() != BCI1->getSExtValue())
-      reportInvalidDeoptBundle(CB, "mismatched adjacent i32 bci values");
-
-    return {I - 2, static_cast<int>(BCI0->getSExtValue())};
-  }
-
-  reportInvalidDeoptBundle(CB, "missing adjacent i32 deopt bci pair");
+  std::optional<unsigned> Start =
+      jeandle::pea::findInnermostDeoptScopeBCIPairStart(CB);
+  if (!Start)
+    reportInvalidDeoptBundle(CB,
+                             "missing or mismatched adjacent i32 deopt bci pair");
+  return {*Start, 0};
 }
 
 } // namespace

@@ -162,6 +162,47 @@ static void relocateDependentMaterializes(
   }
 }
 
+// Splice an analyzer-built UNPARENTED instruction — and every unparented
+// instruction in its operand chain — into IR immediately before IP, in
+// postorder so each operand is parented before its user. PHINodes are
+// treated as leaves (splicing a PHI mid-block is illegal; analyzer-built
+// PHIs are owned by CreatePHI effects). No-op for values already in IR, for
+// PHIs, and for non-instructions. Used when an effect's recorded value was
+// built by the analyzer (e.g. a pea.coerce bitcast) but was never spliced —
+// e.g. the ReplaceLoad that owned it was dropped by dropEffectsFor.
+static void spliceUnparentedAt(Instruction *IP, Value *V) {
+  auto *RI = dyn_cast_or_null<Instruction>(V);
+  if (!RI || isa<PHINode>(RI) || RI->getParent())
+    return;
+  SmallPtrSet<Instruction *, 4> Visited;
+  SmallVector<Instruction *, 4> PostOrder;
+  struct Frame {
+    Instruction *I;
+    unsigned NextOpIdx;
+  };
+  SmallVector<Frame, 4> Frames;
+  Visited.insert(RI);
+  Frames.push_back({RI, 0});
+  while (!Frames.empty()) {
+    Frame &Top = Frames.back();
+    if (Top.NextOpIdx < Top.I->getNumOperands()) {
+      Value *Op = Top.I->getOperand(Top.NextOpIdx++);
+      if (auto *OpI = dyn_cast<Instruction>(Op)) {
+        if (OpI->getParent() == nullptr && !isa<PHINode>(OpI) &&
+            Visited.insert(OpI).second) {
+          Frames.push_back({OpI, 0});
+        }
+      }
+    } else {
+      PostOrder.push_back(Top.I);
+      Frames.pop_back();
+    }
+  }
+  for (Instruction *I : PostOrder)
+    if (I->getParent() == nullptr)
+      I->insertBefore(IP->getIterator());
+}
+
 static void applyMaterialize(
     Function &F, const jeandle::PEAResult &Result,
     const jeandle::MaterializeEffect &E,
@@ -172,8 +213,8 @@ static void applyMaterialize(
   assert(E.Target && "Materialize effect must carry the original allocation");
 
   jeandle::VirtualObject &VObj = *Result.VirtualObjects[E.ObjID];
-  CallBase *OrigAlloc = VObj.AllocationCall;
-  assert(OrigAlloc == E.Target);
+  CallBase *OrigAlloc = cast_or_null<CallBase>((Value *)VObj.AllocationCall);
+  assert((Value *)OrigAlloc == (Value *)E.Target);
 
   Module *M = F.getParent();
   LLVMContext &Ctx = M->getContext();
@@ -225,6 +266,16 @@ static void applyMaterialize(
     }
     if (!V)
       continue;
+    // An analyzer-built unparented value (e.g. a pea.coerce bitcast whose
+    // owning ReplaceLoad was dropped) must be spliced before use; everything
+    // else must already be in IR (review §3 #2 — a dangling field value here
+    // was the production SIGSEGV root cause; the analysis-side normalization
+    // + commit availability sweep make this a defense-in-depth check).
+    spliceUnparentedAt(InsertBefore, V);
+    assert((isa<Constant>(V) || isa<Argument>(V) ||
+            cast<Instruction>(V)->getParent() != nullptr) &&
+           "materialize replay value must be a constant, argument, or "
+           "in-IR instruction");
     Value *Slot =
         SB.CreateInBoundsGEP(I8, MatVal, SB.getInt64(FE.Offset), "pea.matslot");
     // Natural alignment = the field type's store size rounded up to a power of
@@ -247,7 +298,7 @@ static void applyMaterialize(
   // lock's receiver resolves via NewInvOf[ML.SourceEffect]. A single-object
   // escape point (no entry in MaxSeqForEscapePoint) emits its own locks here.
   auto EmitLock = [&](Value *Recv, Function *Callee,
-                      ArrayRef<Value *> NonReceiverArgs) {
+                      ArrayRef<WeakTrackingVH> NonReceiverArgs) {
     if (!Callee)
       return;
     SmallVector<Value *, 4> Args;
@@ -276,29 +327,21 @@ static void applyMaterialize(
     if (E.SeqNo == MaxIt->second) {
       auto It = Result.EscapePointLocks.find(LockKey);
       if (It != Result.EscapePointLocks.end()) {
-        // Defensive depth-ordering check (the analogue of Graal
-        // ObjectState.addLock's strictly-ascending guarantee): computeEscape
-        // PointLocks sorts each escape point's MergedLock list ascending by
-        // BytecodeDepth, and the emitted monitorenter sequence must match that
-        // order so the runtime lock-nesting stack is rebuilt correctly. A
-        // future sort regression or a keying asymmetry would otherwise mis-
-        // order the locks silently. The enforced invariant here is NON-
-        // DECREASING (the sort comparator is `A.Depth < B.Depth`, a weak
-        // ordering): the merged list spans multiple sibling VOs, each
-        // contributing its full captured lock stack, so two siblings holding
-        // locks at the same depth produce equal-depth entries by design (e.g.
-        // test 446 emits la,la,lb,lb). Graal's strictly-ascending per-
-        // ObjectState guarantee is not directly checkable on this cross-object
-        // merged list; the non-decreasing check still catches any unsorted/
-        // reversed sequence (the sort-regression case that matters).
+        // Depth-ordering check (the analogue of Graal's
+        // DefaultJavaLoweringProvider `GraalError.guarantee(lastDepth <
+        // monitorId.getLockDepth())` — STRICTLY increasing): the lightweight
+        // locking thread lock stack requires strict nesting order.
+        // BytecodeDepth is unique per enter call site (LockDepthCache), so an
+        // equal-depth pair in one merged list can only be the SAME folded
+        // lock captured twice (the pre-fix per-pred duplicate) — excluded by
+        // the commit-time dominance dedup and the computeEscapePointLocks
+        // defensive dedup, and asserted against here.
         bool First = true;
         uint32_t LastDepth = 0;
         for (const jeandle::MergedLock &ML : It->second) {
-          assert((First || LastDepth <= ML.BytecodeDepth) &&
-                 "emitted lock sequence must be non-decreasing in "
-                 "BytecodeDepth (sort-regression guard; Graal "
-                 "ObjectState.addLock per-object strict-ascending guarantee "
-                 "is not checkable on the cross-object merged list)");
+          assert((First || LastDepth < ML.BytecodeDepth) &&
+                 "emitted lock sequence must be strictly increasing in "
+                 "BytecodeDepth (Graal lastDepth < getLockDepth guarantee)");
           First = false;
           LastDepth = ML.BytecodeDepth;
           auto NIt = NewInvOf.find(ML.SourceEffect);
@@ -312,15 +355,15 @@ static void applyMaterialize(
     // A non-tail sibling emits nothing here; the tail emits the whole escape
     // point's locks.
   } else {
-    // Per-effect (single-object / non-cascade) path: the analyzer's
-    // captureMaterializedLocks sorts E.Locks ascending by BytecodeDepth with
-    // the same weak ordering, so enforce non-decreasing here too.
+    // Per-effect (single-object / non-cascade) path: E.Locks is strictly
+    // increasing by the ObjectState::addLock invariant (a VO's own lock stack
+    // nests strictly), so enforce strictly increasing here too.
     bool First = true;
     uint32_t LastDepth = 0;
     for (const jeandle::MaterializedLock &ML : E.Locks) {
-      assert((First || LastDepth <= ML.BytecodeDepth) &&
-             "emitted lock sequence must be non-decreasing in BytecodeDepth "
-             "(sort-regression guard)");
+      assert((First || LastDepth < ML.BytecodeDepth) &&
+             "emitted lock sequence must be strictly increasing in "
+             "BytecodeDepth (Graal lastDepth < getLockDepth guarantee)");
       First = false;
       LastDepth = ML.BytecodeDepth;
       EmitLock(MatVal, ML.Callee, ML.NonReceiverArgs);
@@ -369,12 +412,6 @@ struct jeandle::TransformContext {
   // could miss the key at a multi-object escape point.
   DenseMap<const jeandle::MaterializeEffect *, Instruction *> &OrigInsertBefore;
 
-  // OrigAllocs of PartiallyEscapes VOs. EliminateAllocation must SKIP these
-  // (OrigAlloc is the single sound SSA value kept alive for the object's
-  // surviving uses); only NeverEscapes OrigAllocs are erased. Built once in
-  // run() from Result.EscapeClassification + Result.VirtualObjects.
-  DenseSet<Instruction *> PartiallyEscapesAllocs;
-
   // ORIGINAL safepoint CallBase -> its latest rebuilt replacement, so multiple
   // RewriteDeoptBundleEffects at the same safepoint (a VO plus its transitive
   // members) accumulate descriptors on ONE rebuilt bundle. Each
@@ -388,6 +425,9 @@ struct jeandle::TransformContext {
 void jeandle::ReplaceLoadEffect::apply(jeandle::TransformContext &Ctx) {
   if (!Target || !Replacement)
     return;
+  // Target is a WeakTrackingVH (see PartialEscape.h); it was non-null above,
+  // so the instruction is still alive.
+  Instruction *Target = cast<Instruction>((Value *)this->Target);
   Value *Repl = Replacement;
   // When the replacement's stamp is wider than the original, a Pi node would
   // normally be injected. LLVM has no per-Value stamp at this layer — the
@@ -419,40 +459,7 @@ void jeandle::ReplaceLoadEffect::apply(jeandle::TransformContext &Ctx) {
   // before its user; all land immediately before Target. A PHINode replacement
   // is owned by a CreatePHI effect that runs LATER in SeqNo order, so it is
   // treated as a leaf here (splicing it mid-block is illegal).
-  if (auto *RI = dyn_cast<Instruction>(Repl); RI && !isa<PHINode>(RI)) {
-    SmallVector<Instruction *, 4> Stack;
-    SmallPtrSet<Instruction *, 4> Visited;
-    if (RI->getParent() == nullptr && Visited.insert(RI).second)
-      Stack.push_back(RI);
-    SmallVector<Instruction *, 4> PostOrder;
-    struct Frame {
-      Instruction *I;
-      unsigned NextOpIdx;
-    };
-    SmallVector<Frame, 4> Frames;
-    if (!Stack.empty()) {
-      Frames.push_back({Stack.back(), 0});
-      while (!Frames.empty()) {
-        Frame &Top = Frames.back();
-        if (Top.NextOpIdx < Top.I->getNumOperands()) {
-          Value *Op = Top.I->getOperand(Top.NextOpIdx++);
-          if (auto *OpI = dyn_cast<Instruction>(Op)) {
-            if (OpI->getParent() == nullptr && !isa<PHINode>(OpI) &&
-                Visited.insert(OpI).second) {
-              Frames.push_back({OpI, 0});
-            }
-          }
-        } else {
-          PostOrder.push_back(Top.I);
-          Frames.pop_back();
-        }
-      }
-    }
-    for (Instruction *I : PostOrder) {
-      if (I->getParent() == nullptr)
-        I->insertBefore(Target->getIterator());
-    }
-  }
+  spliceUnparentedAt(Target, Repl);
   if (!Target->use_empty())
     Target->replaceAllUsesWith(Repl);
   // Eager-update: re-aim any Materialize keyed on `Target` to its next
@@ -471,6 +478,8 @@ void jeandle::ReplaceCallEffect::apply(jeandle::TransformContext &Ctx) {
   // terminators cleaned up by ConstantFoldTerminator in run().
   if (!Target)
     return;
+  // Target is a WeakTrackingVH (see PartialEscape.h); it was non-null above.
+  Instruction *Target = cast<Instruction>((Value *)this->Target);
   // foldGetClass records the constant Class mirror by oop id rather than as an
   // LLVM value: building the GC-safe oop-handle load here (instead of during
   // analysis) keeps the analyzer side-effect-free. RS4GC, which runs downstream
@@ -537,9 +546,18 @@ void jeandle::EliminateAllocationEffect::apply(jeandle::TransformContext &Ctx) {
   // AlwaysEscapes VO, or a non-allocation Target) still fails loudly inside
   // eraseAllocation's existing isJeandleAllocation asserts — the skip here only
   // suppresses the case the model requires (PartiallyEscapes OrigAlloc kept
-  // alive).
-  if (Ctx.PartiallyEscapesAllocs.count(Target))
+  // alive). The check is classification-based (not OrigAlloc-pointer-based):
+  // a RewriteDeoptBundleEffect may have cloned this allocation's invoke in
+  // Pass 1 (its deopt bundle carries another VO's descriptor), so the live
+  // instruction is the clone — the classification is clone-proof.
+  auto ClassIt = Ctx.Result.EscapeClassification.find(ObjID);
+  if (ClassIt != Ctx.Result.EscapeClassification.end() &&
+      ClassIt->second == jeandle::PEAResult::EscapeKind::PartiallyEscapes)
     return;
+  if (!Target)
+    return; // allocation was erased without replacement by a sibling effect.
+  // Target is a WeakTrackingVH (see PartialEscape.h); it was non-null above.
+  Instruction *Target = cast<Instruction>((Value *)this->Target);
   if (eraseAllocation(Target))
     Ctx.Changed = true;
 }
@@ -618,13 +636,20 @@ void jeandle::RewriteDeoptBundleEffect::apply(jeandle::TransformContext &Ctx) {
   // its transitive members). Each effect rebuilds the deopt bundle and erases
   // the prior CB; resolve the CURRENT CB by following the replacement chain
   // keyed on the analysis-time Safepoint (never dereferenced post-erasure —
-  // used only as a DenseMap identity key).
-  CallBase *CB = Safepoint;
-  if (auto It = Ctx.SafepointReplacements.find(CB);
+  // used only as a DenseMap identity key). If there is no recorded replacement,
+  // fall back to SafepointVH (the WeakTrackingVH follower): it must still be
+  // the ORIGINAL safepoint — a follow to a DIFFERENT value means the call was
+  // RAUW'd by a sibling effect (e.g. a JavaOp fold replaced it with a
+  // constant), so its bundle is gone and the rewrite must no-op. (This is what
+  // makes co-emitting a Rewrite with a ReplaceCall on the same call safe.)
+  CallBase *CB = nullptr;
+  if (auto It = Ctx.SafepointReplacements.find(Safepoint);
       It != Ctx.SafepointReplacements.end())
     CB = It->second;
+  else if ((Value *)SafepointVH == (Value *)Safepoint)
+    CB = Safepoint;
   if (!CB || !CB->getParent())
-    return; // safepoint erased (e.g. folded away) — TODO(pea-deopt).
+    return; // safepoint erased (e.g. folded away) — nothing to rewrite.
   auto Deopt = CB->getOperandBundle(LLVMContext::OB_deopt);
   if (!Deopt)
     return; // bundle gone — nothing to rewrite.
@@ -656,8 +681,17 @@ void jeandle::RewriteDeoptBundleEffect::apply(jeandle::TransformContext &Ctx) {
       jeandle::HotspotBasicType BT =
           jeandle::LLVM2JavaComputational(FE.Value.getDeclaredType());
       assert(BT != jeandle::T_ILLEGAL && "scoped deopt field has illegal type");
+      Value *FieldV = FE.Value.getScalar();
+      // Same unparented-value hardening as applyMaterialize (review §3 #2).
+      if (FieldV) {
+        spliceUnparentedAt(CB, FieldV);
+        assert((isa<Constant>(FieldV) || isa<Argument>(FieldV) ||
+                cast<Instruction>(FieldV)->getParent() != nullptr) &&
+               "deopt descriptor field value must be a constant, argument, "
+               "or in-IR instruction");
+      }
       FieldPairs.push_back(
-          {FE.Offset, BT, /*IsVORef=*/false, FE.Value.getScalar(), 0});
+          {FE.Offset, BT, /*IsVORef=*/false, FieldV, 0});
     }
   }
 
@@ -666,15 +700,32 @@ void jeandle::RewriteDeoptBundleEffect::apply(jeandle::TransformContext &Ctx) {
   // preserved verbatim.
   unsigned InsertPos = getDeoptScopeVOInsertPos(*CB);
 
-  // Confirm OrigAlloc is still a bundle input (it may have been scrubbed by an
-  // earlier transform step). A ROOT (OrigAllocInBundle) requires OrigAlloc
-  // present — bail to avoid an orphan descriptor whose slot is already gone.
-  // A TRANSITIVE member (OrigAllocInBundle=false) is referenced only via
-  // another VO's VORef field, so its OrigAlloc is never a bundle operand —
-  // proceed and emit the descriptor unconditionally.
+  // A bundle operand denotes this VO iff it is the OrigAlloc OR one of the
+  // analysis-recorded RootOperands (identity aliases: Case-B PHI / freeze /
+  // offset-0 select / offset-0 GEP / load-through result — see
+  // RewriteDeoptBundleEffect::RootOperands in PartialEscape.h). A
+  // load-through alias is RAUW'd to OrigAlloc by its ReplaceLoad before this
+  // effect applies (covered by the OrigAlloc match); the other shapes are
+  // never RAUW'd and are covered by RootOperands (WeakTrackingVH, so each
+  // handle follows any earlier RAUW).
+  auto IsRootOperand = [&](Value *V) {
+    if (V == OrigAlloc)
+      return true;
+    for (const WeakTrackingVH &RO : RootOperands)
+      if ((Value *)RO == V)
+        return true;
+    return false;
+  };
+
+  // Confirm the VO is still a bundle input (it may have been scrubbed by an
+  // earlier transform step). A ROOT (OrigAllocInBundle) requires a root
+  // operand present — bail to avoid an orphan descriptor whose slot is
+  // already gone. A TRANSITIVE member (OrigAllocInBundle=false) is referenced
+  // only via another VO's VORef field, so it is never a bundle operand itself
+  // — proceed and emit the descriptor unconditionally.
   bool OrigAllocPresent = false;
   for (unsigned i = InsertPos; i < Deopt->Inputs.size(); ++i)
-    if (Deopt->Inputs[i].get() == OrigAlloc) {
+    if (IsRootOperand(Deopt->Inputs[i].get())) {
       OrigAllocPresent = true;
       break;
     }
@@ -717,7 +768,7 @@ void jeandle::RewriteDeoptBundleEffect::apply(jeandle::TransformContext &Ctx) {
   //    standard eliminated=false, owner=OrigAlloc path.
   for (unsigned i = InsertPos; i < Deopt->Inputs.size(); ++i) {
     Value *V = Deopt->Inputs[i].get();
-    if (V == OrigAlloc) {
+    if (IsRootOperand(V)) {
       assert(i > InsertPos && !Args.empty() &&
              "OrigAlloc slot missing its preceding encoding");
       assert(isa<ConstantInt>(Args.back()) &&
@@ -771,6 +822,10 @@ void jeandle::RewriteDeoptBundleEffect::apply(jeandle::TransformContext &Ctx) {
   CallBase *NewCB =
       CallBase::Create(CB, OperandBundleDef("deopt", Args), CB->getIterator());
   NewCB->takeName(CB);
+  // Eager-update: re-aim any Materialize whose InsertBefore is CB to the clone
+  // (same program point) — the InsertBeforeDependents index is keyed on the
+  // old CB, which is about to be erased.
+  relocateDependentMaterializes(Ctx.InsertBeforeDependents, CB, NewCB);
   CB->replaceAllUsesWith(NewCB);
   CB->eraseFromParent();
   // Record the replacement keyed on the ORIGINAL Safepoint so a subsequent
@@ -809,21 +864,6 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
     return PreservedAnalyses::all();
 
   bool Changed = false;
-
-  // Build the set of PartiallyEscapes OrigAllocs. These are kept alive
-  // (EliminateAllocation skips them) because OrigAlloc is the single sound SSA
-  // value for a PartiallyEscapes VO and carries the allocation-site deopt
-  // bundle. NeverEscapes OrigAllocs are erased (the VO is described by a
-  // descriptor in the deopt bundle and HotSpot reallocs at deopt).
-  DenseSet<Instruction *> PartiallyEscapesAllocs;
-  for (const auto &Kv : Result.EscapeClassification) {
-    if (Kv.second != jeandle::PEAResult::EscapeKind::PartiallyEscapes)
-      continue;
-    if (Kv.first >= Result.VirtualObjects.size())
-      continue;
-    if (auto *Alloc = Result.VirtualObjects[Kv.first]->AllocationCall)
-      PartiallyEscapesAllocs.insert(Alloc);
-  }
 
   // effect -> OrigAlloc (the CallBase each Materialize replays onto). Filled
   // incrementally as each Materialize applies; consumed by the tail effect at
@@ -878,7 +918,6 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
   // -------------------------------------------------------------------------
   jeandle::TransformContext Ctx{
       F, Result, Changed, NewInvOf, InsertBeforeDependents, OrigInsertBefore};
-  Ctx.PartiallyEscapesAllocs = std::move(PartiallyEscapesAllocs);
 
   for (BasicBlock *BB : RPOT) {
     auto It = Result.BlockEffects.find(BB);
@@ -890,7 +929,8 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
   // -------------------------------------------------------------------------
   // Pass 2: cfgKill effects (EliminateAllocation only) — same dispatch with
   // CfgKills=true. NeverEscapes OrigAllocs are erased here; PartiallyEscapes
-  // OrigAllocs are skipped (Ctx.PartiallyEscapesAllocs) and stay alive.
+  // OrigAllocs are skipped (EscapeClassification check in
+  // EliminateAllocationEffect::apply) and stay alive.
   // -------------------------------------------------------------------------
   for (BasicBlock *BB : RPOT) {
     auto It = Result.BlockEffects.find(BB);

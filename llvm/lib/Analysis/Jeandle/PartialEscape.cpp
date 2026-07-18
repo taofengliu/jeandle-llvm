@@ -64,9 +64,16 @@ int VirtualObject::getOrCreateFieldIndex(int64_t Offset, Type *Ty,
     // heap pointer size (DL.getPointerSize(JavaHeapAddrSpace)) — 8 on the
     // current 64-bit target, but derived from the DataLayout so a 32-bit or
     // compressed-oop heap model stays correct rather than hardcoding 8.
-    assert(Ty->getPointerAddressSpace() ==
-               jeandle::AddrSpace::JavaHeapAddrSpace &&
-           "reference field must be in JavaHeapAddrSpace");
+    //
+    // TODO(compressed-oop): narrow-oop (addrspace 3) reference fields are NOT
+    // supported — bail conservatively (-1) instead of asserting (debug) or
+    // modelling the slot at the wrong width (release: getPointerSize(1)=8
+    // where the real slot is 4 bytes -> corrupt field model). Callers treat
+    // -1 as keep-everything-real. PEA as a whole is also gated against
+    // narrow-oop modules in PartialEscapeAnalysis::run; this is the
+    // per-access defense for hand-written / mixed IR.
+    if (Ty->getPointerAddressSpace() != jeandle::AddrSpace::JavaHeapAddrSpace)
+      return -1;
     ByteSize = static_cast<uint8_t>(
         DL.getPointerSize(jeandle::AddrSpace::JavaHeapAddrSpace));
     IsReference = true;
@@ -74,6 +81,8 @@ int VirtualObject::getOrCreateFieldIndex(int64_t Offset, Type *Ty,
     unsigned Bits = Ty->getPrimitiveSizeInBits();
     if (Bits == 0)
       return -1; // unknown-size type (e.g. vector/struct) — conservative escape
+    if ((Bits + 7) / 8 > 255)
+      return -1; // oversized field (does not fit FieldDesc::ByteSize) — bail
     ByteSize = static_cast<uint8_t>((Bits + 7) / 8);
   }
 
@@ -266,12 +275,15 @@ void VirtualObject::copyStructuralFieldsFrom(const VirtualObject &O) {
   Fields = O.Fields;
 }
 
+VirtualObject::VirtualObject(ObjectID id, ClassKind k, CallBase *alloc)
+    : ID(id), Kind(k), AllocationCall(alloc) {}
+
 std::unique_ptr<VirtualObject> VirtualObject::duplicate() const {
   // The clone is detached: ID is set to InvalidObjectID and the caller is
   // expected to register it via PEAResult::createVirtualObject to obtain a
   // fresh ID.
-  auto Clone =
-      std::make_unique<VirtualObject>(InvalidObjectID, Kind, AllocationCall);
+  auto Clone = std::make_unique<VirtualObject>(
+      InvalidObjectID, Kind, cast_or_null<CallBase>((Value *)AllocationCall));
   Clone->copyStructuralFieldsFrom(*this);
   // Synthetic-state fields are NOT copied — duplicate() is shared by the
   // generic VirtualObject clone path AND the Case C synthesis path; the
@@ -290,7 +302,7 @@ FieldValue FieldValue::scalar(Value *V) {
   assert(V && "scalar value must be non-null");
   FieldValue F;
   F.T = Scalar;
-  F.U.V = V;
+  F.V = V;
   F.DeclaredType = V->getType();
   return F;
 }
@@ -303,7 +315,7 @@ FieldValue FieldValue::virtualRef(ObjectID ID, Type *RefTy) {
          "virtualRef DeclaredType must be ptr addrspace(1)");
   FieldValue F;
   F.T = VirtualRef;
-  F.U.Ref = ID;
+  F.Ref = ID;
   F.DeclaredType = RefTy;
   return F;
 }
@@ -312,7 +324,7 @@ FieldValue FieldValue::materializedRef(Value *Ptr) {
   assert(Ptr && Ptr->getType()->isPointerTy());
   FieldValue F;
   F.T = MaterializedRef;
-  F.U.V = Ptr;
+  F.V = Ptr;
   F.DeclaredType = Ptr->getType();
   return F;
 }
@@ -336,9 +348,9 @@ bool FieldValue::shallowEquals(const FieldValue &O) const {
     return true;
   case Scalar:
   case MaterializedRef:
-    return U.V == O.U.V;
+    return (Value *)V == (Value *)O.V;
   case VirtualRef:
-    return U.Ref == O.U.Ref;
+    return Ref == O.Ref;
   }
   return false;
 }
@@ -540,8 +552,31 @@ void PEAResult::computeEscapePointLocks() {
       if (CIt == Count.end() || CIt->second < 2)
         continue; // single-effect escape point — per-effect emit
       auto &Vec = EscapePointLocks[Key];
-      for (const jeandle::MaterializedLock &ML : ME->Locks)
-        Vec.push_back({ML.Callee, ML.NonReceiverArgs, ML.BytecodeDepth, ME});
+      for (const jeandle::MaterializedLock &ML : ME->Locks) {
+        // Defensive dedup (review §3 #3): a merged list must never contain
+        // the same lock twice. BytecodeDepth is unique per enter call site
+        // (LockDepthCache), so two entries with the same (Callee,
+        // NonReceiverArgs, BytecodeDepth) can only be the same folded lock
+        // captured twice (e.g. the pre-fix per-pred duplicate). The
+        // commit-time dominance dedup already removes those; this is the
+        // belt-and-braces layer that keeps the strict-increasing emit
+        // invariant true by construction.
+        bool Dup = false;
+        for (const jeandle::MergedLock &X : Vec) {
+          if (X.Callee == ML.Callee && X.BytecodeDepth == ML.BytecodeDepth &&
+              X.NonReceiverArgs.size() == ML.NonReceiverArgs.size() &&
+              std::equal(X.NonReceiverArgs.begin(), X.NonReceiverArgs.end(),
+                         ML.NonReceiverArgs.begin(),
+                         [](const WeakTrackingVH &A, const WeakTrackingVH &B) {
+                           return (Value *)A == (Value *)B;
+                         })) {
+            Dup = true;
+            break;
+          }
+        }
+        if (!Dup)
+          Vec.push_back({ML.Callee, ML.NonReceiverArgs, ML.BytecodeDepth, ME});
+      }
       uint32_t &Max = MaxSeqForEscapePoint[Key];
       if (ME->SeqNo > Max)
         Max = ME->SeqNo;
@@ -599,8 +634,8 @@ ObjectID PEAResult::createVirtualObject(std::unique_ptr<VirtualObject> VO) {
   // Re-stamp the ID. VirtualObject::ID is const, so use placement-new to
   // construct a fresh instance with the correct ID while keeping the rest of
   // the state intact.
-  auto Stamped =
-      std::make_unique<VirtualObject>(ID, VO->getKind(), VO->AllocationCall);
+  auto Stamped = std::make_unique<VirtualObject>(
+      ID, VO->getKind(), cast_or_null<CallBase>((Value *)VO->AllocationCall));
   Stamped->copyStructuralFieldsFrom(*VO);
   VirtualObjects.push_back(std::move(Stamped));
   return ID;
