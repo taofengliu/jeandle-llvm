@@ -4941,14 +4941,15 @@ bool Analyzer::foldICmpEquality(ICmpInst *ICmp) {
       // operands of the SAME virtual at DIFFERENT offsets (e.g. %o vs
       // gep(%o,8)) would otherwise conflate to equal. Compare the byte
       // offsets too: equal -> equal addresses, different -> distinct. A
-      // symbolic offset can't be proven either way; keep the object real
-      // (markIneligible) so a derived-GEP operand stays valid and the icmp
-      // survives as a real compare — returning false would hit the gate's
-      // materializeAllVirtualOperands(icmp) and poison that operand.
+      // symbolic offset can't be proven either way: materialize the object
+      // AT the icmp (Graal processNodeInputs) — reuse-OrigAlloc keeps both
+      // derived operands valid (OrigAlloc dominates them and is kept alive
+      // by the surviving Materialize effect), and the icmp survives as a
+      // real compare.
       auto O0 = jeandle::pea::resolveFieldOffset(Op0, DL);
       auto O1 = jeandle::pea::resolveFieldOffset(Op1, DL);
       if (!O0 || !O1) {
-        markIneligible(*V0); // *V0 == *V1 (same object).
+        materializeAt(*V0, ICmp, MatReason::Unhandled); // *V0 == *V1.
         return true;
       }
       Folded = true;
@@ -6127,15 +6128,16 @@ void Analyzer::commit() {
   //      write (processStore, synthesizeCaseC) into the append-only
   //      VirtualRefEdges member — the pre-fix walk over the per-block live
   //      FieldStates only ever saw the LAST processed block's edges. This is
-  //      the complete backstop for objects made ineligible by NON-store
-  //      paths — e.g. unbalanced locking at a function exit, merge hazards,
-  //      the availability sweep, the deopt cascade, and the defensive /
-  //      consistency bails (the processLoad inner-ineligible /
-  //      ObjectState-missing / unparented-Repl / null-MaterializedRef guards
-  //      and the foldICmpEquality symbolic-offset bail): store-time hazards
-  //      instead materialize at the store (processStore), and untrackable
-  //      loads materialize at the load (processLoad), which recursively
-  //      materializes nested VirtualRefs and needs no commit-time help. It
+  //      the complete backstop for objects made ineligible by NON-store /
+  //      NON-load paths — e.g. unbalanced locking at a function exit, merge
+  //      hazards, the availability sweep, the deopt cascade, and the
+  //      defensive / consistency bails (the processLoad inner-ineligible /
+  //      ObjectState-missing / unparented-Repl / null-MaterializedRef
+  //      guards): store-time hazards materialize at the store
+  //      (processStore), untrackable loads materialize at the load
+  //      (processLoad), and symbolic-offset icmps materialize at the icmp
+  //      (foldICmpEquality), each of which recursively materializes nested
+  //      VirtualRefs and needs no commit-time help. It
   //      catches VirtualRefs recorded at ANY point — before the object was
   //      markIneligible'd AND after (recorded because processStore does not
   //      check Eligible). Graal has no analog: it
