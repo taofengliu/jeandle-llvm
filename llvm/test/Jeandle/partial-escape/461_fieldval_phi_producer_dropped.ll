@@ -1,12 +1,15 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Commit availability sweep (review §3 #2): o.f = p.g where p.g is a MERGE
-; field-PHI (analyzer-built, owned by p's CreatePHI effect). p then becomes
-; ineligible (derived-pointer escape) -> dropEffectsFor(p) drops the
-; CreatePHI AND the ReplaceLoad that folded %lg -> %lg survives as a real
-; load. o's surviving Materialize would replay the never-to-be-inserted PHI
-; -> the sweep must keep o real too (its whole effect set is dropped), so
-; the o.f store survives as a real store of the real load.
+; Field-PHI producer under materialize-at-use: o.f = p.g where p.g is a
+; MERGE field-PHI (analyzer-built, owned by p's CreatePHI effect). p then
+; escapes via a DERIVED pointer (%gp) — under Graal processNodeInputs this
+; MATERIALIZES p at the call instead of marking it ineligible, so p's
+; CreatePHI effect survives and the field-PHI is replayed onto p's
+; OrigAlloc before the call. o likewise materializes at its escape,
+; replaying o.f's tracked store of the folded field-PHI. Both allocations
+; stay real, the PHI has live uses in the two replays, no orphan PHI, no
+; poison. (The commit availability sweep of review §3 #2 no longer fires on
+; this shape: the derived-pointer escape materializes rather than bails.)
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -36,10 +39,11 @@ m:
 no:
   %of = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
   store atomic i32 %lg, ptr addrspace(1) %of unordered, align 4
-  ; derived-pointer escape of p -> p ineligible -> CreatePHI dropped.
+  ; derived-pointer escape of p -> p materializes at the call (CreatePHI
+  ; survives; the field-PHI is replayed onto OrigAlloc).
   %gp = getelementptr inbounds i8, ptr addrspace(1) %p, i64 4
   call void @sinkp(ptr addrspace(1) %gp)
-  ; o escapes: without the sweep its Materialize would replay the orphan PHI.
+  ; o escapes: its tracked o.f store replays the folded field-PHI.
   call void @sink(ptr addrspace(1) %o)
   ret void
 u:
@@ -47,15 +51,19 @@ u:
   resume i64 %lp
 }
 
-; Everything stays real: both allocations retained, %lg is a real load, the
-; o.f store is a real store, no orphan PHI, no poison.
+; Both allocations stay real; the branch stores fold into %pea.field.phi;
+; each escape replays its tracked store onto the OrigAlloc immediately
+; before the call; no orphan PHI, no poison.
 ; CHECK-LABEL: define void @phi_producer_dropped(
-; CHECK: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 100 to ptr), i32 16)
-; CHECK: %lg = load atomic i32, ptr addrspace(1) %pg unordered, align 4
-; CHECK: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 200 to ptr), i32 16)
-; CHECK: store atomic i32 %lg, ptr addrspace(1) %of unordered, align 4
+; CHECK: %p = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 100 to ptr), i32 16)
+; CHECK: %pea.field.phi = phi i32 [ 2, %f ], [ 1, %t ]
+; CHECK: %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 200 to ptr), i32 16)
+; CHECK: %pea.matslot = getelementptr inbounds i8, ptr addrspace(1) %p, i64 8
+; CHECK: store atomic i32 %pea.field.phi, ptr addrspace(1) %pea.matslot unordered, align 4
+; CHECK: call void @sinkp(ptr addrspace(1) %gp)
+; CHECK: %pea.matslot1 = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
+; CHECK: store atomic i32 %pea.field.phi, ptr addrspace(1) %pea.matslot1 unordered, align 4
 ; CHECK: call void @sink(ptr addrspace(1) %o)
-; CHECK-NOT: pea.field.phi
 ; CHECK-NOT: poison
 
 !java-method-compilation = !{}

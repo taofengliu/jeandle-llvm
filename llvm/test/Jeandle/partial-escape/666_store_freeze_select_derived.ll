@@ -5,7 +5,13 @@
 ; different derived pointers — must not be recorded as a whole-object
 ; VirtualRef. resolveFieldOffset has no Select case (it returns 0 through
 ; the freeze), so only a recursive whole-object check (Select arms and PHI
-; incomings) catches this shape; the store and both objects stay real.
+; incomings) catches this shape. The select itself is not whole-object
+; either (both arms are derived GEPs), so the generic escape path
+; MATERIALIZES %inner at the select (Graal processNodeInputs): %inner's
+; allocation survives and the derived arms stay valid. The store of %fr
+; then tracks a live materialized value, the load folds to %fr (NOT to
+; %inner's base — the offset-losing regression this test guards), and
+; %outer is eliminated.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -35,14 +41,15 @@ u:
   resume i64 %lp
 }
 
-; Both allocations and the store survive; the load is a real load of the
-; stored select (NOT folded to the inner object's base).
+; %inner's allocation survives (materialized at the select); the select and
+; freeze stay real over the derived pointers; the load folds to the stored
+; %fr; %outer's allocation, the store and the load are eliminated.
 ; CHECK-LABEL: define void @store_freeze_select_derived
 ; CHECK: %inner = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
-; CHECK: %outer = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
+; CHECK-NOT: new_instance
 ; CHECK: %sel = select i1 %c, ptr addrspace(1) %g1, ptr addrspace(1) %g2
-; CHECK: store ptr addrspace(1) %fr, ptr addrspace(1) %field
+; CHECK: %fr = freeze ptr addrspace(1) %sel
+; CHECK: call void @sink(ptr addrspace(1) %fr)
 ; CHECK-NOT: store ptr addrspace(1) poison
-; CHECK: %v = load ptr addrspace(1), ptr addrspace(1) %field
 
 !java-method-compilation = !{}

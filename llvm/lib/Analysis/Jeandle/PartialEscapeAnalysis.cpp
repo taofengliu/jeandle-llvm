@@ -409,9 +409,14 @@ private:
       FieldStates;
 
   // Per-object eligibility flag. Function-wide: starts true at allocation;
-  // flipped to false on any escape (non-constant offset, type mismatch,
-  // nested-virtual store/load, opaque consumer, incompatible multi-pred
-  // merge). Once false, commit() drops every recorded effect for the object.
+  // flipped to false ONLY where keeping the original IR is semantically
+  // required — merge/loop hazards (retry cap, synthetic-VO mixed merge,
+  // lock re-emit hazard), lock/value-based semantics, commit-time cascades,
+  // and the materialize-time value-availability fallback. Use points
+  // (untrackable accesses, opaque consumers) MATERIALIZE instead (Graal
+  // processNodeInputs): markIneligible is function-wide and retroactive
+  // (commit() drops every recorded effect for the object), while
+  // materialize preserves every fold recorded so far.
   DenseMap<jeandle::ObjectID, bool> Eligible;
 
   // Persistent cross-block VirtualRef edge set (review §3 #1): an edge
@@ -437,8 +442,8 @@ private:
   // operands so describing an object in a deopt bundle does not, by itself,
   // force a materialization (Graal addVirtualMapping semantics). Per-
   // instruction: cleared and repopulated by recordDeoptBundleMappings at the
-  // top of the call dispatch, consumed by materializeAllVirtualOperands /
-  // markVirtualOperandsIneligible in the same dispatch.
+  // top of the call dispatch, consumed by materializeAllVirtualOperands in
+  // the same dispatch.
   DenseSet<jeandle::ObjectID> DeoptBundleHandled;
 
   // Per-object monitor lock counter. Incremented on a folded monitorenter,
@@ -1076,15 +1081,15 @@ private:
   // the bundle's monitor entry (eliminated=true with a VORef owner). Graal
   // analog: addVirtualMapping — a deopt-state reference to a virtual object is
   // recorded as a virtual mapping (re-emitted as an ObjectValue at deopt),
-  // NOT an escape. The generic escape path (materializeAllVirtualOperands /
-  // markVirtualOperandsIneligible) consults DeoptBundleHandled to skip the
-  // handled deopt-bundle operands so the bundle alone does not force a
-  // materialization. Out-of-scope shapes (derived bundle operand, array of
-  // unknown element kind, narrow-oop (addrspace-3) reference field, non-null
-  // constant oop field, multi-scope/inlinee bundles — TODO) are
-  // conservatively left unrecorded so they fall through to the existing
-  // escape/materialization behavior; a VO referencing such an undescribable
-  // VO is itself contagiously bailed (greatest-fixpoint, no dangling VORef).
+  // NOT an escape. The generic escape path (materializeAllVirtualOperands)
+  // consults DeoptBundleHandled to skip the handled deopt-bundle operands so
+  // the bundle alone does not force a materialization. Out-of-scope shapes
+  // (derived bundle operand, array of unknown element kind, narrow-oop
+  // (addrspace-3) reference field, non-null constant oop field,
+  // multi-scope/inlinee bundles — TODO) are conservatively left unrecorded so
+  // they fall through to the existing escape/materialization behavior; a VO
+  // referencing such an undescribable VO is itself contagiously bailed
+  // (greatest-fixpoint, no dangling VORef).
   void recordDeoptBundleMappings(CallBase *CB);
   // True iff \p U is an input of I's "deopt" operand bundle whose resolved
   // ObjectID was recorded as a scoped virtual mapping at this instruction
@@ -1092,44 +1097,21 @@ private:
   // deopt-state operands.
   bool isHandledDeoptBundleOperand(const Use &U, Instruction *I);
   // Single source of truth for "which distinct virtual ObjectIDs does I use as
-  // operands (skipping described deopt-bundle operands)?" Both the generic
-  // escape path (materializeAllVirtualOperands) and the bail-all path
-  // (markVirtualOperandsIneligible) enumerate the SAME operand set the same
-  // way; before extraction the two loops drifted independently (Lessons §2
-  // "two slightly-divergent enumerations"). Returns IDs sorted for
-  // deterministic effect order.
+  // operands (skipping described deopt-bundle operands)?" The generic escape
+  // path (materializeAllVirtualOperands) enumerates this set. Returns IDs
+  // sorted for deterministic effect order.
   void collectDistinctVirtualOperands(
       Instruction *I, SmallVectorImpl<jeandle::ObjectID> &Out);
   void materializeAllVirtualOperands(Instruction *I);
   // Graal processNodeInputs (Graal PartialEscapeClosure): materialize every
-  // virtual NON-BUNDLE call argument of CB before the call. Runs BEFORE
-  // recordDeoptBundleMappings (Graal processNodeWithState), so a VO that is
-  // both a real argument AND a deopt-bundle operand of the same call is
-  // materialized at the call and its bundle slot keeps the live OrigAlloc —
-  // one Java object keeps one identity across a during-call deopt (review §3
-  // #6). Arg-scoped: bundle operands are NOT consulted (they are frame
-  // state, handled by recordDeoptBundleMappings). A derived argument
-  // (resolveVirtualRef hit with V != AllocationCall) makes every virtual
-  // argument ineligible — bundle-only VOs are deliberately NOT collateral
-  // (unlike markVirtualOperandsIneligible, which would bail them while
-  // DeoptBundleHandled is still empty).
+  // virtual NON-BUNDLE call argument of CB before the call, per argument.
+  // Runs BEFORE recordDeoptBundleMappings (Graal processNodeWithState), so a
+  // VO that is both a real argument AND a deopt-bundle operand of the same
+  // call is materialized at the call and its bundle slot keeps the live
+  // OrigAlloc — one Java object keeps one identity across a during-call
+  // deopt (review §3 #6). Arg-scoped: bundle operands are NOT consulted
+  // (they are frame state, handled by recordDeoptBundleMappings).
   void materializeVirtualCallArgs(CallBase *CB);
-  // Sound analog of materializeAllVirtualOperands: materialize only when no
-  // operand is a DERIVED pointer of a still-virtual object (a derived operand
-  // computed before I is bailed conservatively rather than materialized — under
-  // reuse-OrigAlloc OrigAlloc in fact dominates it, so the bail is conservative;
-  // see TODO(bail-all-conservative)); otherwise mark every virtual operand's
-  // object ineligible so derived pointers stay valid. Graal's processNodeInputs
-  // (Graal PartialEscapeClosure) always materializes — Jeandle diverges
-  // to markIneligible only because LLVM represents field access as derived
-  // address computations, which Graal's identity-based alias model does not.
-  void materializeVirtualOperandsSafely(Instruction *I);
-  // Mark every distinct virtual ObjectID among I's operands ineligible (each
-  // keeps its ORIGINAL allocation real). The bail primitive backing
-  // materializeVirtualOperandsSafely; same principle as the processStore/
-  // processLoad bail (markIneligible rather than materialize, to keep a
-  // pre-computed derived address valid).
-  void markVirtualOperandsIneligible(Instruction *I);
   void materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
                      MatReason Reason = MatReason::Unhandled);
 
@@ -3373,7 +3355,7 @@ void Analyzer::processInstruction(Instruction *I) {
       // (VirtualObject::AllocationCall, effect Targets) follows the RAUW via
       // WeakTrackingVH.
       recordDeoptBundleMappings(CB);
-      materializeVirtualOperandsSafely(CB);
+      materializeAllVirtualOperands(CB);
       return;
     }
   }
@@ -3547,17 +3529,16 @@ void Analyzer::processInstruction(Instruction *I) {
       // Record VO descriptors for any still-virtual OrigAlloc referenced in
       // CB's "deopt" bundle. (recordDeoptBundleMappings checks hasDeoptBundle
       // and populates DeoptBundleHandled for THIS call, consumed by
-      // materializeVirtualOperandsSafely below; the transform's apply no-ops
+      // materializeAllVirtualOperands below; the transform's apply no-ops
       // if the call/bundle was later folded away, so scanning handled calls
       // is safe.)
       recordDeoptBundleMappings(CB);
     }
-    // Any other consumer of a virtual operand. Materialize when sound; if a
-    // derived-GEP virtual operand is present, markIneligible instead so it
-    // doesn't resolve to poison (see materializeVirtualOperandsSafely).
+    // Any other consumer of a virtual operand: materialize every virtual
+    // operand at I (Graal processNodeInputs — unconditional, per operand).
     // Deopt-bundle operands whose ObjectID is in DeoptBundleHandled are
     // skipped (recordDeoptBundleMappings described them).
-    materializeVirtualOperandsSafely(I);
+    materializeAllVirtualOperands(I);
     return;
   }
 
@@ -5025,10 +5006,9 @@ void Analyzer::propagatePointerAlias(Instruction *I) {
   // of 16. So alias-forward only when both arms denote the WHOLE object
   // (resolveFieldOffset 0 each — a poison arm also resolves to 0 and cannot
   // execute without UB). Any other shape (non-zero/symbolic offset, or
-  // different objects) is handed to materializeVirtualOperandsSafely: it
-  // materializes whole-object arms but calls markIneligible on any object whose
-  // derived-GEP arm would poison if materialized at the select (same class as
-  // the processStore/processLoad bail — see materializeVirtualOperandsSafely).
+  // different objects) is handed to the generic escape path, which
+  // materializes every virtual operand at the select (Graal
+  // processNodeInputs): reuse-OrigAlloc keeps a derived-GEP arm valid.
   if (auto *Sel = dyn_cast<SelectInst>(I)) {
     auto BaseID =
         jeandle::pea::resolveVirtualRef(Sel, CurrentState, Aliases, DL);
@@ -5038,7 +5018,7 @@ void Analyzer::propagatePointerAlias(Instruction *I) {
       Aliases.addVirtualAlias(I, *BaseID);
       return;
     }
-    materializeVirtualOperandsSafely(I);
+    materializeAllVirtualOperands(I);
     return;
   }
 
@@ -5535,15 +5515,15 @@ void Analyzer::materializeAllVirtualOperands(Instruction *I) {
 
 void Analyzer::materializeVirtualCallArgs(CallBase *CB) {
   // Graal processNodeInputs: materialize the virtual NON-BUNDLE inputs of
-  // the call. Bundle operands are frame state — recordDeoptBundleMappings
+  // the call — unconditionally, per argument (Graal has no cross-input
+  // skip). Bundle operands are frame state — recordDeoptBundleMappings
   // handles them right after this (see processInstruction's call dispatch).
-  // Any derived argument forces the conservative bail of every virtual
-  // ARGUMENT (a derived operand computed before the call cannot be
-  // materialized into validity at the call); bundle-only VOs are untouched
-  // so they stay describable.
+  // A DERIVED argument (GEP/bitcast of the virtual) is materialized the same
+  // way: under reuse-OrigAlloc the materialized value IS OrigAlloc, which
+  // dominates the derived pointer, and the surviving Materialize effect
+  // keeps OrigAlloc alive, so the derived argument stays valid.
   SmallVector<jeandle::ObjectID, 4> ArgVOs;
   DenseSet<jeandle::ObjectID> Seen;
-  bool AnyDerived = false;
   for (Value *Arg : CB->args()) {
     if (!Arg)
       continue;
@@ -5552,78 +5532,10 @@ void Analyzer::materializeVirtualCallArgs(CallBase *CB) {
       continue;
     if (Seen.insert(*ID).second)
       ArgVOs.push_back(*ID);
-    if (Arg != Result.VirtualObjects[*ID]->AllocationCall)
-      AnyDerived = true;
-  }
-  if (AnyDerived) {
-    for (jeandle::ObjectID ID : ArgVOs)
-      markIneligible(ID);
-    return;
   }
   llvm::sort(ArgVOs); // deterministic effect order
   for (jeandle::ObjectID ID : ArgVOs)
     materializeAt(ID, CB, MatReason::Unhandled);
-}
-
-void Analyzer::materializeVirtualOperandsSafely(Instruction *I) {
-  // Materialize every virtual operand of I, unless any operand is a DERIVED
-  // pointer of a still-virtual object. A direct OrigAlloc (AllocationCall) use
-  // at I is sound: under reuse-OrigAlloc the materialized value is OrigAlloc
-  // itself, which dominates every use (it is the original allocation invoke);
-  // escaping OrigAlloc uses are handled by EliminateAllocation's poison RAUW
-  // (NeverEscapes) or kept alive (PartiallyEscapes). A DERIVED operand (any
-  // value != AllocationCall that resolveVirtualRef chases to a virtual: GEP,
-  // bitcast, addrspacecast, freeze, inttoptr-roundtrip, PHI, select, or an
-  // alias-map entry) is computed before I; this path conservatively bails the
-  // whole operand set via markIneligible rather than materializing — see
-  // TODO(bail-all-conservative) (under reuse-OrigAlloc OrigAlloc in fact
-  // dominates, so the bail is conservative, retained as a soundness net rather
-  // than re-proven per object). The derived test is structural (V !=
-  // AllocationCall), NOT offset-based: a zero-offset `gep %o, 0` is still a
-  // derived instruction and is still bailed.
-  for (Use &U : I->operands()) {
-    Value *V = U.get();
-    if (!V)
-      continue;
-    auto ID = jeandle::pea::resolveVirtualRef(V, CurrentState, Aliases, DL);
-    if (!ID)
-      continue;
-    if (V != Result.VirtualObjects[*ID]->AllocationCall) {
-      markVirtualOperandsIneligible(I);
-      return;
-    }
-  }
-  materializeAllVirtualOperands(I);
-}
-
-void Analyzer::markVirtualOperandsIneligible(Instruction *I) {
-  // Bail primitive: mark every distinct virtual ObjectID among I's operands
-  // ineligible so each keeps its ORIGINAL allocation real (AlwaysEscapes via
-  // commit() -> dropEffectsFor dropping EliminateAllocationEffect). Mirrors
-  // materializeAllVirtualOperands enumeration but markIneligible instead of
-  // materializeAt — both share collectDistinctVirtualOperands so the skip
-  // set and ordering cannot drift apart. Used wherever materializing at I
-  // would poison a derived operand (processStore/processLoad bail,
-  // materializeVirtualOperandsSafely).
-  SmallVector<jeandle::ObjectID, 4> ToBail;
-  collectDistinctVirtualOperands(I, ToBail);
-  // TODO(bail-all-conservative): GRAAL DIVERGENCE — when ANY operand is
-  // derived, this bails EVERY virtual operand's object (including operands
-  // that are themselves the OrigAlloc, i.e. V == AllocationCall, for which
-  // materializing at I WOULD be sound: OrigAlloc (the reuse-OrigAlloc
-  // materialized value at I) dominates that OrigAlloc use at I). Graal's
-  // processNodeInputs (Graal PartialEscapeClosure) has no
-  // derived pointers and always materializes per-input at the use, so it
-  // keeps such objects virtual on non-escaping paths. The bail-all is a
-  // deliberate soundness net: materializing one operand's object at I could
-  // poison a derived GEP of the SAME object on another path that the I-point
-  // materialize does not dominate. Recovering
-  // the lost scalar-replacement here means proving, per-object, that none of
-  // its live uses across all paths is an undominated derived address — bail
-  // only the derived operand's object, materialize the OrigAlloc operands at
-  // I. Until that cross-path dominance check exists, keep bail-all.
-  for (jeandle::ObjectID ID : ToBail)
-    markIneligible(ID);
 }
 
 // Materialize placement is escape-point / predecessor-end (Graal
