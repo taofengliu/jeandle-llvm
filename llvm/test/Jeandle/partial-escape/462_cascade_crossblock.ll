@@ -1,17 +1,21 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/441_nested_virtual_fieldstates_cascade.cblog %s | FileCheck %s
 
-; Cross-block VirtualRef cascade (review §3 #1): 441's pattern moved out of
-; the LAST block. arr[0]=inner0 (constant index) records VirtualRef and an
-; EliminateStore; arr[i]=innerI (SYMBOLIC index) cannot be virtualized, so
-; arr and innerI materialize AT the symbolic store; the arr escape is in
-; `tail`. The pre-fix commit cascade read the per-block live FieldStates —
+; Cross-block VirtualRef cascade (review §3 #1): 441's pattern with the arr
+; escape moved into a LATER block (`tail`). arr[0]=inner0 (constant index)
+; records VirtualRef and an EliminateStore; arr[i]=innerI (SYMBOLIC index)
+; cannot be virtualized, so arr and innerI materialize AT the symbolic store
+; in n2. Under the pre-materialize-at-store design (symbolic store ->
+; markIneligible) the commit cascade read the per-block live FieldStates —
 ; which held only `tail`'s (empty) state — missed the arr->inner0 edge, left
 ; inner0 NeverEscapes, and the surviving real store wrote POISON into the
-; escaped array. The persistent VirtualRefEdges set (recorded at
-; processStore) now carries the edge across blocks: inner0 is materialized
-; as well, the tracked arr[0]=inner0 store is replayed onto arr's OrigAlloc
-; (pea.matslot) immediately before the symbolic store, and the symbolic
-; store writes the real innerI pointer.
+; escaped array. With materialize-at-store the hazard is gone by
+; construction: the materialize point sits in n2 next to the VirtualRef, and
+; materializeAt RECURSIVELY materializes inner0 (MatReason::Nested) before
+; replaying the tracked arr[0]=inner0 store onto arr's OrigAlloc
+; (pea.matslot), so the replayed store and the symbolic store both write
+; live pointers. The commit-time VirtualRefEdges cascade remains as a
+; backstop for objects made ineligible by NON-store paths while holding
+; VirtualRef fields — see 674_commit_cascade_lock_imbalance.ll.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)

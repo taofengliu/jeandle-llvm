@@ -6107,11 +6107,14 @@ void Analyzer::commit() {
   //      write (processStore, synthesizeCaseC) into the append-only
   //      VirtualRefEdges member — the pre-fix walk over the per-block live
   //      FieldStates only ever saw the LAST processed block's edges. This is
-  //      the complete backstop: it catches VirtualRefs recorded at ANY point
-  //      — before the object was markIneligible'd (e.g. `arr[0]=new T();
-  //      arr[i]=new T()` — the constant store precedes the symbolic bail) AND
-  //      after (`arr[i]=new T(); arr[0]=new T()` — recorded because
-  //      processStore does not check Eligible). Graal has no analog: it
+  //      the complete backstop for objects made ineligible by NON-store paths
+  //      (unbalanced locking at a function exit, merge hazards, the
+  //      availability sweep, the deopt cascade): store-time hazards instead
+  //      materialize at the store (processStore), which recursively
+  //      materializes nested VirtualRefs and needs no commit-time help. It
+  //      catches VirtualRefs recorded at ANY point — before the object was
+  //      markIneligible'd AND after (recorded because processStore does not
+  //      check Eligible). Graal has no analog: it
   //      materializes in place at the escape point, so the recursive entry
   //      cascade (materializeWithCommit, Graal PartialEscapeBlockState) runs
   //      at the very point the outer is committed; Jeandle's

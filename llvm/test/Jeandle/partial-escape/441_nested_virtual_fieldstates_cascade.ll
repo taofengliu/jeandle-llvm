@@ -15,15 +15,16 @@
 ; prevents this: inner0 is materialized first and its live pointer is
 ; replayed into the field.
 ;
-; The commit-time transitive ineligibility cascade over the persistent
-; VirtualRefEdges set (recorded at processStore) covers what a single
-; materialize point cannot: cross-block escapes where the materialize effect
-; and the VirtualRef live in different blocks (see
-; 462_cascade_crossblock.ll). Being commit-time it is order-independent —
-; a walk-time cascade would be order-dependent and miss VirtualRefs recorded
-; after the materialize point. Mirrors Graal's recursive entry cascade
-; (materializeWithCommit, PartialEscapeBlockState.java:293-343) on the
-; conservative path; Graal materializes in place so it has no
+; Note the commit-time transitive ineligibility cascade over the persistent
+; VirtualRefEdges set (recorded at processStore) is NOT what keeps inner0
+; real here: same-block, materializeAt's recursive VirtualRef
+; materialization (MatReason::Nested) handles it at the materialize point.
+; The cascade remains as a backstop for objects made ineligible by NON-store
+; paths (unbalanced locking at function exit, merge hazards, the
+; availability sweep, the deopt cascade) while holding VirtualRef fields —
+; see 674_commit_cascade_lock_imbalance.ll. It mirrors Graal's recursive
+; entry cascade (materializeWithCommit, PartialEscapeBlockState.java:293-343)
+; on the conservative path; Graal materializes in place so it has no
 ; analysis/transform split.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
