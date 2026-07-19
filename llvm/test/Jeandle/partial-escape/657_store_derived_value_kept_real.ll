@@ -5,7 +5,8 @@
 ; resolveVirtualRef returns the inner object's identity but discards the
 ; byte offset, so `store ptr gep(%inner, 8), ptr gep(%outer, 16)` would
 ; silently lose the +8 — a later load of the field would fold to the
-; inner's base pointer. The store (and both objects) must be kept real.
+; inner's base pointer. The store must survive, with both objects
+; materialized at the store.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))

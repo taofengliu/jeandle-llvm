@@ -8,8 +8,9 @@
 ;
 ; Before the fix bail path 2 did `markIneligible(o); return true` without
 ; touching %v, so %v leaked (NeverEscapes -> poison) while the reference store
-; survived as `store ptr poison`. After the fix the bail returns false, the
-; gate materializes both %o and %v, and the store keeps the live %v pointer.
+; survived as `store ptr poison`. Now the unvirtualizable store materializes
+; BOTH %o and %v AT the store (materializeOperandsAtStore), so the surviving
+; store keeps the live %v pointer.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare i32 @__gxx_personality_v0(...)

@@ -9,8 +9,8 @@
 ; only 0..ArrayLength-1), so a store to it was silently lost and a
 ; NeverEscapes array could be eliminated while a live store targeted memory
 ; past its end. The fix adds the upper-bound check `Offset >= ArrayBaseOffset
-; + ArrayLength*scale -> bail`, so the array is kept real and the store
-; survives.
+; + ArrayLength*scale -> bail`, so the array materializes at the offending
+; store and the store survives.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 
@@ -36,9 +36,11 @@ u:
   resume i64 %lp
 }
 
-; The OOB access bails the array (markIneligible -> kept real): the alloc and
-; BOTH stores survive. Before the fix the OOB offset was modeled as a phantom
-; field, the array was eliminated, and the stores vanished.
+; The OOB access cannot be virtualized, so the array materializes AT the OOB
+; store: the alloc survives, the tracked in-bounds store is replayed onto
+; OrigAlloc (pea.matslot) immediately before it, and the OOB store survives.
+; Before the fix the OOB offset was modeled as a phantom field, the array was
+; eliminated, and the stores vanished.
 ; CHECK-LABEL: define void @test_oob_byte_gep_array_bails
 ; CHECK: jeandle.new_array
 ; CHECK: store atomic i32 10

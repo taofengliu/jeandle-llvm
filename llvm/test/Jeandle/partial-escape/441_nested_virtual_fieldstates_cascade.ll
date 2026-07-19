@@ -6,32 +6,35 @@
 ; instance (arr[0] = inner0): processStore succeeds, records
 ; FieldStates[arr][16] = VirtualRef(inner0) and emits an EliminateStoreEffect
 ; for arr. A second store at a SYMBOLIC index `%i` (arr[i] = innerI) fails
-; resolveAccess -> bailKeepingOperandsReal -> markIneligible(arr) + innerI.
-; commit() then dropEffectsFor(arr) erases arr's EliminateStoreEffect, so the
-; arr[0] store survives as a real store. If inner0 were left eligible it would
-; be classified NeverEscapes (no surviving Materialize) -> Pass 2 RAUWs
-; inner0.OrigAlloc to poison -> the surviving real arr[0] store writes poison
-; into the escaped array -> miscompile.
+; resolveAccess and materializes arr + innerI AT the symbolic store: the
+; tracked arr[0] store is replayed onto arr's OrigAlloc (pea.matslot)
+; immediately before it. If inner0 were left eligible it would be classified
+; NeverEscapes (no surviving Materialize) -> Pass 2 RAUWs inner0.OrigAlloc
+; to poison -> the replayed arr[0] store would write poison into the escaped
+; array -> miscompile. Recursive materialization of the nested VirtualRef
+; prevents this: inner0 is materialized first and its live pointer is
+; replayed into the field.
 ;
-; The fix is a transitive ineligibility cascade in commit() over FieldStates
-; VirtualRef entries: any virtual referenced by a kept-real (ineligible)
-; object's field is also kept real (its OrigAlloc survives), so the surviving
-; store writes the real pointer. This runs once at classification time, so it
-; catches VirtualRefs recorded BEFORE the bail (test_nested_virtual... —
-; arr[0] precedes arr[i]) AND AFTER (test_reverse_order... — arr[i] precedes
-; arr[0], recorded because processStore does not check Eligible). A walk-time
-; cascade in markIneligible would be order-dependent and miss the latter.
-; Mirrors Graal's recursive entry cascade (materializeWithCommit,
-; PartialEscapeBlockState.java:293-343) on the conservative path; Graal
-; materializes in place so it has no analysis/transform split.
+; The commit-time transitive ineligibility cascade over the persistent
+; VirtualRefEdges set (recorded at processStore) covers what a single
+; materialize point cannot: cross-block escapes where the materialize effect
+; and the VirtualRef live in different blocks (see
+; 462_cascade_crossblock.ll). Being commit-time it is order-independent —
+; a walk-time cascade would be order-dependent and miss VirtualRefs recorded
+; after the materialize point. Mirrors Graal's recursive entry cascade
+; (materializeWithCommit, PartialEscapeBlockState.java:293-343) on the
+; conservative path; Graal materializes in place so it has no
+; analysis/transform split.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
-; Order A: constant store FIRST, symbolic bail SECOND. The VirtualRef is in
-; FieldStates[arr] before markIneligible(arr) runs.
+; Order A: constant store FIRST, symbolic store SECOND. The VirtualRef is in
+; FieldStates[arr] before the symbolic store materializes arr, so the
+; materialize point replays arr[0]=inner0 (pea.matslot) after recursively
+; materializing inner0.
 define void @test_nested_virtual_fieldstates_cascade(i64 %i) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   %arr = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
@@ -58,9 +61,10 @@ u:
   resume i64 %lp
 }
 
-; Order B: symbolic bail FIRST, constant store SECOND. The VirtualRef is
-; recorded AFTER markIneligible(arr) ran, so a walk-time cascade would miss
-; it; only the commit-time cascade catches it.
+; Order B: symbolic store FIRST, constant store SECOND. arr (and innerI)
+; materialize AT the symbolic store; when the constant-index store is
+; processed arr is already materialized, so that store survives as a real
+; store and inner0 is kept real as its stored value.
 define void @test_reverse_order_fieldstates_cascade(i64 %i) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   %arr = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
@@ -95,8 +99,8 @@ u:
 ; CHECK-LABEL: define void @test_reverse_order_fieldstates_cascade
 ; CHECK: jeandle.new_array
 ; Both inner instances survive real; the arr[0] store writes the real inner0
-; pointer (not poison), even though inner0's VirtualRef was recorded after
-; markIneligible(arr).
+; pointer (not poison), even though it was processed after arr had already
+; materialized at the symbolic store.
 ; CHECK-COUNT-2: invoke hotspotcc{{.*}}@jeandle.new_instance
 ; CHECK-NOT: poison
 

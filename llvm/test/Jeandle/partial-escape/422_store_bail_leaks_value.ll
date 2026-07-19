@@ -11,9 +11,9 @@
 ; touching %v. processInstruction then returned immediately, so the
 ; materializeAllVirtualOperands gate never ran: %v was classified NeverEscapes
 ; and RAUW'd to poison while the store survived, writing `store ptr poison`
-; into the materialized array. After the fix the bail returns false, falling
-; through to the gate, which materializes BOTH %arr and %v so the store keeps
-; the live %v pointer.
+; into the materialized array. Now the unvirtualizable store materializes
+; BOTH %arr and %v AT the store (materializeOperandsAtStore), so the
+; surviving store keeps the live %v pointer.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)

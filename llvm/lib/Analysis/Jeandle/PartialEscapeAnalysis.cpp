@@ -3921,21 +3921,21 @@ bool Analyzer::processStore(StoreInst *SI) {
 
   jeandle::VirtualObject &VObj = *Result.VirtualObjects[*BaseID];
 
-  // The store could not be virtualized. Keep the base's ORIGINAL allocation
-  // real (markIneligible) so a pre-computed derived store address — e.g. a
-  // symbolic-index GEP computed earlier in the block — stays valid:
-  // materializing the base via the gate would insert a fresh alloc at the
-  // store that does not dominate that derived GEP, so its pointer operand
-  // would resolve to poison. The stored value, if itself virtual, must also be
-  // kept real or it would be eliminated (NeverEscapes -> poison) while the
-  // store survives, writing poison into the base's field. The store itself
-  // stays as a real store (no EliminateStoreEffect is emitted); returning true
-  // keeps processInstruction from re-running the gate on it.
-  auto bailKeepingOperandsReal = [&] {
-    markIneligible(*BaseID);
+  // The store could not be virtualized. Materialize the base AT the store
+  // (Graal: a node whose virtualize() fails keeps its inputs and
+  // processNodeInputs materializes them at the node): tracked field stores
+  // are replayed onto OrigAlloc right before SI, and OrigAlloc is kept
+  // (PartiallyEscapes), so the pre-computed derived/symbolic store address
+  // stays valid. The stored value, if itself virtual, is materialized at
+  // the store too, so the surviving real store writes a live pointer. The
+  // store itself stays as a real store (no EliminateStoreEffect is
+  // emitted); returning true keeps processInstruction from re-running the
+  // gate on it.
+  auto materializeOperandsAtStore = [&] {
+    materializeAt(*BaseID, SI, MatReason::Unhandled);
     if (auto RefID =
             jeandle::pea::resolveVirtualRef(Val, CurrentState, Aliases, DL))
-      markIneligible(*RefID);
+      materializeAt(*RefID, SI, MatReason::Unhandled);
   };
 
   // Shared offset resolution (array-element GEP fast path + constant-offset
@@ -3943,7 +3943,7 @@ bool Analyzer::processStore(StoreInst *SI) {
   // array index, non-constant GEP, header offset) -> bail.
   std::optional<int64_t> Offset = resolveAccess(Ptr, *BaseID);
   if (!Offset) {
-    bailKeepingOperandsReal();
+    materializeOperandsAtStore();
     return true;
   }
 
@@ -3955,7 +3955,7 @@ bool Analyzer::processStore(StoreInst *SI) {
   // -1 means an overlap/size conflict, or an unknown-size value type such as a
   // vector/struct — bail either way.
   if (VObj.getOrCreateFieldIndex(*Offset, Val->getType(), DL) < 0) {
-    bailKeepingOperandsReal();
+    materializeOperandsAtStore();
     return true;
   }
 
@@ -3970,10 +3970,10 @@ bool Analyzer::processStore(StoreInst *SI) {
     // materialization would replay the inner base pointer into the field.
     // Only a value denoting the WHOLE inner object (constant byte offset 0
     // on every path — checked recursively through Select arms and PHI
-    // incomings) may be recorded as a VirtualRef; anything else keeps the
-    // store and both objects real.
+    // incomings) may be recorded as a VirtualRef; anything else leaves the
+    // store in place and materializes both objects at the store.
     if (!jeandle::pea::isWholeObjectReference(Val, DL)) {
-      bailKeepingOperandsReal();
+      materializeOperandsAtStore();
       return true;
     }
     // Nested virtual reference. Recursive materialization handles this at

@@ -3,7 +3,10 @@
 
 ; EscapeClassification population + -jeandle-dump-pea-stats.
 ;
-; Three functions are crafted to populate each enum value at least once:
+; Three functions cover the NeverEscapes / PartiallyEscapes classifications
+; (AlwaysEscapes is no longer reachable from these patterns: processStore's
+; unresolved-offset path now materializes at the store instead of marking the
+; object ineligible):
 ;
 ;  * @t_never:  one VO with a load/store pair, used only locally and never
 ;               escaped — eligible at commit() with no surviving Materialize
@@ -19,9 +22,9 @@
 ;               is rewritten to a branch by Pass 2).
 ;
 ;  * @t_always: one VO with a store at a runtime (non-constant) byte offset.
-;               processStore's resolveFieldOffset returns nullopt and flips
-;               Eligible to false; commit() drops the effects and stamps
-;               AlwaysEscapes.
+;               processStore's resolveFieldOffset returns nullopt, so the
+;               object materializes AT the store (Materialize effect survives,
+;               OrigAlloc kept) and is stamped PartiallyEscapes.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare i32 @__gxx_personality_v0(...)
@@ -70,8 +73,8 @@ entry:
             ptr inttoptr (i64 33333 to ptr), i32 16)
          to label %n unwind label %u
 n:
-  ; runtime byte offset -> resolveFieldOffset bails -> Eligible=false ->
-  ; commit() stamps AlwaysEscapes.
+  ; runtime byte offset -> resolveFieldOffset bails -> materialize at the
+  ; store -> commit() stamps PartiallyEscapes.
   %slot = getelementptr inbounds i8, ptr addrspace(1) %obj, i64 %dyn_off
   store atomic i32 1, ptr addrspace(1) %slot unordered, align 4
   ret void
@@ -82,6 +85,6 @@ u:
 
 ; CHECK-DAG: ;; PEA stats @t_never: NeverEscapes=1 PartiallyEscapes=0 AlwaysEscapes=0
 ; CHECK-DAG: ;; PEA stats @t_partial: NeverEscapes=0 PartiallyEscapes=1 AlwaysEscapes=0
-; CHECK-DAG: ;; PEA stats @t_always: NeverEscapes=0 PartiallyEscapes=0 AlwaysEscapes=1
+; CHECK-DAG: ;; PEA stats @t_always: NeverEscapes=0 PartiallyEscapes=1 AlwaysEscapes=0
 
 !java-method-compilation = !{}
