@@ -1,0 +1,3 @@
+# int[] virtual — ElementBasicTypeOfArrayKlass(12345) returns JBasicType::Int (4).
+RequiresStrictLockOrder = 1
+ElementBasicTypeOfArrayKlass 12345 = 4

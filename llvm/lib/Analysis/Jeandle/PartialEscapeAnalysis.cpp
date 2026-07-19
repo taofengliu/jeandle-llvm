@@ -3931,6 +3931,12 @@ bool Analyzer::processStore(StoreInst *SI) {
   // store itself stays as a real store (no EliminateStoreEffect is
   // emitted); returning true keeps processInstruction from re-running the
   // gate on it.
+  // TODO(resolve-cap-blind-spot): if the stored value is virtual-derived
+  // but resolveVirtualRef fails STRUCTURALLY (depth cap, opaque
+  // non-round-trip inttoptr), the store survives with an unaccounted
+  // virtual operand that can still classify NeverEscapes -> poison. This
+  // blind spot predates materialize-at-store (the old markIneligible code
+  // had the same guarded resolve) and is inherited, not introduced.
   auto materializeOperandsAtStore = [&] {
     materializeAt(*BaseID, SI, MatReason::Unhandled);
     if (auto RefID =
@@ -3971,7 +3977,11 @@ bool Analyzer::processStore(StoreInst *SI) {
     // Only a value denoting the WHOLE inner object (constant byte offset 0
     // on every path — checked recursively through Select arms and PHI
     // incomings) may be recorded as a VirtualRef; anything else leaves the
-    // store in place and materializes both objects at the store.
+    // store in place and materializes both objects at the store. (A
+    // successful getOrCreateFieldIndex above may have inserted a FieldDesc
+    // before this point — inert, because the object is materialized
+    // immediately and never virtualized again: replay is FieldStates-keyed,
+    // not FieldDesc-keyed.)
     if (!jeandle::pea::isWholeObjectReference(Val, DL)) {
       materializeOperandsAtStore();
       return true;
@@ -4016,9 +4026,9 @@ void Analyzer::processLoad(LoadInst *LI) {
 
   // Array length load (e.g. a bounds check): the length lives in the array
   // header at ArrayLengthOffset, which resolveAccess's header guard rejects as
-  // a non-Java-field offset, so the load would otherwise hit markIneligible and
-  // drop the whole array's virtualization (every array access has a bounds
-  // check, so without this fold no array could ever stay virtual). Fold the
+  // a non-Java-field offset, so the load would otherwise materialize the whole
+  // array at the load (every array access has a bounds check, so without this
+  // fold no array could stay virtual across a bounds check). Fold the
   // length load to the known ArrayLength constant. Sound even if the array
   // later materializes: a materialized array is allocated with exactly
   // ArrayLength elements, so the constant matches the real header length.
@@ -4044,7 +4054,12 @@ void Analyzer::processLoad(LoadInst *LI) {
   // resolver + header guard). See resolveAccess.
   std::optional<int64_t> Offset = resolveAccess(Ptr, *BaseID);
   if (!Offset) {
-    markIneligible(*BaseID);
+    // Unresolvable offset (symbolic array index, non-constant GEP, header):
+    // the load cannot be tracked. Materialize the base AT the load (Graal
+    // processNodeInputs): tracked stores are replayed onto OrigAlloc right
+    // before LI, and OrigAlloc is kept (PartiallyEscapes), so the derived
+    // address stays valid. The load survives as a real load.
+    materializeAt(*BaseID, LI, MatReason::Unhandled);
     return;
   }
 
@@ -4059,10 +4074,11 @@ void Analyzer::processLoad(LoadInst *LI) {
   // same offset, proceed to coerceToType.
   uint64_t LoadBits = LoadTy->isSized() ? DL.getTypeSizeInBits(LoadTy) : 0;
   // Unknown-size (unsized type) or oversized load (does not fit the uint8_t
-  // field-width model — same guard as getOrCreateFieldIndex): keep the object
-  // real rather than mis-model the access.
+  // field-width model — same guard as getOrCreateFieldIndex): cannot be
+  // modelled — materialize the base at the load rather than mis-model the
+  // access.
   if (LoadBits == 0 || (LoadBits + 7) / 8 > 255) {
-    markIneligible(*BaseID);
+    materializeAt(*BaseID, LI, MatReason::Unhandled);
     return;
   }
   uint8_t LoadByteSize = static_cast<uint8_t>((LoadBits + 7) / 8);
@@ -4087,8 +4103,8 @@ void Analyzer::processLoad(LoadInst *LI) {
   }
   if (OverlapsNoncontained) {
     // TODO(unsafe-inliner): see the access dispatch (processStore/processLoad).
-    // Any straddling load conservatively forces materialization.
-    markIneligible(*BaseID);
+    // Any straddling load conservatively forces materialization at the load.
+    materializeAt(*BaseID, LI, MatReason::Unhandled);
     return;
   }
 
@@ -4131,7 +4147,7 @@ void Analyzer::processLoad(LoadInst *LI) {
   // (see WithinSlotByteOff above). Force the object to materialize so the
   // original load survives in IR.
   if (WithinSlotByteOff != 0) {
-    markIneligible(*BaseID);
+    materializeAt(*BaseID, LI, MatReason::Unhandled);
     return;
   }
 
@@ -4139,11 +4155,13 @@ void Analyzer::processLoad(LoadInst *LI) {
     Value *V = Existing->getScalar();
     // Coerce to LoadTy: same-type passthrough or same-bit-width primitive↔
     // primitive reinterpret (bitcast). Pointer↔primitive, cross-AS pointer
-    // pairs, and any cross-width mismatch (narrowing/widening) bail to
-    // ineligible per the stable-slot-kind and width policies.
+    // pairs, and any cross-width mismatch (narrowing/widening) cannot be
+    // folded: a kind/width-mismatched load materializes the object at the
+    // load (Graal: a kind mismatch in loadVirtualEntry also leads to
+    // materialization), keeping the tracked slot's stable kind/width intact.
     Value *Coerced = coerceToType(V, LoadTy, LI);
     if (!Coerced) {
-      markIneligible(*BaseID);
+      materializeAt(*BaseID, LI, MatReason::Unhandled);
       return;
     }
     auto E = std::make_unique<jeandle::ReplaceLoadEffect>();
@@ -4221,13 +4239,14 @@ void Analyzer::processLoad(LoadInst *LI) {
 
     // Type-compatibility. For ordinary reference loads, both LoadTy and the
     // inner allocation are `ptr addrspace(1)` and coerceToType returns Repl
-    // unchanged. Cross-address-space or ptr↔primitive mismatch bails per the
-    // stable-slot-kind invariant. (Sub-slot pointer loads were already rejected
-    // by the WithinSlotByteOff bail above.) We don't poison InnerID because
-    // other paths may still be able to virtualize it.
+    // unchanged. Cross-address-space or ptr↔primitive mismatch materializes
+    // the outer at the load (stable-slot-kind invariant). (Sub-slot pointer
+    // loads were already rejected by the WithinSlotByteOff bail above.) We
+    // don't poison InnerID because other paths may still be able to
+    // virtualize it.
     Value *Coerced = coerceToType(Repl, LoadTy, LI);
     if (!Coerced) {
-      markIneligible(*BaseID);
+      materializeAt(*BaseID, LI, MatReason::Unhandled);
       return;
     }
 
@@ -4261,12 +4280,13 @@ void Analyzer::processLoad(LoadInst *LI) {
     }
     // A materialized ref slot can only be loaded back as a pointer (and in
     // practice, since LLVM 17 uses opaque pointers, only as the same
-    // ptr-AS). coerceToType bails on ptr↔primitive (stable-slot-kind) and
-    // cross-AS pointer pairs. (Partial pointer loads were already rejected by
-    // the WithinSlotByteOff bail above.)
+    // ptr-AS). coerceToType fails on ptr↔primitive (stable-slot-kind) and
+    // cross-AS pointer pairs — materialize at the load in that case.
+    // (Partial pointer loads were already rejected by the WithinSlotByteOff
+    // bail above.)
     Value *Coerced = coerceToType(V, LoadTy, LI);
     if (!Coerced) {
-      markIneligible(*BaseID);
+      materializeAt(*BaseID, LI, MatReason::Unhandled);
       return;
     }
     auto E = std::make_unique<jeandle::ReplaceLoadEffect>();
@@ -6107,10 +6127,14 @@ void Analyzer::commit() {
   //      write (processStore, synthesizeCaseC) into the append-only
   //      VirtualRefEdges member — the pre-fix walk over the per-block live
   //      FieldStates only ever saw the LAST processed block's edges. This is
-  //      the complete backstop for objects made ineligible by NON-store paths
-  //      (unbalanced locking at a function exit, merge hazards, the
-  //      availability sweep, the deopt cascade): store-time hazards instead
-  //      materialize at the store (processStore), which recursively
+  //      the complete backstop for objects made ineligible by NON-store
+  //      paths — e.g. unbalanced locking at a function exit, merge hazards,
+  //      the availability sweep, the deopt cascade, and the defensive /
+  //      consistency bails (the processLoad inner-ineligible /
+  //      ObjectState-missing / unparented-Repl / null-MaterializedRef guards
+  //      and the foldICmpEquality symbolic-offset bail): store-time hazards
+  //      instead materialize at the store (processStore), and untrackable
+  //      loads materialize at the load (processLoad), which recursively
   //      materializes nested VirtualRefs and needs no commit-time help. It
   //      catches VirtualRefs recorded at ANY point — before the object was
   //      markIneligible'd AND after (recorded because processStore does not
