@@ -2,9 +2,12 @@
 
 ; Derived-pointer VO reference inside an allocation invoke's deopt bundle
 ; (review §3 #10 companion): %g = gep(%a, 8) is a DERIVED bundle operand —
-; undescribable. materializeVirtualOperandsSafely at the allocation keeps
-; %a fully real (markVirtualOperandsIneligible), so the GEP and the bundle
-; slot stay valid. Companion of 475 (describable case).
+; undescribable, so recordDeoptBundleMappings records nothing and the
+; allocation's own deopt path materializes %a at the %b invoke (Graal
+; processNodeInputs). Under reuse-OrigAlloc OrigAlloc dominates the
+; pre-computed GEP, so the GEP and the bundle slot stay valid; %a tracks no
+; stores, so there is nothing to replay and the IR is unchanged. Companion
+; of 475 (describable case).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -29,8 +32,9 @@ u:
   resume i64 %lp
 }
 
-; %a is kept real (undescribable derived operand): its invoke, the GEP, and
-; the bundle slot all survive verbatim. No descriptor, no poison.
+; %a materializes at the %b invoke (PartiallyEscapes; undescribable derived
+; operand): its invoke, the GEP, and the bundle slot all survive verbatim.
+; No descriptor, no poison.
 ; CHECK-LABEL: define void @derived_in_alloc_bundle(
 ; CHECK: %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
 ; CHECK: %g = getelementptr inbounds i8, ptr addrspace(1) %a, i64 8

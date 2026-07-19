@@ -2,11 +2,13 @@
 
 ; Select of symbolic-offset derived GEPs into a virtual object. %g1 and %g2 are
 ; gep %o, %idx where %idx is a non-constant SSA value, so resolveFieldOffset
-; returns nullopt. The arms are derived pointers computed before any
-; materialize point, so PEA keeps %o real (markIneligible) rather than
-; materializing at the select, which would poison the arms. The object
-; survives, the select/load survive reading the real address, and the load is
-; NOT folded to the field@0 value 7.
+; returns nullopt and the select is NOT alias-forwarded. The generic escape
+; path materializes %o at the select (Graal processNodeInputs): under
+; reuse-OrigAlloc OrigAlloc dominates the pre-computed arms, so they stay
+; valid. The object survives (PartiallyEscapes) with its tracked store (7 at
+; offset 0) replayed via pea.matslot before the select, the select/load
+; survive reading the real address, and the load is NOT folded to the
+; field@0 value 7 (a symbolic-offset access is untrackable).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)

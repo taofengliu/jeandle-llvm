@@ -5481,8 +5481,8 @@ void Analyzer::collectDistinctVirtualOperands(
   // Walk every operand of I, skipping described "deopt" operand-bundle inputs
   // (Graal addVirtualMapping: a deopt-state reference is NOT an escape), and
   // collect each distinct virtual ObjectID resolved via resolveVirtualRef.
-  // Deterministic order is required by both callers (effect emission order +
-  // cascade invariant), so callers receive a sorted vector.
+  // Deterministic order is required by the caller (effect emission order),
+  // so it receives a sorted vector.
   DenseSet<jeandle::ObjectID> Seen;
   for (Use &U : I->operands()) {
     Value *V = U.get();
