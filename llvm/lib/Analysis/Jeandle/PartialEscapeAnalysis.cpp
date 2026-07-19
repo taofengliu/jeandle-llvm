@@ -6135,9 +6135,11 @@ void Analyzer::commit() {
   //      ObjectState-missing / unparented-Repl / null-MaterializedRef
   //      guards): store-time hazards materialize at the store
   //      (processStore), untrackable loads materialize at the load
-  //      (processLoad), and symbolic-offset icmps materialize at the icmp
-  //      (foldICmpEquality), each of which recursively materializes nested
-  //      VirtualRefs and needs no commit-time help. It
+  //      (processLoad), symbolic-offset icmps materialize at the icmp
+  //      (foldICmpEquality), and every other virtual operand is materialized
+  //      at its use by the generic gate (materializeAllVirtualOperands /
+  //      materializeVirtualCallArgs) — each of which recursively
+  //      materializes nested VirtualRefs and needs no commit-time help. It
   //      catches VirtualRefs recorded at ANY point — before the object was
   //      markIneligible'd AND after (recorded because processStore does not
   //      check Eligible). Graal has no analog: it

@@ -3,10 +3,11 @@
 ; Equality icmp of two symbolic-offset derived GEPs of the SAME virtual object.
 ; %g1 = gep %o, %s1; %g2 = gep %o, %s2. Both offsets are non-constant, so
 ; resolveFieldOffset returns nullopt and the icmp can't be folded (the
-; addresses can't be proven equal or distinct). The derived GEPs are computed
-; before any materialize point, so PEA keeps %o real (markIneligible) rather
-; than materializing at the icmp, which would poison both operands. The icmp
-; survives as a real compare over two valid pointers.
+; addresses can't be proven equal or distinct). The object materializes AT the
+; icmp (Graal processNodeInputs): under reuse-OrigAlloc the materialized value
+; IS OrigAlloc, which dominates both GEPs and is kept alive (PartiallyEscapes),
+; so both derived operands stay valid. The icmp survives as a real compare over
+; two valid pointers.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i1)

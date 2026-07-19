@@ -2,10 +2,11 @@
 
 ; Symbolic-offset derived GEP in an equality icmp. %g = gep %o, %sym where %sym
 ; is a non-constant SSA value, so resolveFieldOffset returns nullopt. The icmp
-; can't be folded (the offset can't be proven equal or distinct to 0), and the
-; derived GEP %g is computed before any materialize point, so PEA keeps %o real
-; (markIneligible) instead of materializing at the icmp (which would poison
-; %g). The icmp survives as a real compare over two valid pointers.
+; can't be folded (the offset can't be proven equal or distinct to 0), so the
+; object materializes AT the icmp (Graal processNodeInputs): under
+; reuse-OrigAlloc the materialized value IS OrigAlloc, which dominates %g and
+; is kept alive (PartiallyEscapes), so the derived GEP stays valid. The icmp
+; survives as a real compare over two valid pointers.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i1)
