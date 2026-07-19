@@ -92,8 +92,8 @@ static ResolveResult resolveArrayLength(Value *V, const DataLayout &DL,
   // derived pointer into the middle of an array is not the array.
   int64_t Offset = 0;
   bool NonConstant = false;
-  Value *Root = jeandle::pea::stripPointerCastsAndOffsets(V, DL, &Offset,
-                                                          &NonConstant);
+  Value *Root =
+      jeandle::pea::stripPointerCastsAndOffsets(V, DL, &Offset, &NonConstant);
   if (NonConstant || Offset != 0 || !Root)
     return {ResolveKind::Conflict, nullptr};
 
@@ -168,8 +168,7 @@ PreservedAnalyses JavaOpLengthFolding::run(Function &F,
   for (BasicBlock &BB : F) {
     for (Instruction &I : BB) {
       auto *CB = dyn_cast<CallBase>(&I);
-      if (!CB || !jeandle::pea::isJeandleArrayLength(CB) ||
-          CB->arg_size() != 1)
+      if (!CB || !jeandle::pea::isJeandleArrayLength(CB) || CB->arg_size() != 1)
         continue;
       // Only plain calls and invokes are foldable forms; anything more
       // exotic (callbr, ...) is left untouched.

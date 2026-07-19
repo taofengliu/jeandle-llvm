@@ -11,36 +11,35 @@
 #include "llvm/Jeandle/Pipeline.h"
 #include "llvm/Analysis/Jeandle/PartialEscapeAnalysis.h"
 #include "llvm/IR/PassManager.h"
-#include "llvm/Transforms/InstCombine/InstCombine.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Jeandle/CHADevirtualization.h"
 #include "llvm/Transforms/Jeandle/ConstantFieldFolding.h"
 #include "llvm/Transforms/Jeandle/ExpandNarrowOopCast.h"
 #include "llvm/Transforms/Jeandle/InsertGCBarriers.h"
+#include "llvm/Transforms/Jeandle/JavaOpLengthFolding.h"
 #include "llvm/Transforms/Jeandle/JavaOperationDeletion.h"
 #include "llvm/Transforms/Jeandle/JavaOperationLower.h"
-#include "llvm/Transforms/Jeandle/PartialEscapeIterative.h"
-#include "llvm/Transforms/Jeandle/PartialEscapeTransform.h"
 #include "llvm/Transforms/Jeandle/JeandleInliner.h"
 #include "llvm/Transforms/Jeandle/JeandleNarrowOopMarker.h"
-#include "llvm/Transforms/Jeandle/JavaOpLengthFolding.h"
+#include "llvm/Transforms/Jeandle/PartialEscapeIterative.h"
+#include "llvm/Transforms/Jeandle/PartialEscapeTransform.h"
 #include "llvm/Transforms/Jeandle/RepeatedConstantFolding.h"
 #include "llvm/Transforms/Jeandle/TLSPointerRewrite.h"
 #include "llvm/Transforms/Jeandle/TypeCheckElimination.h"
 #include "llvm/Transforms/Scalar/ADCE.h"
+#include "llvm/Transforms/Scalar/EarlyCSE.h"
 #include "llvm/Transforms/Scalar/GVN.h"
 #include "llvm/Transforms/Scalar/IndVarSimplify.h"
+#include "llvm/Transforms/Scalar/InstSimplifyPass.h"
 #include "llvm/Transforms/Scalar/LoopDeletion.h"
 #include "llvm/Transforms/Scalar/LoopPassManager.h"
 #include "llvm/Transforms/Scalar/LoopRotation.h"
 #include "llvm/Transforms/Scalar/LoopUnrollPass.h"
-#include "llvm/Transforms/Scalar/SimpleLoopUnswitch.h"
-#include "llvm/Transforms/Utils/LoopSimplify.h"
-#include "llvm/Transforms/Scalar/EarlyCSE.h"
-#include "llvm/Transforms/Scalar/InstSimplifyPass.h"
 #include "llvm/Transforms/Scalar/RewriteStatepointsForGC.h"
+#include "llvm/Transforms/Scalar/SimpleLoopUnswitch.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
-#include "llvm/Support/CommandLine.h"
+#include "llvm/Transforms/Utils/LoopSimplify.h"
 
 namespace llvm::jeandle {
 
@@ -141,13 +140,12 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
     // runtime, and upper-bound unrolling are disabled; peeling stays at the
     // default policy (it peels a few iterations off loops that resist full
     // unrolling, exposing straight-line allocations to PEA).
-    PrePEAHighTier.addPass(
-        LoopUnrollPass(LoopUnrollOptions(/*OptLevel=*/3)
-                           .setPartial(false)
-                           .setRuntime(false)
-                           .setUpperBound(false)
-                           .setFullUnrollMaxCount(
-                               JeandlePrePEAFullUnrollMaxCount)));
+    PrePEAHighTier.addPass(LoopUnrollPass(
+        LoopUnrollOptions(/*OptLevel=*/3)
+            .setPartial(false)
+            .setRuntime(false)
+            .setUpperBound(false)
+            .setFullUnrollMaxCount(JeandlePrePEAFullUnrollMaxCount)));
     PrePEAHighTier.addPass(createFunctionToLoopPassAdaptor(
         SimpleLoopUnswitchPass(/*NonTrivial=*/true)));
     PrePEAHighTier.addPass(InstCombinePass());
