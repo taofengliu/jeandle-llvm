@@ -111,6 +111,22 @@ bool isWholeObjectReference(Value *V, const DataLayout &DL);
 // IR, not only frontend-produced bundles).
 std::optional<unsigned> findInnermostDeoptScopeBCIPairStart(const CallBase &CB);
 
+/// Returns the start index of the FIRST (root) scope's duplicated-BCI pair in
+/// the "deopt" operand bundle of CB, or std::nullopt if the bundle is missing
+/// or carries no adjacent equal-i32 pair. A bundle is laid out as
+/// [root scope][inlinee scope]... and every scope begins with a duplicated
+/// BCI marker (two adjacent equal i32 constants). The marker is always
+/// immediately preceded by at least one i64 (the should_reexecute slot; an
+/// inlinee scope additionally carries its MethodType pair), and every i32
+/// slot VALUE is always followed by an i64 encoding — so an adjacent
+/// equal-i32 pair can only ever be a scope's BCI marker, and the FIRST one
+/// anchors the root scope. PEA places ALL VO descriptors into the root
+/// scope's VO section (the deopt-point-level object pool — C2's
+/// dump_object_pool-before-scope-values analog), so this finder (not the
+/// innermost one) anchors the descriptor insert position. Graceful: returns
+/// std::nullopt on malformed bundles so callers can bail conservatively.
+std::optional<unsigned> findFirstDeoptScopeBCIPairStart(const CallBase &CB);
+
 // Returns the klass pointer (as uintptr_t) attached to the allocation call's
 // klass argument, or 0 if not statically known.  Wraps
 // jeandle::extractKlassConstant for the allocation-specific operand index.

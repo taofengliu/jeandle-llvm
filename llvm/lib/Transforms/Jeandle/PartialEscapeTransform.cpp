@@ -719,9 +719,12 @@ void jeandle::RewriteDeoptBundleEffect::apply(jeandle::TransformContext &Ctx) {
     }
   }
 
-  // The VO descriptor section sits AFTER the duplicated-BCI marker and BEFORE
-  // the locals section. Anything before InsertPos (prefix + BCI pair) is
-  // preserved verbatim.
+  // The VO descriptor section sits in the ROOT (outermost) scope, AFTER the
+  // FIRST duplicated-BCI marker and BEFORE the root scope's locals section —
+  // the deopt-point-level object pool (see getDeoptScopeVOInsertPos).
+  // Anything before InsertPos (the root scope's header) is preserved
+  // verbatim; everything from InsertPos on — ALL scopes' locals/stack/monitor
+  // sections — is scanned for slots to rewrite.
   unsigned InsertPos = getDeoptScopeVOInsertPos(*CB);
 
   // A bundle operand denotes this VO iff it is the OrigAlloc OR one of the

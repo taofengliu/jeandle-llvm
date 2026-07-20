@@ -79,11 +79,13 @@ void appendVirtualObjectDescriptor(SmallVectorImpl<Value *> &Args,
                                    ArrayRef<VODescriptorField> Fields);
 
 /// Returns the operand index immediately AFTER the duplicated-BCI pair of the
-/// current (innermost) "deopt" scope on \p CB. A VO descriptor section is
-/// placed at this position — AFTER the duplicated-BCI marker and BEFORE the
-/// locals section — so every VO is described before any slot references it
-/// (mirrors C2 dumping its object pool first). \p CB must carry a well-formed
-/// "deopt" bundle (the same precondition createPreCallDeoptBundle relies on).
+/// FIRST (root/outermost) "deopt" scope on \p CB. The VO descriptor section
+/// is placed at this position — AFTER the root scope's duplicated-BCI marker
+/// and BEFORE the root locals — and serves as the deopt-point-level object
+/// pool: every VO is described before any VORef slot in ANY scope references
+/// it (mirrors C2's dump_object_pool before create_scope_values). \p CB must
+/// carry a well-formed "deopt" bundle (the same precondition
+/// createPreCallDeoptBundle relies on).
 unsigned getDeoptScopeVOInsertPos(const CallBase &CB);
 
 /// Emits an llvm.experimental.deoptimize and terminates the current block.

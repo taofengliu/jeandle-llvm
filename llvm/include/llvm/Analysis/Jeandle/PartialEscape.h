@@ -733,9 +733,16 @@ public:
 // virtual object referenced in the bundle (and still virtual at the safepoint)
 // is described by a VO descriptor (ScalarValueType header + klass + per-offset
 // field values) and the bundle slot that held OrigAlloc becomes a VORefType
-// reference. Non-cfgKill (Pass 1). A field whose value is ANOTHER in-scope VO
-// is emitted as a VORef FIELD (vo-id) so the descriptor graph can be cyclic /
-// transitive (mirrors C2/Graal nested ObjectValue + id back-ref). Scope of
+// reference. Non-cfgKill (Pass 1). ALL descriptors of a deopt point are
+// placed in the ROOT (outermost) scope's VO section — the deopt-point-level
+// object pool (C2's dump_object_pool-before-scope-values analog) — and a
+// bundle slot in ANY scope (locals/stack of an outer or inner scope, or an
+// outer-scope monitor owner) is rewritten to a VORef by vo-id; the HotSpot
+// parser resolves VORefs through a record-level vo_map populated from the
+// root scope's VO section, which always precedes any reference. A field
+// whose value is ANOTHER in-scope VO is emitted as a VORef FIELD (vo-id) so
+// the descriptor graph can be cyclic / transitive (mirrors C2/Graal nested
+// ObjectValue + id back-ref). Scope of
 // the current implementation: instance objects AND arrays (whose element kind
 // the VMCallback could classify — ArrayElementType != nullptr &&
 // ArrayIndexScale != 0), not synthetic, referenced as the OrigAlloc (not a
@@ -760,9 +767,6 @@ public:
 //     TODO(compressed-oop));
 //   - a non-null constant oop field (would trip HotSpot
 //     fill_one_scope_value);
-//   - multi-scope/inlinee deopt bundles: the flat Inputs walk does not
-//     split by scope today (see docs/Jeandle-PEA-Review.md §3 #7 for the
-//     residual soundness gap, deferred).
 //
 // Graal analog: addVirtualMapping (PartialEscapeClosure.java) records a
 // FrameState's reference to a still-virtual object as a virtual mapping

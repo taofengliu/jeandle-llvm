@@ -150,20 +150,26 @@ public:
     //            HotSpot relock_objects leaves it alone.
     //   index=1  PEA-ELIMINATED lock on a VIRTUAL object. `object` is the owner
     //            VO's vo-id as an i32 CONSTANT (NOT a live oop) — the parser
-    //            resolves it through vo_map to the owner's ObjectValue*, and
-    //            builds the MonitorValue with eliminated=true so relock_objects
-    //            re-acquires the monitor on the realloc'd owner (C2/Graal
-    //            MonitorValue{owner=ObjectValue, eliminated=true} analog). The
-    //            basic_lock slot is preserved verbatim;
+    //            resolves it through the record-level vo_map (descriptors live
+    //            in the root scope's VO section) to the owner's ObjectValue*,
+    //            and builds the MonitorValue with eliminated=true so
+    //            relock_objects re-acquires the monitor on the realloc'd owner
+    //            (C2/Graal MonitorValue{owner=ObjectValue, eliminated=true}
+    //            analog). The basic_lock slot is preserved verbatim;
     //            ObjectSynchronizer::enter initializes it. The PEA transform
     //            emits this form (RewriteDeoptBundleEffect).
     MonitorType = 3,
     // ScalarValueType encodes a PEA virtual-object (VO) descriptor inside a
     // "deopt" operand bundle so HotSpot can reallocate the object at deopt
-    // (C2/Graal scalar-replacement analog). It is emitted once per in-scope VO
-    // in a per-scope VO section placed AFTER the duplicated-BCI marker and
-    // BEFORE locals (so every VO is described before any slot references it,
-    // avoiding forward references — mirrors C2 dumping its object pool first).
+    // (C2/Graal scalar-replacement analog). It is emitted ONCE PER VO PER
+    // DEOPT POINT. ALL descriptors of a deopt point are placed in the ROOT
+    // (outermost) scope's VO section — right AFTER the root's duplicated-BCI
+    // marker and BEFORE the root locals — which serves as the deopt-point-
+    // level object pool: every descriptor precedes any VORef that references
+    // it (the HotSpot parser walks scopes outermost-first and resolves
+    // VORefs through a record-level vo_map), mirroring C2's dump_object_pool
+    // before create_scope_values and Graal/JVMCI's per-DebugInfo
+    // VirtualObject[] pool.
     //
     // On the wire, a ScalarValueType entry is the header of a multi-location
     // sequence read by the HotSpot parser:
@@ -178,7 +184,8 @@ public:
     //   [field N-1]    ;   value may itself be a VORef referencing another VO
     //                   ;   (cycle/transitive closure) or a live materialized
     //                   ;   oop (OrigAlloc).
-    // A field whose value is ANOTHER in-scope VO is encoded as a VORef FIELD:
+    // A field whose value is ANOTHER VO in this deopt point is encoded as a
+    // VORef FIELD:
     //   [field_enc]    DeoptValueEncoding(offset, VORefLocalType, T_OBJECT)
     //   [field_value]  i32 constant = the referenced VO's vo-id
     // The parser consumes (3 + 2*field_count) locations for one descriptor.
@@ -195,7 +202,8 @@ public:
     NarrowOopMarkerType = 7,
     // VORefLocalType / VORefStackType mark a locals / stack slot that holds a
     // VO already described by a ScalarValueType descriptor earlier in this
-    // scope. The trailing location is the i32 vo_id; the slot's ScopeValue is
+    // deopt point (all descriptors live in the root scope's VO section). The
+    // trailing location is the i32 vo_id; the slot's ScopeValue is
     // the ObjectValue built from that descriptor. TWO distinct types (not one
     // VORefType) so the HotSpot parser can route the slot to the correct
     // interpreter array (locals vs expression stack) — the parser routes every

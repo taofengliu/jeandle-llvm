@@ -1083,13 +1083,17 @@ private:
   // recorded as a virtual mapping (re-emitted as an ObjectValue at deopt),
   // NOT an escape. The generic escape path (materializeAllVirtualOperands)
   // consults DeoptBundleHandled to skip the handled deopt-bundle operands so
-  // the bundle alone does not force a materialization. Out-of-scope shapes
-  // (derived bundle operand, array of unknown element kind, narrow-oop
-  // (addrspace-3) reference field, non-null constant oop field,
-  // multi-scope/inlinee bundles — TODO) are conservatively left unrecorded so
-  // they fall through to the existing escape/materialization behavior; a VO
-  // referencing such an undescribable VO is itself contagiously bailed
-  // (greatest-fixpoint, no dangling VORef).
+  // the bundle alone does not force a materialization. Roots are collected
+  // across ALL scopes of the bundle (outer-scope locals/stack slots and
+  // monitor owners included); all descriptors are emitted into the root
+  // scope's VO section, the record-level (whole-deopt-point) object pool —
+  // C2's dump_object_pool-before-scope-values analog (see the MULTI-SCOPE
+  // comment in the implementation). Out-of-scope shapes (derived bundle
+  // operand, array of unknown element kind, narrow-oop (addrspace-3)
+  // reference field, non-null constant oop field) are conservatively left
+  // unrecorded so they fall through to the existing escape/materialization
+  // behavior; a VO referencing such an undescribable VO is itself
+  // contagiously bailed (greatest-fixpoint, no dangling VORef).
   void recordDeoptBundleMappings(CallBase *CB);
   // True iff \p U is an input of I's "deopt" operand bundle whose resolved
   // ObjectID was recorded as a scoped virtual mapping at this instruction
@@ -5098,7 +5102,9 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
   // described) are clean falls-through; long/double fields are described (one
   // wire entry, expanded to two slots on the parse side); arrays of known
   // element kind are described with a T_ARRAY header and all elements emitted;
-  // multi-scope/inlinee bundles remain TODO.
+  // roots are collected across ALL scopes of the bundle — outer-scope
+  // references are described like inner ones (see the MULTI-SCOPE comment at
+  // Step 1 below).
 
   // Per-cell plan: a touched field/element is either a plain scalar, a VORef to
   // another in-scope VO (by id), or Bad (this VO cannot be described). For an
@@ -5317,23 +5323,32 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
   // order) so the SeqNo assignment — and thus the transform's descriptor emit
   // order — is deterministic.
   //
-  // MULTI-SCOPE GUARD (review §3 #7): the bundle is [root scope][inlinee
-  // scope]... with the innermost (current-method) scope LAST, and both the
-  // transform's slot scan/rewrite AND the JDK parser's vo_map are per-scope —
-  // today only the INNERMOST scope is supported on both sides. A VO with ANY
-  // reference outside the innermost scope (an outer-scope local/stack slot,
-  // or an outer-scope monitor owner) must NOT be treated as handled: it is
-  // banned here, which excludes it from DeoptBundleHandled so the generic
-  // escape path materializes it at the call — the live OrigAlloc oop is a
-  // valid value in EVERY scope. (Per-scope descriptors across inlinee scopes
-  // are the long-term fix; TODO(multi-scope-descriptors).) When the scope
-  // boundary itself cannot be computed (malformed bundle — never the case
-  // for frontend IR, but PEA must not crash on arbitrary IR), bail the whole
-  // recording: DeoptBundleHandled stays empty and every virtual bundle
-  // operand is materialized by the generic path.
-  std::optional<unsigned> InnermostScopeStart =
-      jeandle::pea::findInnermostDeoptScopeBCIPairStart(*CB);
-  if (!InnermostScopeStart)
+  // MULTI-SCOPE (root-scope pool): the bundle is [root scope][inlinee
+  // scope]... with the innermost (current-method) scope LAST. ALL VO
+  // descriptors are emitted into the ROOT scope's VO section (right after the
+  // FIRST duplicated-BCI pair), which serves as the deopt-point-level object
+  // pool — mirrors C2 dumping its object pool before the scope values
+  // (dump_object_pool before create_scope_values) and Graal/JVMCI's
+  // per-DebugInfo VirtualObject[] pool. Roots are therefore collected across
+  // the WHOLE bundle: a VO referenced from ANY scope — an outer-scope
+  // locals/stack slot or an outer-scope monitor owner — is describable, and
+  // the transform rewrites every such slot in place to a VORef by vo-id. The
+  // JDK parser resolves every VORef through a record-level (whole-deopt-
+  // point) vo_map populated from the root scope's VO section, which always
+  // precedes any reference. (Scope headers — the i64 should_reexecute, the
+  // BCI pair, the inlinee MethodType pair — hold only integer constants, so
+  // no header operand can resolve to a virtual ref and no per-scope boundary
+  // tracking is needed on this scan.) When the root scope boundary cannot be
+  // computed (malformed bundle — never the case for frontend IR, but PEA must
+  // not crash on arbitrary IR), bail the whole recording: DeoptBundleHandled
+  // stays empty and every virtual bundle operand is materialized by the
+  // generic path.
+  // (The position value itself is not needed — the slot-rewrite scan covers
+  // the whole bundle; the finder is used here only as a malformed-bundle
+  // probe.)
+  std::optional<unsigned> RootScopeStart =
+      jeandle::pea::findFirstDeoptScopeBCIPairStart(*CB);
+  if (!RootScopeStart)
     return;
   SmallVector<jeandle::ObjectID, 4> Roots;
   DenseSet<jeandle::ObjectID> RootSeen;
@@ -5353,13 +5368,6 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
     if (!isVirtualHere(*ID))
       continue;
     jeandle::VirtualObject &VObj = *Result.VirtualObjects[*ID];
-    // A reference outside the innermost scope cannot be rewritten by the
-    // transform and cannot be resolved by the per-scope vo_map — keep the VO
-    // real instead of describing it (see the guard comment above).
-    if (OpIdx < *InnermostScopeStart) {
-      Banned.insert(*ID);
-      continue;
-    }
     // V is a describable root iff it is the VO's OrigAlloc OR an alias-map
     // virtual-alias entry for this VO denoting the WHOLE object (object
     // identity, e.g. the result of a load-through-virtual-ref folded by

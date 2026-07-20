@@ -41,10 +41,13 @@ struct DeoptScopeInfo {
 
 DeoptScopeInfo findCurrentDeoptScope(const CallBase &CB) {
   // Built on the shared graceful finder (jeandle::pea::
-  // findInnermostDeoptScopeBCIPairStart, which PEA's analysis side also
-  // uses). The transform side keeps the hard failure: every Jeandle
-  // frontend path that reaches these transforms upholds the well-formed-
-  // bundle invariant, so a malformed bundle here is a genuine bug.
+  // findInnermostDeoptScopeBCIPairStart). The innermost variant is now used
+  // only by this file's computeDeoptStackLayout — PEA's analysis side and
+  // getDeoptScopeVOInsertPos anchor on the FIRST (root) scope via
+  // findFirstDeoptScopeBCIPairStart instead. The transform side keeps the
+  // hard failure: every Jeandle frontend path that reaches these transforms
+  // upholds the well-formed-bundle invariant, so a malformed bundle here is
+  // a genuine bug.
   // TODO(robustness): thread std::optional<DeoptScopeInfo> through
   // getDeoptScopeVOInsertPos + computeDeoptStackLayout and their callers
   // instead; deferred as it is not cheap.
@@ -265,12 +268,24 @@ void appendVirtualObjectDescriptor(SmallVectorImpl<Value *> &Args,
 }
 
 unsigned getDeoptScopeVOInsertPos(const CallBase &CB) {
-  // The VO section sits AFTER the duplicated-BCI marker of the current scope
-  // and BEFORE its locals section. findCurrentDeoptScope returns the index of
-  // the first BCI of the innermost adjacent-equal i32 pair; the insert
-  // position is immediately past the pair (BCIPairStart + 2). Mirrors the
-  // layout assumed by createPreCallDeoptBundle / computeDeoptStackLayout.
-  return findCurrentDeoptScope(CB).BCIPairStart + 2;
+  // The VO section is the deopt-point-level object pool: it sits in the ROOT
+  // (outermost) scope, right AFTER the FIRST duplicated-BCI marker and BEFORE
+  // the root scope's locals, so every descriptor precedes any VORef slot in
+  // any scope (the HotSpot parser walks scopes outermost-first and resolves
+  // VORefs through a record-level vo_map). Mirrors C2's dump_object_pool
+  // before create_scope_values. findFirstDeoptScopeBCIPairStart returns the
+  // index of the first BCI of the FIRST adjacent-equal i32 pair; the insert
+  // position is immediately past the pair (BCIPairStart + 2). The transform
+  // keeps the hard failure on malformed bundles (frontend invariant), unlike
+  // the analysis side's graceful bail.
+  if (!CB.getOperandBundle(LLVMContext::OB_deopt))
+    reportInvalidDeoptBundle(CB, "missing deopt bundle for VO section");
+  std::optional<unsigned> Start =
+      jeandle::pea::findFirstDeoptScopeBCIPairStart(CB);
+  if (!Start)
+    reportInvalidDeoptBundle(
+        CB, "missing or mismatched adjacent i32 deopt bci pair");
+  return *Start + 2;
 }
 
 } // namespace llvm
