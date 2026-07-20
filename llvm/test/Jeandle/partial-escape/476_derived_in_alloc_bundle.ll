@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Derived-pointer VO reference inside an allocation invoke's deopt bundle
-; (review §3 #10 companion): %g = gep(%a, 8) is a DERIVED bundle operand —
+; Derived-pointer VO reference inside an allocation invoke's deopt bundle:
+; %g = gep(%a, 8) is a DERIVED bundle operand —
 ; undescribable, so recordDeoptBundleMappings records nothing and the
 ; allocation's own deopt path materializes %a at the %b invoke (Graal
 ; processNodeInputs). Under reuse-OrigAlloc OrigAlloc dominates the

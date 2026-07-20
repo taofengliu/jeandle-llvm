@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; VO referenced ONLY by another allocation invoke's deopt bundle (review §3
-; #10 — the memory (g) TODO). Allocation invokes now go through
+; VO referenced ONLY by another allocation invoke's deopt bundle. Allocation
+; invokes now go through
 ; recordDeoptBundleMappings like every other safepoint: %a (still virtual at
 ; %b's allocation) is described in %b's bundle, exactly as Graal describes
 ; virtual objects in an allocation's frame state. Pre-fix, the allocation

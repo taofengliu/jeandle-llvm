@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Late/shared handler + merge-driven UnwindData patch (review §3 #5). A
+; Late/shared handler + merge-driven UnwindData patch. A
 ; locked VO %o is virtual on the t arm (invoke @foo(%p) escapes %p, so t's
 ; pre-invoke snapshot is stashed as UnwindData) and materialized on the f
 ; arm (sink(%o)). The merge at m does a Case-A materialize of %o with locks

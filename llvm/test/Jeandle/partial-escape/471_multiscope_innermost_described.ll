@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Multi-scope bundle, innermost-only reference (review §3 #7 companion): a
+; Multi-scope bundle, innermost-only reference: a
 ; VO referenced only INSIDE the innermost scope is described like any other
 ; scope's reference. The descriptor is emitted into the ROOT scope's VO
 ; section (right after the FIRST duplicated-BCI pair — the VO section is a

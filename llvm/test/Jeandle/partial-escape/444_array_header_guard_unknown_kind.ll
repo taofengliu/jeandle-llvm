@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Array header guard on an UNKNOWN element-kind array (review §3.2).
+; Array header guard on an UNKNOWN element-kind array.
 ;
 ; When elementTypeForArrayKlass returns nullopt (klass not registered with a
 ; cblog), processAllocation left ArrayBaseOffset at its default 0, so the

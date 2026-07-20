@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -verify-each %s | FileCheck %s
 ;
-; §1.4 deepest/nearest-dominating-def selection in resolveMaterializedUses.
+; Deepest/nearest-dominating-def selection in resolveMaterializedUses.
 ;
 ; A loop-local object %X is allocated in the loop body and escapes on BOTH arms
 ; of an in-body diamond (@sink on each). Under the reuse-OrigAlloc model the

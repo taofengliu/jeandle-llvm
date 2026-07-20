@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; icmp eq virtual, null should fold to false (a virtual is by construction
-; non-null since it tracks an in-flight allocation). Per plan §2.3 this is a
+; non-null since it tracks an in-flight allocation). This is a
 ; recognised JavaOp-style fold; the analyzer should constant-fold the icmp,
 ; the conditional branch becomes unconditional, and the alloc is eliminated.
 

@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Dangling field snapshot, deopt descriptor path (review §3 #2). Scalar load
+; Dangling field snapshot, deopt descriptor path. Scalar load
 ; from a virtual VO stored into another virtual VO (o.f = p.g), then the
 ; outer VO is described in a deopt bundle. The folded load (%lg) gets a
 ; scalar alias + a ReplaceLoad effect that erases it in Pass 1;

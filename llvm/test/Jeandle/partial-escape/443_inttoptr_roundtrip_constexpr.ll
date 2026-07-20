@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; ConstantExpr inttoptr/ptrtoint round-trip wrapper-stripping (review §3.1).
+; ConstantExpr inttoptr/ptrtoint round-trip wrapper-stripping.
 ;
 ; getIntToPtrRoundTripInner and the resolveVirtualRefImpl case-7 gate used
 ; Instruction-only casts (`IntToPtrInst`/`PtrToIntInst`), so a ConstantExpr

@@ -49,11 +49,10 @@
 
 using namespace llvm;
 
-// Default round count. Lit tests that pin `-jeandle-pea-iterations=N`
-// explicitly are unaffected; the convergence break in `run()` makes round 2
-// a no-op when round 1 already reached fixed point, so the cost on simple
-// functions is one extra `countJeandleAllocations` walk + early exit. The
-// hard cap is HardIterationCap (16).
+// Default 2 rounds. The convergence break in run() makes round 2 a no-op
+// when round 1 already reached fixed point; the hard cap is
+// HardIterationCap (16). Lit tests that pin -jeandle-pea-iterations=N are
+// unaffected.
 static cl::opt<unsigned> JeandlePEAIterations(
     "jeandle-pea-iterations", cl::init(2), cl::Hidden,
     cl::desc("PEA: maximum number of analyze+transform+canonicalize rounds "

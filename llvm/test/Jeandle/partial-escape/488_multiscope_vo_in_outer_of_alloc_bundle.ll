@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Multi-scope descriptors, VO in the OUTER scope of ANOTHER ALLOCATION's own
-; deopt bundle (multi-scope variant of review §3 #10; single-scope version:
+; Multi-scope descriptors, VO in the OUTER scope of ANOTHER ALLOCATION's
+; own deopt bundle (multi-scope variant of
 ; 475_vo_in_other_alloc_bundle.ll). %b is allocated first and referenced
 ; ONLY by the ROOT scope of the deopt bundle carried by %a's allocation
 ; invoke. %b is NeverEscapes: described in the ROOT scope's VO section of

@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Invoke-unwind lock re-emit vs the unwind-edge state split (review §3 #5).
+; Invoke-unwind lock re-emit vs the unwind-edge state split.
 ; A locked VO escapes at a TERMINATOR invoke `foo(o)`. The materialize is
 ; placed BEFORE the invoke, so the re-emitted monitorenter executes on BOTH
 ; the normal and unwind edges. Pre-fix, the unwind successor inherited the

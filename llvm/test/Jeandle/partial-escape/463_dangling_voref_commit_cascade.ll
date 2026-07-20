@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; VORef across a post-description materialization (review §3 #8). At S1,
+; VORef across a post-description materialization. At S1,
 ; %outer is described in the deopt bundle with its field as a VORef to
 ; %inner (transitive closure describes both). AFTER S1, %inner escapes via
 ; a DERIVED pointer (%gep) — under Graal processNodeInputs this

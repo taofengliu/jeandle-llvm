@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; (§2.3.16a): only addrspace(1)→addrspace(1) casts preserve the virtual
+; Only addrspace(1)→addrspace(1) casts preserve the virtual
 ; alias. Casting to addrspace(0) (or any other AS) crosses the Java-heap
 ; boundary and forces materialization. Test: alloc, cast to AS(0), pass to a
 ; non-AS sink. The allocation must survive the analysis pass as a

@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Non-zero-offset GEP as a deopt-bundle operand (review §3 #9): %g =
+; Non-zero-offset GEP as a deopt-bundle operand: %g =
 ; gep(%o, 16) resolves to VO 0 but is a DERIVED pointer, NOT an identity —
 ; propagatePointerAlias registered it in the alias map unconditionally. The
 ; strengthened IsIdentityAlias check (alias-map hit AND

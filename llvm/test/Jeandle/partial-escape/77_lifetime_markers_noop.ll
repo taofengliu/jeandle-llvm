@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; (§2.3.14): llvm.lifetime.start / llvm.lifetime.end on a virtual must be
+; llvm.lifetime.start / llvm.lifetime.end on a virtual must be
 ; recognised as no-op intrinsics. The alloc still escapes nowhere visible and
 ; must be eliminable.
 

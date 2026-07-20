@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 ; RUN: opt -disable-output -passes="require<partial-escape-analysis>" -jeandle-dump-pea-stats %s 2>&1 | FileCheck %s --check-prefix=STATS
 
-; Commit-time VirtualRefEdges ineligibility cascade (review §3 #1) —
+; Commit-time VirtualRefEdges ineligibility cascade —
 ; backstop coverage for NON-store ineligibility. Since unvirtualizable
 ; stores now materialize their operands AT the store (recursively
 ; materializing nested VirtualRefs, MatReason::Nested), the commit-time

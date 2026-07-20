@@ -4,8 +4,7 @@
 ; root scope's locals slot) is described like any inner-scope reference. The
 ; descriptor is emitted into the ROOT scope's VO section (right after the
 ; FIRST duplicated-BCI pair — the deopt-point-level object pool) and the
-; outer-scope slot is rewritten to a VORef by vo-id. Pre-fix (review §3 #7
-; guard) such a VO was banned and materialized at the call.
+; outer-scope slot is rewritten to a VORef by vo-id.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(i32)

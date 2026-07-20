@@ -486,31 +486,15 @@ void AliasMap::restore(const AliasMap &S) { *this = S; }
 // ===========================================================================
 
 void PEAResult::computeEscapePointLocks() {
-  // Globally merge + depth-sort the locks of every CASCADE group: a set of
-  // MaterializeEffects (live-path OR per-pred) whose analysis-time
-  // InsertBefore Instruction* is shared. Only such groups (>= 2 effects at a
-  // point) need a merged re-emit; a single-effect escape point emits its own
-  // locks per-effect (OrigAlloc trivially dominates its own emit point).
-  //
-  // GROUPING RULE (live today — NO critical-edge pre-pass exists): grouping is
-  // purely by the InsertBefore Instruction*. per-pred materializes use the
-  // analysis-time SafeIP = PH->getTerminator() (ComputeSafeIP, which returns
-  // the PH terminator for the per-pred path), so every per-pred materialize
-  // FROM THE SAME predecessor PH shares the same terminator pointer and
-  // therefore groups under one InsertBefore exactly like a live-path cascade.
-  //
-  // CROSS-PH per-pred cascades — per-pred materializes from different PHs
-  // feeding the same escape point — do NOT share an InsertBefore pointer
-  // (distinct terminators) and so fall through the Count<2 early-out below to
-  // per-effect emit, where only intra-effect self-sort (by BytecodeDepth in
-  // captureMaterializedLocks) is guaranteed. Cross-object interleaved-lock
-  // ordering is NOT preserved in that case today — see
-  // docs/Jeandle-PEA-Review.md §3 #3/#4 (residual gap, deferred).
+  // Merges + depth-sorts the locks of every CASCADE group (a set of
+  // MaterializeEffects sharing one InsertBefore Instruction*, live-path OR
+  // per-pred). See the canonical comment on EscapePointLocks in PartialEscape.h
+  // for the grouping rule, per-pred SafeIP, and the Cross-PH limitation
+  // (TODO(cross-ph-lock-order)).
   //
   // Record the highest SeqNo per escape point so the transform emits the
   // merged list once, from the last-applied effect (by then every sibling's
-  // OrigAlloc is recorded in NewInvOf for receiver lookup). See the comment
-  // on EscapePointLocks in PartialEscape.h.
+  // OrigAlloc is recorded in NewInvOf for receiver lookup).
   DenseMap<Instruction *, unsigned> Count;
   for (auto &Kv : BlockEffects)
     for (jeandle::Effect &E : Kv.second) {
@@ -533,14 +517,14 @@ void PEAResult::computeEscapePointLocks() {
         continue; // single-effect escape point — per-effect emit
       auto &Vec = EscapePointLocks[Key];
       for (const jeandle::MaterializedLock &ML : ME->Locks) {
-        // Defensive dedup (review §3 #3): a merged list must never contain
-        // the same lock twice. BytecodeDepth is unique per enter call site
-        // (LockDepthCache), so two entries with the same (Callee,
-        // NonReceiverArgs, BytecodeDepth) can only be the same folded lock
-        // captured twice (e.g. the pre-fix per-pred duplicate). The
-        // commit-time dominance dedup already removes those; this is the
-        // belt-and-braces layer that keeps the strict-increasing emit
-        // invariant true by construction.
+        // Defensive dedup: a merged list must never contain the same lock
+        // twice. BytecodeDepth is unique per enter call site (LockDepthCache),
+        // so two entries with the same (Callee, NonReceiverArgs,
+        // BytecodeDepth) can only be the same folded lock captured twice
+        // (e.g. a per-pred duplicate across edges). The commit-time
+        // dominance dedup already removes those; this is the belt-and-braces
+        // layer that keeps the strict-increasing emit invariant true by
+        // construction.
         bool Dup = false;
         for (const jeandle::MergedLock &X : Vec) {
           if (X.Callee == ML.Callee && X.BytecodeDepth == ML.BytecodeDepth &&

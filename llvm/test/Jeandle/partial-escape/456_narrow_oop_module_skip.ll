@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Compressed-oops module gate (review §3 #12): when the module DataLayout
+; Compressed-oops module gate: when the module DataLayout
 ; describes a narrow-oop address space (p3 narrower than p1, as the frontend
 ; emits under UseCompressedOops), PartialEscapeAnalysis returns an empty
 ; result and PEA leaves the function completely untouched — even an

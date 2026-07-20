@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Rewrite-clone then EliminateAllocation on the SAME allocation invoke
-; (review §3 #10/#11): %b is described with %a in its deopt bundle (Pass 1
+; Rewrite-clone then EliminateAllocation on the SAME allocation invoke:
+; %b is described with %a in its deopt bundle (Pass 1
 ; clones %b's invoke with the descriptor), and %b itself is NeverEscapes
 ; (Pass 2 erases the clone via the WeakTrackingVH Target that followed the
 ; RAUW). Pre-VH-hardening this double-touched the freed original invoke.

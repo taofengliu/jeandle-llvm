@@ -10,7 +10,7 @@
 ; outer materializedValuePhi propagates materialization into the inner loop.
 ;
 ; This is the canonical "outer allocation partially escapes in inner loop"
-; scenario from the review (§4.2). Soundness: exactly one allocation.
+; scenario. Soundness: exactly one allocation.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))

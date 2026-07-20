@@ -289,9 +289,8 @@ static bool applyMaterialize(
       continue;
     // An analyzer-built unparented value (e.g. a pea.coerce bitcast whose
     // owning ReplaceLoad was dropped) must be spliced before use; everything
-    // else must already be in IR (review §3 #2 — a dangling field value here
-    // was the production SIGSEGV root cause; the analysis-side normalization
-    // + commit availability sweep make this a defense-in-depth check).
+    // else must already be in IR. Analysis-side scalar-alias normalization +
+    // the commit availability sweep make this a defense-in-depth check.
     spliceUnparentedAt(InsertBefore, V);
     assert((isa<Constant>(V) || isa<Argument>(V) ||
             cast<Instruction>(V)->getParent() != nullptr) &&
@@ -337,11 +336,11 @@ static bool applyMaterialize(
            "re-emitted monitorenter must be bare");
     return true;
   };
-  // Lock lookup uses the ORIGINAL escape-point InsertBefore (the pre-scan-
-  // captured key computeEscapePointLocks used), NOT the possibly eager-update-
-  // re-aimed E.InsertBefore — a re-aimed Case-A materialize at a multi-object
-  // interleaved-lock escape point would otherwise miss the key, fall to
-  // per-effect emission, and mis-order the runtime lock stack.
+  // Lock lookup uses the ORIGINAL escape-point InsertBefore captured before
+  // any eager-update re-aim, NOT the possibly re-aimed E.InsertBefore (a
+  // re-aimed Case-A materialize would otherwise miss the key, fall to
+  // per-effect emission, and mis-order the runtime lock stack). See the
+  // canonical comment on EscapePointLocks in PartialEscape.h.
   Instruction *LockKey = OrigInsertBefore.lookup(&E);
   if (!LockKey)
     LockKey = InsertBefore;
@@ -356,7 +355,7 @@ static bool applyMaterialize(
         // locking thread lock stack requires strict nesting order.
         // BytecodeDepth is unique per enter call site (LockDepthCache), so an
         // equal-depth pair in one merged list can only be the SAME folded
-        // lock captured twice (the pre-fix per-pred duplicate) — excluded by
+        // lock captured twice (a per-pred duplicate) — excluded by
         // the commit-time dominance dedup and the computeEscapePointLocks
         // defensive dedup, and asserted against here.
         bool First = true;
@@ -403,18 +402,9 @@ static bool applyMaterialize(
 // Graal's `apply(StructuredGraph graph, ArrayList<Node> obsoleteNodes)` — LLVM
 // mutates a Function, not a StructuredGraph).
 //
-// The shared maps are:
-//   NewInvOf               effect -> OrigAlloc (CallBase). Used by the lock
-//                          re-emit to resolve each sibling's receiver at an
-//                          escape point that merges locks across objects.
-//   InsertBeforeDependents escape-point InsertBefore -> the Materialize effects
-//                          keyed on it. The eager-update hook
-//                          (relocateDependentMaterializes) consumes this to
-//                          re-aim each dependent Materialize to the in-block
-//                          successor BEFORE a sibling erase nulls the
-//                          WeakTrackingVH. Required for the Case-A path whose
-//                          InsertBefore is a folded JavaOp invoke terminator
-//                          that a sibling ReplaceCall erases (tests 438/439/440).
+// The struct carries the three shared maps below (NewInvOf,
+// InsertBeforeDependents, OrigInsertBefore); each member is documented at
+// its definition.
 struct jeandle::TransformContext {
   Function &F;
   jeandle::PEAResult &Result;
@@ -706,7 +696,7 @@ void jeandle::RewriteDeoptBundleEffect::apply(jeandle::TransformContext &Ctx) {
           jeandle::LLVM2JavaComputational(FE.Value.getDeclaredType());
       assert(BT != jeandle::T_ILLEGAL && "scoped deopt field has illegal type");
       Value *FieldV = FE.Value.getScalar();
-      // Same unparented-value hardening as applyMaterialize (review §3 #2).
+      // Same unparented-value hardening as applyMaterialize.
       if (FieldV) {
         spliceUnparentedAt(CB, FieldV);
         assert((isa<Constant>(FieldV) || isa<Argument>(FieldV) ||

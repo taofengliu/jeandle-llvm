@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; §2.2 regression: the single-state loop-convergence test
+; Loop-convergence regression: the single-state loop-convergence test
 ; (Analyzer::exitDataEquivalent) must treat two states as NON-equivalent
 ; whenever an ObjectID is present in one and absent in the other. Every map
 ; (Virtuals, Materialized, FieldStates, LockCounts, LiveLockEnters,

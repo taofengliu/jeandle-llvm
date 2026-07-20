@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; UAF regression (review §3 #11): a folded JavaOp (balanced monitorenter/exit
+; UAF regression: a folded JavaOp (balanced monitorenter/exit
 ; on virtual %b) whose monitorenter carries a deopt bundle referencing
 ; ANOTHER virtual VO (%a). recordDeoptBundleMappings records a
 ; RewriteDeoptBundleEffect (lower SeqNo) and foldMonitorEnter records a

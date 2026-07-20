@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; (§8.1.15 atomics): a virtual receives a `store atomic seq_cst` on its
+; Atomics: a virtual receives a `store atomic seq_cst` on its
 ; field, then escapes via @sink. The materialization must replay the field
 ; store (per applyMaterialize, replay stores are emitted as
 ; atomic-unordered, matching jeandle-jdk's emission convention). The original

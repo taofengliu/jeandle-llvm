@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; §2.7: the replayed field stores at a materialization point MUST carry the
+; The replayed field stores at a materialization point MUST carry the
 ; field type's natural ABI alignment, derived from the DataLayout — NOT a
 ; hardcoded `pointer ? 8 : 1`. The stores are atomic-unordered, and an atomic
 ; access that is not naturally aligned is illegal (lowers to a libcall / is

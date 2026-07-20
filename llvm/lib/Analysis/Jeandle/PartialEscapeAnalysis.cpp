@@ -243,7 +243,7 @@ struct BlockExitInfo : BlockExitData {
   // data of this struct), while the unwind successor sees the pre-call
   // snapshot recorded in UnwindData (the materialize logically happened
   // during the call, so on unwind any partially-materialized state is
-  // unobservable to the handler). EXCEPTION (review §3 #5): a VO whose
+  // unobservable to the handler). EXCEPTION: a VO whose
   // invoke-triggered materialize captured LOCKS re-acquires them BEFORE the
   // invoke — a real side effect on BOTH edges. For such VOs the pre-call
   // snapshot is patched to the materialized view (markUnwindDataMaterialized)
@@ -419,7 +419,7 @@ private:
   // materialize preserves every fold recorded so far.
   DenseMap<jeandle::ObjectID, bool> Eligible;
 
-  // Persistent cross-block VirtualRef edge set (review §3 #1): an edge
+  // Persistent cross-block VirtualRef edge set: an edge
   // Outer -> Inner means "Outer's field was recorded as VirtualRef(Inner) at
   // some point", i.e. a surviving real store into Outer's field may write
   // Inner's OrigAlloc. The commit() ineligibility cascade must propagate
@@ -549,12 +549,12 @@ private:
   // SeqNo assignment guarantees a deferred CreatePHI sorts strictly AFTER any
   // per-pred Materialize emitted in the same processBlock walk. This matters
   // when the merge block is its own back-edge predecessor — both the CreatePHI
-  // and a per-pred Materialize land in BlockEffects[BB], and the per-pred
-  // The per-pred placeholder is populated first (cached by (PH,
-  // TargetMergeBlock, ID) in getOrCreatePerPredMatPlaceholder) so any
-  // CreatePHI Case-2 field-value PHI that reads the back-edge incoming sees
-  // the per-pred placeholder rather than OrigAlloc. The materialized-object
-  // merge PHI (Case 1) is skipped at apply (OrigAlloc — not the placeholder —
+  // and a per-pred Materialize land in BlockEffects[BB]. The per-pred
+  // placeholder is populated first (cached by (PH, TargetMergeBlock, ID) in
+  // getOrCreatePerPredMatPlaceholder) so any CreatePHI Case-2 field-value PHI
+  // that reads the back-edge incoming sees the per-pred placeholder rather
+  // than OrigAlloc. The materialized-object merge PHI (Case 1) is skipped at
+  // apply (OrigAlloc — not the placeholder —
   // is the single SSA value on every path), and EliminateAllocation never
   // touches the OrigAlloc of a PartiallyEscapes VO.
   DenseMap<BasicBlock *, jeandle::EffectList> PendingMergePhis;
@@ -1113,7 +1113,7 @@ private:
   // VO that is both a real argument AND a deopt-bundle operand of the same
   // call is materialized at the call and its bundle slot keeps the live
   // OrigAlloc — one Java object keeps one identity across a during-call
-  // deopt (review §3 #6). Arg-scoped: bundle operands are NOT consulted
+  // deopt. Arg-scoped: bundle operands are NOT consulted
   // (they are frame state, handled by recordDeoptBundleMappings).
   void materializeVirtualCallArgs(CallBase *CB);
   void materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
@@ -1364,7 +1364,7 @@ void Analyzer::processBlock(BasicBlock *BB) {
     }
     Info.UnwindEdgeKilled = Virtualized;
 
-    // #5 (review §3): patch the pre-invoke snapshot for every VO whose
+    // Patch the pre-invoke snapshot for every VO whose
     // invoke-triggered materialize captured locks — the lock re-emit
     // physically executes before the invoke on BOTH edges, so the unwind
     // successor must inherit the materialized view (see
@@ -2097,10 +2097,9 @@ bool Analyzer::MergeProcessor::materializeAndBuildPhi(jeandle::ObjectID ID) {
     // so this is a no-op there; lock/stack mismatch materializes each one.
     if (Preds[i]->Virtuals.count(ID)) {
       uint32_t PreSeqNo = Result.NextSeqNo;
-      // Lock-carrying preds take the shared-flip (Case-A) path (review §3
-      // #3/#4): under reuse-OrigAlloc the materialized value is OrigAlloc on
-      // every edge (it dominates all successors), so the per-pred no-flip
-      // design has no remaining motivation, and flipping the shared
+      // Lock-carrying preds take the shared-flip (Case-A) path: under
+      // reuse-OrigAlloc the materialized value is OrigAlloc on every edge
+      // (it dominates all successors), and flipping the shared
       // BlockExits[PH] is exactly Graal's ensureMaterialized-at-pred.endNode
       // (Graal PartialEscapeClosure). The flip makes (a) the SECOND merge
       // sharing this pred see the VO already materialized (no duplicate
@@ -2449,7 +2448,7 @@ bool Analyzer::MergeProcessor::mergeFieldStates(jeandle::ObjectID ID) {
         uint32_t PreSeqNo = Result.NextSeqNo;
         // Case-A inner-VO mat (SkipGlobalRAUW=false): mat at PH end (SafeIP =
         // PH->getTerminator()); the value reuses OrigAlloc, which dominates all
-        // successors — flips the shared ExitInfo (original behavior) so other
+        // successors — flips the shared ExitInfo so other
         // merges sharing this pred see the materialization.
         A.materializeAtPredFromExitInfo(InnerID, PredBBs[i], *Preds[i],
                                         /*SkipGlobalRAUW=*/false,
@@ -2818,12 +2817,10 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
       // dominates the body GEP by the SSA invariant (see applyMaterialize's
       // assert that the materialized value equals VObj.AllocationCall). The
       // carrying PHI's incoming is therefore LEFT UNCHANGED; no re-derive
-      // effect is emitted (the old RewritePhiIncomingEffect was a no-op apply
-      // and its only live role was being purged by dropEffectsFor, which is
-      // vacuous when nothing is emitted). Graal's getAliasAndResolve +
-      // setPhiInput re-derivations do not apply here: Graal re-derives from a
-      // fresh per-pred AllocatedObjectNode; Jeandle reuses OrigAlloc directly,
-      // so the carry is already sound.
+      // effect is emitted. Graal's getAliasAndResolve + setPhiInput
+      // re-derivations do not apply here: Graal re-derives from a fresh
+      // per-pred AllocatedObjectNode; Jeandle reuses OrigAlloc directly, so
+      // the carry is already sound.
       jeandle::ObjectID OID = *InIDs[I];
       if (!Eligible.lookup(OID))
         continue; // a prior/sibling incoming already made this object
@@ -3345,19 +3342,17 @@ void Analyzer::processInstruction(Instruction *I) {
   if (auto *CB = dyn_cast<CallBase>(I)) {
     if (jeandle::pea::isJeandleAllocation(CB)) {
       processAllocation(CB);
-      // #10 (review §3): the allocation's OWN deopt bundle (the frontend
-      // attaches create_current_deopt_bundle to every new_instance/new_array,
-      // which can deopt on unresolved klass / OOM) is a safepoint like any
-      // other: a still-virtual VO referenced by it must be described (Graal
-      // describes VOs in allocation frame states) or materialized — the
-      // pre-fix early-return left such VOs for Pass-2 poison-RAUW inside the
-      // surviving allocation bundle. Both helpers are no-ops when the bundle
-      // has no virtual references, and every processAllocation early-return
-      // path (cache hit, finalizer, length cap, ...) still lands here. The
-      // transform side is clone-safe: a RewriteDeoptBundleEffect on the
-      // allocation invoke clones it, and every handle to the original
-      // (VirtualObject::AllocationCall, effect Targets) follows the RAUW via
-      // WeakTrackingVH.
+      // The allocation's OWN deopt bundle (the frontend attaches
+      // create_current_deopt_bundle to every new_instance/new_array, which
+      // can deopt on unresolved klass / OOM) is a safepoint like any other:
+      // a still-virtual VO referenced by it must be described (Graal
+      // describes VOs in allocation frame states) or materialized. Both
+      // helpers are no-ops when the bundle has no virtual references, and
+      // every processAllocation early-return path (cache hit, finalizer,
+      // length cap, ...) still lands here. The transform side is clone-safe:
+      // a RewriteDeoptBundleEffect on the allocation invoke clones it, and
+      // every handle to the original (VirtualObject::AllocationCall, effect
+      // Targets) follows the RAUW via WeakTrackingVH.
       recordDeoptBundleMappings(CB);
       materializeAllVirtualOperands(CB);
       return;
@@ -3511,24 +3506,21 @@ void Analyzer::processInstruction(Instruction *I) {
         // recorded: VOs describable here stay virtual; the rest are handled
         // by the generic escape path when their effects survive. When the
         // fold survives, the rewrite no-ops at apply (the bundle died with
-        // the call). NOTE: this describes the POST-fold state — no foldable
-        // JavaOp carries a deopt bundle today, so the reorder vs
-        // record-first is latent (see review §3 #11).
+        // the call). NOTE: no foldable JavaOp carries a deopt bundle today,
+        // so this path is latent.
         recordDeoptBundleMappings(CB);
         return;
       }
-      // Graal order (review §3 #6): processNodeInputs (materialize the
-      // call's REAL virtual inputs) BEFORE processNodeWithState (record the
-      // virtual mappings for the frame state). A VO that is both a real
-      // argument AND a deopt-bundle operand of this call must be
-      // MATERIALIZED here — the bundle slot then keeps the live OrigAlloc
-      // and a during-call deopt sees ONE object identity (caller and callee
-      // share the real object). Recording first (the pre-fix order)
-      // described it as virtual AND materialized it — the deopt then split
-      // one Java object into two identities. VOs that only REFERENCE an
-      // arg-VO from a field flip to MaterializedRef via
-      // updateOtherStatesForMaterialized and stay describable as live-oop
-      // fields (same precision as Graal's MaterializedObjectState).
+      // Graal order: processNodeInputs (materialize the call's REAL virtual
+      // inputs) BEFORE processNodeWithState (record the virtual mappings for
+      // the frame state). A VO that is both a real argument AND a
+      // deopt-bundle operand of this call must be MATERIALIZED here — the
+      // bundle slot then keeps the live OrigAlloc and a during-call deopt
+      // sees ONE object identity (caller and callee share the real object).
+      // VOs that only REFERENCE an arg-VO from a field flip to
+      // MaterializedRef via updateOtherStatesForMaterialized and stay
+      // describable as live-oop fields (same precision as Graal's
+      // MaterializedObjectState).
       materializeVirtualCallArgs(CB);
       // Record VO descriptors for any still-virtual OrigAlloc referenced in
       // CB's "deopt" bundle. (recordDeoptBundleMappings checks hasDeoptBundle
@@ -3890,7 +3882,11 @@ bool Analyzer::processStore(StoreInst *SI) {
   Value *Val = SI->getValueOperand();
 
   // Normalize the stored value through the scalar-alias chain before any
-  // resolution / recording (review §3 #2 — the production crash root cause).
+  // resolution / recording. A value folded by processLoad / foldICmpEquality /
+  // emitReplaceCall is RAUW'd and ERASED by its ReplaceLoad/ReplaceCall effect
+  // in Pass 1, which runs BEFORE the Materialize / RewriteDeoptBundle effects
+  // that read the FieldStates snapshot — recording the folded instruction
+  // itself would leave a dangling pointer in the snapshot. The alias chain
   // A value folded by processLoad / foldICmpEquality / emitReplaceCall is
   // RAUW'd and ERASED by its ReplaceLoad/ReplaceCall effect in Pass 1, which
   // runs BEFORE the Materialize / RewriteDeoptBundle effects that read the
@@ -3938,9 +3934,7 @@ bool Analyzer::processStore(StoreInst *SI) {
   // TODO(resolve-cap-blind-spot): if the stored value is virtual-derived
   // but resolveVirtualRef fails STRUCTURALLY (depth cap, opaque
   // non-round-trip inttoptr), the store survives with an unaccounted
-  // virtual operand that can still classify NeverEscapes -> poison. This
-  // blind spot predates materialize-at-store (the old markIneligible code
-  // had the same guarded resolve) and is inherited, not introduced.
+  // virtual operand that can still classify NeverEscapes -> poison.
   auto materializeOperandsAtStore = [&] {
     materializeAt(*BaseID, SI, MatReason::Unhandled);
     if (auto RefID =
@@ -5374,7 +5368,7 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
     // processLoad, a Case-B PHI, a freeze, or an offset-0 select). A
     // byte-offset DERIVED pointer is banned: its bundle slot cannot become a
     // VORef without losing the derived shape, and it would be left for
-    // Pass-2 poison-RAUW. The offset guard is load-bearing (review §3 #9):
+    // Pass-2 poison-RAUW. The offset guard is load-bearing:
     // propagatePointerAlias registers GEP results in the alias map
     // UNCONDITIONALLY (any offset), so an alias-map hit alone does NOT prove
     // identity — resolveFieldOffset(V)==0 is what makes the alias an
@@ -6127,15 +6121,14 @@ void Analyzer::commit() {
   // producers:
   //
   //  (a) Transitive ineligibility cascade over the PERSISTENT VirtualRefEdges
-  //      set (review §3 #1) plus the synthetic-Case-C source cascade. Any
-  //      virtual referenced by a kept-real (ineligible) object's field must
-  //      also be kept real: a surviving real store into that field (its
-  //      EliminateStoreEffect was dropped by dropEffectsFor below) would
-  //      otherwise write a NeverEscapes object's OrigAlloc, which Pass 2 RAUWs
-  //      to poison -> miscompile. The edges are recorded at every VirtualRef
-  //      write (processStore, synthesizeCaseC) into the append-only
-  //      VirtualRefEdges member — the pre-fix walk over the per-block live
-  //      FieldStates only ever saw the LAST processed block's edges. This is
+  //      set plus the synthetic-Case-C source cascade. Any virtual referenced
+  //      by a kept-real (ineligible) object's field must also be kept real: a
+  //      surviving real store into that field (its EliminateStoreEffect was
+  //      dropped by dropEffectsFor below) would otherwise write a
+  //      NeverEscapes object's OrigAlloc, which Pass 2 RAUWs to poison ->
+  //      miscompile. The edges are recorded at every VirtualRef write
+  //      (processStore, synthesizeCaseC) into the append-only VirtualRefEdges
+  //      member, which holds edges across ALL processed blocks. This is
   //      the complete backstop for objects made ineligible by NON-store /
   //      NON-load paths — e.g. unbalanced locking at a function exit, merge
   //      hazards, the availability sweep, the deopt cascade, and the
@@ -6156,7 +6149,7 @@ void Analyzer::commit() {
   //      at the very point the outer is committed; Jeandle's
   //      analysis/transform split defers classification to here.
   //
-  //  (b) Deopt-descriptor dependency cascade (review §3 #8): a
+  //  (b) Deopt-descriptor dependency cascade: a
   //      RewriteDeoptBundleEffect whose Fields hold a VORef to an ineligible
   //      (undescribed) VO would emit a DANGLING VORef — the JDK parser's
   //      deferred-voref resolution asserts / writes nullptr. The dependent
@@ -6165,7 +6158,7 @@ void Analyzer::commit() {
   //      slots stay live oops. DeoptRefDeps maps referenced-inner -> referrers
   //      and is built from the effects as they stand at commit start.
   //
-  //  (c) Field-value availability sweep (review §3 #2). Every value
+  //  (c) Field-value availability sweep. Every value
   //      referenced by a surviving effect's field snapshot must be
   //      PRODUCIBLE at apply time: a Constant / Argument / in-IR instruction
   //      (a WeakTrackingVH follows any RAUW), or an unparented analyzer-built
@@ -6274,12 +6267,12 @@ void Analyzer::commit() {
             for (jeandle::ObjectID Src :
                  Result.VirtualObjects[Cur]->SyntheticSourceIDs)
               WList.push_back(Src);
-          // Persistent cross-block VirtualRef edges (review §3 #1).
+          // Persistent cross-block VirtualRef edges.
           if (auto EIt = VirtualRefEdges.find(Cur);
               EIt != VirtualRefEdges.end())
             for (jeandle::ObjectID Inner : EIt->second)
               WList.push_back(Inner);
-          // Deopt-descriptor dependents (review §3 #8).
+          // Deopt-descriptor dependents.
           if (auto DIt = DeoptRefDeps.find(Cur); DIt != DeoptRefDeps.end())
             for (jeandle::ObjectID Outer : DIt->second)
               WList.push_back(Outer);
@@ -6322,7 +6315,7 @@ void Analyzer::commit() {
       dropEffectsFor(ID);
   }
 
-  // Dominance-aware lock re-emit dedup (review §3 #3/#4): one folded lock
+  // Dominance-aware lock re-emit dedup: one folded lock
   // (one VO, one BytecodeDepth) must be re-acquired at most once per dynamic
   // path. Two captures of the same lock arise when a VO escapes twice inside
   // a single lock region and the first escape's state flip was not visible to
@@ -6506,7 +6499,6 @@ void Analyzer::processLoopExit(Loop *L) {
   // LCSSA PHIs (and exception handlers reading them) wired to stale
   // OrigAlloc placeholders; the forced drain ensures every still-virtual
   // VO has a real allocation by the time the EH handler executes.
-  // (Keep the safety concern — it is real; only the dead name is gone.)
   // Graal runs processLoopExit unconditionally (Graal PartialEscapeClosure)
   // and force-materializes loop-local virtuals at any exception-handling
   // exit. Jeandle preserves the common OOM-cleanup optimization by skipping
@@ -6671,9 +6663,9 @@ void Analyzer::materializeAtPredFromExitInfo(
   auto ClearLockState = [&](jeandle::ObjectID Oid) {
     LockCounts[Oid] = 0;
     LiveLockEnters.erase(Oid);
-    // Case-A / global: clear the shared ExitInfo's lock state (original
-    // behavior — the flip makes the VO materialized, so the lock state is
-    // irrelevant). Per-pred: do NOT clear ExitInfo — per-pred doesn't flip
+    // Case-A / global: clear the shared ExitInfo's lock state — the flip
+    // makes the VO materialized, so the lock state is irrelevant. Per-pred:
+    // do NOT clear ExitInfo — per-pred doesn't flip
     // (clearing the shared pred lock state would leak to non-target
     // successors AND make the do/while retry see locks-match, taking the
     // wrong mergeFieldStates path instead of re-entering
@@ -6761,7 +6753,7 @@ void Analyzer::materializeAtPredFromExitInfo(
       It != ExitInfo.LiveLockEnters.end() && !It->second.empty())
     HadLocks = true;
   ensureMaterialized(ID, C);
-  // Merge-driven #5 (review §3): a Case-A (shared-flip) materialize with
+  // Merge-driven: a Case-A (shared-flip) materialize with
   // locks placed at a pred's INVOKE terminator, after that pred's
   // processBlock already stashed its UnwindData. The lock re-emit executes
   // before the invoke on BOTH edges, so the already-stashed UnwindData must

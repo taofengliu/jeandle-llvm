@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/441_nested_virtual_fieldstates_cascade.cblog %s | FileCheck %s
 
-; Cross-block VirtualRef cascade (review §3 #1): 441's pattern with the arr
+; Cross-block VirtualRef cascade: 441's pattern with the arr
 ; escape moved into a LATER block (`tail`). arr[0]=inner0 (constant index)
 ; records VirtualRef and an EliminateStore; arr[i]=innerI (SYMBOLIC index)
 ; cannot be virtualized, so arr and innerI materialize AT the symbolic store

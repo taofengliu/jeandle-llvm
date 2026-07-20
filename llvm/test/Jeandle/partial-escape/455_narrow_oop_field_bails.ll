@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Compressed-oops guard (review §3 #12): a reference field stored as a
+; Compressed-oops guard: a reference field stored as a
 ; narrow oop (ptr addrspace(3)) must make getOrCreateFieldIndex bail
 ; conservatively (-1) instead of asserting (debug) or mis-modeling the slot
 ; at the wrong width (release). The allocation is kept real and the store

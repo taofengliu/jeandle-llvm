@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Per-pred cascade with RE-ENTRANT interleaved locks, exercising the §1.2 fix
-; (per-pred lock re-emit global depth sort).
+; Per-pred cascade with RE-ENTRANT interleaved locks, exercising the
+; per-pred lock re-emit global depth sort.
 ;
 ; A forward field chain a.f = b, b.g = c (so per-pred materializing `a` cascades
 ; prerequisites `b` then `c`). `a`, `b`, `c` are distinct new_instance klasses

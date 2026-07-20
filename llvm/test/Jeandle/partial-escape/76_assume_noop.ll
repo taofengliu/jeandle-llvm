@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; (§2.3.14 recognised non-escaping LLVM intrinsics): llvm.assume should be
+; Recognised non-escaping LLVM intrinsics: llvm.assume should be
 ; treated as a no-op for escape analysis. Even when the assume's "align"
 ; operand bundle references the virtual pointer, the alloc must remain
 ; eliminable. Per the plan, an assume on a virtual must NOT escalate to

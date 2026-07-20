@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/441_nested_virtual_fieldstates_cascade.cblog %s | FileCheck %s
 
-; Nested-virtual poison via FieldStates VirtualRef (review §1.1).
+; Nested-virtual poison via FieldStates VirtualRef.
 ;
 ; An Object[] array `arr` receives a CONSTANT-index store of a fresh virtual
 ; instance (arr[0] = inner0): processStore succeeds, records

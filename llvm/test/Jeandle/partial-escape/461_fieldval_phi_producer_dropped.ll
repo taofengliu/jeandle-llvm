@@ -8,8 +8,8 @@
 ; OrigAlloc before the call. o likewise materializes at its escape,
 ; replaying o.f's tracked store of the folded field-PHI. Both allocations
 ; stay real, the PHI has live uses in the two replays, no orphan PHI, no
-; poison. (The commit availability sweep of review §3 #2 no longer fires on
-; this shape: the derived-pointer escape materializes rather than bails.)
+; poison. The commit availability sweep does not fire on this shape: the
+; derived-pointer escape materializes rather than bails.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))

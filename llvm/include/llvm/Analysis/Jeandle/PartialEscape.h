@@ -242,11 +242,11 @@ private:
   // Valid when T is Scalar or MaterializedRef. WeakTrackingVH (NOT a raw
   // Value*): the snapshotted value may be RAUW'd during the transform — a
   // folded load RAUW'd to its replacement, or a safepoint call cloned by
-  // RewriteDeoptBundleEffect::apply — and the handle follows the RAUW so the
-  // snapshot never dangles (review §3 #2: a raw Value* here was the
-  // production SIGSEGV root cause). A value DELETED without replacement
-  // nulls the handle; the transform asserts values are non-null and parented
-  // (or Constant/Argument) at use. Valid when T is VirtualRef: the vo-id.
+  // RewriteDeoptBundleEffect::apply — and a raw Value* would then dangle.
+  // The handle follows the RAUW so the snapshot never dangles. A value
+  // DELETED without replacement nulls the handle; the transform asserts
+  // values are non-null and parented (or Constant/Argument) at use. Valid
+  // when T is VirtualRef: the vo-id.
   WeakTrackingVH V;
   ObjectID Ref = InvalidObjectID;
   Type *DeclaredType = nullptr;
@@ -404,14 +404,14 @@ public:
   unsigned getStateCount() const {
     return ObjectStates ? static_cast<unsigned>(ObjectStates->size()) : 0u;
   }
-  // DEAD-BLOCK PRUNING IS NOT WIRED. Graal's killIfBranch marks a block dead
-  // (and PEA then skips processing it); Jeandle's pre-PEA LLVM cleanup
-  // (SimplifyCFG + ADCE) removes unreachable blocks via removeUnreachableBlock
-  // instead, so every block that reaches PEA is reachable. The legacy
-  // Dead/markDead/isDead flag had no setter call-site (isDead was queried once
-  // in ensureMaterialized but always returned false); both were removed.
-  // If Jeandle ever needs in-PEA dead-block marking, reintroduce the flag and
-  // wire foldICmpEquality / killIfBranch to set it.
+  // Dead-block pruning is handled out of band: pre-PEA LLVM cleanup
+  // (SimplifyCFG + ADCE) removes unreachable blocks via
+  // removeUnreachableBlock, so every block that reaches PEA is reachable.
+  // Graal's killIfBranch marks a block dead so PEA can skip it; Jeandle has
+  // no in-PEA dead-block flag.
+  // TODO(in-pea-dead-block-flag): if Jeandle ever needs in-PEA dead-block
+  // marking, reintroduce a flag and wire foldICmpEquality / killIfBranch to
+  // set it.
 
 private:
   SmallVector<std::optional<ObjectState>, 8> *getArrayForModification();
@@ -672,17 +672,14 @@ public:
   // (Graal: synthetic MonitorEnterNodes at the CommitAllocationNode), sorted
   // ascending by BytecodeDepth.
   SmallVector<MaterializedLock, 2> Locks;
-  // Per-pred materializations used to carry (IsPerPred, PerPredPlaceholder,
-  // TargetMergeBB) flags here to route a fresh per-edge allocation invoke
-  // through a critical edge. Under reuse-OrigAlloc every per-pred materialize
-  // is placed at PH->getTerminator(), reuses OrigAlloc as the materialized
-  // value, and the consuming merge-PHI is skipped (CreatePHIEffect::apply Case
-  // 1) — so per-pred distinctness survives only via the analysis-side
+  // Per-pred materializations carry no fields on this effect. Under
+  // reuse-OrigAlloc every per-pred materialize is placed at
+  // PH->getTerminator(), reuses OrigAlloc as the materialized value, and the
+  // consuming merge-PHI is skipped (CreatePHIEffect::apply Case 1) — so
+  // per-pred distinctness survives via the analysis-side
   // getOrCreatePerPredMatPlaceholder cache key (PH, TargetMerge, ID) and the
   // per-effect NewInvOf[SourceEffect] receiver lookup in the lock-cascade
-  // path. No per-edge value ever reaches this effect, so the flags were
-  // write-only and have been removed.
-  // The single live per-pred-origin marker kept (an unparented placeholder
+  // path. The single live per-pred-origin marker (an unparented placeholder
   // Value* used as the lock-cascade identity key) lives in
   // PEAResult::OwnedMatPlaceholders / getOrCreatePerPredMatPlaceholder.
 
@@ -958,10 +955,9 @@ public:
   // fall through the Count<2 early-out to per-effect emit, where only
   // intra-effect self-sort (by BytecodeDepth in captureMaterializedLocks) is
   // guaranteed. Cross-object interleaved-lock ordering is therefore NOT
-  // preserved by EscapePointLocks today — see docs/Jeandle-PEA-Review.md
-  // §3 #3/#4 for the residual soundness gap (out of scope for the §7
-  // documentation pass that corrected this comment; the bug itself is
-  // deferred).
+  // preserved by EscapePointLocks in that case.
+  // TODO(cross-ph-lock-order): merge cross-PH per-pred cascades at a shared
+  // escape point so cross-object interleaved-lock ordering is preserved.
   //
   // OrigInsertBefore (captured by the TransformContext in run() before Pass 1)
   // records the analysis-time InsertBefore before any eager-update re-aim by

@@ -1,8 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; A VO that is BOTH a real call argument AND a deopt-bundle operand of the
-; same call is MATERIALIZED at the call — never described as virtual there
-; (review §3 #6). Graal's processNodeInputs (materialize the call's real
+; same call is MATERIALIZED at the call — never described as virtual there.
+; Graal's processNodeInputs (materialize the call's real
 ; virtual inputs) runs BEFORE processNodeWithState (record the frame-state
 ; virtual mappings); Jeandle's materializeVirtualCallArgs now runs before
 ; recordDeoptBundleMappings in the same order. At a DURING-CALL deopt this

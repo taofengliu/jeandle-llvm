@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Double-acquire on a sibling path processed before the merge (review §3 #4
-; + the RPO twist). `n` holds an unbalanced enter on %o; `p` branches to
+; Double-acquire on a sibling path processed before the merge (with the
+; RPO twist). `n` holds an unbalanced enter on %o; `p` branches to
 ; merge1 and `s`; `q` escapes via foo(o); `s` escapes via baz(o). RPO is
 ; [entry, n, q, p, s, merge1]: s's baz(o) escape captures and would re-emit
 ; the SAME folded lock BEFORE merge1's shared-flip materialize at p's

@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Hazard scan (review §3 #4): a folded monitorexit in a PH-dominated block
+; Hazard scan: a folded monitorexit in a PH-dominated block
 ; processed BEFORE the merge that flips PH. `n` holds an unbalanced enter on
 ; %o (folded); `t` invokes @foo() (no PEA state change, so no UnwindData —
 ; the handler inherits %o virtual+locked); the handler `h` monitorexit's %o

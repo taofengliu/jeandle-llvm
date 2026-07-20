@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; freeze / offset-0-select bundle operands (review §3 #9): both are object
+; freeze / offset-0-select bundle operands: both are object
 ; IDENTITY for the VO (freeze is peeled by resolveFieldOffset; a select with
 ; both arms at offset 0 of the same VO is alias-forwarded by
 ; propagatePointerAlias). They are describable and their slots are rewritten

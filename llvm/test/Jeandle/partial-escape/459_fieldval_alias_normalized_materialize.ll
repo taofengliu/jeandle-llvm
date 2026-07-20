@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Dangling field snapshot (review §3 #2 — the production SIGSEGV root cause).
+; Dangling field snapshot.
 ; %b is NeverEscapes; %v = load %b.f8 folds to %x (ReplaceLoad RAUWs + erases
 ; %v in Pass 1, BEFORE the Materialize applies). The store of %v into %a.f8
 ; must be tracked as Scalar(%x) — the scalar-alias-normalized terminal — not

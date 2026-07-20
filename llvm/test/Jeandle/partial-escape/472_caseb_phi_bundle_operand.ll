@@ -1,11 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Case-B PHI as a deopt-bundle operand (review §3 #9). %p = phi(%o, %o) is a
-; Case-B alias of VO 0 — object IDENTITY, not a derived pointer — so VO 0 is
-; describable and %p's bundle slot must be rewritten to a VORef. Pre-fix,
-; the transform's slot scan only matched the literal OrigAlloc: the PHI
-; operand made OrigAllocPresent false, the rewrite bailed, and the Case-B
-; PHI erasure RAUW'd the slot to poison. The analysis now records the exact
+; Case-B PHI as a deopt-bundle operand. %p = phi(%o, %o) is a Case-B alias
+; of VO 0 — object IDENTITY, not a derived pointer — so VO 0 is describable
+; and %p's bundle slot must be rewritten to a VORef. The analysis records the exact
 ; root operand in RootOperands and the transform matches it; the PHI itself
 ; is erased as redundant (its only remaining use was the bundle slot).
 

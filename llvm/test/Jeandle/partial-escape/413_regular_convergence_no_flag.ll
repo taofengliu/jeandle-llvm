@@ -4,7 +4,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s \
 ; RUN:     | FileCheck %s --check-prefix=IR
 
-; §2.8: the -jeandle-pea-force-materialize-all knob is a hidden testing aid and
+; The -jeandle-pea-force-materialize-all knob is a hidden testing aid and
 ; must NOT be required to exercise the Regular convergence path. This test runs
 ; WITHOUT the flag: a loop with a loop-local, non-escaping allocation must
 ; converge in Regular mode and fully eliminate the allocation — proving the

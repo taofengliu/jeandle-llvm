@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Multi-successor lock-carrying pred under the reuse-OrigAlloc model
-; (review §3 #3). `right` holds UNBALANCED enters on %a (depth 0) and %b
+; Multi-successor lock-carrying pred under the reuse-OrigAlloc model.
+; `right` holds UNBALANCED enters on %a (depth 0) and %b
 ; (depth 1) and has TWO successor merges (merge1, merge2), both mixed (left
 ; arm virtual, right arm locked). The a.f=b field store is tracked, and
 ; materializing a cascades b (forward prerequisite).

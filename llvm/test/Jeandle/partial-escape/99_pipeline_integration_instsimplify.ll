@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform,instsimplify" %s | FileCheck %s
 
-; (§8.1.17 pipeline integration sanity): running PEA followed by
+; Pipeline integration sanity: running PEA followed by
 ; InstSimplify must produce well-formed IR — no broken SSA, no dangling PHIs,
 ; no malformed terminators. The presence of InstSimplify after PEA exercises
 ; the post-PEA verifier path implicitly (opt verifies the module before each

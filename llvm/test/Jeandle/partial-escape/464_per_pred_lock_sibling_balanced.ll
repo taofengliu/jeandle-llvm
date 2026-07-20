@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Lock leak via per-pred lock re-emit on a shared pred (review §3 #4).
+; Lock leak via per-pred lock re-emit on a shared pred.
 ; `lockpath` holds an unbalanced enter on %o and branches to `m1` (sink(o)
 ; escape) and `m2` (the matching monitorexit); `alt` (no lock) also reaches
 ; `m1`. Pre-fix, the per-pred materialize re-emitted the enter at

@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; (§8.1.13): Cyclic nested virtuals. Two virtuals A and B form a cycle —
+; Cyclic nested virtuals. Two virtuals A and B form a cycle —
 ; A.f = B and B.g = A. Returning A escapes A; B escapes transitively (A.f
 ; references it). Under reuse-OrigAlloc both OrigAllocs are KEPT (each
 ; dominates the single escape point), so every field store replays directly
