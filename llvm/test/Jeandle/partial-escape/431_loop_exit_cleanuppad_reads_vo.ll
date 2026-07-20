@@ -1,17 +1,15 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; processLoopExit EH-pad successor coverage: a cleanuppad-headed loop-exit
-; successor. %o is a loop-local virtual; the loop body's may_throw invoke
-; unwinds to a cleanuppad (%cleanup) that READS %o's field. A cleanuppad body
-; is not constrained to resume, so processLoopExit must treat it as an
-; exception-handling exit and force %o to be materialised by the time the
-; handler runs — exactly as it does for a landingpad/catchpad successor.
+; EH handler (cleanuppad) that reads a loop-local VO's field.
 ;
-; Without cleanuppad detection (isEHPad()), %o would be eliminated and the
-; cleanup's load folded to the stored constant, leaving the handler with no
-; real object. The personality is the standard landingpad one (__gxx_personality_v0)
-; so the materialise's landingpad unwind-dest is valid IR; cleanuppad itself
-; verifies under it, exercising the analysis-side detection directly.
+; %o is a loop-local virtual; the loop body's may_throw invoke unwinds to a
+; cleanuppad (%cleanup) that READS %o's field. As with the landingpad form
+; (430_loop_exit_cleanup_reads_vo.ll), PEA propagates %o's virtual state
+; (field = 42) to the cleanuppad via the unwind-edge pre-invoke snapshot, so
+; the cleanup's load FOLDS to the stored constant. %o stays NeverEscapes and is
+; eliminated; the cleanup calls @use(42). (Previously processLoopExit
+; force-materialized %o at any EH-pad exit — landingpad/catchpad/cleanuppad;
+; that force was vestigial under reuse-OrigAlloc and has been removed.)
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @may_throw()
@@ -45,10 +43,10 @@ cleanup:
 }
 
 ; CHECK-LABEL: define void @test_loop_exit_cleanuppad_reads_vo
-; %o is materialised (it must be real when %cleanup reads its field), and the
-; cleanup's load survives reading the real field.
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
-; CHECK: load atomic i32
-; CHECK: call void @use
+; %o is eliminated (NeverEscapes); the cleanup's load folds to the stored
+; constant 42 via the unwind-edge virtual-state propagation.
+; CHECK-NOT: jeandle.new_instance
+; CHECK-NOT: load atomic
+; CHECK: call void @use(i32 42)
 
 !java-method-compilation = !{}

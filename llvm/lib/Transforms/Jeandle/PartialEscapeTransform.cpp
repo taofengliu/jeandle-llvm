@@ -593,30 +593,20 @@ void jeandle::MaterializeEffect::apply(jeandle::TransformContext &Ctx) {
 }
 
 void jeandle::CreatePHIEffect::apply(jeandle::TransformContext &Ctx) {
-  // The analyzer's CreatePHI emission falls into two cases, distinguished by
-  // RAUWOrigToPHI:
+  // Field-value PHI: merges a per-offset field VALUE (scalar or
+  // materialized-ref pointer) across preds / around a loop. Emitted by
+  // mergeFieldStates and synthesizeCaseC. This is NOT a materialized-object
+  // PHI — it tracks a real field value that must be merged. The analyzer's
+  // recorded (PHIIncomingValues[I], PHIIncomingBlocks[I]) are valid as-is:
+  // each incoming is a dominating field value, and a materialized-ref
+  // incoming is the peer VO's OrigAlloc, which is kept alive.
   //
-  // (1) Materialized-object merge PHI (RAUWOrigToPHI == true, emitted ONLY by
-  //     materializeAndBuildPhi): combines per-pred materializations of one
-  //     VO's pointer at a mixed-state merge. OrigAlloc is the single SSA value
-  //     on every path (it dominates every escape point), so this PHI is
-  //     unnecessary: every incoming would be OrigAlloc and the PHI would
-  //     trivially fold. SKIP creating it. The analyzer-built PhiInst stays
-  //     unparented and is cleaned up by run()'s OwnedInsts sweep / the
-  //     PEAResult destructor.
-  //
-  // (2) Field-value PHI (RAUWOrigToPHI == false, emitted by mergeFieldStates
-  //     and synthesizeCaseC): merges a per-offset field VALUE (scalar or
-  //     materialized-ref pointer) across preds / around a loop. This is NOT a
-  //     materialized-object PHI — it tracks a real field value that must be
-  //     merged. KEEP creating it. The analyzer's recorded
-  //     (PHIIncomingValues[I], PHIIncomingBlocks[I]) are valid as-is: each
-  //     incoming is a dominating field value, and a materialized-ref incoming
-  //     is the peer VO's OrigAlloc, which is kept alive.
-  if (RAUWOrigToPHI)
-    return; // Case (1): skip the materialized-object merge PHI.
-
-  // Case (2): insert the field-value PHI and wire its incomings directly.
+  // (The former "materialized-object merge PHI" variant — RAUWOrigToPHI ==
+  // true, emitted by materializeAndBuildPhi — was a no-op at apply time
+  // under reuse-OrigAlloc: OrigAlloc is the single SSA value on every path,
+  // so every incoming would have been OrigAlloc and the PHI would have
+  // trivially folded. The emission site and the RAUWOrigToPHI field have
+  // been removed; only this live field-value-PHI path remains.)
   PHINode *Phi = PhiInst;
   assert(Phi && "CreatePHI effect requires a PhiInst");
   assert(Phi->getParent() == nullptr &&

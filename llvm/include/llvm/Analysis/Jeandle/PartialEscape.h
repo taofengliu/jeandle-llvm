@@ -674,14 +674,10 @@ public:
   SmallVector<MaterializedLock, 2> Locks;
   // Per-pred materializations carry no fields on this effect. Under
   // reuse-OrigAlloc every per-pred materialize is placed at
-  // PH->getTerminator(), reuses OrigAlloc as the materialized value, and the
-  // consuming merge-PHI is skipped (CreatePHIEffect::apply Case 1) — so
-  // per-pred distinctness survives via the analysis-side
-  // getOrCreatePerPredMatPlaceholder cache key (PH, TargetMerge, ID) and the
-  // per-effect NewInvOf[SourceEffect] receiver lookup in the lock-cascade
-  // path. The single live per-pred-origin marker (an unparented placeholder
-  // Value* used as the lock-cascade identity key) lives in
-  // PEAResult::OwnedMatPlaceholders / getOrCreatePerPredMatPlaceholder.
+  // PH->getTerminator(), reuses OrigAlloc as the materialized value, and no
+  // materialized-object merge PHI is emitted — per-pred distinctness survives
+  // via the per-effect NewInvOf[SourceEffect] receiver lookup in the
+  // lock-cascade path, keyed by the per-pred SourceEffect identity.
 
   Kind getKind() const override { return Kind::Materialize; }
   static bool classof(const Effect *E) { return E->getKind() == Kind::Materialize; }
@@ -708,6 +704,12 @@ public:
 // Insert an analyzer-built unparented PHINode at a merge block and wire its
 // incomings. Non-cfgKill (Pass 1). Graal analog: addFloatingNode + setPhiInput
 // (initializePhiInput).
+//
+// All CreatePHIEffects are field-value PHIs (merging a per-offset field VALUE
+// across preds / around a loop, emitted by mergeFieldStates and
+// synthesizeCaseC). The former "materialized-object merge PHI" variant
+// (RAUWOrigToPHI) was a no-op at apply time under reuse-OrigAlloc — OrigAlloc
+// is the single SSA value on every path — and has been removed.
 class CreatePHIEffect : public Effect {
 public:
   Type *PHIType = nullptr;
@@ -716,7 +718,6 @@ public:
   SmallVector<WeakTrackingVH, 4> PHIIncomingValues;
   SmallVector<BasicBlock *, 4> PHIIncomingBlocks;
   PHINode *PhiInst = nullptr;
-  bool RAUWOrigToPHI = false;
 
   Kind getKind() const override { return Kind::CreatePHI; }
   static bool classof(const Effect *E) { return E->getKind() == Kind::CreatePHI; }
@@ -946,9 +947,9 @@ public:
   // single-PH per-pred cascade therefore groups under one InsertBefore
   // exactly like a live-path cascade. Two distinct edge targets from the same
   // PH ALSO share that same terminator key — there is NO per-merge
-  // bucketing; this is sound only because the materialized-object merge PHI
-  // is SKIPPED at apply (CreatePHIEffect::apply Case 1), so cross-merge
-  // placeholder identity has no observable lock effect.
+  // bucketing; this is sound under reuse-OrigAlloc because no
+  // materialized-object merge PHI is ever emitted, so cross-merge identity
+  // has no observable lock effect.
   //
   // CROSS-PH per-pred cascades — multiple per-pred materializes from different
   // PHs feeding the same escape point or merge — do NOT merge today: they
@@ -1009,20 +1010,6 @@ public:
   // BlockExits[BB] would reference a deleted PHI. Lifecycle is identical to
   // OwnedPhis.
   SmallVector<WeakTrackingVH, 4> OwnedLoopFieldPhis;
-
-  // Per-pred materialization placeholder Value*s synthesized by the analyzer
-  // (one per (predecessor-block, ObjectID) materialization). Distinct
-  // unparented instructions that mark which predecessor a per-pred
-  // materialize belongs to for the lock-cascade key. Under reuse-OrigAlloc
-  // they are resolved away (never inserted into IR) at apply time: the
-  // materialized-object merge PHI that would have carried them is SKIPPED
-  // (CreatePHIEffect::apply Case 1), so a placeholder never becomes a PHI
-  // incoming — it is flushed here at teardown.
-  // Same ownership rules as OwnedPhis: the transform never inserts them, so
-  // the destructor deletes any handle still non-null and unparented at
-  // teardown. WeakTrackingVH guards against a UAF if a placeholder is ever
-  // erased.
-  SmallVector<WeakTrackingVH, 4> OwnedMatPlaceholders;
 
   // Parented LLVM PHIs the transform should RAUW to poison + erase after
   // the main Pass-2 EliminateAllocation sweep. These are Case-B aliases on

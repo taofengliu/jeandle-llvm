@@ -1,13 +1,16 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; processLoopExit 0-clause cleanup that observes a VO.
+; EH handler (landingpad cleanup) that reads a loop-local VO's field.
 ;
 ; %o is a loop-local virtual; the loop body's may_throw invoke unwinds to a
-; 0-clause cleanup (%cleanup) that READS %o's field. The cleanup is not a pure
-; `landingpad; resume` OOM handler, so processLoopExit must treat it as an
-; exception-handling exit and force %o material by the time the handler runs.
-; (The pre-fix clause-count heuristic skipped ALL 0-clause landingpads on the
-; unverified assumption that they only resume.)
+; 0-clause cleanup (%cleanup) that READS %o's field. The EH handler runs with
+; real state during exception unwind, but PEA propagates %o's virtual state
+; (field = 42) to the cleanup via the unwind-edge pre-invoke snapshot, so the
+; cleanup's load FOLDS to the stored constant. %o stays NeverEscapes and is
+; eliminated; the cleanup calls @use(42) — the value that would have been in
+; %o's field. (Previously processLoopExit conservatively force-materialized %o
+; at such exits; that force was vestigial under reuse-OrigAlloc and has been
+; removed — see deopt_within_reach_* tests.)
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @may_throw()
@@ -41,10 +44,11 @@ cleanup:
 }
 
 ; CHECK-LABEL: define void @test_loop_exit_cleanup_reads_vo
-; %o is materialized (it must be real when %cleanup reads its field), and the
-; cleanup's load survives reading the real field.
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
-; CHECK: load atomic i32
-; CHECK: call void @use
+; %o is eliminated (NeverEscapes); the cleanup's load folds to the stored
+; constant 42 via the unwind-edge virtual-state propagation. No allocation
+; survives, no real field load is needed.
+; CHECK-NOT: jeandle.new_instance
+; CHECK-NOT: load atomic
+; CHECK: call void @use(i32 42)
 
 !java-method-compilation = !{}

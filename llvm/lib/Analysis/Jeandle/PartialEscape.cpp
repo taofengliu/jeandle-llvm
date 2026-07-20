@@ -582,14 +582,6 @@ PEAResult::~PEAResult() {
           delete Phi;
     }
   }
-  // Per-pred materialization placeholders (never inserted by the transform).
-  for (WeakTrackingVH &VH : OwnedMatPlaceholders) {
-    if (Value *V = VH) {
-      if (auto *I = dyn_cast<Instruction>(V))
-        if (!I->getParent())
-          I->deleteValue();
-    }
-  }
 }
 
 void PEAResult::truncateOwnedTo(size_t PhisMark, size_t InstsMark) {
