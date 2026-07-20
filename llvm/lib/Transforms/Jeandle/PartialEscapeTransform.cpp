@@ -546,7 +546,7 @@ void jeandle::ReplaceCallEffect::apply(jeandle::TransformContext &Ctx) {
 void jeandle::EliminateStoreEffect::apply(jeandle::TransformContext &Ctx) {
   if (!Target)
     return;
-  // Eager-update (defensive, TODO(pea-deopt)): EliminateStore and Materialize-
+  // Eager-update (defensive): EliminateStore and Materialize-
   // at-store are mutually exclusive by the processStore dispatch, so this never
   // fires today, but a store CAN be a Materialize IP (value-side fall-through),
   // so the hook is future-proof if that exclusion ever changes.
