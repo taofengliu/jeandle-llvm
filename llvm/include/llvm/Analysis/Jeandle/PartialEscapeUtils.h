@@ -64,9 +64,13 @@ std::optional<JBasicType> elementTypeForArrayKlass(uintptr_t ArrayKlass);
 // Object→ptr addrspace(1)).  Returns nullptr if Kind == Count.
 Type *llvmElementTypeFor(JBasicType Kind, LLVMContext &Ctx);
 
-// Strip pointer-identity-preserving operations (bitcast, addrspacecast
-// within addrspace(1), freeze) and constant-offset GEPs, accumulating the
-// constant offset into *OutOffset. Returns the root pointer. Sets
+// Strip pointer-identity-preserving operations (bitcast, addrspacecast within
+// addrspace(1), freeze, launder/strip.invariant.group, ptr.annotation, and a
+// pre-existing same-width inttoptr(ptrtoint(x)) round-trip) and
+// constant-offset GEPs, accumulating the constant offset into *OutOffset.
+// Instruction dispatch still treats PtrToIntInst as an identity observation;
+// structural round-trip support does not keep a virtual live across it. Returns
+// the root pointer. Sets
 // *NonConstant = true if a non-constant GEP index was encountered (then the
 // accumulated offset is invalid). Shared structural helper used by
 // resolveVirtualRef and resolveFieldOffset.

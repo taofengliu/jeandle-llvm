@@ -2794,12 +2794,19 @@ bool Analyzer::hasObservableIdentityUse(jeandle::ObjectID ID, PHINode *CaseCPhi,
       if (isa<PHINode>(UI) || isa<SelectInst>(UI))
         return true;
 
+      // Instruction-form ptrtoint is deliberately not transparent here: the
+      // normal instruction dispatch treats the integer value as an identity
+      // observation and materializes the virtual before a later inttoptr can
+      // form a same-width round-trip. PartialEscapeUtils can structurally peel
+      // a pre-existing round-trip for identity/offset consistency, but that is
+      // not a promise to keep a virtual object live across PtrToIntInst.
       bool Traceable = isa<GEPOperator>(UI) || isa<BitCastOperator>(UI) ||
                        isa<AddrSpaceCastOperator>(UI) || isa<FreezeInst>(UI);
       if (auto *II = dyn_cast<IntrinsicInst>(UI)) {
         Intrinsic::ID IID = II->getIntrinsicID();
         Traceable = IID == Intrinsic::launder_invariant_group ||
-                    IID == Intrinsic::strip_invariant_group;
+                    IID == Intrinsic::strip_invariant_group ||
+                    IID == Intrinsic::ptr_annotation;
       }
       std::optional<int64_t> Offset = jeandle::pea::resolveFieldOffset(UI, DL);
       if (!Traceable || !Offset)

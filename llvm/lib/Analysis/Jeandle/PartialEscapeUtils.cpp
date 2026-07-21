@@ -270,14 +270,16 @@ Value *stripPointerCastsAndOffsets(Value *Ptr, const DataLayout &DL,
       V = FI->getOperand(0);
       continue;
     }
-    // llvm.launder/strip.invariant.group are pointer-identity-preserving.
+    // llvm.launder/strip.invariant.group and llvm.ptr.annotation are
+    // pointer-identity-preserving.
     // resolveVirtualRef sees them through the alias map (processIntrinsic
-    // installs it); offset resolution must peel them too, so a launder-wrapped
-    // GEP keeps its accumulated byte offset.
+    // installs it); offset resolution must peel them too, so a wrapped GEP
+    // keeps its accumulated byte offset.
     if (auto *II = dyn_cast<IntrinsicInst>(V)) {
       Intrinsic::ID ID = II->getIntrinsicID();
       if (ID == Intrinsic::launder_invariant_group ||
-          ID == Intrinsic::strip_invariant_group) {
+          ID == Intrinsic::strip_invariant_group ||
+          ID == Intrinsic::ptr_annotation) {
         V = II->getArgOperand(0);
         continue;
       }
@@ -497,10 +499,10 @@ std::optional<int64_t> resolveFieldOffset(Value *Ptr, const DataLayout &DL) {
   // Delegate to the shared offset accumulator so identity- and
   // offset-resolution peel the same set of wrappers (GEP constant offsets,
   // bitcast, JavaHeap addrspacecast, freeze, launder/strip.invariant.group,
-  // inttoptr(ptrtoint(x)) round-trip): a pointer that resolves to a virtual
-  // base yields its true byte offset here. A non-constant GEP -> nullopt
-  // (caller materializes); a non-GEP base (the object itself, a whole-object
-  // Case-B PHI/Select) -> 0.
+  // ptr.annotation, inttoptr(ptrtoint(x)) round-trip): a pointer that resolves
+  // to a virtual base yields its true byte offset here. A non-constant GEP ->
+  // nullopt (caller materializes); a non-GEP base (the object itself, a
+  // whole-object Case-B PHI/Select) -> 0.
   int64_t Off = 0;
   bool NonConst = false;
   stripPointerCastsAndOffsets(Ptr, DL, &Off, &NonConst);
