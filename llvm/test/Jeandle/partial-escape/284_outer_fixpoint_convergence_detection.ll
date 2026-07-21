@@ -35,13 +35,25 @@
 ; RUN:   -jeandle-dump-pea-ir-function=test_merged_lock_replay_converges %s 2>&1 \
 ; RUN:   | grep '^;; PEA-DUMP' | FileCheck %s --check-prefix=MERGED-LOCK-REPEAT
 ; RUN: opt -S -passes="partial-escape-iterative,partial-escape-iterative" \
-; RUN:   -jeandle-pea-iterations=16 %s -o %t.repeat.ll
-; RUN: FileCheck %s --check-prefixes=PARTIAL-FINAL,LOCK-FINAL,MERGED-LOCK-FINAL,VALUE-FINAL,DEAD-FINAL \
+; RUN:   -verify-each -jeandle-pea-iterations=16 \
+; RUN:   -jeandle-dump-pea-ir-function=test_volatile_replay_mismatch %s 2>&1 \
+; RUN:   | grep '^;; PEA-DUMP' | FileCheck %s --check-prefix=VOLATILE-REPEAT
+; RUN: opt -S -passes="partial-escape-iterative,partial-escape-iterative" \
+; RUN:   -verify-each -jeandle-pea-iterations=16 \
+; RUN:   -jeandle-dump-pea-ir-function=test_syncscope_replay_mismatch %s 2>&1 \
+; RUN:   | grep '^;; PEA-DUMP' | FileCheck %s --check-prefix=SYNCSCOPE-REPEAT
+; RUN: opt -S -passes="partial-escape-iterative,partial-escape-iterative" \
+; RUN:   -verify-each -jeandle-pea-iterations=16 %s -o %t.repeat.ll
+; RUN: FileCheck %s --check-prefixes=PARTIAL-FINAL,LOCK-FINAL,MERGED-LOCK-FINAL,VALUE-FINAL,VOLATILE-FINAL,SYNCSCOPE-FINAL,DEAD-FINAL \
 ; RUN:   < %t.repeat.ll
 ; RUN: sed -n '/^define i32 @test_partial_replay_converges/,/^}/p' %t.repeat.ll \
 ; RUN:   | grep -c '^  store atomic' | FileCheck %s --check-prefix=PARTIAL-STORE-COUNT
 ; RUN: sed -n '/^define i32 @test_replay_value_change/,/^}/p' %t.repeat.ll \
 ; RUN:   | grep -c '^  store atomic' | FileCheck %s --check-prefix=VALUE-STORE-COUNT
+; RUN: sed -n '/^define i32 @test_volatile_replay_mismatch/,/^}/p' %t.repeat.ll \
+; RUN:   | grep -c '^  store atomic' | FileCheck %s --check-prefix=VOLATILE-STORE-COUNT
+; RUN: sed -n '/^define i32 @test_syncscope_replay_mismatch/,/^}/p' %t.repeat.ll \
+; RUN:   | grep -c '^  store atomic' | FileCheck %s --check-prefix=SYNCSCOPE-STORE-COUNT
 ; RUN: sed -n '/^define void @test_merged_lock_replay_converges/,/^}/p' %t.repeat.ll \
 ; RUN:   | grep -c 'call hotspotcc void @jeandle.monitorenter_with_lightweight_lock' \
 ; RUN:   | FileCheck %s --check-prefix=MERGED-LOCK-COUNT
@@ -201,6 +213,63 @@ u:
   resume i64 %lp
 }
 
+; PEA-owned replay metadata does not by itself make a semantically different
+; store reusable. A volatile replay must be replaced by the ordinary
+; system-scope unordered store emitted for the current materialization plan.
+define i32 @test_volatile_replay_mismatch(i1 %escape, i32 %value)
+    gc "hotspotgc" personality ptr @__gxx_personality_v0 {
+entry:
+  %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+            ptr inttoptr (i64 50101 to ptr), i32 16)
+       to label %n unwind label %u
+n:
+  %slot = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
+  store atomic i32 %value, ptr addrspace(1) %slot unordered, align 4
+  br i1 %escape, label %escape.block, label %merge
+escape.block:
+  %replay.slot = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8,
+      !jeandle.pea.replay !0
+  store atomic volatile i32 %value, ptr addrspace(1) %replay.slot unordered,
+      align 4,
+      !jeandle.pea.replay !0
+  call void @sink(ptr addrspace(1) %o)
+  br label %merge
+merge:
+  %loaded = load atomic i32, ptr addrspace(1) %slot unordered, align 4
+  ret i32 %loaded
+u:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
+; A non-system sync scope likewise changes the operation. It must not satisfy
+; the exact replay matcher even when its value, receiver, offset, ordering, and
+; alignment match the materialization plan.
+define i32 @test_syncscope_replay_mismatch(i1 %escape, i32 %value)
+    gc "hotspotgc" personality ptr @__gxx_personality_v0 {
+entry:
+  %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+            ptr inttoptr (i64 50102 to ptr), i32 16)
+       to label %n unwind label %u
+n:
+  %slot = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
+  store atomic i32 %value, ptr addrspace(1) %slot unordered, align 4
+  br i1 %escape, label %escape.block, label %merge
+escape.block:
+  %replay.slot = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8,
+      !jeandle.pea.replay !0
+  store atomic i32 %value, ptr addrspace(1) %replay.slot syncscope("singlethread")
+      unordered, align 4, !jeandle.pea.replay !0
+  call void @sink(ptr addrspace(1) %o)
+  br label %merge
+merge:
+  %loaded = load atomic i32, ptr addrspace(1) %slot unordered, align 4
+  ret i32 %loaded
+u:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
 ; The first transform can create a replay in the apparently escaping arm. Once
 ; canonicalization deletes that arm, the next transform must eliminate both the
 ; allocation and its marked replay rather than treating ownership as liveness.
@@ -306,6 +375,32 @@ u:
 ; MERGED-LOCK-REPEAT-NEXT: ;; PEA-DUMP after iter=1 function test_merged_lock_replay_converges transform_idle=1
 ; MERGED-LOCK-REPEAT-NOT: ;; PEA-DUMP
 
+; A semantic mismatch is rewritten once. The next two rounds establish the
+; stable replay, and a second pipeline invocation is entirely idle.
+; VOLATILE-REPEAT: ;; PEA-DUMP before iter=0 function test_volatile_replay_mismatch
+; VOLATILE-REPEAT-NEXT: ;; PEA-DUMP after iter=0 function test_volatile_replay_mismatch transform_idle=0
+; VOLATILE-REPEAT-NEXT: ;; PEA-DUMP before iter=1 function test_volatile_replay_mismatch
+; VOLATILE-REPEAT-NEXT: ;; PEA-DUMP after iter=1 function test_volatile_replay_mismatch transform_idle=1
+; VOLATILE-REPEAT-NEXT: ;; PEA-DUMP before iter=2 function test_volatile_replay_mismatch
+; VOLATILE-REPEAT-NEXT: ;; PEA-DUMP after iter=2 function test_volatile_replay_mismatch transform_idle=1
+; VOLATILE-REPEAT-NEXT: ;; PEA-DUMP before iter=0 function test_volatile_replay_mismatch
+; VOLATILE-REPEAT-NEXT: ;; PEA-DUMP after iter=0 function test_volatile_replay_mismatch transform_idle=1
+; VOLATILE-REPEAT-NEXT: ;; PEA-DUMP before iter=1 function test_volatile_replay_mismatch
+; VOLATILE-REPEAT-NEXT: ;; PEA-DUMP after iter=1 function test_volatile_replay_mismatch transform_idle=1
+; VOLATILE-REPEAT-NOT: ;; PEA-DUMP
+
+; SYNCSCOPE-REPEAT: ;; PEA-DUMP before iter=0 function test_syncscope_replay_mismatch
+; SYNCSCOPE-REPEAT-NEXT: ;; PEA-DUMP after iter=0 function test_syncscope_replay_mismatch transform_idle=0
+; SYNCSCOPE-REPEAT-NEXT: ;; PEA-DUMP before iter=1 function test_syncscope_replay_mismatch
+; SYNCSCOPE-REPEAT-NEXT: ;; PEA-DUMP after iter=1 function test_syncscope_replay_mismatch transform_idle=1
+; SYNCSCOPE-REPEAT-NEXT: ;; PEA-DUMP before iter=2 function test_syncscope_replay_mismatch
+; SYNCSCOPE-REPEAT-NEXT: ;; PEA-DUMP after iter=2 function test_syncscope_replay_mismatch transform_idle=1
+; SYNCSCOPE-REPEAT-NEXT: ;; PEA-DUMP before iter=0 function test_syncscope_replay_mismatch
+; SYNCSCOPE-REPEAT-NEXT: ;; PEA-DUMP after iter=0 function test_syncscope_replay_mismatch transform_idle=1
+; SYNCSCOPE-REPEAT-NEXT: ;; PEA-DUMP before iter=1 function test_syncscope_replay_mismatch
+; SYNCSCOPE-REPEAT-NEXT: ;; PEA-DUMP after iter=1 function test_syncscope_replay_mismatch transform_idle=1
+; SYNCSCOPE-REPEAT-NOT: ;; PEA-DUMP
+
 ; FINAL-LABEL: define i32 @test_convergence_detection()
 ; FINAL-NOT: jeandle.new_instance
 ; FINAL-NOT: call void @sink
@@ -363,6 +458,30 @@ u:
 ; VALUE-FINAL-NOT: poison
 ; VALUE-FINAL: }
 ; VALUE-STORE-COUNT: {{^2$}}
+
+; VOLATILE-FINAL-LABEL: define i32 @test_volatile_replay_mismatch(
+; VOLATILE-FINAL-NOT: volatile
+; VOLATILE-FINAL-NOT: syncscope
+; VOLATILE-FINAL: escape.block:
+; VOLATILE-FINAL-NEXT: %[[VOLATILE_SLOT:[A-Za-z0-9._]+]] = getelementptr inbounds{{( nuw)?}} i8, ptr addrspace(1) {{.*}}, i64 8, !jeandle.pea.replay
+; VOLATILE-FINAL-NEXT: store atomic i32 %value, ptr addrspace(1) %[[VOLATILE_SLOT]] unordered, align 4, !jeandle.pea.replay
+; VOLATILE-FINAL-NEXT: call void @sink
+; VOLATILE-FINAL-NOT: volatile
+; VOLATILE-FINAL-NOT: syncscope
+; VOLATILE-FINAL: }
+; VOLATILE-STORE-COUNT: {{^2$}}
+
+; SYNCSCOPE-FINAL-LABEL: define i32 @test_syncscope_replay_mismatch(
+; SYNCSCOPE-FINAL-NOT: volatile
+; SYNCSCOPE-FINAL-NOT: syncscope
+; SYNCSCOPE-FINAL: escape.block:
+; SYNCSCOPE-FINAL-NEXT: %[[SYNCSCOPE_SLOT:[A-Za-z0-9._]+]] = getelementptr inbounds{{( nuw)?}} i8, ptr addrspace(1) {{.*}}, i64 8, !jeandle.pea.replay
+; SYNCSCOPE-FINAL-NEXT: store atomic i32 %value, ptr addrspace(1) %[[SYNCSCOPE_SLOT]] unordered, align 4, !jeandle.pea.replay
+; SYNCSCOPE-FINAL-NEXT: call void @sink
+; SYNCSCOPE-FINAL-NOT: volatile
+; SYNCSCOPE-FINAL-NOT: syncscope
+; SYNCSCOPE-FINAL: }
+; SYNCSCOPE-STORE-COUNT: {{^2$}}
 
 ; DEAD-FINAL-LABEL: define i32 @test_dead_replay_branch(i32 %value)
 ; DEAD-FINAL-NOT: jeandle.new_instance

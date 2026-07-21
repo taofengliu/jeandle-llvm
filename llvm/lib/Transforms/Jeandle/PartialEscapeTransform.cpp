@@ -195,7 +195,8 @@ matchExistingReplay(Instruction *InsertBefore,
     if (Op.K == ExpectedReplayOperation::Kind::Store) {
       auto *Store = dyn_cast<StoreInst>(I);
       if (!Store || Store->getValueOperand() != Op.StoredValue ||
-          !Store->isAtomic() ||
+          Store->isVolatile() || !Store->isAtomic() ||
+          Store->getSyncScopeID() != SyncScope::System ||
           Store->getOrdering() != AtomicOrdering::Unordered)
         return false;
       int64_t Offset = 0;
