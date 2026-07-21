@@ -1,11 +1,12 @@
 ; RUN: opt -S -verify-each -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 ; RUN: opt -S -verify-each -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s --check-prefix=NOPOISON
 
-; The SCC {left, right, merge} has two entries and no natural-loop header:
-; entry can reach both left and right directly, while merge can return to
-; either arm.  In RPO one of merge's reachable predecessors is necessarily
-; unvisited when the first SCC block is processed.  A partial predecessor
-; state must not let PEA fold the merged load to either arm's constant.
+; The SCC {left, right, merge, cycle} has two entries and no natural-loop
+; header: entry can reach both left and right directly, while merge can return
+; to either arm through cycle.  In RPO one of merge's reachable predecessors
+; is necessarily unvisited when the first SCC block is processed.  A partial
+; predecessor state must not let PEA fold the merged load to either arm's
+; constant.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink_i32(i32)

@@ -38,10 +38,14 @@ unwind:
 
 ; CHECK-LABEL: define void @merge_i32_float
 ; CHECK: %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
-; CHECK-COUNT-1: store atomic i32 7,
-; CHECK-NOT: store atomic i32 7,
-; CHECK-COUNT-1: store atomic float 1.500000e+00,
-; CHECK-NOT: store atomic float 1.500000e+00,
+; CHECK: left:
+; CHECK-NEXT: [[I32_SLOT:%pea.matslot[0-9]*]] = getelementptr inbounds i8, ptr addrspace(1) %o, i64 16
+; CHECK-NEXT: store atomic i32 7, ptr addrspace(1) [[I32_SLOT]] unordered, align 4
+; CHECK-NEXT: br label %merge
+; CHECK: right:
+; CHECK-NEXT: [[FLOAT_SLOT:%pea.matslot[0-9]*]] = getelementptr inbounds i8, ptr addrspace(1) %o, i64 16
+; CHECK-NEXT: store atomic float 1.500000e+00, ptr addrspace(1) [[FLOAT_SLOT]] unordered, align 4
+; CHECK-NEXT: br label %merge
 ; CHECK: %v = load atomic i32, ptr addrspace(1) %mf unordered, align 4
 ; CHECK: call void @sink_i32(i32 %v)
 ; CHECK-NOT: pea.field.phi
@@ -53,20 +57,25 @@ unwind:
 define void @merge_scalar_reference(i1 %c, ptr addrspace(1) %ref)
     gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
-  %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
-           ptr inttoptr (i64 67402 to ptr), i32 32)
-       to label %dispatch unwind label %unwind
-dispatch:
-  br i1 %c, label %left, label %right
+  br i1 %c, label %left_alloc, label %right_alloc
+left_alloc:
+  %left_o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+                ptr inttoptr (i64 67402 to ptr), i32 32)
+            to label %left unwind label %unwind
 left:
-  %lf = getelementptr inbounds i8, ptr addrspace(1) %o, i64 16
+  %lf = getelementptr inbounds i8, ptr addrspace(1) %left_o, i64 16
   store atomic i64 9, ptr addrspace(1) %lf unordered, align 8
   br label %merge
+right_alloc:
+  %right_o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+                 ptr inttoptr (i64 67402 to ptr), i32 32)
+             to label %right unwind label %unwind
 right:
-  %rf = getelementptr inbounds i8, ptr addrspace(1) %o, i64 16
+  %rf = getelementptr inbounds i8, ptr addrspace(1) %right_o, i64 16
   store atomic ptr addrspace(1) %ref, ptr addrspace(1) %rf unordered, align 8
   br label %merge
 merge:
+  %o = phi ptr addrspace(1) [ %left_o, %left ], [ %right_o, %right ]
   %mf = getelementptr inbounds i8, ptr addrspace(1) %o, i64 16
   %v = load atomic i64, ptr addrspace(1) %mf unordered, align 8
   call void @sink_i64(i64 %v)
@@ -77,11 +86,17 @@ unwind:
 }
 
 ; CHECK-LABEL: define void @merge_scalar_reference
-; CHECK: %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
-; CHECK-COUNT-1: store atomic i64 9,
-; CHECK-NOT: store atomic i64 9,
-; CHECK-COUNT-1: store atomic ptr addrspace(1) %ref,
-; CHECK-NOT: store atomic ptr addrspace(1) %ref,
+; CHECK: %left_o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
+; CHECK: left:
+; CHECK-NEXT: [[I64_SLOT:%pea.matslot[0-9]*]] = getelementptr inbounds i8, ptr addrspace(1) %left_o, i64 16
+; CHECK-NEXT: store atomic i64 9, ptr addrspace(1) [[I64_SLOT]] unordered, align 8
+; CHECK-NEXT: br label %merge
+; CHECK: %right_o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
+; CHECK: right:
+; CHECK-NEXT: [[REF_SLOT:%pea.matslot[0-9]*]] = getelementptr inbounds i8, ptr addrspace(1) %right_o, i64 16
+; CHECK-NEXT: store atomic ptr addrspace(1) %ref, ptr addrspace(1) [[REF_SLOT]] unordered, align 8
+; CHECK-NEXT: br label %merge
+; CHECK: %o = phi ptr addrspace(1) [ %left_o, %left ], [ %right_o, %right ]
 ; CHECK: %v = load atomic i64, ptr addrspace(1) %mf unordered, align 8
 ; CHECK: call void @sink_i64(i64 %v)
 ; CHECK-NOT: pea.field.phi
@@ -123,8 +138,15 @@ unwind:
 
 ; CHECK-LABEL: define void @merge_virtual_materialized_child
 ; CHECK-COUNT-1: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance{{.*}}i64 67404
-; CHECK-COUNT-2: store atomic i32 31,
-; CHECK-NOT: store atomic i32 31,
+; CHECK: left:
+; CHECK-NEXT: [[LEFT_CHILD_SLOT:%pea.matslot[0-9]*]] = getelementptr inbounds i8, ptr addrspace(1) %child, i64 16
+; CHECK-NEXT: store atomic i32 31, ptr addrspace(1) [[LEFT_CHILD_SLOT]] unordered, align 4
+; CHECK-NEXT: call void @sink_ref(ptr addrspace(1) %child)
+; CHECK-NEXT: br label %merge
+; CHECK: right:
+; CHECK-NEXT: [[RIGHT_CHILD_SLOT:%pea.matslot[0-9]*]] = getelementptr inbounds i8, ptr addrspace(1) %child, i64 16
+; CHECK-NEXT: store atomic i32 31, ptr addrspace(1) [[RIGHT_CHILD_SLOT]] unordered, align 4
+; CHECK-NEXT: br label %merge
 ; CHECK-NOT: pea.field.phi
 ; CHECK: merge:
 ; CHECK-NEXT: call void @sink_ref(ptr addrspace(1) %child)
@@ -182,8 +204,14 @@ unwind:
 ; CHECK-LABEL: define void @merge_inner_changes_outer_retry
 ; CHECK-NOT: i64 67405
 ; CHECK-COUNT-1: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance{{.*}}i64 67406
-; CHECK-COUNT-2: store atomic i32 47,
-; CHECK-NOT: store atomic i32 47,
+; CHECK: left:
+; CHECK-NEXT: [[LEFT_INNER_SLOT:%pea.matslot[0-9]*]] = getelementptr inbounds i8, ptr addrspace(1) %inner, i64 16
+; CHECK-NEXT: store atomic i32 47, ptr addrspace(1) [[LEFT_INNER_SLOT]] unordered, align 4
+; CHECK-NEXT: br label %merge
+; CHECK: right:
+; CHECK-NEXT: [[RIGHT_INNER_SLOT:%pea.matslot[0-9]*]] = getelementptr inbounds i8, ptr addrspace(1) %inner, i64 16
+; CHECK-NEXT: store atomic i32 47, ptr addrspace(1) [[RIGHT_INNER_SLOT]] unordered, align 4
+; CHECK-NEXT: br label %merge
 ; CHECK: merge:
 ; CHECK-NEXT: [[OUTER1:%pea.field.phi[^ ]*]] = phi ptr addrspace(1) [ %p1, %right ], [ %inner, %left ]
 ; CHECK-NEXT: [[OUTER2:%pea.field.phi[^ ]*]] = phi ptr addrspace(1) [ %p2, %right ], [ %inner, %left ]
