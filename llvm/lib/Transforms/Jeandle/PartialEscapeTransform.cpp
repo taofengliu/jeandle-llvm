@@ -559,9 +559,8 @@ static bool applyMaterialize(
 // Graal's `apply(StructuredGraph graph, ArrayList<Node> obsoleteNodes)` — LLVM
 // mutates a Function, not a StructuredGraph).
 //
-// The struct carries the three shared maps below (NewInvOf,
-// InsertBeforeDependents, OrigInsertBefore); each member is documented at
-// its definition.
+// The struct carries the shared state used while effects apply; each member is
+// documented at its definition.
 struct jeandle::TransformContext {
   Function &F;
   jeandle::PEAResult &Result;
