@@ -1,17 +1,19 @@
-; RUN: opt -S -passes="partial-escape-iterative" -jeandle-pea-iterations=2 %s | FileCheck %s
+; RUN: opt -S -passes="partial-escape-iterative" -jeandle-pea-iterations=2 \
+; RUN:   -jeandle-dump-pea-ir-function=test_two_round_elim %s 2>&1 \
+; RUN:   | grep '^;; PEA-DUMP' | FileCheck %s --check-prefix=CAP2
+; RUN: opt -S -passes="partial-escape-iterative" -jeandle-pea-iterations=2 %s \
+; RUN:   | FileCheck %s --check-prefix=FINAL
 
 ; Outer fixpoint demonstration. The escape arm (%escape -> sink) is
 ; guarded by an `icmp ne` of a load from a constant-zero global; the analyzer
-; in round 1 cannot see through the load and so visits %escape, where the
-; sink call forces materialization. Between rounds InstCombine folds the load
-; and the icmp, SimplifyCFG removes the dead branch, ADCE prunes the
-; orphaned mat invoke + sink call. Round 2 sees a single-block control flow
-; where %o has only loads/stores to fixed offsets — PEA virtualizes %o end
-; to end and the function reduces to `ret i32 42`.
+; in iteration 0 cannot see through the load and therefore leaves the partial
+; escape unchanged. Inter-round canonicalization folds the condition and
+; removes the dead escape arm. Iteration 1 then virtualizes the allocation and
+; folds its field load to 42.
 ;
-; With -jeandle-pea-iterations=2 we expect zero jeandle.new_instance left in
-; the function. Compare with 282 (default iterations=1) where the alloc
-; survives.
+; A cap of two is sufficient for the final transformation, but not for an
+; additional idle confirmation round. This test pins both that marker sequence
+; and the final function shape.
 
 @G_zero = private unnamed_addr constant i32 0
 
@@ -44,15 +46,20 @@ u:
   resume i64 %lp
 }
 
-; CHECK-LABEL: define i32 @test_two_round_elim()
-; The dead escape branch is removed and the load folds, so the result is the
-; constant 42 and no sink remains. With escape-point placement the partial-
-; escape materialize lands on the (now dead) escape arm; after the branch is
-; removed the surviving materialize feeds %fast and is not re-virtualized by
-; round 2, so a dead allocation may remain (the store is never observed). Full
-; elimination is a future refinement of the escape-point + outer-fixpoint
-; interplay (loop/fixpoint work).
-; CHECK-NOT: call void @sink
-; CHECK: ret i32 42
+; CAP2: ;; PEA-DUMP before iter=0 function test_two_round_elim
+; CAP2-NEXT: ;; PEA-DUMP after iter=0 function test_two_round_elim transform_idle=1
+; CAP2-NEXT: ;; PEA-DUMP before iter=1 function test_two_round_elim
+; CAP2-NEXT: ;; PEA-DUMP after iter=1 function test_two_round_elim transform_idle=0
+; CAP2-NOT: ;; PEA-DUMP
+
+; FINAL-LABEL: define i32 @test_two_round_elim()
+; FINAL-NOT: jeandle.new_instance
+; FINAL-NOT: call void @sink
+; FINAL-NOT: store
+; FINAL-NOT: load
+; FINAL-NOT: phi
+; FINAL-NOT: poison
+; FINAL: ret i32 42
+; FINAL-NEXT: }
 
 !java-method-compilation = !{}
