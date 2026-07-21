@@ -249,15 +249,12 @@ struct BlockExitInfo : BlockExitData {
   // VirtualMap / FieldStates each successor INHERITS from the analyzer's
   // book-keeping: the normal successor sees the post-call state (the base
   // data of this struct), while the unwind successor sees the pre-call
-  // snapshot recorded in UnwindData (the materialize logically happened
-  // during the call, so on unwind any partially-materialized state is
-  // unobservable to the handler). EXCEPTION: a VO whose
-  // invoke-triggered materialize captured LOCKS re-acquires them BEFORE the
-  // invoke — a real side effect on BOTH edges. For such VOs the pre-call
-  // snapshot is patched to the materialized view (markUnwindDataMaterialized)
-  // so the handler cannot re-emit the same locks (double acquire) or lose
-  // the matching exit (lock leak). Field-only replay is idempotent and does
-  // not need the patch.
+  // snapshot recorded in UnwindData. A materialize emitted for an invoke
+  // executes before the invoke: it replays fields, re-emits locks, and exposes
+  // the real object to the callee on both successors. The pre-invoke snapshot
+  // is therefore patched to the materialized view for every such object. This
+  // prevents an unwind handler from folding a pre-call field value or
+  // re-emitting locks, while leaving unrelated virtual objects untouched.
   //
   // TerminatorInvoke / UnwindDest are stashed so the analyzer's pred-state
   // lookup (exitDataFor) can detect "this pred's terminator is an invoke
@@ -282,11 +279,10 @@ struct BlockExitInfo : BlockExitData {
   std::optional<BlockExitData> UnwindData;
 };
 
-// Mark ID as materialized-with-locks-cleared in a pre-invoke snapshot (see
-// the BlockExitInfo comment). Mirrors what the invoke-triggered materialize
-// did to the post-invoke base data: the lock re-emit physically executes
-// before the invoke on BOTH edges, so the unwind handler must see the real,
-// already-locked object (OrigAlloc), never the still-virtual one.
+// Mark ID as materialized in a pre-invoke snapshot (see the BlockExitInfo
+// comment). The invoke-triggered materialize physically executes before the
+// invoke on both edges, so the unwind handler must see the real object and no
+// stale virtual fields or locks.
 static void markUnwindDataMaterialized(BlockExitData &Data,
                                        jeandle::ObjectID ID) {
   Data.Virtuals.erase(ID);
@@ -1274,9 +1270,9 @@ void Analyzer::processBlock(BasicBlock *BB) {
   // snapshot the per-object state immediately BEFORE applying the invoke.
   // The post-invoke state (the regular snapshotExitState below) is what
   // the normal successor inherits; the snapshot we take here becomes the
-  // unwind successor's inheritance (the materialize logically happens
-  // during the call, so the handler should not see partially-materialized
-  // state).
+  // unwind successor's inheritance. Materializations inserted before this
+  // invoke patch the snapshot after instruction processing because their
+  // replay and object exposure execute on both successors.
   //
   // We only bother when the function has a personality (no personality =>
   // no real exception handlers; the work would be observably inert) and
@@ -1345,19 +1341,17 @@ void Analyzer::processBlock(BasicBlock *BB) {
     }
     Info.UnwindEdgeKilled = Virtualized;
 
-    // Patch the pre-invoke snapshot for every VO whose
-    // invoke-triggered materialize captured locks — the lock re-emit
-    // physically executes before the invoke on BOTH edges, so the unwind
-    // successor must inherit the materialized view (see
-    // markUnwindDataMaterialized). Field-only materializes are left to the
-    // split (their replay is idempotent). Patching BEFORE the equivalence
-    // check below can make the whole split unnecessary.
+    // Patch the pre-invoke snapshot for every VO materialized immediately
+    // before this invoke. Field replay, lock re-emission, and exposure of the
+    // real object all precede the call on both successors, so the unwind state
+    // must not retain pre-call virtual fields or locks. Patching before the
+    // equivalence check below can make the whole split unnecessary.
     if (PreInvokeSnapshot) {
       auto EIt = Result.BlockEffects.find(BB);
       if (EIt != Result.BlockEffects.end())
         for (const auto &E : EIt->second) {
           const auto *ME = dyn_cast<jeandle::MaterializeEffect>(&E);
-          if (!ME || ME->Locks.empty())
+          if (!ME)
             continue;
           if ((Value *)ME->InsertBefore != (Value *)TermII)
             continue;
