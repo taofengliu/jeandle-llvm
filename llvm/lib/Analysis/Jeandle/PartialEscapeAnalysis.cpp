@@ -43,6 +43,7 @@
 #include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/ConstantFolding.h"
 #include "llvm/Analysis/Jeandle/PartialEscape.h"
 #include "llvm/Analysis/Jeandle/PartialEscapeUtils.h"
@@ -56,12 +57,12 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
-#include "llvm/IR/Operator.h"
 #include "llvm/IR/Jeandle/JavaType.h"
 #include "llvm/IR/Jeandle/Metadata.h"
 #include "llvm/IR/Jeandle/VMCallback.h"
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 
@@ -780,6 +781,14 @@ private:
   bool synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
                        ArrayRef<std::optional<jeandle::ObjectID>> InIDs,
                        jeandle::EffectList &Out);
+
+  // Case C may collapse different allocation identities only when the
+  // selected source identity cannot reach an observing consumer. Follow
+  // LLVM pointer wrappers transitively; ordinary merge values are observing
+  // boundaries, while access paths ending at planned scalar-replacement
+  // effects are internal to the virtual object.
+  bool hasObservableIdentityUse(jeandle::ObjectID ID, PHINode *CaseCPhi,
+                                ArrayRef<BlockExitData *> ExitInfos);
 
   // In-loop cache for Case C — keyed on (mergeBB, source-IDs in incoming
   // order). The cache exists so an iterative merge stabilization re-visiting
@@ -2721,6 +2730,106 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
   }
 }
 
+bool Analyzer::hasObservableIdentityUse(jeandle::ObjectID ID, PHINode *CaseCPhi,
+                                        ArrayRef<BlockExitData *> ExitInfos) {
+  jeandle::VirtualObject &VO = *Result.VirtualObjects[ID];
+  CallBase *OrigAlloc = cast_or_null<CallBase>((Value *)VO.AllocationCall);
+  if (!OrigAlloc)
+    return true;
+
+  DenseSet<Instruction *> InternalTargets;
+  for (auto &KV : Result.BlockEffects)
+    for (const auto &E : KV.second)
+      if (E.ObjID == ID)
+        if (Instruction *Target = E.getTarget())
+          InternalTargets.insert(Target);
+
+  // LLVM has explicit pointer-derivation instructions between an allocation
+  // and its consumers. Follow every alias-preserving derivation with a known
+  // byte offset so a later identity use cannot hide behind a zero-GEP/freeze
+  // chain. Constant non-zero derivations are followed as access paths: they
+  // are harmless only when every leaf is a planned virtual load/store effect.
+  // Symbolic offsets are opaque and therefore observing. PHIs and selects are
+  // merge points, not wrappers; only the exact Case-C PHI is internal.
+  SmallVector<Value *, 8> Worklist(1, OrigAlloc);
+  SmallPtrSet<Value *, 16> Visited;
+  while (!Worklist.empty()) {
+    Value *Current = Worklist.pop_back_val();
+    if (!Visited.insert(Current).second)
+      continue;
+    for (Use &Use : Current->uses()) {
+      User *U = Use.getUser();
+      if (U == CaseCPhi)
+        continue;
+      auto *UI = dyn_cast<Instruction>(U);
+      if (!UI)
+        return true;
+      // A frame-state reference at a safepoint that cannot execute after this
+      // merge observes the source object only on its original predecessor
+      // path. It is Graal's virtual mapping, not a use of the collapsed
+      // identity. A deopt operand at or after the Case-C PHI remains
+      // observable: reconstruction could otherwise expose the source and the
+      // synthetic object simultaneously.
+      if (auto *CB = dyn_cast<CallBase>(UI)) {
+        unsigned Operand = Use.getOperandNo();
+        if (CB->isBundleOperand(Operand) &&
+            CB->getOperandBundleForOperand(Operand).isDeoptOperandBundle()) {
+          // In a loop, the safepoint can be CFG-reachable from this PHI only
+          // after executing OrigAlloc again, in which case it describes the
+          // next dynamic allocation rather than the identity collapsed here.
+          // Excluding the allocation block models that redefinition barrier.
+          SmallPtrSet<BasicBlock *, 1> AllocationBarrier;
+          AllocationBarrier.insert(OrigAlloc->getParent());
+          if (!isPotentiallyReachable(CaseCPhi, CB, &AllocationBarrier, &DT,
+                                      &LI))
+            continue;
+        }
+      }
+      if (InternalTargets.count(UI))
+        continue;
+
+      auto AliasID = Aliases.getVirtualAlias(UI);
+      if (!AliasID || *AliasID != ID)
+        return true;
+      if (isa<PHINode>(UI) || isa<SelectInst>(UI))
+        return true;
+
+      bool Traceable = isa<GEPOperator>(UI) || isa<BitCastOperator>(UI) ||
+                       isa<AddrSpaceCastOperator>(UI) || isa<FreezeInst>(UI);
+      if (auto *II = dyn_cast<IntrinsicInst>(UI)) {
+        Intrinsic::ID IID = II->getIntrinsicID();
+        Traceable = IID == Intrinsic::launder_invariant_group ||
+                    IID == Intrinsic::strip_invariant_group;
+      }
+      std::optional<int64_t> Offset = jeandle::pea::resolveFieldOffset(UI, DL);
+      if (!Traceable || !Offset)
+        return true;
+      Worklist.push_back(UI);
+    }
+  }
+
+  // No other virtual object may retain this source identity in a virtual
+  // field. Include both predecessor snapshots and the live analyzer state:
+  // an object synthesized earlier in the same merge iteration exists only in
+  // the latter until the block exit is snapshotted.
+  for (BlockExitData *ExitInfo : ExitInfos)
+    for (auto &KV : ExitInfo->FieldStates) {
+      if (KV.first == ID)
+        continue;
+      for (auto &Off : KV.second)
+        if (Off.second.isVirtualRef() && Off.second.getVirtualRef() == ID)
+          return true;
+    }
+  for (auto &KV : FieldStates) {
+    if (KV.first == ID)
+      continue;
+    for (auto &Off : KV.second)
+      if (Off.second.isVirtualRef() && Off.second.getVirtualRef() == ID)
+        return true;
+  }
+  return false;
+}
+
 bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
                                ArrayRef<std::optional<jeandle::ObjectID>> InIDs,
                                jeandle::EffectList &Out) {
@@ -2813,78 +2922,14 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
       return false;
   }
 
-  // Identity check (single-usage-allocation). Every VO has identity.
-  // For each per-pred VO we require:
-  //   (a) the LLVM PHI is the only "external" user of the per-pred alloc.
-  //       An "external" user is one that is neither (i) covered by a planned
-  //       PEA effect for that ID (EliminateStore, ReplaceLoad, ReplaceCall,
-  //       EliminateAllocation, Materialize), nor (ii) registered in the
-  //       AliasMap as a virtual alias of the same ID (GEP/cast/freeze
-  //       forwarded by propagatePointerAlias).
-  //   (b) no OTHER VO at any pred references this VO via virtualRef in its
-  //       FieldStates (otherwise materializing that other VO would also
-  //       materialize this one and expose identity).
+  // Every VO has identity. Graal requires the incoming allocation to have no
+  // other observable use before Case C replaces its identity. LLVM aliases
+  // are explicit SSA instructions, so apply the same rule to the transitive
+  // pointer-use graph rather than only to OrigAlloc's direct users.
   for (unsigned i = 0; i < N; ++i) {
     jeandle::ObjectID PID = PerPredIDs[i];
-    jeandle::VirtualObject &PVO = *Result.VirtualObjects[PID];
-    CallBase *OrigAlloc = cast_or_null<CallBase>((Value *)PVO.AllocationCall);
-    if (!OrigAlloc)
+    if (hasObservableIdentityUse(PID, Phi, ExitInfos))
       return false;
-    // Cheap-out — an alloc with only one use (the PHI itself)
-    // trivially satisfies the no-other-external-user requirement, so
-    // the expensive Effect-target collection below is unnecessary.
-    // hasNUsesOrMore(2) does an O(1) check against the use list.
-    bool MaybeOtherUsers = OrigAlloc->hasNUsesOrMore(2);
-    if (MaybeOtherUsers) {
-      DenseSet<Instruction *> InternalTargets;
-      for (auto &Kv : Result.BlockEffects) {
-        for (const auto &E : Kv.second) {
-          if (E.ObjID == PID)
-            if (Instruction *T = E.getTarget())
-              InternalTargets.insert(T);
-        }
-      }
-      for (User *U : OrigAlloc->users()) {
-        if (U == Phi)
-          continue;
-        auto *UI = dyn_cast<Instruction>(U);
-        if (!UI)
-          return false;
-        if (InternalTargets.count(UI))
-          continue;
-        auto AID = Aliases.getVirtualAlias(UI);
-        if (AID && *AID == PID)
-          continue;
-        // An unaccounted-for user — identity-bail.
-        return false;
-      }
-    }
-    // No other VO references PID through a virtualRef field entry.
-    // Cross-check both per-pred ExitInfos AND the analyzer's
-    // live FieldStates / CurrentState. A VO synthesized earlier in
-    // this same mergeStates iteration (e.g. a prior Case-C inner)
-    // may carry a VirtualRef(PID) entry that isn't yet reflected in
-    // any pred's ExitInfo — the analyzer's CurrentState is the only
-    // place it lives until snapshotExitState runs. Missing this
-    // check leaks identity through the in-flight synthesis.
-    for (auto *EI : ExitInfos) {
-      for (auto &Kv : EI->FieldStates) {
-        if (Kv.first == PID)
-          continue;
-        for (auto &Off : Kv.second) {
-          if (Off.second.isVirtualRef() && Off.second.getVirtualRef() == PID)
-            return false;
-        }
-      }
-    }
-    for (auto &Kv : FieldStates) {
-      if (Kv.first == PID)
-        continue;
-      for (auto &Off : Kv.second) {
-        if (Off.second.isVirtualRef() && Off.second.getVirtualRef() == PID)
-          return false;
-      }
-    }
   }
 
   // In-loop cache lookup. The cache covers ANY in-loop merge block, not just
