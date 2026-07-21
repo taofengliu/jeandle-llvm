@@ -1,5 +1,6 @@
 ; RUN: opt -S -verify-each -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
-; RUN: opt -S -verify-each -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s --check-prefix=NOPOISON
+; RUN: opt -S -verify-each -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s --check-prefix=STORECOUNT
+; RUN: opt -S -verify-each -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s --check-prefix=NEGATIVE
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink_i32(i32)
@@ -220,13 +221,29 @@ unwind:
 ; CHECK-NEXT: ret void
 ; CHECK-NOT: poison
 
-; NOPOISON-LABEL: define void @merge_i32_float
-; NOPOISON-NOT: poison
-; NOPOISON-LABEL: define void @merge_scalar_reference
-; NOPOISON-NOT: poison
-; NOPOISON-LABEL: define void @merge_virtual_materialized_child
-; NOPOISON-NOT: poison
-; NOPOISON-LABEL: define void @merge_inner_changes_outer_retry
-; NOPOISON-NOT: poison
+; STORECOUNT-LABEL: define void @merge_i32_float
+; STORECOUNT-COUNT-2: store atomic
+; STORECOUNT-NOT: store atomic
+; STORECOUNT-LABEL: define void @merge_scalar_reference
+; STORECOUNT-COUNT-2: store atomic
+; STORECOUNT-NOT: store atomic
+; STORECOUNT-LABEL: define void @merge_virtual_materialized_child
+; STORECOUNT-COUNT-2: store atomic
+; STORECOUNT-NOT: store atomic
+; STORECOUNT-LABEL: define void @merge_inner_changes_outer_retry
+; STORECOUNT-COUNT-2: store atomic
+; STORECOUNT-NOT: store atomic
+
+; NEGATIVE-LABEL: define void @merge_i32_float
+; NEGATIVE-NOT: pea.field.phi
+; NEGATIVE-NOT: poison
+; NEGATIVE-LABEL: define void @merge_scalar_reference
+; NEGATIVE-NOT: pea.field.phi
+; NEGATIVE-NOT: poison
+; NEGATIVE-LABEL: define void @merge_virtual_materialized_child
+; NEGATIVE-NOT: pea.field.phi
+; NEGATIVE-NOT: poison
+; NEGATIVE-LABEL: define void @merge_inner_changes_outer_retry
+; NEGATIVE-NOT: poison
 
 !java-method-compilation = !{}
