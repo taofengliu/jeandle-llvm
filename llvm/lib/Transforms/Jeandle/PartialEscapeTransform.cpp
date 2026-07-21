@@ -62,6 +62,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Jeandle/Attributes.h"
 #include "llvm/IR/Jeandle/Metadata.h"
+#include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/Support/MathExtras.h"
@@ -70,7 +71,159 @@
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/Local.h"
 
+#include <algorithm>
+
 using namespace llvm;
+
+static constexpr StringLiteral PEAReplayMetadata = "jeandle.pea.replay";
+
+static bool isPEAReplayInstruction(const Instruction &I) {
+  return I.getMetadata(PEAReplayMetadata) != nullptr;
+}
+
+static void markPEAReplayInstruction(Instruction &I) {
+  I.setMetadata(PEAReplayMetadata, MDNode::get(I.getContext(), {}));
+}
+
+struct ExpectedReplayOperation {
+  enum class Kind : uint8_t { Store, Lock } K;
+  Value *Receiver = nullptr;
+  Value *StoredValue = nullptr;
+  int64_t Offset = 0;
+  Function *LockCallee = nullptr;
+  SmallVector<Value *, 4> LockArgs;
+};
+
+static Value *
+materializedFieldValue(const jeandle::MaterializeEffect::FieldEntry &FE) {
+  if (FE.Value.isScalar())
+    return FE.Value.getScalar();
+  if (FE.Value.isMaterializedRef())
+    return FE.Value.getMaterialized();
+  return nullptr;
+}
+
+// A later outer PEA round sees the stores and monitorenters emitted by the
+// preceding round as ordinary virtualizable operations. Replacing an identical
+// replay sequence would mutate the IR forever without making semantic
+// progress. Build the exact sequence this round would emit at one escape point
+// and compare it with the contiguous PEA-owned sequence already there.
+static bool
+matchExistingReplay(Instruction *InsertBefore,
+                    ArrayRef<jeandle::MaterializeEffect *> Effects,
+                    jeandle::PEAResult &Result,
+                    SmallVectorImpl<Instruction *> &MatchingInstructions) {
+  SmallVector<ExpectedReplayOperation, 16> Expected;
+  SmallVector<jeandle::MaterializeEffect *, 4> Ordered(Effects);
+  llvm::sort(Ordered, [](const jeandle::MaterializeEffect *A,
+                         const jeandle::MaterializeEffect *B) {
+    return A->SeqNo < B->SeqNo;
+  });
+
+  auto appendLock = [&](Value *Receiver, Function *Callee,
+                        ArrayRef<WeakTrackingVH> NonReceiverArgs) {
+    ExpectedReplayOperation Op;
+    Op.K = ExpectedReplayOperation::Kind::Lock;
+    Op.LockCallee = Callee;
+    Op.LockArgs.push_back(Receiver);
+    for (Value *Arg : NonReceiverArgs)
+      Op.LockArgs.push_back(Arg);
+    Expected.push_back(std::move(Op));
+  };
+
+  auto MaxIt = Result.MaxSeqForEscapePoint.find(InsertBefore);
+  for (jeandle::MaterializeEffect *Effect : Ordered) {
+    for (const auto &Field : Effect->FieldEntries) {
+      Value *Stored = materializedFieldValue(Field);
+      Value *Receiver = Effect->Target;
+      if (!Stored || !Receiver)
+        return false;
+      Expected.push_back({ExpectedReplayOperation::Kind::Store,
+                          Receiver,
+                          Stored,
+                          Field.Offset,
+                          nullptr,
+                          {}});
+    }
+
+    if (MaxIt != Result.MaxSeqForEscapePoint.end()) {
+      if (Effect->SeqNo != MaxIt->second)
+        continue;
+      auto LocksIt = Result.EscapePointLocks.find(InsertBefore);
+      if (LocksIt == Result.EscapePointLocks.end())
+        continue;
+      for (const jeandle::MergedLock &Lock : LocksIt->second) {
+        Value *Receiver =
+            Lock.SourceEffect ? (Value *)Lock.SourceEffect->Target : nullptr;
+        if (!Receiver || !Lock.Callee)
+          return false;
+        appendLock(Receiver, Lock.Callee, Lock.NonReceiverArgs);
+      }
+    } else {
+      for (const jeandle::MaterializedLock &Lock : Effect->Locks) {
+        Value *Receiver = Effect->Target;
+        if (!Receiver || !Lock.Callee)
+          return false;
+        appendLock(Receiver, Lock.Callee, Lock.NonReceiverArgs);
+      }
+    }
+  }
+
+  SmallVector<Instruction *, 16> Existing;
+  for (Instruction *I = InsertBefore->getPrevNode(); I; I = I->getPrevNode()) {
+    if (!isPEAReplayInstruction(*I))
+      break;
+    Existing.push_back(I);
+  }
+  std::reverse(Existing.begin(), Existing.end());
+
+  SmallVector<Instruction *, 16> Semantic;
+  for (Instruction *I : Existing) {
+    if (isa<GetElementPtrInst>(I))
+      continue;
+    if (!isa<StoreInst>(I) && !isa<CallInst>(I))
+      return false;
+    Semantic.push_back(I);
+  }
+  if (Semantic.size() != Expected.size())
+    return false;
+
+  const DataLayout &DL = InsertBefore->getModule()->getDataLayout();
+  for (unsigned Index = 0; Index < Expected.size(); ++Index) {
+    const ExpectedReplayOperation &Op = Expected[Index];
+    Instruction *I = Semantic[Index];
+    if (Op.K == ExpectedReplayOperation::Kind::Store) {
+      auto *Store = dyn_cast<StoreInst>(I);
+      if (!Store || Store->getValueOperand() != Op.StoredValue ||
+          !Store->isAtomic() ||
+          Store->getOrdering() != AtomicOrdering::Unordered)
+        return false;
+      int64_t Offset = 0;
+      bool NonConstant = false;
+      Value *Base = jeandle::pea::stripPointerCastsAndOffsets(
+          Store->getPointerOperand(), DL, &Offset, &NonConstant);
+      if (NonConstant || Base != Op.Receiver || Offset != Op.Offset)
+        return false;
+      uint64_t StoreSize =
+          DL.getTypeStoreSize(Op.StoredValue->getType()).getFixedValue();
+      if (Store->getAlign() != Align(PowerOf2Ceil(StoreSize ? StoreSize : 1)))
+        return false;
+      continue;
+    }
+
+    auto *Call = dyn_cast<CallInst>(I);
+    if (!Call || Call->getCalledFunction() != Op.LockCallee ||
+        Call->getCallingConv() != CallingConv::Hotspot_JIT ||
+        Call->hasOperandBundles() || Call->arg_size() != Op.LockArgs.size())
+      return false;
+    for (unsigned Arg = 0; Arg < Op.LockArgs.size(); ++Arg)
+      if (Call->getArgOperand(Arg) != Op.LockArgs[Arg])
+        return false;
+  }
+
+  MatchingInstructions.append(Existing.begin(), Existing.end());
+  return true;
+}
 
 static bool eraseAllocation(Instruction *Target) {
   assert(Target && "EliminateAllocation target must be non-null");
@@ -298,6 +451,8 @@ static bool applyMaterialize(
            "in-IR instruction");
     Value *Slot =
         SB.CreateInBoundsGEP(I8, MatVal, SB.getInt64(FE.Offset), "pea.matslot");
+    if (auto *SlotI = dyn_cast<Instruction>(Slot))
+      markPEAReplayInstruction(*SlotI);
     // Natural alignment = the field type's store size rounded up to a power of
     // two (atomic-unordered stores MUST be naturally aligned; ABI align may be
     // smaller than store size, e.g. i64 under the default datalayout). Derived
@@ -307,6 +462,7 @@ static bool applyMaterialize(
     Align NaturalAlign(llvm::PowerOf2Ceil(StoreSz ? StoreSz : 1));
     StoreInst *S = SB.CreateAlignedStore(V, Slot, NaturalAlign);
     S->setAtomic(AtomicOrdering::Unordered); // Java heap stores are unordered
+    markPEAReplayInstruction(*S);
     Emitted = true;
   }
 
@@ -328,6 +484,7 @@ static bool applyMaterialize(
       Args.push_back(A);
     CallInst *Enter = SB.CreateCall(Callee, Args);
     Enter->setCallingConv(CallingConv::Hotspot_JIT);
+    markPEAReplayInstruction(*Enter);
     // The re-emitted monitorenter is a REAL held lock on OrigAlloc (never a
     // deopt safepoint), so it MUST carry no "deopt" operand bundle — a bundle
     // here would describe a MATERIALIZED VO's lock as a safepoint state,
@@ -426,6 +583,13 @@ struct jeandle::TransformContext {
   // could miss the key at a multi-object escape point.
   DenseMap<const jeandle::MaterializeEffect *, Instruction *> &OrigInsertBefore;
 
+  // A stable replay from a preceding outer round is retained in place when it
+  // exactly matches this round's materialization plan. The corresponding
+  // eliminate effects and materializations become real no-ops, allowing the
+  // iterative driver to observe convergence without hiding an IR mutation.
+  DenseSet<Instruction *> &PreservedReplayInstructions;
+  DenseSet<const jeandle::MaterializeEffect *> &ReusedMaterializations;
+
   // ORIGINAL safepoint CallBase -> its latest rebuilt replacement, so multiple
   // RewriteDeoptBundleEffects at the same safepoint (a VO plus its transitive
   // members) accumulate descriptors on ONE rebuilt bundle. Each
@@ -497,6 +661,8 @@ void jeandle::ReplaceCallEffect::apply(jeandle::TransformContext &Ctx) {
     return;
   // Target is a WeakTrackingVH (see PartialEscape.h); it was non-null above.
   Instruction *Target = cast<Instruction>((Value *)this->Target);
+  if (Ctx.PreservedReplayInstructions.count(Target))
+    return;
   // foldGetClass records the constant Class mirror by oop id rather than as an
   // LLVM value: building the GC-safe oop-handle load here (instead of during
   // analysis) keeps the analyzer side-effect-free. RS4GC, which runs downstream
@@ -546,6 +712,8 @@ void jeandle::ReplaceCallEffect::apply(jeandle::TransformContext &Ctx) {
 void jeandle::EliminateStoreEffect::apply(jeandle::TransformContext &Ctx) {
   if (!Target)
     return;
+  if (Ctx.PreservedReplayInstructions.count(Target))
+    return;
   // Eager-update (defensive): EliminateStore and Materialize-
   // at-store are mutually exclusive by the processStore dispatch, so this never
   // fires today, but a store CAN be a Materialize IP (value-side fall-through),
@@ -587,6 +755,11 @@ void jeandle::MaterializeEffect::apply(jeandle::TransformContext &Ctx) {
   // on whether applyMaterialize actually emitted anything: an all-idle round
   // (no field stores, no surviving locks) leaves the IR untouched, and marking
   // it Changed would needlessly prevent the iterative driver from converging.
+  if (Ctx.ReusedMaterializations.count(this)) {
+    auto *OrigAlloc = cast<CallBase>((Value *)Target);
+    Ctx.NewInvOf[this] = OrigAlloc;
+    return;
+  }
   if (applyMaterialize(Ctx.F, Ctx.Result, *this, Ctx.NewInvOf,
                        Ctx.OrigInsertBefore))
     Ctx.Changed = true;
@@ -904,6 +1077,8 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
   // miss the key, fall to per-effect emission, and mis-order multi-object
   // interleaved locks.
   DenseMap<const jeandle::MaterializeEffect *, Instruction *> OrigInsertBefore;
+  DenseMap<Instruction *, SmallVector<jeandle::MaterializeEffect *, 4>>
+      MaterializationsAt;
   for (auto &Kv : Result.BlockEffects)
     for (jeandle::Effect &E : Kv.second) {
       auto *M = dyn_cast<jeandle::MaterializeEffect>(&E);
@@ -912,8 +1087,20 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
       if (Instruction *Key = dyn_cast_or_null<Instruction>(M->InsertBefore)) {
         InsertBeforeDependents[Key].push_back(M);
         OrigInsertBefore.try_emplace(M, Key);
+        MaterializationsAt[Key].push_back(M);
       }
     }
+
+  DenseSet<Instruction *> PreservedReplayInstructions;
+  DenseSet<const jeandle::MaterializeEffect *> ReusedMaterializations;
+  for (auto &KV : MaterializationsAt) {
+    SmallVector<Instruction *, 16> MatchingInstructions;
+    if (!matchExistingReplay(KV.first, KV.second, Result, MatchingInstructions))
+      continue;
+    PreservedReplayInstructions.insert(MatchingInstructions.begin(),
+                                       MatchingInstructions.end());
+    ReusedMaterializations.insert(KV.second.begin(), KV.second.end());
+  }
 
   // -------------------------------------------------------------------------
   // Pass 1: non-cfgKill effects (ReplaceLoad, ReplaceCall, EliminateStore,
@@ -923,8 +1110,14 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
   // apply(graph, obsoleteNodes, cfgKills=false)). isCfgKill() partitions the
   // two passes; EliminateAllocation is the only cfgKill, so it is skipped here.
   // -------------------------------------------------------------------------
-  jeandle::TransformContext Ctx{
-      F, Result, Changed, NewInvOf, InsertBeforeDependents, OrigInsertBefore};
+  jeandle::TransformContext Ctx{F,
+                                Result,
+                                Changed,
+                                NewInvOf,
+                                InsertBeforeDependents,
+                                OrigInsertBefore,
+                                PreservedReplayInstructions,
+                                ReusedMaterializations};
 
   for (BasicBlock *BB : RPOT) {
     auto It = Result.BlockEffects.find(BB);
