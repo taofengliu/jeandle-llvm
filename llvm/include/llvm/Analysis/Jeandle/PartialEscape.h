@@ -850,8 +850,8 @@ public:
   const Effect &operator[](size_t I) const { return *Effects[I]; }
 
   // IR-form extension: remove and return ownership of element I. Used by
-  // processBlock's PendingMergePhis drain to move synthesized Case-B PHI
-  // effects into BlockEffects in SeqNo order.
+  // processBlock's post-merge PendingMergePhis drain to move synthesized
+  // Case-B PHI effects into BlockEffects in SeqNo order.
   std::unique_ptr<Effect> spliceOut(size_t I) {
     auto E = std::move(Effects[I]);
     Effects.erase(Effects.begin() + I);

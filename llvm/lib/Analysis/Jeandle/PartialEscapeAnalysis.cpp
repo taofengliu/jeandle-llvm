@@ -171,6 +171,22 @@ static llvm::cl::opt<std::string> JeandleEscapeAnalyzeOnly(
                    "supplied substring. Empty (the default) analyzes every "
                    "Java method gated by jeandle.java_method_compilation."));
 
+static llvm::cl::list<std::string> JeandleEscapeAnalyzeFunctions(
+    "jeandle-pea-analyze-function", llvm::cl::Hidden,
+    llvm::cl::desc("PEA: only analyze functions whose name exactly matches "
+                   "one of the supplied names. May be repeated. Empty (the "
+                   "default) preserves substring-filter behavior."),
+    llvm::cl::value_desc("function"));
+
+static bool matchesExactAnalyzeFunction(llvm::StringRef FunctionName) {
+  if (JeandleEscapeAnalyzeFunctions.empty())
+    return true;
+  for (const std::string &Allowed : JeandleEscapeAnalyzeFunctions)
+    if (FunctionName == llvm::StringRef(Allowed))
+      return true;
+  return false;
+}
+
 // Per-effect dbgs() trace. The cl::opt itself lives in
 // PartialEscape.cpp (the centralised effect-emission site at
 // PEAResult::addBlockEffect is the only consumer), so no declaration is
@@ -535,14 +551,14 @@ private:
   // surviving state (restoreLoopSnapshot truncates OwnedLoopFieldPhis).
   DenseMap<Value *, BasicBlock *> PhiHome;
 
-  // Per-merge-block deferred CreatePHI effects. mergeStates pushes
-  // every CreatePHI it would have committed directly onto this list (keyed
-  // by merge block); processBlock drains the list at the END of the block
-  // walk, assigning each effect a FRESH nextSeqNo() at drain time. Drain-time
-  // SeqNo assignment guarantees a deferred CreatePHI sorts strictly AFTER any
-  // per-pred Materialize emitted in the same processBlock walk. This matters
-  // when the merge block is its own back-edge predecessor — both the CreatePHI
-  // and a per-pred Materialize land in BlockEffects[BB]. All remaining
+  // Per-merge-block deferred CreatePHI effects. mergeStates pushes every
+  // CreatePHI it would have committed directly onto this list (keyed by merge
+  // block). processBlock drains the list after the merge fixpoint and before
+  // walking the block body, assigning each effect a fresh nextSeqNo(). This
+  // places CreatePHI after merge-time per-pred Materialize effects and before
+  // body effects that may consume the PHI. The first relation matters when the
+  // merge block is its own back-edge predecessor, where both effects land in
+  // BlockEffects[BB]. All remaining
   // CreatePHI effects are field-value PHIs (Case-2); the materialized-object
   // merge PHI variant has been removed (under reuse-OrigAlloc OrigAlloc is the
   // single SSA value on every path, so the PHI would trivially fold), and
@@ -728,8 +744,8 @@ private:
   // processBlock to capture the pre-invoke state for the unwind variant.
   void snapshotExitStateInto(BlockExitData &Data);
   // Out receives this block's deferred CreatePHI effects. For the entry /
-  // single-pred paths it is PendingMergePhis[BB] (drained at end of
-  // processBlock); for a merge it is the MergeProcessor's retry-cleared
+  // single-pred paths it is PendingMergePhis[BB] (drained before the body
+  // walk); for a merge it is the MergeProcessor's retry-cleared
   // MergeEffects buffer (committed to PendingMergePhis[BB] after the fixpoint
   // converges) — matching Graal's separation of mergeEffects from the
   // blockEffects committed only once the merge stabilizes.
@@ -1237,6 +1253,23 @@ void Analyzer::processBlock(BasicBlock *BB) {
     mergeStates(BB);
   }
 
+  // Merge effects precede effects produced while walking the block body, as
+  // in Graal's EffectsClosure.merge. Per-pred Materialize effects already
+  // received their sequence numbers while the merge was stabilized; assign
+  // the deferred CreatePHI effects sequence numbers now so the resulting
+  // order is per-pred Materialize, CreatePHI, then body effects. A body
+  // Materialize can consequently replay a merged field PHI that is already
+  // present in the IR.
+  auto It = PendingMergePhis.find(BB);
+  if (It != PendingMergePhis.end()) {
+    jeandle::EffectList &Phis = It->second;
+    for (auto &PE : Phis)
+      PE.SeqNo = Result.nextSeqNo();
+    while (!Phis.empty())
+      Result.addBlockEffect(Phis.spliceOut(0));
+    PendingMergePhis.erase(It);
+  }
+
   // Exception edge state splitting. If the block ends in an InvokeInst,
   // snapshot the per-object state immediately BEFORE applying the invoke.
   // The post-invoke state (the regular snapshotExitState below) is what
@@ -1341,25 +1374,6 @@ void Analyzer::processBlock(BasicBlock *BB) {
     if (!Virtualized && PreInvokeSnapshot &&
         !exitDataEquivalent(Info, *PreInvokeSnapshot))
       Info.UnwindData = std::move(PreInvokeSnapshot);
-  }
-
-  // Drain deferred CreatePHI effects emitted during this block's
-  // mergeStates / processBlockPhis / synthesizeCaseC, assigning each a
-  // FRESH SeqNo at drain time so it sorts strictly AFTER any per-pred
-  // Materialize emitted during the instruction walk above. Cross-block
-  // ordering is unchanged because the per-pred Materialize lives in a
-  // different BlockEffects bucket from the CreatePHI; the SeqNo assigned
-  // here is irrelevant to cross-block ordering (RPO drives that), but
-  // consistent across runs because nextSeqNo is monotonic within a single
-  // Analyzer::run.
-  auto It = PendingMergePhis.find(BB);
-  if (It != PendingMergePhis.end()) {
-    jeandle::EffectList &Phis = It->second;
-    for (auto &PE : Phis)
-      PE.SeqNo = Result.nextSeqNo();
-    while (!Phis.empty())
-      Result.addBlockEffect(Phis.spliceOut(0));
-    PendingMergePhis.erase(It);
   }
 }
 
@@ -1792,10 +1806,9 @@ void Analyzer::MergeProcessor::run() {
     }
   } while (Changed);
 
-  // Commit this merge's deferred CreatePHI effects to PendingMergePhis[BB];
-  // processBlock drains the list at the end of the block walk, assigning each
-  // a fresh SeqNo strictly after any per-pred Materialize emitted during the
-  // same block walk (the self-loop ordering invariant).
+  // Commit this merge's deferred CreatePHI effects to PendingMergePhis[BB].
+  // processBlock drains the list before its body walk, assigning each a fresh
+  // SeqNo after any merge-time per-pred Materialize effect.
   PendingMergePhis[BB].addAll(MergeEffects);
 }
 
@@ -7221,10 +7234,13 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
 }
 
 jeandle::PEAResult Analyzer::run() {
-  // Filter PEA to functions matching a name substring. Empty
-  // option (the default) lets every gated Java method through unchanged.
+  // Apply the legacy substring gate and the repeatable exact-name gate
+  // independently. Empty filters preserve the existing all-functions
+  // behavior.
   if (!JeandleEscapeAnalyzeOnly.empty() &&
       !F.getName().contains(JeandleEscapeAnalyzeOnly))
+    return jeandle::PEAResult();
+  if (!matchesExactAnalyzeFunction(F.getName()))
     return jeandle::PEAResult();
 
   // Outer walk: RPO over F. When we hit any block belonging to a top-level

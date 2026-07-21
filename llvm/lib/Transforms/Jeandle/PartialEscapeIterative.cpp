@@ -68,6 +68,22 @@ static cl::opt<std::string> JeandleDumpPEAIR(
              "PartialEscapeTransform round whose function name contains "
              "the given substring. Empty (the default) disables the dump."));
 
+static cl::list<std::string> JeandleDumpPEAIRFunctions(
+    "jeandle-dump-pea-ir-function", cl::Hidden,
+    cl::desc("PEA: restrict IR dumps to functions whose name exactly matches "
+             "one of the supplied names. May be repeated. Empty (the "
+             "default) preserves substring-filter behavior."),
+    cl::value_desc("function"));
+
+static bool matchesExactDumpFunction(StringRef FunctionName) {
+  if (JeandleDumpPEAIRFunctions.empty())
+    return true;
+  for (const std::string &Allowed : JeandleDumpPEAIRFunctions)
+    if (FunctionName == StringRef(Allowed))
+      return true;
+  return false;
+}
+
 // Hard upper bound guarding against non-converging inputs.
 static constexpr unsigned HardIterationCap = 16;
 
@@ -123,9 +139,14 @@ PartialEscapeIterative::run(Function &F, FunctionAnalysisManager &FAM) {
     return Sub;
   };
 
-  // Dump-IR gating (substring match is fixed for the run).
-  const bool DumpThisFunc = !JeandleDumpPEAIR.empty() &&
-                            F.getName().contains(JeandleDumpPEAIR);
+  // Dump-IR gating (legacy substring and exact allowlist matches are fixed
+  // for the run).
+  const bool HasDumpFilter =
+      !JeandleDumpPEAIR.empty() || !JeandleDumpPEAIRFunctions.empty();
+  const bool LegacyDumpMatches =
+      JeandleDumpPEAIR.empty() || F.getName().contains(JeandleDumpPEAIR);
+  const bool DumpThisFunc = HasDumpFilter && LegacyDumpMatches &&
+                            matchesExactDumpFunction(F.getName());
 
   for (unsigned Iter = 0; Iter < IterCap; ++Iter) {
     if (DumpThisFunc) {

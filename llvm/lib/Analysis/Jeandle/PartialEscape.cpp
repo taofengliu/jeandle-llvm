@@ -658,6 +658,10 @@ void Effect::dump(raw_ostream &OS) const {
     OS << "RewriteDeoptBundle";
     break;
   }
+  if (Function *F = Block ? Block->getParent() : nullptr) {
+    OS << " function=";
+    F->printAsOperand(OS, false);
+  }
   if (ObjID != InvalidObjectID)
     OS << " [VO=" << static_cast<unsigned>(ObjID) << "]";
   if (Block && Block->hasName())

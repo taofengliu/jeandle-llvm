@@ -5,10 +5,11 @@
 ; Self-loop where the loop header IS its own back-edge predecessor. The
 ; merge-block CreatePHI (emitted by mergeStates) and the per-pred
 ; Materialize for the back-edge (emitted by processBlockPhis) both
-; co-reside in BlockEffects[header]. mergeStates DEFERS CreatePHI
+; co-reside in BlockEffects[header]. mergeStates defers CreatePHI
 ; emission via PendingMergePhis; processBlock drains the pending list
-; AFTER the instruction walk, so the CreatePHI is assigned a SeqNo
-; strictly greater than the per-pred Materialize. The transform applies
+; after merge stabilization and before the body walk, so the CreatePHI is
+; assigned a SeqNo strictly greater than the per-pred Materialize. The
+; transform applies
 ; Materialize first (populating MatPerBlock) and CreatePHI second
 ; (resolving its back-edge incoming through MatPerBlock to the per-pred
 ; NewInv). If the order were reversed, CreatePHI would wire the
