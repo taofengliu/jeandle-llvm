@@ -1,4 +1,16 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" \
+; RUN:   %s -o %t.ir
+; RUN: FileCheck %s < %t.ir
+; RUN: sed -n '/^define ptr addrspace(1) @cyclic_and_forward_chain_mixed/,/^}/p' %t.ir \
+; RUN:   | grep -c '^  store atomic' | FileCheck %s --check-prefix=STORE-COUNT
+; RUN: opt -disable-output -passes="require<partial-escape-analysis>" \
+; RUN:   -jeandle-trace-pea -jeandle-dump-pea-stats \
+; RUN:   -jeandle-pea-analyze-function=cyclic_and_forward_chain_mixed %s > %t.trace 2>&1
+; RUN: FileCheck %s --check-prefix=TRACE < %t.trace
+; RUN: grep -c '^PEA: EliminateStore function=@cyclic_and_forward_chain_mixed ' %t.trace \
+; RUN:   | FileCheck %s --check-prefix=ELIMINATE-COUNT
+; RUN: grep -c '^PEA: Materialize function=@cyclic_and_forward_chain_mixed ' %t.trace \
+; RUN:   | FileCheck %s --check-prefix=MATERIALIZE-COUNT
 
 ; Mixed forward and back edges among three objects: A.f = B and B.g = C are
 ; forward, while C.h = A is a back edge. Returning A escapes the whole group.
@@ -40,15 +52,25 @@ u3:
 !java-method-compilation = !{}
 
 ; CHECK-LABEL: define ptr addrspace(1) @cyclic_and_forward_chain_mixed
-; CHECK-DAG: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr)
-; CHECK-DAG: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr)
-; CHECK-DAG: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 33333 to ptr)
+; CHECK: %[[A:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr)
+; CHECK: %[[B:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr)
+; CHECK: %[[C:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 33333 to ptr)
 ; No fresh materialization invoke is emitted.
 ; CHECK-NOT: pea.mat = invoke
-; All three replayed field stores use OrigAlloc values — the back edge C.h = A
-; resolves through A's OrigAlloc (kept alive), never poison.
-; CHECK: store atomic ptr addrspace(1) %a, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
-; CHECK: store atomic ptr addrspace(1) %c, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
-; CHECK: store atomic ptr addrspace(1) %b, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
+; All three field groups use OrigAlloc values — the back edge C.h = A resolves
+; through A's OrigAlloc (kept alive), never poison.
+; CHECK-DAG: %[[A_SLOT:[A-Za-z0-9._]+]] = getelementptr inbounds{{( nuw)?}} i8, ptr addrspace(1) %[[A]], i64 8
+; CHECK-DAG: store atomic ptr addrspace(1) %[[B]], ptr addrspace(1) %[[A_SLOT]] unordered, align 8
+; CHECK-DAG: %[[B_SLOT:[A-Za-z0-9._]+]] = getelementptr inbounds{{( nuw)?}} i8, ptr addrspace(1) %[[B]], i64 8
+; CHECK-DAG: store atomic ptr addrspace(1) %[[C]], ptr addrspace(1) %[[B_SLOT]] unordered, align 8
+; CHECK-DAG: %[[C_SLOT:[A-Za-z0-9._]+]] = getelementptr inbounds{{( nuw)?}} i8, ptr addrspace(1) %[[C]], i64 16
+; CHECK-DAG: store atomic ptr addrspace(1) %[[A]], ptr addrspace(1) %[[C_SLOT]] unordered, align 8
 ; CHECK-NOT: poison
-; CHECK: ret ptr addrspace(1) %a
+; CHECK: ret ptr addrspace(1) %[[A]]
+
+; TRACE-COUNT-3: PEA: EliminateStore function=@cyclic_and_forward_chain_mixed
+; TRACE-COUNT-3: PEA: Materialize function=@cyclic_and_forward_chain_mixed
+; TRACE: ;; PEA stats @cyclic_and_forward_chain_mixed: NeverEscapes=0 PartiallyEscapes=3 AlwaysEscapes=0
+; STORE-COUNT: {{^3$}}
+; ELIMINATE-COUNT: {{^3$}}
+; MATERIALIZE-COUNT: {{^3$}}

@@ -45,12 +45,14 @@
 #include "llvm/Transforms/Jeandle/PartialEscapeTransform.h"
 
 #include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/Jeandle/PartialEscape.h"
 #include "llvm/Analysis/Jeandle/PartialEscapeAnalysis.h"
 #include "llvm/Analysis/Jeandle/PartialEscapeUtils.h"
 #include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -75,14 +77,155 @@
 
 using namespace llvm;
 
-static constexpr StringLiteral PEAReplayMetadata = "jeandle.pea.replay";
+// Graal places a merge-driven materialization at the predecessor EndNode,
+// which denotes one incoming edge.  An LLVM predecessor terminator denotes
+// every outgoing edge, so a critical Source->Target edge needs a dedicated
+// block before any replay plan is constructed.  All MaterializeEffects for an
+// edge move together: field stores and monitor replay have identical control
+// dependence.
+static bool splitReplayEdges(jeandle::PEAResult &Result) {
+  struct EdgePlan {
+    BasicBlock *Source;
+    BasicBlock *Target;
+    unsigned SuccessorIndex;
+    uint32_t MinSeqNo;
+    SmallVector<jeandle::MaterializeEffect *, 4> Effects;
+  };
 
-static bool isPEAReplayInstruction(const Instruction &I) {
-  return I.getMetadata(PEAReplayMetadata) != nullptr;
-}
+  SmallVector<EdgePlan, 4> Plans;
+  for (auto &KV : Result.BlockEffects)
+    for (jeandle::Effect &E : KV.second) {
+      auto *ME = dyn_cast<jeandle::MaterializeEffect>(&E);
+      if (!ME || !ME->ReplaySource || !ME->ReplayTarget)
+        continue;
+      // Reuse-OrigAlloc materialization can be state-only: with no fields or
+      // monitors to replay, applying the effect emits no instruction. Its
+      // target-local analysis state is still required, but splitting the CFG
+      // would create an empty block with no runtime control dependence to
+      // preserve.
+      if (ME->FieldEntries.empty() && ME->Locks.empty())
+        continue;
+      EdgePlan *Plan = nullptr;
+      for (EdgePlan &Candidate : Plans)
+        if (Candidate.Source == ME->ReplaySource &&
+            Candidate.Target == ME->ReplayTarget) {
+          Plan = &Candidate;
+          break;
+      }
+      if (!Plan) {
+        Instruction *Term = ME->ReplaySource->getTerminator();
+        unsigned SuccessorIndex = Term->getNumSuccessors();
+        for (unsigned I = 0; I < Term->getNumSuccessors(); ++I)
+          if (Term->getSuccessor(I) == ME->ReplayTarget) {
+            SuccessorIndex = I;
+            break;
+          }
+        assert(SuccessorIndex != Term->getNumSuccessors() &&
+               "replay source must reach its recorded target");
+        Plans.push_back({ME->ReplaySource, ME->ReplayTarget, SuccessorIndex,
+                         ME->SeqNo, {}});
+        Plan = &Plans.back();
+      }
+      Plan->MinSeqNo = std::min(Plan->MinSeqNo, ME->SeqNo);
+      Plan->Effects.push_back(ME);
+    }
 
-static void markPEAReplayInstruction(Instruction &I) {
-  I.setMetadata(PEAReplayMetadata, MDNode::get(I.getContext(), {}));
+  // BlockEffects is a DenseMap. Use the analyzer's function-wide monotonic
+  // effect sequence to make block creation, naming, RPO, and trace IDs stable.
+  llvm::sort(Plans, [](const EdgePlan &A, const EdgePlan &B) {
+    return A.MinSeqNo < B.MinSeqNo;
+  });
+
+  // Landingpad predecessor splitting clones the landingpad and may synthesize
+  // intermediate PHIs for the selected and remaining unwind predecessors.
+  // Insert analysis-owned field PHIs first so LLVM's canonical utility updates
+  // them together with every PHI already present in the IR.
+  SmallPtrSet<BasicBlock *, 4> LandingPadTargets;
+  for (const EdgePlan &Plan : Plans) {
+    SmallPtrSet<BasicBlock *, 4> Successors;
+    for (BasicBlock *Succ : successors(Plan.Source))
+      Successors.insert(Succ);
+    if (Successors.size() > 1 && Plan.Target->isLandingPad())
+      LandingPadTargets.insert(Plan.Target);
+  }
+  if (!LandingPadTargets.empty()) {
+    SmallVector<jeandle::CreatePHIEffect *, 8> DeferredPhis;
+    for (auto &KV : Result.BlockEffects)
+      for (jeandle::Effect &E : KV.second) {
+        auto *PE = dyn_cast<jeandle::CreatePHIEffect>(&E);
+        if (PE && LandingPadTargets.count(PE->Block))
+          DeferredPhis.push_back(PE);
+      }
+    llvm::sort(DeferredPhis,
+               [](const jeandle::CreatePHIEffect *A,
+                  const jeandle::CreatePHIEffect *B) {
+                 return A->SeqNo < B->SeqNo;
+               });
+    for (jeandle::CreatePHIEffect *PE : DeferredPhis) {
+      PHINode *Phi = PE->PhiInst;
+      assert(Phi && !Phi->getParent() &&
+             "deferred field PHI must be unparented before CFG normalization");
+      Phi->insertBefore(PE->Block->getFirstNonPHIIt());
+      assert(PE->PHIIncomingValues.size() == PE->PHIIncomingBlocks.size());
+      for (unsigned I = 0; I < PE->PHIIncomingValues.size(); ++I)
+        Phi->addIncoming(PE->PHIIncomingValues[I],
+                         PE->PHIIncomingBlocks[I]);
+    }
+  }
+
+  bool Changed = false;
+  for (EdgePlan &Plan : Plans) {
+    // CFG utilities preserve a terminator's successor indices while replacing
+    // their destinations. A prior landingpad split may have redirected this
+    // unwind index to a cloned landingpad (including through several earlier
+    // splits), so the recorded index is the exact current physical target.
+    Instruction *Term = Plan.Source->getTerminator();
+    assert(Plan.SuccessorIndex < Term->getNumSuccessors());
+    BasicBlock *CurrentTarget = Term->getSuccessor(Plan.SuccessorIndex);
+
+    SmallPtrSet<BasicBlock *, 4> DistinctSuccessors;
+    for (BasicBlock *Succ : successors(Plan.Source)) {
+      DistinctSuccessors.insert(Succ);
+    }
+    if (DistinctSuccessors.size() <= 1)
+      continue;
+
+    assert(!isa<IndirectBrInst>(Plan.Source->getTerminator()) &&
+           CurrentTarget->canSplitPredecessors() &&
+           "analysis must keep unsplittable replay edges real");
+    BasicBlock *Edge = SplitBlockPredecessors(
+        CurrentTarget, {Plan.Source}, ".pea.replay");
+    assert(Edge && Edge->getTerminator() &&
+           "splittable replay edge must produce an insertion block");
+
+    // Landingpad-targeted deferred PHIs were inserted above and therefore were
+    // rewritten by SplitBlockPredecessors itself. Ordinary targets can still
+    // own unparented field-value PHIs; keep their recorded incoming blocks
+    // synchronized with the normalized CFG. replaceSuccessorWith redirects
+    // every duplicate switch edge from Source, so matching incomings move
+    // together.
+    for (auto &KV : Result.BlockEffects)
+      for (jeandle::Effect &E : KV.second) {
+        auto *PE = dyn_cast<jeandle::CreatePHIEffect>(&E);
+        if (!PE || PE->PhiInst->getParent() || PE->Block != CurrentTarget)
+          continue;
+        for (BasicBlock *&Incoming : PE->PHIIncomingBlocks)
+          if (Incoming == Plan.Source)
+            Incoming = Edge;
+      }
+
+    for (jeandle::MaterializeEffect *ME : Plan.Effects) {
+      // Keep ownership in the original source bucket so EffectList references
+      // remain stable. Block and InsertBefore describe the normalized semantic
+      // location; applyMaterialize inserts through InsertBefore rather than
+      // assuming the bucket key is the physical block.
+      ME->ReplaySource = Edge;
+      ME->Block = Edge;
+      ME->setInsertBefore(Edge->getTerminator());
+    }
+    Changed = true;
+  }
+  return Changed;
 }
 
 struct ExpectedReplayOperation {
@@ -94,6 +237,12 @@ struct ExpectedReplayOperation {
   SmallVector<Value *, 4> LockArgs;
 };
 
+struct ExpectedReplayFieldGroup {
+  Value *Receiver = nullptr;
+  bool HasDistinctRealAllocation = false;
+  SmallVector<ExpectedReplayOperation, 4> Fields;
+};
+
 static Value *
 materializedFieldValue(const jeandle::MaterializeEffect::FieldEntry &FE) {
   if (FE.Value.isScalar())
@@ -103,17 +252,104 @@ materializedFieldValue(const jeandle::MaterializeEffect::FieldEntry &FE) {
   return nullptr;
 }
 
+static Instruction *previousNonDebugInstruction(Instruction *I) {
+  for (I = I->getPrevNode(); I; I = I->getPrevNode())
+    if (!I->isDebugOrPseudoInst())
+      return I;
+  return nullptr;
+}
+
+static bool isCanonicalReplayGEP(GetElementPtrInst &GEP,
+                                 const ExpectedReplayOperation &Op,
+                                 StoreInst &Store) {
+  if (GEP.getPointerOperand() != Op.Receiver ||
+      GEP.getSourceElementType() != Type::getInt8Ty(GEP.getContext()) ||
+      GEP.getNumIndices() != 1 || GEP.getParent() != Store.getParent() ||
+      !GEP.hasOneUse() || *GEP.user_begin() != &Store ||
+      previousNonDebugInstruction(&Store) != &GEP ||
+      GEP.hasMetadataOtherThanDebugLoc())
+    return false;
+
+  auto *Index = dyn_cast<ConstantInt>(*GEP.idx_begin());
+  if (!Index || Index->getBitWidth() != 64 ||
+      Index->getSExtValue() != Op.Offset)
+    return false;
+
+  // IRBuilder::CreateInBoundsGEP emits the inbounds/nusw combination.  The
+  // canonical pipeline between two PEA rounds may additionally prove nuw for
+  // this constant field offset; no other flag combination is emitted or
+  // inferred by that pipeline.
+  GEPNoWrapFlags Flags = GEP.getNoWrapFlags();
+  GEPNoWrapFlags InBounds = GEPNoWrapFlags::inBounds();
+  return Flags == InBounds ||
+         Flags == (InBounds | GEPNoWrapFlags::noUnsignedWrap());
+}
+
+// Reject matching only the tail of a longer sequence that still looks like
+// replay for the same materialized receivers.  Being conservative here costs
+// one rewrite round, whereas retaining an extra source operation can make the
+// fixed-point depend on an accidental instruction boundary.
+static bool isReplayLikePrefix(Instruction *I,
+                               ArrayRef<ExpectedReplayOperation> Expected,
+                               const DataLayout &DL) {
+  if (!I)
+    return false;
+
+  if (auto *Store = dyn_cast<StoreInst>(I)) {
+    int64_t Offset = 0;
+    bool NonConstant = false;
+    Value *Base = jeandle::pea::stripPointerCastsAndOffsets(
+        Store->getPointerOperand(), DL, &Offset, &NonConstant);
+    if (NonConstant)
+      return false;
+    for (const ExpectedReplayOperation &Op : Expected)
+      if (Op.Receiver == Base)
+        return true;
+    return false;
+  }
+
+  auto *Call = dyn_cast<CallInst>(I);
+  if (!Call || Call->arg_empty())
+    return false;
+  for (const ExpectedReplayOperation &Op : Expected)
+    if (Op.K == ExpectedReplayOperation::Kind::Lock &&
+        Call->getCalledFunction() == Op.LockCallee &&
+        Call->getArgOperand(0) == Op.Receiver)
+      return true;
+  return false;
+}
+
+static bool hasCanonicalReplayCallAttributes(const CallInst &Call) {
+  AttributeList Attrs = Call.getAttributes();
+  if (Attrs.hasFnAttrs() || Attrs.hasRetAttrs())
+    return false;
+  // InstCombine may annotate the exact allocation and BasicLock operands as
+  // nonnull between PEA rounds.  It does not add those attributes in the
+  // emitter itself, but they are a canonical strengthening of these same SSA
+  // operands.  All other call-site attributes change semantics the matcher
+  // does not reconstruct and therefore force ordinary delete-and-replay.
+  for (unsigned Arg = 0; Arg < Call.arg_size(); ++Arg)
+    for (Attribute Attr : Attrs.getParamAttrs(Arg))
+      if (!Attr.hasKindAsEnum() || Attr.getKindAsEnum() != Attribute::NonNull)
+        return false;
+  return true;
+}
+
 // A later outer PEA round sees the stores and monitorenters emitted by the
 // preceding round as ordinary virtualizable operations. Replacing an identical
 // replay sequence would mutate the IR forever without making semantic
-// progress. Build the exact sequence this round would emit at one escape point
-// and compare it with the contiguous PEA-owned sequence already there.
-static bool
-matchExistingReplay(Instruction *InsertBefore,
-                    ArrayRef<jeandle::MaterializeEffect *> Effects,
-                    jeandle::PEAResult &Result,
-                    SmallVectorImpl<Instruction *> &MatchingInstructions) {
+// progress. Match the contiguous semantic suffix exactly within every object's
+// field group and within the final lock list. Complete field groups belonging
+// to distinct real allocations may appear in a different order: their objects
+// are still unpublished, so those groups cannot alias or be observed between
+// stores. Synthetic or repeated receivers retain strict SeqNo order.
+static bool matchExistingReplaySuffix(
+    Instruction *InsertBefore, ArrayRef<jeandle::MaterializeEffect *> Effects,
+    jeandle::PEAResult &Result,
+    SmallVectorImpl<Instruction *> &MatchingInstructions) {
   SmallVector<ExpectedReplayOperation, 16> Expected;
+  SmallVector<ExpectedReplayFieldGroup, 4> FieldGroups;
+  SmallVector<ExpectedReplayOperation, 4> ExpectedLocks;
   SmallVector<jeandle::MaterializeEffect *, 4> Ordered(Effects);
   llvm::sort(Ordered, [](const jeandle::MaterializeEffect *A,
                          const jeandle::MaterializeEffect *B) {
@@ -128,101 +364,156 @@ matchExistingReplay(Instruction *InsertBefore,
     Op.LockArgs.push_back(Receiver);
     for (Value *Arg : NonReceiverArgs)
       Op.LockArgs.push_back(Arg);
+    ExpectedLocks.push_back(Op);
     Expected.push_back(std::move(Op));
   };
 
-  auto MaxIt = Result.MaxSeqForEscapePoint.find(InsertBefore);
+  const jeandle::LockReplayBatch *ReplayBatch =
+      Result.getLockReplayBatch(InsertBefore);
   for (jeandle::MaterializeEffect *Effect : Ordered) {
+    ExpectedReplayFieldGroup Group;
+    Group.Receiver = Effect->Target;
+    if (Effect->ObjID < Result.VirtualObjects.size()) {
+      const jeandle::VirtualObject &VObj =
+          *Result.VirtualObjects[Effect->ObjID];
+      auto *Allocation = dyn_cast_or_null<CallBase>((Value *)Effect->Target);
+      Group.HasDistinctRealAllocation =
+          !VObj.IsSynthetic && Allocation &&
+          (Value *)VObj.AllocationCall == (Value *)Allocation &&
+          jeandle::pea::isJeandleAllocation(Allocation);
+    }
     for (const auto &Field : Effect->FieldEntries) {
       Value *Stored = materializedFieldValue(Field);
       Value *Receiver = Effect->Target;
       if (!Stored || !Receiver)
         return false;
-      Expected.push_back({ExpectedReplayOperation::Kind::Store,
-                          Receiver,
-                          Stored,
-                          Field.Offset,
-                          nullptr,
-                          {}});
+      ExpectedReplayOperation Op{ExpectedReplayOperation::Kind::Store,
+                                 Receiver,
+                                 Stored,
+                                 Field.Offset,
+                                 nullptr,
+                                 {}};
+      Group.Fields.push_back(Op);
+      Expected.push_back(std::move(Op));
     }
+    FieldGroups.push_back(std::move(Group));
 
-    if (MaxIt != Result.MaxSeqForEscapePoint.end()) {
-      if (Effect->SeqNo != MaxIt->second)
-        continue;
-      auto LocksIt = Result.EscapePointLocks.find(InsertBefore);
-      if (LocksIt == Result.EscapePointLocks.end())
-        continue;
-      for (const jeandle::MergedLock &Lock : LocksIt->second) {
+    if (ReplayBatch && Effect->SeqNo == ReplayBatch->EmitterSeqNo) {
+      for (const jeandle::MergedLock &Lock : ReplayBatch->Locks) {
         Value *Receiver =
             Lock.SourceEffect ? (Value *)Lock.SourceEffect->Target : nullptr;
         if (!Receiver || !Lock.Callee)
           return false;
         appendLock(Receiver, Lock.Callee, Lock.NonReceiverArgs);
       }
-    } else {
-      for (const jeandle::MaterializedLock &Lock : Effect->Locks) {
-        Value *Receiver = Effect->Target;
-        if (!Receiver || !Lock.Callee)
-          return false;
-        appendLock(Receiver, Lock.Callee, Lock.NonReceiverArgs);
-      }
     }
   }
-
-  SmallVector<Instruction *, 16> Existing;
-  for (Instruction *I = InsertBefore->getPrevNode(); I; I = I->getPrevNode()) {
-    if (!isPEAReplayInstruction(*I))
-      break;
-    Existing.push_back(I);
-  }
-  std::reverse(Existing.begin(), Existing.end());
-
-  SmallVector<Instruction *, 16> Semantic;
-  for (Instruction *I : Existing) {
-    if (isa<GetElementPtrInst>(I))
-      continue;
-    if (!isa<StoreInst>(I) && !isa<CallInst>(I))
-      return false;
-    Semantic.push_back(I);
-  }
-  if (Semantic.size() != Expected.size())
-    return false;
 
   const DataLayout &DL = InsertBefore->getModule()->getDataLayout();
-  for (unsigned Index = 0; Index < Expected.size(); ++Index) {
-    const ExpectedReplayOperation &Op = Expected[Index];
-    Instruction *I = Semantic[Index];
-    if (Op.K == ExpectedReplayOperation::Kind::Store) {
-      auto *Store = dyn_cast<StoreInst>(I);
-      if (!Store || Store->getValueOperand() != Op.StoredValue ||
-          Store->isVolatile() || !Store->isAtomic() ||
-          Store->getSyncScopeID() != SyncScope::System ||
-          Store->getOrdering() != AtomicOrdering::Unordered)
-        return false;
-      int64_t Offset = 0;
-      bool NonConstant = false;
-      Value *Base = jeandle::pea::stripPointerCastsAndOffsets(
-          Store->getPointerOperand(), DL, &Offset, &NonConstant);
-      if (NonConstant || Base != Op.Receiver || Offset != Op.Offset)
-        return false;
-      uint64_t StoreSize =
-          DL.getTypeStoreSize(Op.StoredValue->getType()).getFixedValue();
-      if (Store->getAlign() != Align(PowerOf2Ceil(StoreSize ? StoreSize : 1)))
-        return false;
-      continue;
-    }
-
-    auto *Call = dyn_cast<CallInst>(I);
+  SmallVector<Instruction *, 16> MatchedReverse;
+  Instruction *Cursor = previousNonDebugInstruction(InsertBefore);
+  auto matchLock = [&](const ExpectedReplayOperation &Op) {
+    auto *Call = dyn_cast_or_null<CallInst>(Cursor);
     if (!Call || Call->getCalledFunction() != Op.LockCallee ||
         Call->getCallingConv() != CallingConv::Hotspot_JIT ||
-        Call->hasOperandBundles() || Call->arg_size() != Op.LockArgs.size())
+        Call->hasOperandBundles() || Call->arg_size() != Op.LockArgs.size() ||
+        Call->getTailCallKind() != CallInst::TCK_None ||
+        !hasCanonicalReplayCallAttributes(*Call) ||
+        Call->hasMetadataOtherThanDebugLoc())
       return false;
     for (unsigned Arg = 0; Arg < Op.LockArgs.size(); ++Arg)
       if (Call->getArgOperand(Arg) != Op.LockArgs[Arg])
         return false;
+    MatchedReverse.push_back(Call);
+    Cursor = previousNonDebugInstruction(Call);
+    return true;
+  };
+  for (const ExpectedReplayOperation &Op : llvm::reverse(ExpectedLocks))
+    if (!matchLock(Op))
+      return false;
+
+  auto matchFieldGroup =
+      [&](const ExpectedReplayFieldGroup &Group, Instruction *Start,
+          SmallVectorImpl<Instruction *> &Matched, Instruction *&Before) {
+        Instruction *At = Start;
+        SmallVector<Instruction *, 8> Candidate;
+        for (const ExpectedReplayOperation &Op : llvm::reverse(Group.Fields)) {
+          auto *Store = dyn_cast_or_null<StoreInst>(At);
+          if (!Store || Store->getValueOperand() != Op.StoredValue ||
+              Store->isVolatile() || !Store->isAtomic() ||
+              Store->getSyncScopeID() != SyncScope::System ||
+              Store->getOrdering() != AtomicOrdering::Unordered ||
+              Store->hasMetadataOtherThanDebugLoc())
+            return false;
+          auto *GEP = dyn_cast<GetElementPtrInst>(Store->getPointerOperand());
+          if (!GEP || !isCanonicalReplayGEP(*GEP, Op, *Store))
+            return false;
+          TypeSize StoreSize = DL.getTypeStoreSize(Op.StoredValue->getType());
+          if (StoreSize.isScalable())
+            return false;
+          uint64_t FixedStoreSize = StoreSize.getFixedValue();
+          if (Store->getAlign() !=
+              Align(PowerOf2Ceil(FixedStoreSize ? FixedStoreSize : 1)))
+            return false;
+
+          Candidate.push_back(Store);
+          Candidate.push_back(GEP);
+          At = previousNonDebugInstruction(GEP);
+        }
+        Matched.append(Candidate.begin(), Candidate.end());
+        Before = At;
+        return true;
+      };
+
+  SmallVector<unsigned, 4> NonEmptyGroups;
+  DenseMap<Value *, unsigned> GroupForReceiver;
+  bool MayPermuteGroups = true;
+  for (unsigned I = 0; I < FieldGroups.size(); ++I) {
+    const ExpectedReplayFieldGroup &Group = FieldGroups[I];
+    if (Group.Fields.empty())
+      continue;
+    NonEmptyGroups.push_back(I);
+    MayPermuteGroups &= Group.HasDistinctRealAllocation &&
+                        GroupForReceiver.try_emplace(Group.Receiver, I).second;
   }
 
-  MatchingInstructions.append(Existing.begin(), Existing.end());
+  if (MayPermuteGroups && NonEmptyGroups.size() > 1) {
+    SmallVector<uint8_t, 4> Consumed(FieldGroups.size(), 0);
+    for (unsigned Remaining = NonEmptyGroups.size(); Remaining; --Remaining) {
+      auto *Store = dyn_cast_or_null<StoreInst>(Cursor);
+      auto *GEP = Store
+                      ? dyn_cast<GetElementPtrInst>(Store->getPointerOperand())
+                      : nullptr;
+      if (!GEP)
+        return false;
+      auto It = GroupForReceiver.find(GEP->getPointerOperand());
+      if (It == GroupForReceiver.end() || Consumed[It->second])
+        return false;
+      unsigned Match = It->second;
+      SmallVector<Instruction *, 8> MatchedGroup;
+      Instruction *MatchedBefore = nullptr;
+      if (!matchFieldGroup(FieldGroups[Match], Cursor, MatchedGroup,
+                           MatchedBefore))
+        return false;
+      Consumed[Match] = true;
+      MatchedReverse.append(MatchedGroup.begin(), MatchedGroup.end());
+      Cursor = MatchedBefore;
+    }
+  } else {
+    for (unsigned I : llvm::reverse(NonEmptyGroups)) {
+      SmallVector<Instruction *, 8> MatchedGroup;
+      Instruction *Before = nullptr;
+      if (!matchFieldGroup(FieldGroups[I], Cursor, MatchedGroup, Before))
+        return false;
+      MatchedReverse.append(MatchedGroup.begin(), MatchedGroup.end());
+      Cursor = Before;
+    }
+  }
+
+  if (!Expected.empty() && isReplayLikePrefix(Cursor, Expected, DL))
+    return false;
+
+  MatchingInstructions.append(MatchedReverse.rbegin(), MatchedReverse.rend());
   return true;
 }
 
@@ -452,8 +743,6 @@ static bool applyMaterialize(
            "in-IR instruction");
     Value *Slot =
         SB.CreateInBoundsGEP(I8, MatVal, SB.getInt64(FE.Offset), "pea.matslot");
-    if (auto *SlotI = dyn_cast<Instruction>(Slot))
-      markPEAReplayInstruction(*SlotI);
     // Natural alignment = the field type's store size rounded up to a power of
     // two (atomic-unordered stores MUST be naturally aligned; ABI align may be
     // smaller than store size, e.g. i64 under the default datalayout). Derived
@@ -463,18 +752,12 @@ static bool applyMaterialize(
     Align NaturalAlign(llvm::PowerOf2Ceil(StoreSz ? StoreSz : 1));
     StoreInst *S = SB.CreateAlignedStore(V, Slot, NaturalAlign);
     S->setAtomic(AtomicOrdering::Unordered); // Java heap stores are unordered
-    markPEAReplayInstruction(*S);
     Emitted = true;
   }
 
-  // Re-emit surviving monitorenters onto OrigAlloc. Locks from MULTIPLE objects
-  // escaping at the same point are interleaved on the runtime lock stack, so
-  // they must be re-emitted as ONE globally depth-sorted list; the analyzer
-  // merged them per escape point into Result.EscapePointLocks. The highest-SeqNo
-  // effect at this escape point emits the merged list once — by then every
-  // sibling's applyMaterialize has recorded its OrigAlloc in NewInvOf, so each
-  // lock's receiver resolves via NewInvOf[ML.SourceEffect]. A single-object
-  // escape point (no entry in MaxSeqForEscapePoint) emits its own locks here.
+  // Re-emit surviving monitorenters from the final result-owned physical plan.
+  // Every lock-carrying site has one depth-sorted batch. Its tail effect emits
+  // after every sibling receiver has been recorded; lockless sites need none.
   auto EmitLock = [&](Value *Recv, Function *Callee,
                       ArrayRef<WeakTrackingVH> NonReceiverArgs) -> bool {
     if (!Callee)
@@ -485,7 +768,6 @@ static bool applyMaterialize(
       Args.push_back(A);
     CallInst *Enter = SB.CreateCall(Callee, Args);
     Enter->setCallingConv(CallingConv::Hotspot_JIT);
-    markPEAReplayInstruction(*Enter);
     // The re-emitted monitorenter is a REAL held lock on OrigAlloc (never a
     // deopt safepoint), so it MUST carry no "deopt" operand bundle — a bundle
     // here would describe a MATERIALIZED VO's lock as a safepoint state,
@@ -495,58 +777,33 @@ static bool applyMaterialize(
     return true;
   };
   // Lock lookup uses the ORIGINAL escape-point InsertBefore captured before
-  // any eager-update re-aim, NOT the possibly re-aimed E.InsertBefore (a
-  // re-aimed Case-A materialize would otherwise miss the key, fall to
-  // per-effect emission, and mis-order the runtime lock stack). See the
-  // canonical comment on EscapePointLocks in PartialEscape.h.
+  // any eager-update re-aim, NOT the possibly re-aimed E.InsertBefore (an
+  // eager-reaimed materialize would otherwise miss the physical batch). See the
+  // canonical comment on LockReplayBatches in PartialEscape.h.
   Instruction *LockKey = OrigInsertBefore.lookup(&E);
   if (!LockKey)
     LockKey = InsertBefore;
-  auto MaxIt = Result.MaxSeqForEscapePoint.find(LockKey);
-  if (MaxIt != Result.MaxSeqForEscapePoint.end()) {
-    if (E.SeqNo == MaxIt->second) {
-      auto It = Result.EscapePointLocks.find(LockKey);
-      if (It != Result.EscapePointLocks.end()) {
-        // Depth-ordering check (the analogue of Graal's
-        // DefaultJavaLoweringProvider `GraalError.guarantee(lastDepth <
-        // monitorId.getLockDepth())` — STRICTLY increasing): the lightweight
-        // locking thread lock stack requires strict nesting order.
-        // BytecodeDepth is unique per enter call site (LockDepthCache), so an
-        // equal-depth pair in one merged list can only be the SAME folded
-        // lock captured twice (a per-pred duplicate) — excluded by
-        // the commit-time dominance dedup and the computeEscapePointLocks
-        // defensive dedup, and asserted against here.
-        bool First = true;
-        uint32_t LastDepth = 0;
-        for (const jeandle::MergedLock &ML : It->second) {
-          assert((First || LastDepth < ML.BytecodeDepth) &&
-                 "emitted lock sequence must be strictly increasing in "
-                 "BytecodeDepth (Graal lastDepth < getLockDepth guarantee)");
-          First = false;
-          LastDepth = ML.BytecodeDepth;
-          auto NIt = NewInvOf.find(ML.SourceEffect);
-          assert(NIt != NewInvOf.end() &&
-                 "every sibling's OrigAlloc must be "
-                 "recorded before the tail emits locks");
-          Emitted |= EmitLock(NIt->second, ML.Callee, ML.NonReceiverArgs);
-        }
-      }
-    }
-    // A non-tail sibling emits nothing here; the tail emits the whole escape
-    // point's locks.
-  } else {
-    // Per-effect (single-object / non-cascade) path: E.Locks is strictly
-    // increasing by the ObjectState::addLock invariant (a VO's own lock stack
-    // nests strictly), so enforce strictly increasing here too.
+  const jeandle::LockReplayBatch *ReplayBatch =
+      Result.getLockReplayBatch(LockKey);
+  assert((ReplayBatch || E.Locks.empty()) &&
+         "every lock-carrying materialize must belong to a replay batch");
+  if (ReplayBatch && E.SeqNo == ReplayBatch->EmitterSeqNo) {
+    // Depth-ordering check (the analogue of Graal's
+    // DefaultJavaLoweringProvider `GraalError.guarantee(lastDepth <
+    // monitorId.getLockDepth())` — STRICTLY increasing).
     bool First = true;
     uint32_t LastDepth = 0;
-    for (const jeandle::MaterializedLock &ML : E.Locks) {
+    for (const jeandle::MergedLock &ML : ReplayBatch->Locks) {
       assert((First || LastDepth < ML.BytecodeDepth) &&
              "emitted lock sequence must be strictly increasing in "
              "BytecodeDepth (Graal lastDepth < getLockDepth guarantee)");
       First = false;
       LastDepth = ML.BytecodeDepth;
-      Emitted |= EmitLock(MatVal, ML.Callee, ML.NonReceiverArgs);
+      auto NIt = NewInvOf.find(ML.SourceEffect);
+      assert(NIt != NewInvOf.end() &&
+             "every sibling's OrigAlloc must be recorded before the tail "
+             "emits locks");
+      Emitted |= EmitLock(NIt->second, ML.Callee, ML.NonReceiverArgs);
     }
   }
 
@@ -578,8 +835,8 @@ struct jeandle::TransformContext {
 
   // effect -> its ORIGINAL escape-point InsertBefore (captured before Pass 1,
   // before any eager-update re-aim). The lock re-emit looks up
-  // MaxSeqForEscapePoint/EscapePointLocks with this — the key
-  // computeEscapePointLocks used — NOT the re-aimed E.InsertBefore, which
+  // LockReplayBatchForSite with this — the key computeEscapePointLocks used —
+  // NOT the re-aimed E.InsertBefore, which
   // could miss the key at a multi-object escape point.
   DenseMap<const jeandle::MaterializeEffect *, Instruction *> &OrigInsertBefore;
 
@@ -782,9 +1039,12 @@ void jeandle::CreatePHIEffect::apply(jeandle::TransformContext &Ctx) {
   // been removed; only this live field-value-PHI path remains.)
   PHINode *Phi = PhiInst;
   assert(Phi && "CreatePHI effect requires a PhiInst");
-  assert(Phi->getParent() == nullptr &&
-         "CreatePHI's PhiInst must be unparented at apply time");
-  Phi->insertBefore(Block->getFirstInsertionPt());
+  if (Phi->getParent()) {
+    assert(Phi->getParent() == Block &&
+           "CFG normalization must preserve the deferred PHI home block");
+    return;
+  }
+  Phi->insertBefore(Block->getFirstNonPHIIt());
   assert(PHIIncomingValues.size() == PHIIncomingBlocks.size());
   for (unsigned I = 0; I < PHIIncomingValues.size(); ++I)
     Phi->addIncoming(PHIIncomingValues[I], PHIIncomingBlocks[I]);
@@ -1050,6 +1310,11 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
   // a multi-object escape point to resolve each MergedLock's receiver.
   DenseMap<const jeandle::MaterializeEffect *, CallBase *> NewInvOf;
 
+  // Normalize incoming-edge materializations before RPO and before replay
+  // batches capture their physical insertion sites.  SplitBlockPredecessors
+  // updates target PHIs and clones landingpads when the target is an EH pad.
+  Changed |= splitReplayEdges(Result);
+
   ReversePostOrderTraversal<Function *> RPOT(&F);
 
   // Build the per-escape-point merged lock lists (one global depth-sort per
@@ -1063,19 +1328,18 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
   // InsertBefore instruction -> effect list. A sibling erase
   // (ReplaceLoad/ReplaceCall/EliminateStore) consults this to re-aim each
   // dependent Materialize to the in-block successor before nulling the
-  // WeakTrackingVH. Required for the Case-A path whose InsertBefore is a folded
-  // JavaOp invoke terminator (tests 438/439/440) — see
+  // WeakTrackingVH. Required when InsertBefore is a folded JavaOp invoke
+  // terminator — see
   // relocateDependentMaterializes.
   DenseMap<Instruction *, SmallVector<jeandle::MaterializeEffect *, 4>>
       InsertBeforeDependents;
-  // Each Materialize effect's ORIGINAL escape-point InsertBefore, captured here
-  // before Pass 1 (before any eager-update re-aim). computeEscapePointLocks
-  // keys EscapePointLocks / MaxSeqForEscapePoint by this same analysis-time
-  // instruction, so the lock re-emit must look up with it — NOT with
+  // Each Materialize effect's edge-normalized InsertBefore, captured here
+  // before Pass 1 and before any eager-update re-aim. computeEscapePointLocks
+  // keys LockReplayBatchForSite by this same normalized instruction, so the
+  // lock re-emit must look up with it — NOT with
   // E.InsertBefore, which relocateDependentMaterializes may re-aim to the
-  // in-block successor for a Case-A materialize. Using the re-aimed value would
-  // miss the key, fall to per-effect emission, and mis-order multi-object
-  // interleaved locks.
+  // in-block successor for a materialize. Using the re-aimed value would
+  // miss the final physical batch.
   DenseMap<const jeandle::MaterializeEffect *, Instruction *> OrigInsertBefore;
   DenseMap<Instruction *, SmallVector<jeandle::MaterializeEffect *, 4>>
       MaterializationsAt;
@@ -1095,7 +1359,8 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
   DenseSet<const jeandle::MaterializeEffect *> ReusedMaterializations;
   for (auto &KV : MaterializationsAt) {
     SmallVector<Instruction *, 16> MatchingInstructions;
-    if (!matchExistingReplay(KV.first, KV.second, Result, MatchingInstructions))
+    if (!matchExistingReplaySuffix(KV.first, KV.second, Result,
+                                   MatchingInstructions))
       continue;
     PreservedReplayInstructions.insert(MatchingInstructions.begin(),
                                        MatchingInstructions.end());

@@ -57,7 +57,10 @@ unwind:
 ; FINAL-LABEL: define void @test_same_twice(
 ; FINAL: %obj = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
 ; FINAL-NOT: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
-; FINAL: %[[SAME_SLOT:pea\.matslot[0-9]*]] = getelementptr inbounds i8, ptr addrspace(1) %obj, i64 8
+; The source store is already the exact canonical suffix immediately before
+; the escape, so structural replay recognition may reuse it without renaming
+; its GEP.
+; FINAL: %[[SAME_SLOT:[A-Za-z0-9._]+]] = getelementptr inbounds i8, ptr addrspace(1) %obj, i64 8
 ; FINAL-NEXT: store atomic i32 %value, ptr addrspace(1) %[[SAME_SLOT]] unordered, align 4
 ; Both positions and both deopt slots retain the one real identity.
 ; FINAL-NEXT: call void @sink2(ptr addrspace(1) %obj, ptr addrspace(1) %obj)

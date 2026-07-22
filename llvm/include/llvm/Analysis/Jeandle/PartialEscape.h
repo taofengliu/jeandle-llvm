@@ -20,8 +20,8 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/Hashing.h"
-#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/IR/ValueHandle.h"
 
 #include <cassert>
@@ -65,17 +65,12 @@ static constexpr ObjectID InvalidObjectID = ~0u;
 // ObjectState's live lock stack. EnterCall is the original
 // jeandle.monitorenter call site (the effects-side anchor used when
 // un-eliding the call on materialisation); BytecodeDepth is the lock-nesting
-// ordering key at the enter site, sourced from the analyzer's monotonic
-// NextLockEnterOrder (cached per call site in the analyzer's LockDepthCache,
-// see PartialEscapeAnalysis.cpp). It is an RPO-order proxy for nesting depth,
-// sound for every load-bearing use here (cascade `<`, re-emit sort,
-// merge-time stack identity, strict-increasing assert): under the
-// structured-locking assumption PEA relies on, "lock X acquired before Y
-// while both live" <=> "X's enter dominates Y's" <=> "RPO visits X before Y".
+// ordering key at the enter site, reconstructed by an edge-sensitive CFG
+// dataflow (see PartialEscapeAnalysis.cpp). It is the absolute dynamic nesting
+// depth, including the inferred interpreter-held entry depth of an OSR root.
 // The analyzer-side mirror struct LockEnter (PartialEscapeAnalysis.cpp)
-// carries Call + BytecodeDepth. BytecodeDepth is the same cached-per-call-site
-// value, so it is stable across loop-fixpoint re-pushes; the convergence
-// check (exitDataEquivalent) therefore compares Call identity only.
+// carries Call + BytecodeDepth. The function-wide dataflow makes the value
+// stable across loop-fixpoint re-pushes.
 struct MonitorIdRef {
   CallBase *EnterCall;
   uint32_t BytecodeDepth;
@@ -113,13 +108,28 @@ struct MaterializedLock {
 // effect to OrigAlloc in applyMaterialize, read by the lock-cascade re-emit
 // path); reuse-OrigAlloc materialization never spawns a per-pred invoke, so
 // the per-effect key disambiguates cascade members without any fallback chain.
-// See PEAResult::EscapePointLocks.
+// See PEAResult::LockReplayBatches.
 class MaterializeEffect;
 struct MergedLock {
   Function *Callee = nullptr;
   SmallVector<WeakTrackingVH, 2> NonReceiverArgs;
   uint32_t BytecodeDepth = 0;
   const MaterializeEffect *SourceEffect = nullptr; // per-effect receiver key
+  // Logical consumers whose effects contributed this one physical replay
+  // operation. The transform emits the operation once; tracing emits one
+  // association row per unique consumer using the same physical ordinal.
+  SmallVector<const Value *, 2> LogicalEscapes;
+};
+
+// Final physical lock-replay batch consumed by the transform. EmitSite is the
+// durable edge-normalized, pre-Pass1 insertion point (before any eager re-aim),
+// and EmitterSeqNo identifies the tail MaterializeEffect that emits the
+// complete globally depth-sorted list after every receiver has been recorded.
+struct LockReplayBatch {
+  Instruction *EmitSite = nullptr;
+  uint32_t EmitterSeqNo = 0;
+  uint32_t SourceID = 0;
+  SmallVector<MergedLock, 4> Locks;
 };
 
 class VirtualObject {
@@ -151,8 +161,8 @@ public:
   // persistent "OrigAlloc". Jeandle's Analysis pass cannot mutate IR (LLVM's
   // Analysis/Transform split), so OrigAlloc persists as a real invoke until the
   // Transform, where it is either eliminated (NeverEscapes) or KEPT and reused
-  // as the materialized value itself for PartiallyEscapes. The analysis rewrites
-  // every VirtualRef → MaterializedRef(OrigAlloc) during prerequisite
+  // as the materialized value itself for PartiallyEscapes. The analysis
+  // rewrites every VirtualRef → MaterializedRef(OrigAlloc) during prerequisite
   // materialization (see processLoad/processStore/resolveVirtualRef), so the
   // transform only replays field stores and re-emits locks onto OrigAlloc — no
   // per-use DT alias resolution pass runs, because OrigAlloc dominates every
@@ -307,10 +317,10 @@ private:
   Value *MaterializedValue = nullptr;
 
 public:
-  // ObjectState carries ONLY the per-VO virtual/materialized flag, the live lock
-  // stack, and (once materialized) the materialized pointer. Per-FIELD state
-  // does NOT live here. Graal's ObjectState.entries is authoritative because
-  // Graal propagates an ObjectState[] across the CFG inside
+  // ObjectState carries ONLY the per-VO virtual/materialized flag, the live
+  // lock stack, and (once materialized) the materialized pointer. Per-FIELD
+  // state does NOT live here. Graal's ObjectState.entries is authoritative
+  // because Graal propagates an ObjectState[] across the CFG inside
   // PartialEscapeBlockState; Jeandle cannot (LLVM's Analysis/Transform split +
   // SSA single-pass walk — see the STATE MODEL comment in
   // PartialEscapeAnalysis.cpp), so field values are tracked in the
@@ -499,6 +509,11 @@ public:
   };
 
   // --- common fields (read by commit/dropEffectsFor/the transform) ---
+  // Block is the effect's semantic insertion block. During edge
+  // normalization a MaterializeEffect may be retargeted to a newly split edge
+  // block while its owning unique_ptr remains in the original BlockEffects
+  // bucket; transform application order still comes from that stable bucket,
+  // and the physical insertion point comes from InsertBefore.
   BasicBlock *Block = nullptr;
   // IR-FORM DIVERGENCE from Graal: Graal applies effects in pure list-order
   // (its per-block EffectList is append-only; loop headers use
@@ -560,7 +575,9 @@ public:
   WeakTrackingVH Replacement;
 
   Kind getKind() const override { return Kind::ReplaceLoad; }
-  static bool classof(const Effect *E) { return E->getKind() == Kind::ReplaceLoad; }
+  static bool classof(const Effect *E) {
+    return E->getKind() == Kind::ReplaceLoad;
+  }
   Instruction *getTarget() const override {
     return dyn_cast_or_null<Instruction>((Value *)Target);
   }
@@ -586,7 +603,9 @@ public:
   int OopHandleId = -1;
 
   Kind getKind() const override { return Kind::ReplaceCall; }
-  static bool classof(const Effect *E) { return E->getKind() == Kind::ReplaceCall; }
+  static bool classof(const Effect *E) {
+    return E->getKind() == Kind::ReplaceCall;
+  }
   Instruction *getTarget() const override {
     return dyn_cast_or_null<Instruction>((Value *)Target);
   }
@@ -603,7 +622,9 @@ public:
   Instruction *Target = nullptr;
 
   Kind getKind() const override { return Kind::EliminateStore; }
-  static bool classof(const Effect *E) { return E->getKind() == Kind::EliminateStore; }
+  static bool classof(const Effect *E) {
+    return E->getKind() == Kind::EliminateStore;
+  }
   Instruction *getTarget() const override { return Target; }
   void apply(TransformContext &Ctx) override;
   std::unique_ptr<Effect> clone() const override {
@@ -672,15 +693,27 @@ public:
   // (Graal: synthetic MonitorEnterNodes at the CommitAllocationNode), sorted
   // ascending by BytecodeDepth.
   SmallVector<MaterializedLock, 2> Locks;
-  // Per-pred materializations carry no fields on this effect. Under
-  // reuse-OrigAlloc every per-pred materialize is placed at
-  // PH->getTerminator(), reuses OrigAlloc as the materialized value, and no
-  // materialized-object merge PHI is emitted — per-pred distinctness survives
-  // via the per-effect NewInvOf[SourceEffect] receiver lookup in the
-  // lock-cascade path, keyed by the per-pred SourceEffect identity.
+  // Stable provenance for the final lock-replay plan. LogicalEscape identifies
+  // the merge/consumer shared by alternative predecessor plans; ReplaySource
+  // identifies the concrete predecessor/path that physically emits this
+  // effect. computeEscapePointLocks converts these analysis-owned anchors to
+  // deterministic numeric IDs before the transform mutates IR.
+  Value *LogicalEscape = nullptr;
+  BasicBlock *ReplaySource = nullptr;
+  // The merge reached by a merge-driven incoming edge.  When ReplaySource
+  // has another distinct successor, the transform splits Source->Target and
+  // moves every replay operation to that edge before building batches. Null
+  // for live-path materializations and true block-end drains.
+  BasicBlock *ReplayTarget = nullptr;
+  // Under reuse-OrigAlloc, incoming-edge materialization reuses OrigAlloc as
+  // the value and emits no materialized-object merge PHI. Field and lock replay
+  // retain edge provenance, and per-pred receiver identity survives via the
+  // per-effect NewInvOf[SourceEffect] lookup.
 
   Kind getKind() const override { return Kind::Materialize; }
-  static bool classof(const Effect *E) { return E->getKind() == Kind::Materialize; }
+  static bool classof(const Effect *E) {
+    return E->getKind() == Kind::Materialize;
+  }
   Instruction *getTarget() const override {
     return dyn_cast_or_null<Instruction>((Value *)Target);
   }
@@ -688,13 +721,10 @@ public:
   std::unique_ptr<Effect> clone() const override {
     return std::make_unique<MaterializeEffect>(*this);
   }
-  // Block is assigned directly at emission (E->Block = SafeIP->getParent() in
-  // materializeAt, PartialEscapeAnalysis.cpp), where SafeIP =
-  // PH->getTerminator() for per-pred or the escape-point instruction for the
-  // live path, and is NEVER re-aimed at apply. reuse-OrigAlloc needs no
-  // per-edge carve-out: OrigAlloc dominates every escape point by SSA (see
-  // applyMaterialize's assert that the materialized value equals
-  // VObj.AllocationCall).
+  // Block and InsertBefore are assigned at emission. Before apply, the
+  // transform re-aims both to a dedicated edge block when ReplaySource has
+  // another distinct successor; OrigAlloc remains the materialized value and
+  // dominates the normalized insertion point by SSA.
   // Defined out-of-line: assigning to the WeakTrackingVH needs Instruction to
   // be a complete type (Instruction* → Value* derived-to-base), which it is
   // not in this header.
@@ -713,6 +743,7 @@ public:
 class CreatePHIEffect : public Effect {
 public:
   Type *PHIType = nullptr;
+  int64_t FieldOffset = 0;
   // WeakTrackingVH: an incoming value may be a call result whose call is
   // cloned by RewriteDeoptBundleEffect — the handle follows the RAUW.
   SmallVector<WeakTrackingVH, 4> PHIIncomingValues;
@@ -720,7 +751,9 @@ public:
   PHINode *PhiInst = nullptr;
 
   Kind getKind() const override { return Kind::CreatePHI; }
-  static bool classof(const Effect *E) { return E->getKind() == Kind::CreatePHI; }
+  static bool classof(const Effect *E) {
+    return E->getKind() == Kind::CreatePHI;
+  }
   void apply(TransformContext &Ctx) override;
   std::unique_ptr<Effect> clone() const override {
     return std::make_unique<CreatePHIEffect>(*this);
@@ -883,14 +916,20 @@ public:
   struct Iterator {
     SmallVectorImpl<std::unique_ptr<Effect>>::iterator It;
     Effect &operator*() const { return **It; }
-    Iterator &operator++() { ++It; return *this; }
+    Iterator &operator++() {
+      ++It;
+      return *this;
+    }
     bool operator==(const Iterator &O) const { return It == O.It; }
     bool operator!=(const Iterator &O) const { return It != O.It; }
   };
   struct ConstIterator {
     SmallVectorImpl<std::unique_ptr<Effect>>::const_iterator It;
     const Effect &operator*() const { return **It; }
-    ConstIterator &operator++() { ++It; return *this; }
+    ConstIterator &operator++() {
+      ++It;
+      return *this;
+    }
     bool operator==(const ConstIterator &O) const { return It == O.It; }
     bool operator!=(const ConstIterator &O) const { return It != O.It; }
   };
@@ -917,61 +956,58 @@ public:
 
   DenseMap<BasicBlock *, EffectList> BlockEffects;
 
-  // Locks to re-emit at each escape point, globally depth-sorted ascending by
-  // BytecodeDepth, plus the highest MaterializeEffect SeqNo at each escape
-  // point. Graal flattens every lock materialized at one point into a single
-  // CommitAllocationNode and lowers them globally depth-sorted with a strict-
-  // increase guarantee (DefaultJavaLoweringProvider). Jeandle's per-VO
+  // Final physical lock-replay batches, globally depth-sorted ascending by
+  // BytecodeDepth. Graal flattens every lock materialized at one point into a
+  // single CommitAllocationNode and lowers them globally depth-sorted with a
+  // strict-increase guarantee (DefaultJavaLoweringProvider). Jeandle's per-VO
   // MaterializeEffect model otherwise would re-emit per-effect, which
   // mis-orders re-entrant interleaved cascades (e.g. [a@0,b@1,a@2,c@3]
   // re-emitting as 0,2,1,3).
   //
   // The transform's tail-effect path emits an escape point's merged list once,
   // from the highest-SeqNo MaterializeEffect among those SHARING the SAME
-  // analysis-time InsertBefore Instruction* pointer (the locked re-emit loop
-  // in applyMaterialize/processEscapePointLocks, gated on
-  // E.SeqNo == MaxSeqForEscapePoint[Key]). Each lock's receiver is resolved
-  // via the single map NewInvOf[ML.SourceEffect], asserted non-empty — NO
-  // fallback chain.
+  // edge-normalized, pre-Pass1 InsertBefore pointer (the locked re-emit loop
+  // in applyMaterialize, gated on E.SeqNo == Batch.EmitterSeqNo). Each lock's
+  // receiver is resolved via the single map NewInvOf[ML.SourceEffect], asserted
+  // non-empty — NO fallback chain.
   //
-  // GROUPING RULE (live today — there is NO critical-edge pre-pass): grouping
-  // is purely by the MaterializeEffect::InsertBefore Instruction*.
-  // computeEscapePointLocks only merges effects that share the SAME
-  // analysis-time InsertBefore pointer; effects whose Count[InsertBefore] < 2
-  // are silently routed to per-effect emit (the Count<2 early-out in
-  // computeEscapePointLocks).
+  // GROUPING RULE: the transform first normalizes each multi-successor
+  // ReplaySource->ReplayTarget edge to a dedicated edge block, re-aiming all
+  // materialize effects and deferred PHI incoming blocks together. It then
+  // groups purely by the normalized MaterializeEffect::InsertBefore pointer.
+  // A lock-carrying site with one effect receives a one-entry physical batch;
+  // lockless sites replay only their fields and consume no lock-batch ID.
   //
-  // For per-pred materializations, SafeIP = PH->getTerminator() (analysis
-  // time, returned by ComputeSafeIP), so every per-pred materialize emitted
-  // FROM THE SAME predecessor PH shares one InsertBefore pointer and a
-  // single-PH per-pred cascade therefore groups under one InsertBefore
-  // exactly like a live-path cascade. Two distinct edge targets from the same
-  // PH ALSO share that same terminator key — there is NO per-merge
-  // bucketing; this is sound under reuse-OrigAlloc because no
-  // materialized-object merge PHI is ever emitted, so cross-merge identity
-  // has no observable lock effect.
+  // All materializations for one normalized incoming edge share its block
+  // terminator and therefore one physical batch. Distinct edge targets from
+  // the same original source have distinct sites and never mix side effects.
+  // Logical consumers are associations on each physical MergedLock, not
+  // properties of the whole batch: lockless effects contribute no association,
+  // while locks that dedup within one edge are emitted once and traced once per
+  // association with the same physical ordinal.
   //
   // CROSS-PH per-pred cascades — multiple per-pred materializes from different
-  // PHs feeding the same escape point or merge — do NOT merge today: they
-  // fall through the Count<2 early-out to per-effect emit, where only
-  // intra-effect self-sort (by BytecodeDepth in captureMaterializedLocks) is
-  // guaranteed. Cross-object interleaved-lock ordering is therefore NOT
-  // preserved by EscapePointLocks in that case.
-  // TODO(cross-ph-lock-order): merge cross-PH per-pred cascades at a shared
-  // escape point so cross-object interleaved-lock ordering is preserved.
+  // PHs feeding the same escape point or merge — remain separate physical
+  // batches, each with its own source provenance. Cross-object interleaved-lock
+  // ordering is therefore not combined across mutually exclusive paths.
   //
-  // OrigInsertBefore (captured by the TransformContext in run() before Pass 1)
-  // records the analysis-time InsertBefore before any eager-update re-aim by
+  // OrigInsertBefore (captured by the TransformContext after edge normalization
+  // and before Pass 1) records InsertBefore before any eager-update re-aim by
   // relocateDependentMaterializes; the lock key is exactly this captured
-  // pointer (looked up via OrigInsertBefore.lookup(&E) — a re-aimed
-  // E.InsertBefore could otherwise miss the key and fall to per-effect emit,
-  // mis-ordering the runtime lock stack).
+  // normalized pointer (looked up via OrigInsertBefore.lookup(&E) — a re-aimed
+  // E.InsertBefore could otherwise miss the final physical batch).
   //
   // Populated by computeEscapePointLocks(), called once before Pass 1 from
   // the TransformContext setup in run().
-  DenseMap<Instruction *, SmallVector<MergedLock, 4>> EscapePointLocks;
-  DenseMap<Instruction *, uint32_t> MaxSeqForEscapePoint;
+  SmallVector<LockReplayBatch, 4> LockReplayBatches;
+  DenseMap<Instruction *, unsigned> LockReplayBatchForSite;
   void computeEscapePointLocks();
+  const LockReplayBatch *getLockReplayBatch(Instruction *EmitSite) const {
+    auto It = LockReplayBatchForSite.find(EmitSite);
+    if (It == LockReplayBatchForSite.end())
+      return nullptr;
+    return &LockReplayBatches[It->second];
+  }
 
   int VirtualizationDelta = 0;
   int AllocationDelta = 0;

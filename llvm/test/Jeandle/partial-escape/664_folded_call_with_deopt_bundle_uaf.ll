@@ -10,8 +10,8 @@
 ; that the transform must survive.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
-declare hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr) nounwind
+declare hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1), ptr) nounwind
 declare void @sink(i32)
 declare i32 @__gxx_personality_v0(...)
 

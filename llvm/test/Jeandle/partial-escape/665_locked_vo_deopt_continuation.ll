@@ -8,7 +8,7 @@
 ; wrongly kept real and never described.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr) nounwind
 declare i32 @__gxx_personality_v0(...)
 
 define i32 @locked_vo_at_deopt_continuation(i32 %a) gc "hotspotgc" personality ptr @__gxx_personality_v0 {

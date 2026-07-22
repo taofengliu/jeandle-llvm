@@ -1,23 +1,16 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s -o %t
+; RUN: FileCheck %s < %t
+; RUN: not grep '!jeandle[.]pea[.]replay' %t
 
-; Case-A + locks + a folded JavaOp-invoke terminator, under the reuse-OrigAlloc
-; model. The object %o has a tracked monitorenter in block `n` (before the
-; branch); `else`'s terminator is a folded arraylength invoke on %o (Case-A
-; materialize at the erased terminator). The eager-update hook
-; (`relocateDependentMaterializes`) re-aims the Materialize's InsertBefore off
-; the erased invoke onto the in-block successor (the `br`).
-;
-; Under reuse-OrigAlloc the original allocation invoke (OrigAlloc %o) is KEPT
-; (no fresh pea.mat invoke). The folded arraylength invoke is erased. The
-; tracked monitorenter — which was virtually elided from block `n` — is
-; re-emitted ONCE at the escape point (in `else`, before the `br` to %merge),
-; with receiver OrigAlloc %o. On the `then` path the object never escapes
-; (the merge PHI picks `null`), so the lock is correctly NOT acquired there
-; (partial-escape elides the lock on the no-escape path).
+; Case-A with a folded arraylength invoke and a structured monitor region.
+; Both normal paths leave the monitor in merge; the exceptional path leaves it
+; in handler. Any replay caused by the pointer PHI must remain on its incoming
+; edge, and every surviving enter must have the corresponding real exit.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) readonly)
-declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr) nounwind
+declare hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1), ptr) nounwind
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
@@ -36,9 +29,13 @@ else:
 merge:
   %p = phi ptr addrspace(1) [ null, %then ], [ %o, %else ]
   call void @sink(ptr addrspace(1) %p)
+  call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
+      ptr addrspace(1) %o, ptr %lo)
   ret void
 handler:
   %lp = landingpad i64 cleanup
+  call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
+      ptr addrspace(1) %o, ptr %lo)
   resume i64 %lp
 u:
   %lpr = landingpad i64 cleanup
@@ -54,12 +51,26 @@ u:
 ; CHECK: %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 7, i32 44, i32 16, i32 1048576)
 ; No pea.mat materialization invoke is emitted.
 ; CHECK-NOT: pea.mat = invoke
-; The tracked monitorenter is re-emitted exactly once at the escape point
-; (in the else block, before the br to merge), receiver OrigAlloc %o.
+; Both normal paths replay the enter because both execute merge's real exit.
+; The else replay is isolated on its incoming edge.
+; CHECK: n:
+; CHECK-NEXT: br i1 %c, label %then, label %else
+; CHECK: then:
+; CHECK-NEXT: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %o, ptr %lo)
+; CHECK-NEXT: br label %merge
 ; CHECK: else:
-; CHECK-NOT: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %o, ptr %lo)
-; CHECK-NOT: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock
-; The merge PHI and sink are preserved (sink receives the PHI).
-; CHECK: %p = phi ptr addrspace(1) [ null, %then ], [ %o, %else ]
-; CHECK: call void @sink(ptr addrspace(1) %p)
+; CHECK-NEXT: br label %[[EDGE:[-A-Za-z$._0-9]+]]
+; CHECK: [[EDGE]]:
+; CHECK-NEXT: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %o, ptr %lo)
+; CHECK-NEXT: br label %merge
+; CHECK: merge:
+; CHECK-NEXT: %p = phi ptr addrspace(1) [ null, %then ], [ %o, %[[EDGE]] ]
+; CHECK-NEXT: call void @sink(ptr addrspace(1) %p)
+; CHECK-NEXT: call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1) %o, ptr %lo)
+; CHECK-NEXT: ret void
+; Allocation unwind occurs before the virtual enter, so it contains no monitor
+; operation. The folded arraylength unwind also disappeared with the invoke.
+; CHECK: u:
+; CHECK-NOT: @jeandle.monitor
+; CHECK-NOT: poison
+; CHECK: }

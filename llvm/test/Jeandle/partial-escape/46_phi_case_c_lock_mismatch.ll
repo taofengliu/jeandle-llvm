@@ -1,4 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -disable-output -jeandle-trace-pea \
+; RUN:   -passes="require<partial-escape-analysis>,partial-escape-transform" %s 2>&1 \
+; RUN:   | FileCheck %s --check-prefix=TRACE
 
 ; PEA Case C lock-mismatch — diamond CFG, both arms allocate the same Klass,
 ; but the left arm enters a monitor on its alloc (live lock count = 1 at
@@ -10,17 +13,20 @@
 ;
 ; Expected: both per-pred allocations survive in IR (materialized at preds);
 ; the LLVM PHI also survives, merging the two materialized invokes.
+; The right arm holds an external padding monitor, giving both incoming edges
+; scalar depth one; the merged held owner is released after the sink.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
-declare hotspotcc void @jeandle.monitorexit_with_thin_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr) nounwind
+declare hotspotcc void @jeandle.monitorexit_with_thin_lock(ptr addrspace(1), ptr) nounwind
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
-define void @test_casec_lock_mismatch(i1 %c)
+define void @test_casec_lock_mismatch(i1 %c, ptr addrspace(1) %pad)
     gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   %lock = alloca i64, align 8
+  %pad.lock = alloca i64, align 8
   br i1 %c, label %left, label %right
 left:
   %o1 = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
@@ -28,7 +34,7 @@ left:
         to label %lcont unwind label %u
 lcont:
   ; Enter monitor on the left arm so left.LockCount == 1 at exit.
-  call hotspotcc void @jeandle.monitorenter_with_thin_lock(
+  tail call hotspotcc void @jeandle.monitorenter_with_thin_lock(
                 ptr addrspace(1) %o1, ptr %lock)
   br label %merge
 right:
@@ -36,10 +42,16 @@ right:
             ptr inttoptr (i64 12345 to ptr), i32 16)
         to label %rcont unwind label %u
 rcont:
+  call hotspotcc void @jeandle.monitorenter_with_thin_lock(
+                ptr addrspace(1) %pad, ptr %pad.lock)
   br label %merge
 merge:
   %p = phi ptr addrspace(1) [ %o1, %lcont ], [ %o2, %rcont ]
+  %held = phi ptr addrspace(1) [ %o1, %lcont ], [ %pad, %rcont ]
+  %held.lock = phi ptr [ %lock, %lcont ], [ %pad.lock, %rcont ]
   call void @sink(ptr addrspace(1) %p)
+  call hotspotcc void @jeandle.monitorexit_with_thin_lock(
+                ptr addrspace(1) %held, ptr %held.lock)
   ret void
 u:
   %lp = landingpad i64 cleanup
@@ -52,5 +64,7 @@ u:
 ; CHECK: invoke hotspotcc {{.*}}@jeandle.new_instance
 ; CHECK: phi ptr addrspace(1)
 ; CHECK: call void @sink
+; CHECK-NOT: tail call hotspotcc void @jeandle.monitorenter_with_thin_lock
+; TRACE: PEA: LockReplay function=@test_casec_lock_mismatch
 
 !java-method-compilation = !{}

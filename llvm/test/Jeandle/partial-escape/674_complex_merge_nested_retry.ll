@@ -40,11 +40,11 @@ unwind:
 ; CHECK-LABEL: define void @merge_i32_float
 ; CHECK: %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
 ; CHECK: left:
-; CHECK-NEXT: [[I32_SLOT:%pea.matslot[0-9]*]] = getelementptr inbounds i8, ptr addrspace(1) %o, i64 16
+; CHECK-NEXT: [[I32_SLOT:%[A-Za-z0-9._]+]] = getelementptr inbounds i8, ptr addrspace(1) %o, i64 16
 ; CHECK-NEXT: store atomic i32 7, ptr addrspace(1) [[I32_SLOT]] unordered, align 4
 ; CHECK-NEXT: br label %merge
 ; CHECK: right:
-; CHECK-NEXT: [[FLOAT_SLOT:%pea.matslot[0-9]*]] = getelementptr inbounds i8, ptr addrspace(1) %o, i64 16
+; CHECK-NEXT: [[FLOAT_SLOT:%[A-Za-z0-9._]+]] = getelementptr inbounds i8, ptr addrspace(1) %o, i64 16
 ; CHECK-NEXT: store atomic float 1.500000e+00, ptr addrspace(1) [[FLOAT_SLOT]] unordered, align 4
 ; CHECK-NEXT: br label %merge
 ; CHECK: %v = load atomic i32, ptr addrspace(1) %mf unordered, align 4
@@ -89,12 +89,12 @@ unwind:
 ; CHECK-LABEL: define void @merge_scalar_reference
 ; CHECK: %left_o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
 ; CHECK: left:
-; CHECK-NEXT: [[I64_SLOT:%pea.matslot[0-9]*]] = getelementptr inbounds i8, ptr addrspace(1) %left_o, i64 16
+; CHECK-NEXT: [[I64_SLOT:%[A-Za-z0-9._]+]] = getelementptr inbounds i8, ptr addrspace(1) %left_o, i64 16
 ; CHECK-NEXT: store atomic i64 9, ptr addrspace(1) [[I64_SLOT]] unordered, align 8
 ; CHECK-NEXT: br label %merge
 ; CHECK: %right_o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
 ; CHECK: right:
-; CHECK-NEXT: [[REF_SLOT:%pea.matslot[0-9]*]] = getelementptr inbounds i8, ptr addrspace(1) %right_o, i64 16
+; CHECK-NEXT: [[REF_SLOT:%[A-Za-z0-9._]+]] = getelementptr inbounds i8, ptr addrspace(1) %right_o, i64 16
 ; CHECK-NEXT: store atomic ptr addrspace(1) %ref, ptr addrspace(1) [[REF_SLOT]] unordered, align 8
 ; CHECK-NEXT: br label %merge
 ; CHECK: %o = phi ptr addrspace(1) [ %left_o, %left ], [ %right_o, %right ]

@@ -41,7 +41,8 @@ u:
 ; CHECK-NOT: pea.mat = invoke
 ; The self-referential field store replays onto OrigAlloc — value operand is
 ; the live OrigAlloc %o, never <badref>.
-; CHECK: store atomic ptr addrspace(1) %o, ptr addrspace(1) %pea.matslot unordered, align 8
+; CHECK: %[[SLOT:[A-Za-z0-9._]+]] = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
+; CHECK: store atomic ptr addrspace(1) %o, ptr addrspace(1) %[[SLOT]] unordered, align 8
 ; No materialized-object PHI at the merge: OrigAlloc is the single SSA value
 ; consumed by both sink calls.
 ; CHECK-NOT: phi

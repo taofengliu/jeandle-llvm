@@ -1,17 +1,17 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Lit coverage for narrow cascade with mixed depths on the proxy path.
-; Three locks; B (the middle one) escapes. With RPO-order proxy depths
+; Lit coverage for narrow cascade with mixed CFG-derived depths.
+; Three locks; B (the middle one) escapes. CFG dataflow gives
 ;   A.depth = 0, B.depth = 1, C.depth = 2
 ; the narrow rule
 ;   other.front().BytecodeDepth < this.back().BytecodeDepth
 ; selects A (A.minDepth=0 < B.maxDepth=1) but NOT C (C.minDepth=2,
 ; NOT < 1). A and B materialise; C stays virtual. Mirrors test
-; 192_narrow_lock_cascade_three_deep.ll, proxy-driven (no metadata).
+; 192_narrow_lock_cascade_three_deep.ll, with no depth metadata.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
-declare hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr) nounwind
+declare hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1), ptr) nounwind
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 

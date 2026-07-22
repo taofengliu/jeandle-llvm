@@ -1,4 +1,16 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" \
+; RUN:   %s -o %t.ir
+; RUN: FileCheck %s < %t.ir
+; RUN: sed -n '/^define ptr addrspace(1) @test_cyclic_nested/,/^}/p' %t.ir \
+; RUN:   | grep -c '^  store atomic' | FileCheck %s --check-prefix=STORE-COUNT
+; RUN: opt -disable-output -passes="require<partial-escape-analysis>" \
+; RUN:   -jeandle-trace-pea -jeandle-dump-pea-stats \
+; RUN:   -jeandle-pea-analyze-function=test_cyclic_nested %s > %t.trace 2>&1
+; RUN: FileCheck %s --check-prefix=TRACE < %t.trace
+; RUN: grep -c '^PEA: EliminateStore function=@test_cyclic_nested ' %t.trace \
+; RUN:   | FileCheck %s --check-prefix=ELIMINATE-COUNT
+; RUN: grep -c '^PEA: Materialize function=@test_cyclic_nested ' %t.trace \
+; RUN:   | FileCheck %s --check-prefix=MATERIALIZE-COUNT
 
 ; Cyclic nested virtuals. Two virtuals A and B form a cycle —
 ; A.f = B and B.g = A. Returning A escapes A; B escapes transitively (A.f
@@ -35,15 +47,25 @@ u2:
 
 ; Both OrigAllocs (klass 11111 = A, klass 22222 = B) are retained.
 ; CHECK-LABEL: define ptr addrspace(1) @test_cyclic_nested
-; CHECK-DAG: invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
-; CHECK-DAG: invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
+; CHECK: %[[A:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
+; CHECK: %[[B:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
 ; No fresh materialization invoke is emitted.
 ; CHECK-NOT: pea.mat = invoke
-; Both replayed field stores use OrigAlloc values — the back edge B.g = A
-; resolves through A's OrigAlloc (kept alive), never poison.
-; CHECK: store atomic ptr addrspace(1) %a, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
-; CHECK: store atomic ptr addrspace(1) %b, ptr addrspace(1) %pea.matslot{{[0-9]*}} unordered, align 8
+; Both field groups use OrigAlloc values — the back edge B.g = A resolves
+; through A's OrigAlloc (kept alive), never poison. An already canonical
+; source suffix is retained without requiring transform-generated SSA names.
+; CHECK-DAG: %[[A_SLOT:[A-Za-z0-9._]+]] = getelementptr inbounds{{( nuw)?}} i8, ptr addrspace(1) %[[A]], i64 8
+; CHECK-DAG: store atomic ptr addrspace(1) %[[B]], ptr addrspace(1) %[[A_SLOT]] unordered, align 8
+; CHECK-DAG: %[[B_SLOT:[A-Za-z0-9._]+]] = getelementptr inbounds{{( nuw)?}} i8, ptr addrspace(1) %[[B]], i64 8
+; CHECK-DAG: store atomic ptr addrspace(1) %[[A]], ptr addrspace(1) %[[B_SLOT]] unordered, align 8
 ; CHECK-NOT: poison
-; CHECK: ret ptr addrspace(1) %a
+; CHECK: ret ptr addrspace(1) %[[A]]
+
+; TRACE-COUNT-2: PEA: EliminateStore function=@test_cyclic_nested
+; TRACE-COUNT-2: PEA: Materialize function=@test_cyclic_nested
+; TRACE: ;; PEA stats @test_cyclic_nested: NeverEscapes=0 PartiallyEscapes=2 AlwaysEscapes=0
+; STORE-COUNT: {{^2$}}
+; ELIMINATE-COUNT: {{^2$}}
+; MATERIALIZE-COUNT: {{^2$}}
 
 !java-method-compilation = !{}

@@ -1,4 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -disable-output -passes="require<partial-escape-analysis>" \
+; RUN:     -jeandle-trace-pea \
+; RUN:     -jeandle-pea-analyze-function=test_field_phi_sparse_offsets \
+; RUN:     %s 2>&1 | FileCheck %s --check-prefix=TRACE
 
 ; MergeProcessor / mergeFieldStates per-offset field PHI with SPARSE offsets.
 ;
@@ -54,5 +58,13 @@ u:
 ; CHECK: = phi i32
 ; CHECK: call void @use
 ; CHECK: call void @use
+
+; Both PHIs have the same object and merge block, so the trace must carry the
+; field offset to give each effect a semantic identity. The NOT checks make
+; this an exact two-effect assertion rather than an at-least-two assertion.
+; TRACE-NOT: PEA: CreatePHI function=@test_field_phi_sparse_offsets
+; TRACE: PEA: CreatePHI function=@test_field_phi_sparse_offsets [VO=0] block=%merge offset=8
+; TRACE-NEXT: PEA: CreatePHI function=@test_field_phi_sparse_offsets [VO=0] block=%merge offset=16
+; TRACE-NOT: PEA: CreatePHI function=@test_field_phi_sparse_offsets
 
 !java-method-compilation = !{}

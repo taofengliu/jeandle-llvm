@@ -31,7 +31,8 @@ u:
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 12345 to ptr)
 ; CHECK-NOT: pea.mat = invoke
 ; The self-referential store uses the live OrigAlloc %o (no <badref>).
-; CHECK: store atomic ptr addrspace(1) %o, ptr addrspace(1) %pea.matslot unordered, align 8
+; CHECK: %[[SLOT:[A-Za-z0-9._]+]] = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
+; CHECK: store atomic ptr addrspace(1) %o, ptr addrspace(1) %[[SLOT]] unordered, align 8
 ; The sink receives OrigAlloc directly (not a fresh pea.mat).
 ; CHECK: call void @sink(ptr addrspace(1) %o)
 ; CHECK: ret void

@@ -34,7 +34,6 @@
 
 #include <algorithm>
 
-
 using namespace llvm;
 using namespace llvm::jeandle;
 
@@ -78,12 +77,15 @@ int VirtualObject::getOrCreateFieldIndex(int64_t Offset, Type *Ty,
         DL.getPointerSize(jeandle::AddrSpace::JavaHeapAddrSpace));
     IsReference = true;
   } else {
-    unsigned Bits = Ty->getPrimitiveSizeInBits();
-    if (Bits == 0)
-      return -1; // unknown-size type (e.g. vector/struct) — conservative escape
-    if ((Bits + 7) / 8 > 255)
+    TypeSize Bits = Ty->getPrimitiveSizeInBits();
+    if (Bits.isScalable())
+      return -1; // runtime-dependent field width — conservative escape
+    uint64_t FixedBits = Bits.getFixedValue();
+    if (FixedBits == 0)
+      return -1; // unknown-size type (e.g. aggregate) — conservative escape
+    if (FixedBits > 255 * 8)
       return -1; // oversized field (does not fit FieldDesc::ByteSize) — bail
-    ByteSize = static_cast<uint8_t>((Bits + 7) / 8);
+    ByteSize = static_cast<uint8_t>((FixedBits + 7) / 8);
   }
 
   auto It = std::lower_bound(
@@ -486,47 +488,95 @@ void AliasMap::restore(const AliasMap &S) { *this = S; }
 // ===========================================================================
 
 void PEAResult::computeEscapePointLocks() {
-  // Merges + depth-sorts the locks of every CASCADE group (a set of
-  // MaterializeEffects sharing one InsertBefore Instruction*, live-path OR
-  // per-pred). See the canonical comment on EscapePointLocks in PartialEscape.h
-  // for the grouping rule, per-pred SafeIP, and the Cross-PH limitation
-  // (TODO(cross-ph-lock-order)).
-  //
-  // Record the highest SeqNo per escape point so the transform emits the
-  // merged list once, from the last-applied effect (by then every sibling's
-  // OrigAlloc is recorded in NewInvOf for receiver lookup).
-  DenseMap<Instruction *, unsigned> Count;
+  LockReplayBatches.clear();
+  LockReplayBatchForSite.clear();
+
+  // SeqNo is analysis-run monotonic, so collecting effects in this order makes
+  // batch IDs and first-seen provenance IDs independent of DenseMap iteration.
+  SmallVector<jeandle::MaterializeEffect *, 8> Effects;
   for (auto &Kv : BlockEffects)
     for (jeandle::Effect &E : Kv.second) {
       auto *ME = dyn_cast<jeandle::MaterializeEffect>(&E);
-      if (!ME)
-        continue;
-      if (auto *Key = dyn_cast_or_null<Instruction>(ME->InsertBefore))
-        ++Count[Key];
+      if (ME)
+        Effects.push_back(ME);
     }
-  for (auto &Kv : BlockEffects)
-    for (jeandle::Effect &E : Kv.second) {
-      auto *ME = dyn_cast<jeandle::MaterializeEffect>(&E);
-      if (!ME)
-        continue;
-      Instruction *Key = dyn_cast_or_null<Instruction>(ME->InsertBefore);
-      if (!Key)
-        continue;
-      auto CIt = Count.find(Key);
-      if (CIt == Count.end() || CIt->second < 2)
-        continue; // single-effect escape point — per-effect emit
-      auto &Vec = EscapePointLocks[Key];
+  llvm::sort(Effects, [](const jeandle::MaterializeEffect *A,
+                         const jeandle::MaterializeEffect *B) {
+    return A->SeqNo < B->SeqNo;
+  });
+
+  DenseMap<const Value *, uint32_t> LogicalEscapeIDs;
+  DenseMap<const BasicBlock *, uint32_t> SourceIDs;
+  SmallVector<SmallVector<jeandle::MaterializeEffect *, 4>, 4> BatchEffects;
+  DenseMap<Instruction *, unsigned> SiteIndex;
+  SmallVector<Instruction *, 4> Sites;
+  SmallVector<SmallVector<jeandle::MaterializeEffect *, 4>, 4> SiteEffects;
+  auto GetLogicalEscapeID = [&](const Value *Key) {
+    auto It = LogicalEscapeIDs.find(Key);
+    if (It == LogicalEscapeIDs.end())
+      It = LogicalEscapeIDs
+               .try_emplace(Key, static_cast<uint32_t>(LogicalEscapeIDs.size()))
+               .first;
+    return It->second;
+  };
+  auto GetSourceID = [&](const BasicBlock *Key) {
+    auto It = SourceIDs.find(Key);
+    if (It == SourceIDs.end())
+      It = SourceIDs.try_emplace(Key, static_cast<uint32_t>(SourceIDs.size()))
+               .first;
+    return It->second;
+  };
+
+  for (jeandle::MaterializeEffect *ME : Effects) {
+    Instruction *EmitSite =
+        dyn_cast_or_null<Instruction>((Value *)ME->InsertBefore);
+    if (!EmitSite)
+      continue;
+
+    auto [SiteIt, Inserted] = SiteIndex.try_emplace(EmitSite, Sites.size());
+    if (Inserted) {
+      Sites.push_back(EmitSite);
+      SiteEffects.emplace_back();
+    }
+    SiteEffects[SiteIt->second].push_back(ME);
+  }
+
+  for (unsigned SiteID = 0; SiteID < Sites.size(); ++SiteID) {
+    ArrayRef<jeandle::MaterializeEffect *> EffectsAtSite = SiteEffects[SiteID];
+    if (llvm::none_of(EffectsAtSite, [](jeandle::MaterializeEffect *ME) {
+          return !ME->Locks.empty();
+        }))
+      continue;
+
+    unsigned BatchID = LockReplayBatches.size();
+    Instruction *EmitSite = Sites[SiteID];
+    LockReplayBatchForSite.try_emplace(EmitSite, BatchID);
+    LockReplayBatches.push_back({EmitSite, 0, 0, {}});
+    BatchEffects.emplace_back();
+    BatchEffects.back().append(EffectsAtSite.begin(), EffectsAtSite.end());
+    for (jeandle::MaterializeEffect *ME : EffectsAtSite)
+      LockReplayBatches.back().EmitterSeqNo =
+          std::max(LockReplayBatches.back().EmitterSeqNo, ME->SeqNo);
+  }
+
+  for (unsigned BatchID = 0; BatchID < LockReplayBatches.size(); ++BatchID) {
+    LockReplayBatch &Batch = LockReplayBatches[BatchID];
+    ArrayRef<jeandle::MaterializeEffect *> EffectsAtSite =
+        BatchEffects[BatchID];
+    for (jeandle::MaterializeEffect *ME : EffectsAtSite)
+      assert((!ME->ReplaySource ||
+              ME->ReplaySource == Batch.EmitSite->getParent()) &&
+             "one physical replay site must have one source block");
+    Batch.SourceID = GetSourceID(Batch.EmitSite->getParent());
+
+    for (jeandle::MaterializeEffect *ME : EffectsAtSite) {
+      const Value *LogicalEscape =
+          ME->LogicalEscape ? ME->LogicalEscape : Batch.EmitSite;
       for (const jeandle::MaterializedLock &ML : ME->Locks) {
-        // Defensive dedup: a merged list must never contain the same lock
-        // twice. BytecodeDepth is unique per enter call site (LockDepthCache),
-        // so two entries with the same (Callee, NonReceiverArgs,
-        // BytecodeDepth) can only be the same folded lock captured twice
-        // (e.g. a per-pred duplicate across edges). The commit-time
-        // dominance dedup already removes those; this is the belt-and-braces
-        // layer that keeps the strict-increasing emit invariant true by
-        // construction.
-        bool Dup = false;
-        for (const jeandle::MergedLock &X : Vec) {
+        // Preserve the existing defensive dedup: a physical batch must never
+        // contain the same folded enter twice.
+        jeandle::MergedLock *Existing = nullptr;
+        for (jeandle::MergedLock &X : Batch.Locks) {
           if (X.Callee == ML.Callee && X.BytecodeDepth == ML.BytecodeDepth &&
               X.NonReceiverArgs.size() == ML.NonReceiverArgs.size() &&
               std::equal(X.NonReceiverArgs.begin(), X.NonReceiverArgs.end(),
@@ -534,22 +584,49 @@ void PEAResult::computeEscapePointLocks() {
                          [](const WeakTrackingVH &A, const WeakTrackingVH &B) {
                            return (Value *)A == (Value *)B;
                          })) {
-            Dup = true;
+            Existing = &X;
             break;
           }
         }
-        if (!Dup)
-          Vec.push_back({ML.Callee, ML.NonReceiverArgs, ML.BytecodeDepth, ME});
+        if (!Existing) {
+          Batch.Locks.push_back(
+              {ML.Callee, ML.NonReceiverArgs, ML.BytecodeDepth, ME, {}});
+          Existing = &Batch.Locks.back();
+        }
+        if (!llvm::is_contained(Existing->LogicalEscapes, LogicalEscape))
+          Existing->LogicalEscapes.push_back(LogicalEscape);
       }
-      uint32_t &Max = MaxSeqForEscapePoint[Key];
-      if (ME->SeqNo > Max)
-        Max = ME->SeqNo;
     }
-  for (auto &Kv : EscapePointLocks)
-    llvm::sort(Kv.second, [](const jeandle::MergedLock &A,
-                             const jeandle::MergedLock &B) {
-      return A.BytecodeDepth < B.BytecodeDepth;
-    });
+  }
+
+  for (LockReplayBatch &Batch : LockReplayBatches)
+    llvm::sort(Batch.Locks,
+               [](const jeandle::MergedLock &A, const jeandle::MergedLock &B) {
+                 return A.BytecodeDepth < B.BytecodeDepth;
+               });
+
+  if (!JeandleTracePEA)
+    return;
+  for (unsigned BatchID = 0; BatchID < LockReplayBatches.size(); ++BatchID) {
+    const LockReplayBatch &Batch = LockReplayBatches[BatchID];
+    Function *F = Batch.EmitSite ? Batch.EmitSite->getFunction() : nullptr;
+    for (unsigned Ordinal = 0; Ordinal < Batch.Locks.size(); ++Ordinal) {
+      const MergedLock &ML = Batch.Locks[Ordinal];
+      for (const Value *LogicalEscape : ML.LogicalEscapes) {
+        llvm::dbgs() << "PEA: LockReplay function=";
+        if (F)
+          F->printAsOperand(llvm::dbgs(), false);
+        else
+          llvm::dbgs() << "<unknown>";
+        llvm::dbgs() << " logical_escape=" << GetLogicalEscapeID(LogicalEscape)
+                     << " batch=" << BatchID << " emit_site=" << BatchID
+                     << " source=" << Batch.SourceID << " receiver_vo="
+                     << static_cast<unsigned>(ML.SourceEffect->ObjID)
+                     << " depth=" << ML.BytecodeDepth << " ordinal=" << Ordinal
+                     << "\n";
+      }
+    }
+  }
 }
 
 PEAResult::~PEAResult() {
@@ -666,6 +743,8 @@ void Effect::dump(raw_ostream &OS) const {
     OS << " [VO=" << static_cast<unsigned>(ObjID) << "]";
   if (Block && Block->hasName())
     OS << " block=%" << Block->getName();
+  if (const auto *PE = dyn_cast<CreatePHIEffect>(this))
+    OS << " offset=" << PE->FieldOffset;
   if (Instruction *T = getTarget())
     OS << " target=" << *T;
 }

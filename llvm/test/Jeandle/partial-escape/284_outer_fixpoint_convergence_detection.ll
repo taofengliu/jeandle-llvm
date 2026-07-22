@@ -30,6 +30,9 @@
 ; RUN: opt -S -passes="partial-escape-iterative" -jeandle-pea-iterations=16 \
 ; RUN:   -jeandle-dump-pea-ir-function=test_merged_lock_replay_converges %s 2>&1 \
 ; RUN:   | grep '^;; PEA-DUMP' | FileCheck %s --check-prefix=MERGED-LOCK
+; RUN: opt -S -passes="partial-escape-iterative" -jeandle-pea-iterations=16 \
+; RUN:   -jeandle-dump-pea-ir-function=test_per_pred_cascade_replay_converges %s 2>&1 \
+; RUN:   | grep '^;; PEA-DUMP' | FileCheck %s --check-prefix=PER-PRED-CASCADE
 ; RUN: opt -S -passes="partial-escape-iterative,partial-escape-iterative" \
 ; RUN:   -jeandle-pea-iterations=16 \
 ; RUN:   -jeandle-dump-pea-ir-function=test_merged_lock_replay_converges %s 2>&1 \
@@ -44,6 +47,7 @@
 ; RUN:   | grep '^;; PEA-DUMP' | FileCheck %s --check-prefix=SYNCSCOPE-REPEAT
 ; RUN: opt -S -passes="partial-escape-iterative,partial-escape-iterative" \
 ; RUN:   -verify-each -jeandle-pea-iterations=16 %s -o %t.repeat.ll
+; RUN: not grep '!jeandle[.]pea[.]replay' %t.repeat.ll
 ; RUN: FileCheck %s --check-prefixes=PARTIAL-FINAL,LOCK-FINAL,MERGED-LOCK-FINAL,VALUE-FINAL,VOLATILE-FINAL,SYNCSCOPE-FINAL,DEAD-FINAL \
 ; RUN:   < %t.repeat.ll
 ; RUN: sed -n '/^define i32 @test_partial_replay_converges/,/^}/p' %t.repeat.ll \
@@ -52,6 +56,8 @@
 ; RUN:   | grep -c '^  store atomic' | FileCheck %s --check-prefix=VALUE-STORE-COUNT
 ; RUN: sed -n '/^define i32 @test_volatile_replay_mismatch/,/^}/p' %t.repeat.ll \
 ; RUN:   | grep -c '^  store atomic' | FileCheck %s --check-prefix=VOLATILE-STORE-COUNT
+; RUN: sed -n '/^define i32 @test_volatile_replay_mismatch/,/^}/p' %t.repeat.ll \
+; RUN:   | grep -c '^  store atomic volatile' | FileCheck %s --check-prefix=VOLATILE-ACCESS-COUNT
 ; RUN: sed -n '/^define i32 @test_syncscope_replay_mismatch/,/^}/p' %t.repeat.ll \
 ; RUN:   | grep -c '^  store atomic' | FileCheck %s --check-prefix=SYNCSCOPE-STORE-COUNT
 ; RUN: sed -n '/^define void @test_merged_lock_replay_converges/,/^}/p' %t.repeat.ll \
@@ -72,8 +78,8 @@
 @G_zero = private unnamed_addr constant i32 0
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
-declare hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr) nounwind
+declare hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1), ptr) nounwind
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
@@ -185,9 +191,79 @@ u:
   resume i64 %lp
 }
 
-; A new source store after a preceding PEA-owned replay invalidates that replay.
+; A selected object escapes from either predecessor while A@0, B@1, A@2 are
+; held.  Escaping C cascades A and B through the live lock stack; escaping B
+; recursively materializes A through b.next.  The complete field-and-lock
+; replay at each physical predecessor must have one stable structural order,
+; independent of recursive materialization discovery order in a later round.
+define void @test_per_pred_cascade_replay_converges(i1 %left)
+    gc "hotspotgc" personality ptr @__gxx_personality_v0 {
+entry:
+  %la0 = alloca i64, align 8
+  %lb1 = alloca i64, align 8
+  %la2 = alloca i64, align 8
+  %lr3 = alloca i64, align 8
+  %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+            ptr inttoptr (i64 40201 to ptr), i32 24)
+       to label %na unwind label %u
+na:
+  %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+            ptr inttoptr (i64 40202 to ptr), i32 24)
+       to label %nb unwind label %u
+nb:
+  %c = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+            ptr inttoptr (i64 40203 to ptr), i32 24)
+       to label %nc unwind label %u
+nc:
+  %a.id = getelementptr inbounds i8, ptr addrspace(1) %a, i64 8
+  store atomic i32 1, ptr addrspace(1) %a.id unordered, align 4
+  %a.x = getelementptr inbounds i8, ptr addrspace(1) %a, i64 12
+  store atomic i32 10, ptr addrspace(1) %a.x unordered, align 4
+  %b.id = getelementptr inbounds i8, ptr addrspace(1) %b, i64 8
+  store atomic i32 2, ptr addrspace(1) %b.id unordered, align 4
+  %b.x = getelementptr inbounds i8, ptr addrspace(1) %b, i64 12
+  store atomic i32 20, ptr addrspace(1) %b.x unordered, align 4
+  %b.next = getelementptr inbounds i8, ptr addrspace(1) %b, i64 16
+  store atomic ptr addrspace(1) %a, ptr addrspace(1) %b.next unordered, align 8
+  %c.id = getelementptr inbounds i8, ptr addrspace(1) %c, i64 8
+  store atomic i32 3, ptr addrspace(1) %c.id unordered, align 4
+  %c.x = getelementptr inbounds i8, ptr addrspace(1) %c, i64 12
+  store atomic i32 30, ptr addrspace(1) %c.x unordered, align 4
+  call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
+      ptr addrspace(1) %a, ptr %la0)
+  call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
+      ptr addrspace(1) %b, ptr %lb1)
+  call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
+      ptr addrspace(1) %a, ptr %la2)
+  br i1 %left, label %left.pred, label %right.pred
+left.pred:
+  store atomic i32 21, ptr addrspace(1) %b.x unordered, align 4
+  br label %consume
+right.pred:
+  store atomic i32 31, ptr addrspace(1) %c.x unordered, align 4
+  br label %consume
+consume:
+  %r = phi ptr addrspace(1) [ %b, %left.pred ], [ %c, %right.pred ]
+  call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
+      ptr addrspace(1) %r, ptr %lr3)
+  call void @sink(ptr addrspace(1) %r)
+  call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
+      ptr addrspace(1) %r, ptr %lr3)
+  call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
+      ptr addrspace(1) %a, ptr %la2)
+  call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
+      ptr addrspace(1) %b, ptr %lb1)
+  call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
+      ptr addrspace(1) %a, ptr %la0)
+  ret void
+u:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
+; A new source store after a preceding exact replay invalidates that replay.
 ; The next transform must remove both source stores and emit exactly the current
-; value once; replay ownership alone never makes a stale store persistent.
+; value once; a stale replay must not be retained.
 define i32 @test_replay_value_change(i1 %escape, i32 %old, i32 %current)
     gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
@@ -195,10 +271,8 @@ entry:
             ptr inttoptr (i64 45678 to ptr), i32 16)
        to label %n unwind label %u
 n:
-  %old.slot = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8,
-      !jeandle.pea.replay !0
-  store atomic i32 %old, ptr addrspace(1) %old.slot unordered, align 4,
-      !jeandle.pea.replay !0
+  %old.slot = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
+  store atomic i32 %old, ptr addrspace(1) %old.slot unordered, align 4
   %current.slot = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
   store atomic i32 %current, ptr addrspace(1) %current.slot unordered, align 4
   br i1 %escape, label %escape.block, label %merge
@@ -213,9 +287,9 @@ u:
   resume i64 %lp
 }
 
-; PEA-owned replay metadata does not by itself make a semantically different
-; store reusable. A volatile replay must be replaced by the ordinary
-; system-scope unordered store emitted for the current materialization plan.
+; A volatile source store cannot be reused as an ordinary materialization
+; replay. The tracked value is replayed before the volatile access materializes
+; the receiver, while the original volatile access itself remains observable.
 define i32 @test_volatile_replay_mismatch(i1 %escape, i32 %value)
     gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
@@ -227,11 +301,9 @@ n:
   store atomic i32 %value, ptr addrspace(1) %slot unordered, align 4
   br i1 %escape, label %escape.block, label %merge
 escape.block:
-  %replay.slot = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8,
-      !jeandle.pea.replay !0
+  %replay.slot = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
   store atomic volatile i32 %value, ptr addrspace(1) %replay.slot unordered,
-      align 4,
-      !jeandle.pea.replay !0
+      align 4
   call void @sink(ptr addrspace(1) %o)
   br label %merge
 merge:
@@ -256,10 +328,9 @@ n:
   store atomic i32 %value, ptr addrspace(1) %slot unordered, align 4
   br i1 %escape, label %escape.block, label %merge
 escape.block:
-  %replay.slot = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8,
-      !jeandle.pea.replay !0
+  %replay.slot = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
   store atomic i32 %value, ptr addrspace(1) %replay.slot syncscope("singlethread")
-      unordered, align 4, !jeandle.pea.replay !0
+      unordered, align 4
   call void @sink(ptr addrspace(1) %o)
   br label %merge
 merge:
@@ -272,7 +343,8 @@ u:
 
 ; The first transform can create a replay in the apparently escaping arm. Once
 ; canonicalization deletes that arm, the next transform must eliminate both the
-; allocation and its marked replay rather than treating ownership as liveness.
+; allocation and its dead replay rather than treating structural similarity as
+; liveness.
 define i32 @test_dead_replay_branch(i32 %value)
     gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
@@ -355,16 +427,26 @@ u:
 ; LOCK-NEXT: ;; PEA-DUMP after iter=2 function test_lock_replay_converges transform_idle=1
 ; LOCK-NOT: ;; PEA-DUMP
 
+; The input's complete a@0,b@1,a@2 suffix already has the exact replay shape,
+; so structural matching reuses it without a delete-and-recreate first round.
 ; MERGED-LOCK: ;; PEA-DUMP before iter=0 function test_merged_lock_replay_converges
-; MERGED-LOCK-NEXT: ;; PEA-DUMP after iter=0 function test_merged_lock_replay_converges transform_idle=0
+; MERGED-LOCK-NEXT: ;; PEA-DUMP after iter=0 function test_merged_lock_replay_converges transform_idle=1
 ; MERGED-LOCK-NEXT: ;; PEA-DUMP before iter=1 function test_merged_lock_replay_converges
 ; MERGED-LOCK-NEXT: ;; PEA-DUMP after iter=1 function test_merged_lock_replay_converges transform_idle=1
 ; MERGED-LOCK-NEXT: ;; PEA-DUMP before iter=2 function test_merged_lock_replay_converges
 ; MERGED-LOCK-NEXT: ;; PEA-DUMP after iter=2 function test_merged_lock_replay_converges transform_idle=1
 ; MERGED-LOCK-NOT: ;; PEA-DUMP
 
+; PER-PRED-CASCADE: ;; PEA-DUMP before iter=0 function test_per_pred_cascade_replay_converges
+; PER-PRED-CASCADE-NEXT: ;; PEA-DUMP after iter=0 function test_per_pred_cascade_replay_converges transform_idle=0
+; PER-PRED-CASCADE-NEXT: ;; PEA-DUMP before iter=1 function test_per_pred_cascade_replay_converges
+; PER-PRED-CASCADE-NEXT: ;; PEA-DUMP after iter=1 function test_per_pred_cascade_replay_converges transform_idle=1
+; PER-PRED-CASCADE-NEXT: ;; PEA-DUMP before iter=2 function test_per_pred_cascade_replay_converges
+; PER-PRED-CASCADE-NEXT: ;; PEA-DUMP after iter=2 function test_per_pred_cascade_replay_converges transform_idle=1
+; PER-PRED-CASCADE-NOT: ;; PEA-DUMP
+
 ; MERGED-LOCK-REPEAT: ;; PEA-DUMP before iter=0 function test_merged_lock_replay_converges
-; MERGED-LOCK-REPEAT-NEXT: ;; PEA-DUMP after iter=0 function test_merged_lock_replay_converges transform_idle=0
+; MERGED-LOCK-REPEAT-NEXT: ;; PEA-DUMP after iter=0 function test_merged_lock_replay_converges transform_idle=1
 ; MERGED-LOCK-REPEAT-NEXT: ;; PEA-DUMP before iter=1 function test_merged_lock_replay_converges
 ; MERGED-LOCK-REPEAT-NEXT: ;; PEA-DUMP after iter=1 function test_merged_lock_replay_converges transform_idle=1
 ; MERGED-LOCK-REPEAT-NEXT: ;; PEA-DUMP before iter=2 function test_merged_lock_replay_converges
@@ -375,8 +457,8 @@ u:
 ; MERGED-LOCK-REPEAT-NEXT: ;; PEA-DUMP after iter=1 function test_merged_lock_replay_converges transform_idle=1
 ; MERGED-LOCK-REPEAT-NOT: ;; PEA-DUMP
 
-; A semantic mismatch is rewritten once. The next two rounds establish the
-; stable replay, and a second pipeline invocation is entirely idle.
+; The volatile access is preserved while its preceding ordinary replay reaches
+; a stable shape. A second pipeline invocation is entirely idle.
 ; VOLATILE-REPEAT: ;; PEA-DUMP before iter=0 function test_volatile_replay_mismatch
 ; VOLATILE-REPEAT-NEXT: ;; PEA-DUMP after iter=0 function test_volatile_replay_mismatch transform_idle=0
 ; VOLATILE-REPEAT-NEXT: ;; PEA-DUMP before iter=1 function test_volatile_replay_mismatch
@@ -414,11 +496,16 @@ u:
 
 ; PARTIAL-FINAL-LABEL: define i32 @test_partial_replay_converges(
 ; PARTIAL-FINAL: %[[PARTIAL_O:[A-Za-z0-9._]+]] = call hotspotcc ptr addrspace(1) @jeandle.new_instance
-; PARTIAL-FINAL: store atomic i32 %value, {{.*}} !jeandle.pea.replay
-; PARTIAL-FINAL: store atomic i32 99, {{.*}} !jeandle.pea.replay
-; PARTIAL-FINAL: store atomic i32 %value, {{.*}} !jeandle.pea.replay
-; PARTIAL-FINAL: store atomic i32 99, {{.*}} !jeandle.pea.replay
-; PARTIAL-FINAL: call void @sink(ptr addrspace(1) %[[PARTIAL_O]])
+; PARTIAL-FINAL: br i1 %escape, label %escape.block, label %[[PARTIAL_EDGE:[-A-Za-z$._0-9]+]]
+; PARTIAL-FINAL: escape.block:
+; PARTIAL-FINAL: store atomic i32 %value,
+; PARTIAL-FINAL: store atomic i32 99,
+; PARTIAL-FINAL-NEXT: call void @sink(ptr addrspace(1) %[[PARTIAL_O]])
+; PARTIAL-FINAL: [[PARTIAL_EDGE]]:
+; PARTIAL-FINAL: store atomic i32 %value,
+; PARTIAL-FINAL: store atomic i32 99,
+; PARTIAL-FINAL-NEXT: br label %merge
+; PARTIAL-FINAL: merge:
 ; PARTIAL-FINAL-NOT: store atomic
 ; PARTIAL-FINAL-NOT: poison
 ; PARTIAL-FINAL: }
@@ -426,7 +513,7 @@ u:
 
 ; LOCK-FINAL-LABEL: define void @test_lock_replay_converges(
 ; LOCK-FINAL: %[[LOCK_O:[A-Za-z0-9._]+]] = call hotspotcc ptr addrspace(1) @jeandle.new_instance
-; LOCK-FINAL: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[LOCK_O]], ptr nonnull %lock), !jeandle.pea.replay
+; LOCK-FINAL: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[LOCK_O]], ptr nonnull %lock)
 ; LOCK-FINAL-NOT: jeandle.monitorenter_with_lightweight_lock
 ; LOCK-FINAL: call void @sink(ptr addrspace(1) %[[LOCK_O]])
 ; LOCK-FINAL: call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1) %[[LOCK_O]], ptr nonnull %lock)
@@ -437,9 +524,9 @@ u:
 ; MERGED-LOCK-FINAL-LABEL: define void @test_merged_lock_replay_converges()
 ; MERGED-LOCK-FINAL: %[[MERGED_A:[A-Za-z0-9._]+]] = call hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr nonnull inttoptr (i64 40101 to ptr), i32 16)
 ; MERGED-LOCK-FINAL: %[[MERGED_B:[A-Za-z0-9._]+]] = call hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr nonnull inttoptr (i64 40102 to ptr), i32 16)
-; MERGED-LOCK-FINAL: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MERGED_A]], ptr nonnull %la0), !jeandle.pea.replay
-; MERGED-LOCK-FINAL-NEXT: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MERGED_B]], ptr nonnull %lb1), !jeandle.pea.replay
-; MERGED-LOCK-FINAL-NEXT: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MERGED_A]], ptr nonnull %la2), !jeandle.pea.replay
+; MERGED-LOCK-FINAL: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MERGED_A]], ptr nonnull %la0)
+; MERGED-LOCK-FINAL-NEXT: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MERGED_B]], ptr nonnull %lb1)
+; MERGED-LOCK-FINAL-NEXT: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MERGED_A]], ptr nonnull %la2)
 ; MERGED-LOCK-FINAL-NEXT: call void @sink(ptr addrspace(1) %[[MERGED_B]])
 ; MERGED-LOCK-FINAL: call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1) %[[MERGED_A]], ptr nonnull %la2)
 ; MERGED-LOCK-FINAL-NEXT: call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1) %[[MERGED_B]], ptr nonnull %lb1)
@@ -451,32 +538,34 @@ u:
 
 ; VALUE-FINAL-LABEL: define i32 @test_replay_value_change(
 ; VALUE-FINAL-NOT: store atomic i32 %old
-; VALUE-FINAL: store atomic i32 %current, {{.*}} !jeandle.pea.replay
+; VALUE-FINAL: store atomic i32 %current,
 ; VALUE-FINAL-NOT: store atomic i32 %old
-; VALUE-FINAL: store atomic i32 %current, {{.*}} !jeandle.pea.replay
+; VALUE-FINAL: store atomic i32 %current,
 ; VALUE-FINAL-NOT: store atomic i32 %old
 ; VALUE-FINAL-NOT: poison
 ; VALUE-FINAL: }
 ; VALUE-STORE-COUNT: {{^2$}}
 
 ; VOLATILE-FINAL-LABEL: define i32 @test_volatile_replay_mismatch(
-; VOLATILE-FINAL-NOT: volatile
 ; VOLATILE-FINAL-NOT: syncscope
 ; VOLATILE-FINAL: escape.block:
-; VOLATILE-FINAL-NEXT: %[[VOLATILE_SLOT:[A-Za-z0-9._]+]] = getelementptr inbounds{{( nuw)?}} i8, ptr addrspace(1) {{.*}}, i64 8, !jeandle.pea.replay
-; VOLATILE-FINAL-NEXT: store atomic i32 %value, ptr addrspace(1) %[[VOLATILE_SLOT]] unordered, align 4, !jeandle.pea.replay
+; VOLATILE-FINAL-NEXT: %[[VOLATILE_SLOT:[A-Za-z0-9._]+]] = getelementptr inbounds{{( nuw)?}} i8, ptr addrspace(1) {{.*}}, i64 8
+; VOLATILE-FINAL-NEXT: %[[VOLATILE_REPLAY:[A-Za-z0-9._]+]] = getelementptr inbounds{{( nuw)?}} i8, ptr addrspace(1) {{.*}}, i64 8
+; VOLATILE-FINAL-NEXT: store atomic i32 %value, ptr addrspace(1) %[[VOLATILE_REPLAY]] unordered, align 4
+; VOLATILE-FINAL-NEXT: store atomic volatile i32 %value, ptr addrspace(1) %[[VOLATILE_SLOT]] unordered, align 4
 ; VOLATILE-FINAL-NEXT: call void @sink
-; VOLATILE-FINAL-NOT: volatile
+; VOLATILE-FINAL-NOT: store atomic volatile
 ; VOLATILE-FINAL-NOT: syncscope
 ; VOLATILE-FINAL: }
-; VOLATILE-STORE-COUNT: {{^2$}}
+; VOLATILE-STORE-COUNT: {{^3$}}
+; VOLATILE-ACCESS-COUNT: {{^1$}}
 
 ; SYNCSCOPE-FINAL-LABEL: define i32 @test_syncscope_replay_mismatch(
 ; SYNCSCOPE-FINAL-NOT: volatile
 ; SYNCSCOPE-FINAL-NOT: syncscope
 ; SYNCSCOPE-FINAL: escape.block:
-; SYNCSCOPE-FINAL-NEXT: %[[SYNCSCOPE_SLOT:[A-Za-z0-9._]+]] = getelementptr inbounds{{( nuw)?}} i8, ptr addrspace(1) {{.*}}, i64 8, !jeandle.pea.replay
-; SYNCSCOPE-FINAL-NEXT: store atomic i32 %value, ptr addrspace(1) %[[SYNCSCOPE_SLOT]] unordered, align 4, !jeandle.pea.replay
+; SYNCSCOPE-FINAL-NEXT: %[[SYNCSCOPE_SLOT:[A-Za-z0-9._]+]] = getelementptr inbounds{{( nuw)?}} i8, ptr addrspace(1) {{.*}}, i64 8
+; SYNCSCOPE-FINAL-NEXT: store atomic i32 %value, ptr addrspace(1) %[[SYNCSCOPE_SLOT]] unordered, align 4
 ; SYNCSCOPE-FINAL-NEXT: call void @sink
 ; SYNCSCOPE-FINAL-NOT: volatile
 ; SYNCSCOPE-FINAL-NOT: syncscope
@@ -485,7 +574,6 @@ u:
 
 ; DEAD-FINAL-LABEL: define i32 @test_dead_replay_branch(i32 %value)
 ; DEAD-FINAL-NOT: jeandle.new_instance
-; DEAD-FINAL-NOT: jeandle.pea.replay
 ; DEAD-FINAL-NOT: @sink
 ; DEAD-FINAL-NOT: store
 ; DEAD-FINAL-NOT: load
@@ -494,4 +582,3 @@ u:
 ; DEAD-FINAL-NEXT: }
 
 !java-method-compilation = !{}
-!0 = !{}

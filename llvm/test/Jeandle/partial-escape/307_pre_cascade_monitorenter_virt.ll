@@ -12,7 +12,8 @@
 ; be globally depth-sorted via the merged re-emit — see 427.)
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr) nounwind
+declare hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1), ptr) nounwind
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
@@ -28,7 +29,7 @@ n1:
                   ptr addrspace(1) %a, ptr %la)
   %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
             ptr inttoptr (i64 22222 to ptr), i32 16)
-       to label %n2 unwind label %u
+       to label %n2 unwind label %u.locked
 n2:
   ; Virtual monitorenter on B.
   call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(
@@ -37,7 +38,16 @@ n2:
   call void @sink(ptr addrspace(1) %a)
   ; Escape B later.
   call void @sink(ptr addrspace(1) %b)
+  call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
+                  ptr addrspace(1) %b, ptr %lb)
+  call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
+                  ptr addrspace(1) %a, ptr %la)
   ret void
+u.locked:
+  %locked.lp = landingpad i64 cleanup
+  call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
+                  ptr addrspace(1) %a, ptr %la)
+  resume i64 %locked.lp
 u:
   %lp = landingpad i64 cleanup
   resume i64 %lp

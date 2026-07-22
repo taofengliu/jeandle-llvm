@@ -1,22 +1,22 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Proxy-path guard: deep 3-level lexical nesting with the INNERMOST object
+; CFG-depth guard: deep 3-level lexical nesting with the INNERMOST object
 ; escaping, no `!jeandle.lock_depth` metadata and no re-entrancy:
 ;   synchronized(a){ synchronized(b){ synchronized(c){ escape(c); } } }
-; The RPO-order proxy assigns the three enters depths 0,1,2 (a, b, c in IR
-; order). Escaping c (depth 2) fires the strict-lock cascade: a (outermost
+; CFG dataflow assigns the three enters depths 0,1,2 (a, b, c in IR order).
+; Escaping c (depth 2) fires the strict-lock cascade: a (outermost
 ; depth 0 < 2) and b (outermost depth 1 < 2) must also materialise at the
 ; same escape point so their re-emitted locks land below c's on the
 ; lightweight-lock thread lock stack. All three surviving (unbalanced) enters
-; are merged and globally re-emitted ascending by proxy depth: a, b, c.
+; are merged and globally re-emitted ascending by CFG-derived depth: a, b, c.
 ;
-; This is the non-re-entrant, proxy-driven analogue of test 427 (which uses
+; This is the non-re-entrant analogue of test 427 (which uses
 ; re-entrant interleaved locks) and exercises the full a->b->c cascade on the
-; proxy path the frontend now produces.
+; metadata-free path the frontend now produces.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
-declare hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr) nounwind
+declare hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1), ptr) nounwind
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
@@ -58,7 +58,7 @@ u:
 
 ; CHECK-LABEL: define void @test_proxy_deep_nest_innermost_escape
 ; All three objects materialise at the escape point; the re-emitted monitorenters
-; appear strictly ascending by proxy depth: a@0 (la), b@1 (lb), c@2 (lc).
+; appear strictly ascending by CFG-derived depth: a@0 (la), b@1 (lb), c@2 (lc).
 ; CHECK: monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MATA:.*]], ptr %la)
 ; CHECK: monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MATB:.*]], ptr %lb)
 ; CHECK: monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MATC:.*]], ptr %lc)

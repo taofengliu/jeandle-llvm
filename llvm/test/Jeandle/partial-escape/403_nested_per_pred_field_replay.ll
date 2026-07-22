@@ -1,4 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -disable-output -jeandle-trace-pea \
+; RUN:   -passes="require<partial-escape-analysis>,partial-escape-transform" %s 2>&1 \
+; RUN:   | FileCheck %s --check-prefix=TRACE
 
 ; Nested per-pred materialization under the reuse-OrigAlloc model. `outer`
 ; (11111) is virtual on both merge preds with lock counts 0 (left) / 1
@@ -17,16 +20,21 @@
 ; %inner as the value) at each materialization point (left and right). No
 ; %pea.mat, no materialized-object PHI, no critical-edge split. The escape
 ; consumes %outer directly.
+; The left arm holds an external padding monitor and the merged owner is
+; released after the sink, keeping both CFG paths balanced at scalar depth one.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr) nounwind
+declare hotspotcc void @jeandle.monitorexit_with_thin_lock(ptr addrspace(1), ptr) nounwind
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
-define void @test_nested_per_pred_field_replay(i1 %c)
+define void @test_nested_per_pred_field_replay(
+    i1 %c, ptr addrspace(1) %pad)
     gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   %lock = alloca i64, align 8
+  %pad.lock = alloca i64, align 8
   %outer = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
               ptr inttoptr (i64 11111 to ptr), i32 16)
            to label %oi unwind label %u
@@ -41,13 +49,19 @@ fld:
 branch:
   br i1 %c, label %left, label %right
 left:
+  call hotspotcc void @jeandle.monitorenter_with_thin_lock(
+              ptr addrspace(1) %pad, ptr %pad.lock)
   br label %merge
 right:
-  call hotspotcc void @jeandle.monitorenter_with_thin_lock(
+  tail call hotspotcc void @jeandle.monitorenter_with_thin_lock(
               ptr addrspace(1) %outer, ptr %lock)
   br label %merge
 merge:
+  %held = phi ptr addrspace(1) [ %pad, %left ], [ %outer, %right ]
+  %held.lock = phi ptr [ %pad.lock, %left ], [ %lock, %right ]
   call void @sink(ptr addrspace(1) %outer)
+  call hotspotcc void @jeandle.monitorexit_with_thin_lock(
+              ptr addrspace(1) %held, ptr %held.lock)
   ret void
 u:
   %lp = landingpad i64 cleanup
@@ -66,7 +80,9 @@ u:
 ; CHECK: getelementptr inbounds i8, ptr addrspace(1) %outer, i64 8
 ; CHECK: store atomic ptr addrspace(1) %inner, ptr addrspace(1) %{{.*}} unordered, align 8
 ; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %outer, ptr %lock)
+; CHECK-NOT: tail call hotspotcc void @jeandle.monitorenter_with_thin_lock
 ; The escape (merge sink) consumes OrigAlloc %outer directly.
 ; CHECK: call void @sink(ptr addrspace(1) %outer)
+; TRACE: PEA: LockReplay function=@test_nested_per_pred_field_replay
 
 !java-method-compilation = !{}

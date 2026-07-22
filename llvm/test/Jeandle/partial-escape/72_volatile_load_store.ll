@@ -1,10 +1,9 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; volatile load/store on a virtual that never escapes. Volatile is a
-; semantic restriction on optimizer reordering, but it does not change escape
-; semantics for an object that the analyzer can prove never leaks. The
-; allocation, the volatile store, and the volatile load should all be
-; eliminated; the load resolves to the stored constant 7.
+; LLVM volatile accesses are observable even when escape analysis proves that
+; the referenced allocation is otherwise thread-local. The first volatile
+; access therefore materializes the receiver, and both accesses survive with
+; their original volatile semantics.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)
@@ -27,9 +26,14 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_volatile_no_escape
-; CHECK-NOT: jeandle.new_instance
+; CHECK: @jeandle.new_instance
+; CHECK-NOT: store volatile
+; CHECK: store volatile i32 7
 ; CHECK-NOT: store volatile
 ; CHECK-NOT: load volatile
-; CHECK: call void @use(i32 7)
+; CHECK: %[[V:[A-Za-z0-9._]+]] = load volatile i32
+; CHECK-NOT: load volatile
+; CHECK: call void @use(i32 %[[V]])
+; CHECK: }
 
 !java-method-compilation = !{}

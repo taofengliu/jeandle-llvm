@@ -33,14 +33,14 @@ u:
   resume i64 %lp
 }
 
-; Single allocation invoke retained (alloc dominates merge). The field write
-; at offset 8 is replayed onto OrigAlloc before the escape; the sink and the
-; return consume OrigAlloc; no materialized-object PHI is built.
+; Single allocation invoke retained (alloc dominates merge). The canonical
+; field write at offset 8 is present on OrigAlloc before the escape; the sink
+; and the return consume OrigAlloc; no materialized-object PHI is built.
 ; CHECK-LABEL: define ptr addrspace(1) @test_mixed_merge_with_field_writes
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
 ; CHECK-NOT: invoke hotspotcc{{.*}}@jeandle.new_instance
-; CHECK: %pea.matslot = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
-; CHECK: store atomic i32 %v, ptr addrspace(1) %pea.matslot unordered, align 4
+; CHECK: %[[SLOT:[A-Za-z0-9._]+]] = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
+; CHECK: store atomic i32 %v, ptr addrspace(1) %[[SLOT]] unordered, align 4
 ; CHECK: call void @sink(ptr addrspace(1) %o)
 ; CHECK-NOT: = phi ptr addrspace(1)
 ; CHECK: ret ptr addrspace(1) %o

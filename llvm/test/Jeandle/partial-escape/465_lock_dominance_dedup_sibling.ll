@@ -1,17 +1,15 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s -o %t
+; RUN: FileCheck %s < %t
+; RUN: not grep '!jeandle[.]pea[.]replay' %t
 
-; Double-acquire on a sibling path processed before the merge (with the
-; RPO twist). `n` holds an unbalanced enter on %o; `p` branches to
-; merge1 and `s`; `q` escapes via foo(o); `s` escapes via baz(o). RPO is
-; [entry, n, q, p, s, merge1]: s's baz(o) escape captures and would re-emit
-; the SAME folded lock BEFORE merge1's shared-flip materialize at p's
-; terminator captures it again — two acquires on the p->s path. The
-; commit-time dominance dedup keeps only the copy whose InsertBefore
-; dominates the other (p's terminator dominates s), so baz's re-emit is
-; dropped: p->s acquires exactly once (at p), q acquires once (at foo).
+; Three disjoint dynamic paths escape one virtually locked object: q at foo,
+; p->s at baz, and p->merge1 on the incoming edge. Each path needs its own
+; replayed enter, followed by the single structured exit in merge1. A replay
+; on p itself would incorrectly also execute on p->s and double-acquire there.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr) nounwind
+declare hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1), ptr) nounwind
 declare void @foo(ptr addrspace(1))
 declare void @baz(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
@@ -35,25 +33,36 @@ s:
   call void @baz(ptr addrspace(1) %o)
   br label %merge1
 merge1:
+  call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(
+              ptr addrspace(1) %o, ptr %lo)
   ret void
 u:
   %lp = landingpad i64 cleanup
   resume i64 %lp
 }
 
-; Exactly two re-emitted enters survive: one at p's terminator (covers both
-; p->merge1 and p->s), one at q's foo (covers q). NONE at s's baz (dropped
-; by the dominance dedup).
+; Exactly three re-emitted enters survive, one on each disjoint escape path,
+; and merge1 retains exactly one common exit.
 ; CHECK-LABEL: define void @s_path(
 ; CHECK: p:
-; CHECK-NEXT: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %o, ptr %lo)
-; CHECK-NEXT: br i1 %c
+; CHECK-NEXT: br i1 %c, label %[[EDGE:[-A-Za-z$._0-9]+]], label %s
 ; CHECK: q:
 ; CHECK-NEXT: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %o, ptr %lo)
 ; CHECK-NEXT: call void @foo(ptr addrspace(1) %o)
+; CHECK-NEXT: br label %merge1
 ; CHECK: s:
+; CHECK-NEXT: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %o, ptr %lo)
 ; CHECK-NEXT: call void @baz(ptr addrspace(1) %o)
-; CHECK-NOT: monitorenter
+; CHECK-NEXT: br label %merge1
+; CHECK: [[EDGE]]:
+; CHECK-NEXT: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %o, ptr %lo)
+; CHECK-NEXT: br label %merge1
+; CHECK: merge1:
+; CHECK-NEXT: call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1) %o, ptr %lo)
+; CHECK-NEXT: ret void
+; CHECK: u:
+; CHECK-NOT: @jeandle.monitor
 ; CHECK-NOT: poison
+; CHECK: }
 
 !java-method-compilation = !{}

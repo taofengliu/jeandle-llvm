@@ -10,8 +10,8 @@
 ; so the alloc, both enters and both exits all eliminate.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
-declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr)
-declare hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1), ptr)
+declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr) nounwind
+declare hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1), ptr) nounwind
 declare i32 @__gxx_personality_v0(...)
 
 define void @test_reentrant_lock_depth_monotonic() gc "hotspotgc" personality ptr @__gxx_personality_v0 {
