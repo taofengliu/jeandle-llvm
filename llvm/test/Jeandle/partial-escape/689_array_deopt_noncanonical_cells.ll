@@ -10,6 +10,7 @@
 ; tracked store before the safepoint, and leaves the real oop in the bundle.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
+declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @safepoint()
 declare i32 @__gxx_personality_v0(...)
 
@@ -142,5 +143,115 @@ unwind:
 ; CHECK-NEXT: call void @safepoint() [ "deopt"(i32 5, i32 5, i64 12, ptr addrspace(1) %arr) ]
 ; CHECK-NOT: i64 262157
 ; CHECK-NOT: i64 524300
+
+; A malformed outer and a shared direct-root child form one reconstruction
+; component.  Generic fallback for the outer recursively materializes the
+; child, so the child must not also receive a deopt descriptor.  A third,
+; disconnected root remains describable, proving fallback is component-local
+; rather than all-or-nothing for the safepoint.
+define void @malformed_outer_shared_direct_child() gc "hotspotgc"
+    personality ptr @__gxx_personality_v0 {
+entry:
+  %outer = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
+      ptr inttoptr (i64 68906 to ptr), i32 2, i32 32, i32 16, i32 1048576)
+      to label %alloc.child unwind label %unwind
+alloc.child:
+  %child = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68907 to ptr), i32 16)
+      to label %alloc.independent unwind label %unwind
+alloc.independent:
+  %independent = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68911 to ptr), i32 16)
+      to label %body unwind label %unwind
+body:
+  %base = getelementptr inbounds i8, ptr addrspace(1) %outer, i64 16
+  %element = getelementptr inbounds ptr addrspace(1), ptr addrspace(1) %base, i64 1
+  store atomic ptr addrspace(1) %child, ptr addrspace(1) %element unordered, align 8
+  %bad = getelementptr inbounds i8, ptr addrspace(1) %base, i64 1
+  store atomic i8 7, ptr addrspace(1) %bad unordered, align 1
+  call void @safepoint()
+      [ "deopt"(i32 6, i32 6, i64 12,
+                 ptr addrspace(1) %outer,
+                 i64 4294967308, ptr addrspace(1) %child,
+                 i64 8589934604,
+                 ptr addrspace(1) %independent) ]
+  ret void
+unwind:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
+; CHECK-LABEL: define void @malformed_outer_shared_direct_child(
+; CHECK-COUNT-1: inttoptr (i64 68906 to ptr)
+; CHECK-COUNT-1: inttoptr (i64 68907 to ptr)
+; CHECK-NOT: inttoptr (i64 68911 to ptr)
+; CHECK: %[[BAD:[-A-Za-z$._0-9]+]] = getelementptr inbounds i8, ptr addrspace(1) %outer, i64 17
+; CHECK-NEXT: store atomic i8 7, ptr addrspace(1) %[[BAD]] unordered, align 1
+; CHECK-NEXT: %[[ELEM:[-A-Za-z$._0-9]+]] = getelementptr inbounds i8, ptr addrspace(1) %outer, i64 20
+; CHECK-NEXT: store atomic ptr addrspace(1) %child, ptr addrspace(1) %[[ELEM]] unordered, align 8
+; CHECK-NEXT: call void @safepoint()
+; independent descriptor: vo-id 2, klass 68911, zero fields.
+; CHECK-SAME: [ "deopt"(i32 6, i32 6,
+; CHECK-SAME: i64 8590196748, i64 68911, i32 0,
+; CHECK-SAME: i64 12, ptr addrspace(1) %outer,
+; CHECK-SAME: i64 4294967308, ptr addrspace(1) %child,
+; independent root slot -> VORef id 2.
+; CHECK-SAME: i64 8590458892, i32 2) ]
+; CHECK-NEXT: ret void
+
+; A malformed root connected to a cycle must make the entire cycle real.
+; Otherwise the direct-root node in the cycle is both described and recursively
+; materialized while replaying outer[1] = a, a.f = b, b.f = a.
+define void @malformed_outer_cyclic_component() gc "hotspotgc"
+    personality ptr @__gxx_personality_v0 {
+entry:
+  %outer = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
+      ptr inttoptr (i64 68908 to ptr), i32 2, i32 32, i32 16, i32 1048576)
+      to label %alloc.a unwind label %unwind
+alloc.a:
+  %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68909 to ptr), i32 24)
+      to label %alloc.b unwind label %unwind
+alloc.b:
+  %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68910 to ptr), i32 24)
+      to label %body unwind label %unwind
+body:
+  %outer.base = getelementptr inbounds i8, ptr addrspace(1) %outer, i64 16
+  %outer.element = getelementptr inbounds ptr addrspace(1), ptr addrspace(1) %outer.base, i64 1
+  store atomic ptr addrspace(1) %a, ptr addrspace(1) %outer.element unordered, align 8
+  %a.slot = getelementptr inbounds i8, ptr addrspace(1) %a, i64 16
+  store atomic ptr addrspace(1) %b, ptr addrspace(1) %a.slot unordered, align 8
+  %b.slot = getelementptr inbounds i8, ptr addrspace(1) %b, i64 16
+  store atomic ptr addrspace(1) %a, ptr addrspace(1) %b.slot unordered, align 8
+  %bad = getelementptr inbounds i8, ptr addrspace(1) %outer.base, i64 1
+  store atomic i8 9, ptr addrspace(1) %bad unordered, align 1
+  call void @safepoint()
+      [ "deopt"(i32 7, i32 7, i64 12,
+                 ptr addrspace(1) %outer,
+                 i64 4294967308, ptr addrspace(1) %b) ]
+  ret void
+unwind:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
+; CHECK-LABEL: define void @malformed_outer_cyclic_component(
+; CHECK-COUNT-1: inttoptr (i64 68908 to ptr)
+; CHECK-COUNT-1: inttoptr (i64 68909 to ptr)
+; CHECK-COUNT-1: inttoptr (i64 68910 to ptr)
+; CHECK: %[[BSLOT:[-A-Za-z$._0-9]+]] = getelementptr inbounds i8, ptr addrspace(1) %b, i64 16
+; CHECK-NEXT: store atomic ptr addrspace(1) %a, ptr addrspace(1) %[[BSLOT]] unordered, align 8
+; CHECK: %[[ASLOT:[-A-Za-z$._0-9]+]] = getelementptr inbounds i8, ptr addrspace(1) %a, i64 16
+; CHECK-NEXT: store atomic ptr addrspace(1) %b, ptr addrspace(1) %[[ASLOT]] unordered, align 8
+; CHECK: %[[BAD:[-A-Za-z$._0-9]+]] = getelementptr inbounds i8, ptr addrspace(1) %outer, i64 17
+; CHECK-NEXT: store atomic i8 9, ptr addrspace(1) %[[BAD]] unordered, align 1
+; CHECK-NEXT: %[[ELEM:[-A-Za-z$._0-9]+]] = getelementptr inbounds i8, ptr addrspace(1) %outer, i64 20
+; CHECK-NEXT: store atomic ptr addrspace(1) %a, ptr addrspace(1) %[[ELEM]] unordered, align 8
+; CHECK-NEXT: call void @safepoint()
+; CHECK-SAME: [ "deopt"(i32 7, i32 7, i64 12,
+; CHECK-SAME: ptr addrspace(1) %outer,
+; CHECK-SAME: i64 4294967308, ptr addrspace(1) %b) ]
+; CHECK-NEXT: ret void
 
 !java-method-compilation = !{}

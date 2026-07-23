@@ -5227,10 +5227,9 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
   // or constant oop — mirrors C2/Graal's nested ObjectValue + id back-ref. This
   // requires:
   //   1. a transitive closure so every referenced VO is described once;
-  //   2. a greatest-fixpoint "contagious bail" so a VO referencing an
-  //      undescribable VO (derived bundle operand / unknown-element-kind
-  //      array / non-describable reference value) is itself not described (a
-  //      dangling VORef is never emitted).
+  //   2. a coherent fallback closure so a descriptor never references an
+  //      undescribable VO and a generically materialized VO never has a
+  //      descendant described separately at the same safepoint.
   // A VO that HOLDS A LOCK at this safepoint is describable too — its
   // (PEA-eliminated) lock is reconstructed at deopt via a monitor entry with
   // eliminated=true whose owner is a VORef to this VO (mirrors C2/Graal
@@ -5257,8 +5256,6 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
     jeandle::ObjectID VORefID = jeandle::InvalidObjectID; // valid when VORef
   };
   struct Plan {
-    bool Eligible = false;
-    bool Bad = false; // greatest-fixpoint "cannot describe" flag
     SmallVector<Cell, 8> Cells;
   };
   DenseMap<jeandle::ObjectID, Plan> Plans;
@@ -5476,8 +5473,9 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
   // operand would otherwise be left for Pass-2 poison-RAUW. Resolve V to a
   // virtual ObjectID that is STILL VIRTUAL AT THIS SAFEPOINT.
   // Roots are collected in bundle-operand ENCOUNTER ORDER (not DenseSet hash
-  // order) so the SeqNo assignment — and thus the transform's descriptor emit
-  // order — is deterministic.
+  // order). This also includes banned roots: descriptor planning excludes
+  // them, but coherent fallback still needs their current VirtualRef
+  // descendants.
   //
   // MULTI-SCOPE (root-scope pool): the bundle is [root scope][inlinee
   // scope]... with the innermost (current-method) scope LAST. ALL VO
@@ -5523,6 +5521,8 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
       continue;
     if (!isVirtualHere(*ID))
       continue;
+    if (RootSeen.insert(*ID).second)
+      Roots.push_back(*ID);
     jeandle::VirtualObject &VObj = *Result.VirtualObjects[*ID];
     // V is a describable root iff it is the VO's OrigAlloc OR an alias-map
     // virtual-alias entry for this VO denoting the WHOLE object (object
@@ -5556,60 +5556,105 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
     // bundle).
     OrigAllocInBundle.insert(*ID);
     RootOperandsMap[*ID].push_back(V);
-    if (RootSeen.insert(*ID).second)
-      Roots.push_back(*ID);
   }
 
-  // ---- Step 2: transitive closure (Graal collectReferencedVirtualObjects:
-  // worklist + identity-set, cycle-safe). Expand from the roots through VORef
-  // cells so every referenced eligible VO is planned once (dedup by id).
+  // ---- Step 2: build the CURRENT materialization graph independently of
+  // descriptor planning. An Outer -> Inner edge exists exactly when
+  // ensureMaterialized(Outer) would recursively materialize a current
+  // FieldValue::VirtualRef(Inner). Keeping this graph separate is essential:
+  // planFields may stop at a malformed array cell before visiting a later
+  // valid VORef element, but generic fallback still follows that element.
+  DenseMap<jeandle::ObjectID, SmallVector<jeandle::ObjectID, 4>>
+      CurrentVirtualRefs;
+  DenseMap<jeandle::ObjectID, SmallVector<jeandle::ObjectID, 4>>
+      DescriptorReferrers;
+  SmallVector<jeandle::ObjectID, 8> ReachableOrder;
   SmallVector<jeandle::ObjectID, 8> Work;
-  for (jeandle::ObjectID R : Roots)
-    Work.push_back(R);
+  DenseSet<jeandle::ObjectID> Reachable;
+  // Preserve the established LIFO traversal of bundle encounter-order roots.
+  // Current references are sorted before being pushed, so their LIFO order is
+  // deterministic too.
+  for (jeandle::ObjectID ID : Roots)
+    Work.push_back(ID);
   while (!Work.empty()) {
     jeandle::ObjectID ID = Work.pop_back_val();
-    if (Plans.count(ID))
+    if (!Reachable.insert(ID).second)
       continue;
-    if (Banned.count(ID) || !isVirtualHere(ID) || !structurallyEligible(ID))
-      continue;
-    Plan &P = Plans[ID];
-    P.Eligible = true;
-    Order.push_back(ID);
-    planFields(ID, P);
-    for (const Cell &C : P.Cells)
-      if (C.Kind == Cell::VORef && !Plans.count(C.VORefID))
-        Work.push_back(C.VORefID);
+    ReachableOrder.push_back(ID);
+
+    SmallVector<jeandle::ObjectID, 4> Refs;
+    auto FSIt = FieldStates.find(ID);
+    if (FSIt != FieldStates.end())
+      for (const auto &OffKV : FSIt->second)
+        if (OffKV.second.isVirtualRef())
+          Refs.push_back(OffKV.second.getVirtualRef());
+    llvm::sort(Refs);
+    Refs.erase(std::unique(Refs.begin(), Refs.end()), Refs.end());
+    for (jeandle::ObjectID Inner : Refs)
+      if (!Reachable.count(Inner))
+        Work.push_back(Inner);
+    CurrentVirtualRefs.try_emplace(ID, std::move(Refs));
   }
 
-  // ---- Step 3: greatest fixpoint (never emit a VORef to an
-  // undescribed/undescribable VO). A VO is describable iff NONE of its cells
-  // is Bad AND every VORef cell points to a planned, eligible, non-Bad VO. A
-  // VORef to a non-planned VO (Banned / not virtual here / structurally
-  // ineligible) makes this VO Bad. Iterate to a fixpoint so cycles
-  // (a.f=b, b.g=a) and transitive failure both propagate.
-  bool Changed = true;
-  while (Changed) {
-    Changed = false;
-    for (jeandle::ObjectID ID : Order) {
-      Plan &P = Plans[ID];
-      if (P.Bad)
-        continue;
-      for (const Cell &C : P.Cells) {
-        if (C.Kind == Cell::Bad) {
-          P.Bad = true;
-          Changed = true;
-          break;
-        }
-        if (C.Kind == Cell::VORef) {
-          auto It = Plans.find(C.VORefID);
-          if (It == Plans.end() || !It->second.Eligible || It->second.Bad) {
-            P.Bad = true;
-            Changed = true;
-            break;
-          }
-        }
-      }
+  // Plan every reachable candidate in stable graph order. Do not use
+  // operator[] for Plans: an unplannable graph node must never become a
+  // default-constructed good plan by lookup.
+  DenseSet<jeandle::ObjectID> Fallback;
+  SmallVector<jeandle::ObjectID, 8> FallbackWork;
+  auto AddFallback = [&](jeandle::ObjectID ID) {
+    if (Fallback.insert(ID).second)
+      FallbackWork.push_back(ID);
+  };
+  for (jeandle::ObjectID ID : ReachableOrder) {
+    if (Banned.count(ID) || !isVirtualHere(ID) || !structurallyEligible(ID)) {
+      AddFallback(ID);
+      continue;
     }
+    auto [PIt, Inserted] = Plans.try_emplace(ID);
+    assert(Inserted && "reachable object planned more than once");
+    Plan &P = PIt->second;
+    Order.push_back(ID);
+    planFields(ID, P);
+  }
+
+  // ---- Step 3: coherent descriptor/materialization closure. Seed malformed
+  // plans and plans that reference an unplanned object. Then propagate:
+  //   * parent -> current VirtualRef descendants, matching generic recursive
+  //     materialization;
+  //   * child -> descriptor referrers, preventing a VORef descriptor from
+  //     naming an object that the same safepoint keeps real.
+  // Each finite ObjectID enters Fallback once, so shared and cyclic graphs
+  // terminate without an iteration cap. Disconnected good components remain
+  // describable.
+  for (jeandle::ObjectID ID : Order) {
+    auto PIt = Plans.find(ID);
+    assert(PIt != Plans.end() && "descriptor order contains no plan");
+    Plan &P = PIt->second;
+    for (const Cell &C : P.Cells) {
+      if (C.Kind == Cell::Bad) {
+        AddFallback(ID);
+        break;
+      }
+      if (C.Kind != Cell::VORef)
+        continue;
+      DescriptorReferrers[C.VORefID].push_back(ID);
+      if (Plans.find(C.VORefID) == Plans.end())
+        AddFallback(ID);
+    }
+  }
+  for (auto &KV : DescriptorReferrers) {
+    llvm::sort(KV.second);
+    KV.second.erase(std::unique(KV.second.begin(), KV.second.end()),
+                    KV.second.end());
+  }
+  while (!FallbackWork.empty()) {
+    jeandle::ObjectID ID = FallbackWork.pop_back_val();
+    if (auto It = CurrentVirtualRefs.find(ID); It != CurrentVirtualRefs.end())
+      for (jeandle::ObjectID Inner : It->second)
+        AddFallback(Inner);
+    if (auto It = DescriptorReferrers.find(ID); It != DescriptorReferrers.end())
+      for (jeandle::ObjectID Outer : It->second)
+        AddFallback(Outer);
   }
 
   // ---- Step 4: record one RewriteDeoptBundleEffect per describable VO.
@@ -5617,9 +5662,11 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
   // analyzer only snapshots dominating stores). VORef cells carry no Value*
   // — only the vo-id — so they are inherently transform-safe.
   for (jeandle::ObjectID ID : Order) {
-    Plan &P = Plans[ID];
-    if (P.Bad)
+    if (Fallback.count(ID))
       continue;
+    auto PIt = Plans.find(ID);
+    assert(PIt != Plans.end() && "descriptor order contains no plan");
+    Plan &P = PIt->second;
     observeFieldDefinitions(ID, FieldDefinitions);
     SmallVector<jeandle::MaterializeEffect::FieldEntry, 8> Snap;
     for (const Cell &C : P.Cells) {

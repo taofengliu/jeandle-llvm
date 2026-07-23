@@ -14,6 +14,8 @@ declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc i1 @jeandle.check_if_value_based(ptr addrspace(1))
 declare void @use_bool(i1)
 declare void @may_throw()
+declare void @sink_owner(ptr addrspace(1))
+declare void @observe_owner(ptr addrspace(1))
 declare void @safepoint()
 declare i32 @__gxx_personality_v0(...)
 
@@ -273,5 +275,174 @@ unwind:
 ; CHECK: call hotspotcc i1 @jeandle.check_if_value_based
 ; CHECK: early.exit:
 ; CHECK-NEXT: ret void
+
+; At the merge, the left child definition is live while the right child store
+; is dead behind a null overwrite.  Falling the owner back to real must retain
+; the left definition and the right null without resurrecting the right child
+; store.
+define void @diamond_mixed_live_and_dead(i1 %choose) gc "hotspotgc"
+    personality ptr @__gxx_personality_v0 {
+entry:
+  %child = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68871 to ptr), i32 16)
+      to label %alloc.outer unwind label %unwind
+alloc.outer:
+  %outer = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68872 to ptr), i32 24)
+      to label %choose.block unwind label %unwind
+choose.block:
+  %slot = getelementptr inbounds i8, ptr addrspace(1) %outer, i64 16
+  br i1 %choose, label %left, label %right
+left:
+  store atomic ptr addrspace(1) %child, ptr addrspace(1) %slot unordered, align 8
+  br label %merge
+right:
+  store atomic ptr addrspace(1) %child, ptr addrspace(1) %slot unordered, align 8
+  store atomic ptr addrspace(1) null, ptr addrspace(1) %slot unordered, align 8
+  br label %merge
+merge:
+  %is.vb = call hotspotcc i1 @jeandle.check_if_value_based(
+      ptr addrspace(1) %outer)
+  call void @use_bool(i1 %is.vb)
+  ret void
+unwind:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
+; CHECK-LABEL: define void @diamond_mixed_live_and_dead(
+; CHECK-COUNT-1: inttoptr (i64 68871 to ptr)
+; CHECK-COUNT-1: inttoptr (i64 68872 to ptr)
+; CHECK-COUNT-1: store atomic ptr addrspace(1) %child
+; CHECK-COUNT-1: store atomic ptr addrspace(1) null
+; CHECK: call hotspotcc i1 @jeandle.check_if_value_based
+
+; The pointer PHI synthesizes a Case-C owner.  Its child definition is
+; overwritten before the synthetic owner escapes, so the child allocation and
+; historical store remain dead even though both real source owners survive.
+define void @casec_owner_overwritten(i1 %choose) gc "hotspotgc"
+    personality ptr @__gxx_personality_v0 {
+entry:
+  %child = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68881 to ptr), i32 16)
+      to label %choose.block unwind label %unwind
+choose.block:
+  br i1 %choose, label %left, label %right
+left:
+  %left.owner = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68882 to ptr), i32 24)
+      to label %left.cont unwind label %unwind
+left.cont:
+  br label %merge
+right:
+  %right.owner = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68882 to ptr), i32 24)
+      to label %right.cont unwind label %unwind
+right.cont:
+  br label %merge
+merge:
+  %owner = phi ptr addrspace(1) [ %left.owner, %left.cont ],
+                                     [ %right.owner, %right.cont ]
+  %slot = getelementptr inbounds i8, ptr addrspace(1) %owner, i64 16
+  store atomic ptr addrspace(1) %child, ptr addrspace(1) %slot unordered, align 8
+  store atomic ptr addrspace(1) null, ptr addrspace(1) %slot unordered, align 8
+  call void @sink_owner(ptr addrspace(1) %owner)
+  ret void
+unwind:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
+; CHECK-LABEL: define void @casec_owner_overwritten(
+; CHECK-NOT: inttoptr (i64 68881 to ptr)
+; CHECK-COUNT-2: inttoptr (i64 68882 to ptr)
+; CHECK-NOT: store atomic ptr addrspace(1) %child
+; CHECK: store atomic ptr addrspace(1) null
+; CHECK: call void @sink_owner
+
+; The companion Case-C owner escapes with its child definition still current.
+; Both source owners and the referenced child must stay real, and the live
+; store must be restored.
+define void @casec_owner_live(i1 %choose) gc "hotspotgc"
+    personality ptr @__gxx_personality_v0 {
+entry:
+  %child = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68891 to ptr), i32 16)
+      to label %choose.block unwind label %unwind
+choose.block:
+  br i1 %choose, label %left, label %right
+left:
+  %left.owner = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68892 to ptr), i32 24)
+      to label %left.cont unwind label %unwind
+left.cont:
+  br label %merge
+right:
+  %right.owner = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68892 to ptr), i32 24)
+      to label %right.cont unwind label %unwind
+right.cont:
+  br label %merge
+merge:
+  %owner = phi ptr addrspace(1) [ %left.owner, %left.cont ],
+                                     [ %right.owner, %right.cont ]
+  %slot = getelementptr inbounds i8, ptr addrspace(1) %owner, i64 16
+  store atomic ptr addrspace(1) %child, ptr addrspace(1) %slot unordered, align 8
+  call void @sink_owner(ptr addrspace(1) %owner)
+  ret void
+unwind:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
+; CHECK-LABEL: define void @casec_owner_live(
+; CHECK-COUNT-1: inttoptr (i64 68891 to ptr)
+; CHECK-COUNT-2: inttoptr (i64 68892 to ptr)
+; CHECK: store atomic ptr addrspace(1) %child
+; CHECK: call void @sink_owner
+
+; Unlike invoke_paths_after_overwrite, this invoke receives a still-virtual
+; owner as a real argument.  Call-input processing must recursively
+; materialize the live child and replay owner.child immediately before the
+; invoke; the deopt slots must keep the same real identities on both edges.
+define void @invoke_observes_virtual_owner() gc "hotspotgc"
+    personality ptr @__gxx_personality_v0 {
+entry:
+  %child = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68893 to ptr), i32 16)
+      to label %alloc.outer unwind label %alloc.unwind
+alloc.outer:
+  %outer = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68894 to ptr), i32 24)
+      to label %body unwind label %alloc.unwind
+body:
+  %slot = getelementptr inbounds i8, ptr addrspace(1) %outer, i64 16
+  store atomic ptr addrspace(1) %child, ptr addrspace(1) %slot unordered, align 8
+  invoke void @observe_owner(ptr addrspace(1) %outer)
+      [ "deopt"(i32 94, i32 94, i64 12,
+                 ptr addrspace(1) %outer, ptr addrspace(1) %child) ]
+      to label %normal unwind label %handler
+normal:
+  ret void
+handler:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+alloc.unwind:
+  %alloc.lp = landingpad i64 cleanup
+  resume i64 %alloc.lp
+}
+
+; CHECK-LABEL: define void @invoke_observes_virtual_owner(
+; CHECK-COUNT-1: inttoptr (i64 68893 to ptr)
+; CHECK-COUNT-1: inttoptr (i64 68894 to ptr)
+; CHECK: %[[SLOT:[-A-Za-z$._0-9]+]] = getelementptr inbounds i8, ptr addrspace(1) %outer, i64 16
+; CHECK-NEXT: store atomic ptr addrspace(1) %child, ptr addrspace(1) %[[SLOT]] unordered, align 8
+; CHECK-NEXT: invoke void @observe_owner(ptr addrspace(1) %outer)
+; CHECK-SAME: [ "deopt"(i32 94, i32 94, i64 12,
+; CHECK-SAME: ptr addrspace(1) %outer, ptr addrspace(1) %child) ]
+; CHECK-NEXT: to label %normal unwind label %handler
+; CHECK: handler:
+; CHECK-NEXT: %lp = landingpad i64
+; CHECK-NEXT: cleanup
 
 !java-method-compilation = !{}
