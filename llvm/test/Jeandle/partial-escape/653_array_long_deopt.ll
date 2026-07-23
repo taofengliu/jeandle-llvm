@@ -2,10 +2,10 @@
 
 ; Array VO deopt descriptor (long[]). A never-escaping long[] of length 2.
 ; Element 0 is touched (the i64 argument %v); element 1 is default 0. Each
-; long element is ONE wire entry enc(offset, LocalType, T_LONG) + the i64
-; value (the HotSpot parser's fill_one_scope_value T_LONG branch expands it
-; to two field_values slots, so field_count == length still holds: a length-2
-; long[] yields 2 wire entries -> 4 field_values slots -> len = 4/2 = 2).
+; long element is one typed wire pair: enc(offset, LocalType, T_LONG) + the i64
+; value. The HotSpot parser expands each pair to two ScopeValue slots, so
+; field_count == length still holds: a length-2 long[] yields 2 wire pairs ->
+; 4 ScopeValue slots -> len = 4/2 = 2.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare void @sink(i64)

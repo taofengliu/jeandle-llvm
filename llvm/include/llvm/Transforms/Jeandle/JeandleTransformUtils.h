@@ -43,11 +43,11 @@ namespace llvm {
 /// The parser consumes (3 + 2*field_count) locations for one descriptor.
 ///
 /// One emitted VO field: its byte offset (carried in the encoding's Index
-/// field so the HotSpot parser can match it to an InstanceKlass field (instance)
-/// or compute the element index (array) and pad untouched fields with defaults
-/// — HotSpot's reassign_fields_by_klass consumes ALL non-static fields, so the
-/// descriptor must be alignable to the full layout), and either a scalar value
-/// or a VORef to another in-scope VO.
+/// field so the HotSpot parser can match it to an InstanceKlass field
+/// (instance) or compute the element index (array) and pad untouched fields
+/// with defaults — HotSpot's reassign_fields_by_klass consumes ALL non-static
+/// fields, so the descriptor must be alignable to the full layout), and either
+/// a scalar value or a VORef to another in-scope VO.
 struct VODescriptorField {
   int64_t Offset;
   jeandle::HotspotBasicType BasicTy;
@@ -65,10 +65,11 @@ struct VODescriptorField {
 /// \p Fields may be in any order; each carries its byte offset. The caller is
 /// responsible for computing each scalar field's HotspotBasicType from its
 /// declared LLVM type. A VORef field (IsVORef) is emitted with T_OBJECT and the
-/// vo-id; BasicTy is ignored for VORef fields. A touched long/double field is
-/// emitted as ONE wire entry (enc(offset, LocalType, T_LONG/T_DOUBLE) + the
-/// i64/f64 value); the HotSpot parser's fill_one_scope_value expands it to the
-/// two field_values slots reassign_fields_by_klass consumes. For an array
+/// vo-id; BasicTy is ignored for VORef fields. Each long/double field or array
+/// element is emitted as one typed wire pair
+/// (enc(offset, LocalType, T_LONG/T_DOUBLE), i64/f64 value); the HotSpot parser
+/// expands it to the two ScopeValue slots reassign_fields_by_klass consumes.
+/// For an array
 /// (\p IsArray) the caller MUST expand every element 0..ArrayLength-1 into
 /// \p Fields (touched + default) so field_count == ArrayLength; the header
 /// basicType is then T_ARRAY. Locks/monitors are out of scope for this

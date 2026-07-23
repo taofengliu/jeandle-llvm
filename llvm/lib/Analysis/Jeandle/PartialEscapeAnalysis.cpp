@@ -80,7 +80,8 @@ using namespace llvm;
 // already counted (Eligible flipped after emission). Treated as a
 // diagnostic, not an audit.
 STATISTIC(JeandlePEAVirtualized, "Number of virtual objects PEA created");
-STATISTIC(JeandlePEAEliminated, "Number of allocations eliminated (erased) by PEA");
+STATISTIC(JeandlePEAEliminated,
+          "Number of allocations eliminated (erased) by PEA");
 STATISTIC(JeandlePEAMaterialized, "Number of materializations emitted by PEA");
 STATISTIC(JeandlePEAMaterializedPHI,
           "Materializations triggered by PHI / Case-A merge");
@@ -619,8 +620,7 @@ private:
   // stale edges are conservative-sound — they only ever ADD ineligibility,
   // and dragging an already-materialized inner to AlwaysEscapes keeps its
   // eliminated stores alive as real stores.
-  DenseMap<jeandle::ObjectID, SmallDenseSet<jeandle::ObjectID>>
-      VirtualRefEdges;
+  DenseMap<jeandle::ObjectID, SmallDenseSet<jeandle::ObjectID>> VirtualRefEdges;
 
   // ObjectIDs whose OrigAlloc appears in the CURRENTLY-processed
   // instruction's "deopt" bundle AND was recorded as a scoped virtual
@@ -669,8 +669,7 @@ private:
   // copies and their Value* references to one processBlock or direct
   // mergeStates invocation. Nested processBlock -> mergeStates scopes share
   // the same views so merge retries observe their own monotone edge flips.
-  DenseMap<BasicBlock *,
-           DenseMap<BasicBlock *, std::unique_ptr<BlockExitData>>>
+  DenseMap<BasicBlock *, DenseMap<BasicBlock *, std::unique_ptr<BlockExitData>>>
       EdgeExitViews;
   unsigned EdgeExitViewScopeDepth = 0;
 
@@ -787,20 +786,17 @@ private:
   // by Value pointer (otherwise every iteration would synthesize a fresh
   // PHI and the fixpoint would never close), AND so that the preserved
   // BlockExits[BB] (restoreLoopSnapshot does not roll back loop-block
-  // BlockExits) never references a PHI that rollback deletes. Offset == -1
-  // (i.e. the magic VirtualObject::ArrayLengthSlotOffset value, also used as
-  // a sentinel here for the "merged materialized pointer" PHI in the
-  // all-materialized merge branch) is overloaded as the cache key for the
-  // materialized-ptr PHI; offsets >= 0 are field PHIs. The cached PHI lives
-  // in Result.OwnedLoopFieldPhis, which is preserved across rollback (unlike
-  // OwnedPhis, which is truncated). The CreatePHI Effect referencing the
-  // cached PHI is re-emitted in BlockEffects[BB] on every iteration —
+  // BlockExits) never references a PHI that rollback deletes. Every entry is
+  // a real per-field PHI keyed by its byte offset. The cached PHI
+  // lives in Result.OwnedLoopFieldPhis, which is preserved across rollback
+  // (unlike OwnedPhis, which is truncated). The CreatePHI Effect referencing
+  // the cached PHI is re-emitted in BlockEffects[BB] on every iteration —
   // BlockEffects[BB] is wiped on rollback, but the PHI itself is not. The
   // `Header` field is the merge block BB passed to getOrCreateLoopFieldPhi.
   struct LoopPhiKey {
     BasicBlock *Header;
     jeandle::ObjectID ID;
-    int64_t Offset; // -1 for the merged-materialized-ptr PHI
+    int64_t Offset; // byte offset of the merged field
     bool operator==(const LoopPhiKey &O) const {
       return Header == O.Header && ID == O.ID && Offset == O.Offset;
     }
@@ -880,7 +876,7 @@ private:
     void intersectVirtualObjects();
     bool mergeObjectState(jeandle::ObjectID ID);
     bool mergeFieldStates(jeandle::ObjectID ID);
-    bool materializeAndBuildPhi(jeandle::ObjectID ID);
+    bool materializePredsAndMerge(jeandle::ObjectID ID);
   };
 
   // Returns a stable PHI for the given (in-loop merge block, ID, offset)
@@ -1224,8 +1220,8 @@ private:
   // operands (skipping described deopt-bundle operands)?" The generic escape
   // path (materializeAllVirtualOperands) enumerates this set. Returns IDs
   // sorted for deterministic effect order.
-  void collectDistinctVirtualOperands(
-      Instruction *I, SmallVectorImpl<jeandle::ObjectID> &Out);
+  void collectDistinctVirtualOperands(Instruction *I,
+                                      SmallVectorImpl<jeandle::ObjectID> &Out);
   void materializeAllVirtualOperands(Instruction *I);
 #ifndef NDEBUG
   // Debug-only reachability check used by the resolve-cap invariant assert in
@@ -1306,12 +1302,6 @@ private:
     // Flip the per-object state to materialized (live CurrentState vs
     // ExitInfo).
     function_ref<void(jeandle::ObjectID)> FlipState;
-    // Resolve the materialized value to record when a field references a just-
-    // materialized object Oid (field-replay). Live returns OrigAlloc (single
-    // global-RAUW materialize); pred returns the per-pred placeholder (Graal's
-    // distinct AllocatedObjectNode) so the field resolves to this pred's OWN
-    // OrigAlloc (the reused allocation). Used by the recursive-prereq rewrite and the sibling sweeps.
-    function_ref<Value *(jeandle::ObjectID)> MaterializedValue;
   };
   void ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C);
   // Whether a field/entry value can be produced at a program point (used by
@@ -1941,7 +1931,8 @@ void Analyzer::MergeProcessor::run() {
     // Graal PartialEscapeClosure), re-evaluated each iteration. If every
     // predecessor's BlockExitData is byte-equivalent, the merge is degenerate:
     // inherit preds[0] directly and skip the O(|preds|*|virtuals|*|offsets|)
-    // per-VO merge. processBlockPhis still runs (Graal runs getPhis()) to alias any pointer PHIs.
+    // per-VO merge. processBlockPhis still runs (Graal runs getPhis()) to alias
+    // any pointer PHIs.
     //
     // SOUNDNESS (why this is safe inside the loop, matching Graal): Graal uses
     // a reference-identity compare on the ObjectState[] array — a materialize
@@ -1954,14 +1945,10 @@ void Analyzer::MergeProcessor::run() {
     // any materialization — exactly when an all-equivalent result is
     // genuinely identical.
     {
-      // Under escape-point placement, two preds can both report an object
-      // materialized with the SAME OrigAlloc placeholder yet have DIFFERENT
-      // per-arm materializes (each arm escapes independently; the per-arm
-      // materialize is placed at the arm's own escape point; OrigAlloc (reused)
-      // dominates each arm). byte-equivalent
-      // exits are then not genuinely identical, so the fast path must NOT fire
-      // when any object is materialized — the per-VO merge (and its
-      // materializedValuePhi) is required to reconcile the per-arm values.
+      // Two preds can both report the same OrigAlloc as materialized yet carry
+      // different edge-local field or lock replay. Byte-equivalent exits are
+      // then not genuinely identical, so the fast path must not fire when any
+      // object is materialized; the per-VO merge must reconcile those effects.
       bool AnyMaterialized = !Preds[0]->Materialized.empty();
       bool AllSame = !AnyMaterialized;
       for (unsigned i = 1; AllSame && i < Preds.size(); ++i) {
@@ -2066,9 +2053,9 @@ bool Analyzer::MergeProcessor::mergeObjectState(jeandle::ObjectID ID) {
     // `Preds.size() > 1` is load-bearing here: with a single predecessor
     // OrigAlloc is the correct merged value and we install it directly
     // (Graal uniqueMaterializedValue). A multi-pred merge still installs a
-    // merged materialized state via materializeAndBuildPhi (no virtuals to
-    // materialize, but the per-pred path records the merged state for
-    // downstream consumers + the loop-fixpoint convergence check).
+    // merged materialized state via materializePredsAndMerge (no virtuals to
+    // materialize, but the common path records OrigAlloc for downstream
+    // consumers and the loop-fixpoint convergence check).
     if (Preds.size() == 1) {
       jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
       jeandle::ObjectState OS;
@@ -2077,7 +2064,7 @@ bool Analyzer::MergeProcessor::mergeObjectState(jeandle::ObjectID ID) {
       Materialized.insert(ID);
       return false;
     }
-    return materializeAndBuildPhi(ID);
+    return materializePredsAndMerge(ID);
   }
 
   if (!AllVirtual) {
@@ -2097,14 +2084,10 @@ bool Analyzer::MergeProcessor::mergeObjectState(jeandle::ObjectID ID) {
     if (MissingOnSomePred)
       return false;
 
-    // Mixed virtual+materialized merge — Graal's per-pred+PHI else-branch
-    // (Graal PartialEscapeClosure): materialize each still-virtual pred
-    // at its predecessor-end and build a materializedValuePhi over the per-pred
-    // materialized pointers. This is sound because (a) each pred's materialize
-    // is placed at its own predecessor-end (self-contained, not a dominating
-    // hoist covering all arms), and (b) the lock model deletes+re-emits enters
-    // at the materialize point (no in-place retarget that would need the
-    // materialize to dominate the original enter).
+    // Mixed virtual+materialized merge: materialize each still-virtual pred at
+    // its predecessor-end. Graal merges distinct allocated-object values with
+    // a materializedValuePhi; Jeandle reuses the one dominating OrigAlloc on
+    // every edge. Field and lock replay remains edge-local.
     //
     // Synthetic VOs (Case-C, borrowed AllocationCall) still bail: they have no
     // per-pred allocation to materialize from. TODO(cascade-materialize):
@@ -2113,7 +2096,7 @@ bool Analyzer::MergeProcessor::mergeObjectState(jeandle::ObjectID ID) {
       A.markIneligible(ID); // cascades transitively over nested synthetics.
       return false;
     }
-    return materializeAndBuildPhi(ID);
+    return materializePredsAndMerge(ID);
   }
 
   // All preds report Virtual: check lock counts and live enter-stacks.
@@ -2155,42 +2138,24 @@ bool Analyzer::MergeProcessor::mergeObjectState(jeandle::ObjectID ID) {
 
   // else (Graal else-branch): a lock-count
   // or live-enter-stack mismatch forces per-pred materialization. Do it in a
-  // SINGLE pass and build the materializedValuePhi here (each pred carries its
-  // OWN lock list, so the alloc-commit emits exactly that pred's monitorenter
-  // set — no synthesized enters are added on the lower-count side). On the
-  // retry every pred has flipped to Materialized; the loop-header-cached PHI
-  // shell stays stable, so this converges in at most one retry.
-  return materializeAndBuildPhi(ID);
+  // SINGLE pass (each pred carries its OWN lock list, so replay emits exactly
+  // that pred's monitorenter set — no synthesized enters are added on the
+  // lower-count side). On retry every pred has flipped to Materialized, and
+  // the unique OrigAlloc value keeps the merged state stable.
+  return materializePredsAndMerge(ID);
 }
 
-// Graal else-branch / the incompatible
-// tail of mergeObjectStates (Graal PartialEscapeBlockState):
-// materialize every still-virtual pred and install a merged materialized
-// ObjectState. Reached for the mixed `!AllVirtual` case (Graal's
-// else-branch), for AllMaterialized multi-pred merges (no virtuals to
-// materialize — just installs the merged state), and for lock/stack mismatch
-// (every virtual pred materialized).
+// Incompatible tail of mergeObjectStates: replay every still-virtual pred and
+// install a merged materialized ObjectState whose value is the original
+// allocation. Reached for mixed virtual/materialized state, all-materialized
+// multi-pred merges, and lock/stack mismatches.
 // Returns true if a per-pred materialize emitted an Effect this iteration (the
 // run() do/while re-runs on true).
 // TODO(ensure-virtualized): when an EnsureVirtualized bit lands on ObjectState,
 // downgrade it here per-pred (Graal setEnsureVirtualized(false) where not all
 // preds agree) — this entry covers the AllMaterialized-divergence arm of
 // mergeObjectState.
-bool Analyzer::MergeProcessor::materializeAndBuildPhi(jeandle::ObjectID ID) {
-  Type *PtrTy =
-      PointerType::get(A.F.getContext(), jeandle::AddrSpace::JavaHeapAddrSpace);
-
-  // Loop-PHI cache: stable PHI across fixpoint iterations. Under reuse-OrigAlloc
-  // this PHI is a pure analyzer-side placeholder — it is NEVER emitted via a
-  // CreatePHI effect (OrigAlloc dominates every escape point by SSA, so the
-  // materialized-object merge PHI would trivially fold). It still serves as a
-  // stable Value* identity for the merged materialized state so the loop
-  // fixpoint's convergence check (which compares Value* identity through
-  // ObjectState::MaterializedValue) can stabilise across iterations.
-  PHINode *Phi = A.getOrCreateLoopFieldPhi(
-      BB, ID, /*Offset=*/-1, PtrTy, Preds.size(), "pea.materialized.phi");
-  A.PhiHome[Phi] = BB;
-
+bool Analyzer::MergeProcessor::materializePredsAndMerge(jeandle::ObjectID ID) {
   bool Mat = false;
   for (unsigned i = 0; i < Preds.size(); ++i) {
     if (!Eligible.lookup(ID))
@@ -2222,14 +2187,12 @@ bool Analyzer::MergeProcessor::materializeAndBuildPhi(jeandle::ObjectID ID) {
   if (!Eligible.lookup(ID))
     return Mat;
 
-  // Install the merged materialized state. Phi is a stable analyzer-side
-  // placeholder under reuse-OrigAlloc; the transform never inserts it — no
-  // CreatePHI effect is emitted because OrigAlloc is the single SSA value on
-  // every edge. The Phi only marks "this VO is now materialized at this
-  // merge block" for the analyzer state and the loop-fixpoint convergence
-  // check.
+  // Install the unique materialized value directly. OrigAlloc dominates every
+  // edge, so its identity is stable across loop-fixpoint retries and no
+  // analyzer-only placeholder is needed.
+  jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
   jeandle::ObjectState OS;
-  OS.escape(Phi);
+  OS.escape(VObj.AllocationCall);
   CurrentState.addObject(ID, std::move(OS));
   Materialized.insert(ID);
   return Mat;
@@ -2238,9 +2201,9 @@ bool Analyzer::MergeProcessor::materializeAndBuildPhi(jeandle::ObjectID ID) {
 // Graal mergeObjectStates (Graal PartialEscapeClosure), COMPATIBLE
 // branch: per-offset field-PHI synthesis for a virtual object whose locks agree
 // across all predecessors. Identical entries flow straight into the merged
-// state; disagreements synthesize a per-offset PHI. (The INCOMPATIBLE tail of
-// Graal's mergeObjectStates — materialize every pred + materializedValuePhi —
-// corresponds to materializeAndBuildPhi here.) Returns true if a nested
+// state; disagreements synthesize a per-offset PHI. The incompatible tail
+// replays every pred and records OrigAlloc via materializePredsAndMerge.
+// Returns true if a nested
 // inner-VO materialize emitted an Effect (retry).
 //
 // TODO(mergeObjectStates-two-slot-and-bytearray): mirror Graal's
@@ -2277,7 +2240,7 @@ bool Analyzer::MergeProcessor::mergeFieldStates(jeandle::ObjectID ID) {
   for (int64_t Off : SortedOffsets) {
     // Any field-merge failure is an incompatibility in Graal's sense
     // (mergeObjectStates sets compatible=false): the whole object is
-    // materialized at every predecessor (the materializeAndBuildPhi tail
+    // materialized at every predecessor (the materializePredsAndMerge tail
     // below) rather than dropping just the offending offset. Dropping an
     // offset would silently lose the eliminated stores that fed it — a later
     // load of that offset would fold to the Java default instead of the
@@ -2471,8 +2434,7 @@ bool Analyzer::MergeProcessor::mergeFieldStates(jeandle::ObjectID ID) {
         // value PHI. OrigAlloc supplies the value, while replay side effects
         // remain edge-local.
         A.materializeAtPredFromExitInfo(InnerID, PredBBs[i], *Preds[i],
-                                        /*EdgeLocal=*/true,
-                                        MatReason::Phi,
+                                        /*EdgeLocal=*/true, MatReason::Phi,
                                         /*TargetMerge=*/BB);
         if (Result.NextSeqNo != PreSeqNo)
           Changed = true;
@@ -2547,12 +2509,12 @@ bool Analyzer::MergeProcessor::mergeFieldStates(jeandle::ObjectID ID) {
   if (BailObject) {
     // Graal mergeObjectStates incompatible tail (Graal
     // PartialEscapeClosure): the fields cannot be merged into a coherent
-    // virtual state, so materialize the object at every predecessor and
-    // build the materializedValuePhi. The original allocation survives and
-    // each pred's tracked field state is replayed onto it — strictly more
+    // virtual state, so replay the object at every predecessor and record
+    // OrigAlloc as the merged materialized value. The original allocation
+    // survives and each pred's tracked field state is replayed onto it — more
     // precise than abandoning virtualization entirely. Any PendingPhiEffects
     // staged above are simply discarded (never committed to MergeEffects).
-    bool MatEmitted = materializeAndBuildPhi(ID);
+    bool MatEmitted = materializePredsAndMerge(ID);
     return MatEmitted || Changed;
   }
 
@@ -2794,9 +2756,8 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
     // Case A: mixed virtual + non-virtual incomings, OR a Case C attempt
     // that bailed. For every virtual incoming, materialize at that
     // incoming's predecessor terminator. The PHI itself stays in IR; each
-    // virtual incoming's OrigAlloc use is OrigAlloc directly (the
-    // materialized-object merge PHI is SKIPPED at apply, so there is nothing
-    // to rewrite — OrigAlloc is reused post-merge).
+    // virtual incoming's OrigAlloc use stays unchanged because OrigAlloc is
+    // reused post-merge.
     for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I) {
       if (!InIDs[I])
         continue;
@@ -2810,8 +2771,8 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
       // (a) a true block-end drain already flipped the shared state (VO no
       // longer virtual in BlockExits[Pred]); (b) an incoming-edge mat for THIS
       // merge (Pred, BB, ID) was already emitted — edge-local replay flips the
-      // target view but not the shared predecessor state. Re-firing here would duplicate
-      // field and lock replay. An edge mat for a DIFFERENT merge is
+      // target view but not the shared predecessor state. Re-firing here would
+      // duplicate field and lock replay. An edge mat for a DIFFERENT merge is
       // recorded under (Pred, M2, ID), so the check correctly does NOT skip
       // in that case.
       if (!PredED->Virtuals.count(*InIDs[I]) ||
@@ -3490,7 +3451,8 @@ void Analyzer::processInstruction(Instruction *I) {
         return;
       // default: fall through to the ICmp / JavaOp / generic-escape path.
     }
-    // TODO(deferred-virtualizers): deferred virtualization handlers — NOT WIRED yet:
+    // TODO(deferred-virtualizers): deferred virtualization handlers — NOT WIRED
+    // yet:
     //   - TODO: processArrayCopy / processMemSet — llvm.memcpy/memmove
     //     (System.arraycopy) and llvm.memset (Arrays.fill). The only
     //     llvm.memset producer today is jeandle.new_instance's lower-phase=1
@@ -3504,10 +3466,10 @@ void Analyzer::processInstruction(Instruction *I) {
     //   - get_class: IMPLEMENTED (foldGetClass). The frontend emits
     //     jeandle.get_class for vmIntrinsic _getClass
     //     (jeandleIntrinsicLowering.cpp). A virtual receiver of known klass
-    //     folds to a GC-safe load of its java.lang.Class mirror: the GetJavaMirror
-    //     VMCallback maps the klass to a mirror oop id, and the transform builds
-    //     the oop-handle load (createConstOopLoad) recorded via
-    //     ReplaceCallEffect::OopHandleId. When the callback is unavailable
+    //     folds to a GC-safe load of its java.lang.Class mirror: the
+    //     GetJavaMirror VMCallback maps the klass to a mirror oop id, and the
+    //     transform builds the oop-handle load (createConstOopLoad) recorded
+    //     via ReplaceCallEffect::OopHandleId. When the callback is unavailable
     //     (offline tests without a callback log) or returns -1, foldGetClass
     //     bails and this fall-through materializes (sound, conservative).
     //
@@ -3523,16 +3485,17 @@ void Analyzer::processInstruction(Instruction *I) {
     // card_table_barrier, check_if_value_based, check_inflated,
     // check_instanceof, check_klass_subtype, check_klass_subtype_slow_path,
     // checkcast, clear_oop_in_lock_stack_top, current_thread,
-    // decrement_lock_count, g1_pre_barrier_loaded, get_class, get_stack_pointer,
-    // idiv, increment_lock_count, instanceof, irem, ldiv, load_klass, lrem,
-    // monitorenter_with_lightweight_lock, monitorenter_with_monitor_lock,
-    // monitorenter_with_thin_lock, monitorexit_with_lightweight_lock,
-    // monitorexit_with_monitor_lock, monitorexit_with_thin_lock, new_instance,
-    // new_array, post_barrier, pre_barrier, reference_get, reference_refers_to,
+    // decrement_lock_count, g1_pre_barrier_loaded, get_class,
+    // get_stack_pointer, idiv, increment_lock_count, instanceof, irem, ldiv,
+    // load_klass, lrem, monitorenter_with_lightweight_lock,
+    // monitorenter_with_monitor_lock, monitorenter_with_thin_lock,
+    // monitorexit_with_lightweight_lock, monitorexit_with_monitor_lock,
+    // monitorexit_with_thin_lock, new_instance, new_array, post_barrier,
+    // pre_barrier, reference_get, reference_refers_to,
     // register_finalizer_if_needed, safepoint_poll, try_acquire_monitor_lock,
     // try_release_monitor_lock. (NOT all listed here get a dedicated fold in
-    // processJavaOp — see the isJeandle* predicates in PartialEscapeUtils.{h,cpp}
-    // for which the analyzer actually recognizes.)
+    // processJavaOp — see the isJeandle* predicates in
+    // PartialEscapeUtils.{h,cpp} for which the analyzer actually recognizes.)
     //
     // TODO(compressed-oop): decode_heap_oop, decode_klass, encode_heap_oop,
     // and encode_klass are frontend JavaOps deferred until CompressedOops
@@ -3645,7 +3608,7 @@ void Analyzer::processAllocation(CallBase *CB) {
   //      Jeandle's ObjectState has no such bit, so the per-pred materialisation
   //      sites that route through materializeAtPredFromExitInfo currently do no
   //      downgrade either — tagged TODO(ensure-virtualized) at their entry
-  //      points (materializeAndBuildPhi, which the AllMaterialized-divergence
+  //      points (materializePredsAndMerge, which the AllMaterialized-divergence
   //      arm of mergeObjectState routes through; and synthesizeCaseC).
   //
   // Soundness: the unconditional return below is CONSERVATIVE — Jeandle
@@ -3714,11 +3677,12 @@ void Analyzer::processAllocation(CallBase *CB) {
   // FieldStates entry) is what protects the analyzer from forming an unsound
   // replay: any field whose stored value is defined later in the loop body
   // cannot dominate the SafeIP just after the alloc, so the object becomes
-  // ineligible and survives in IR untouched. materializePreheaderVirtualsForUnvisitedLoops
-  // independently force-materializes any virtual that is still virtual at a
-  // loop preheader's exit (modulo loops drained by the loop fixpoint's
-  // pessimistic fallback), so objects allocated BEFORE the loop and
-  // surviving into the loop are also handled.
+  // ineligible and survives in IR untouched.
+  // materializePreheaderVirtualsForUnvisitedLoops independently
+  // force-materializes any virtual that is still virtual at a loop preheader's
+  // exit (modulo loops drained by the loop fixpoint's pessimistic fallback), so
+  // objects allocated BEFORE the loop and surviving into the loop are also
+  // handled.
 
   uintptr_t Klass = jeandle::pea::extractAllocationKlass(CB);
   if (Klass == 0)
@@ -3924,7 +3888,7 @@ std::optional<int64_t> Analyzer::resolveAccess(Value *Ptr,
       return std::nullopt;
     if (VObj.ArrayIndexScale > 0) {
       int64_t EndOff = BaseOff + static_cast<int64_t>(VObj.ArrayLength) *
-                                   static_cast<int64_t>(VObj.ArrayIndexScale);
+                                     static_cast<int64_t>(VObj.ArrayIndexScale);
       if (*Offset >= EndOff)
         return std::nullopt; // out-of-bounds tail byte-GEP — bail
     }
@@ -4107,8 +4071,8 @@ void Analyzer::processLoad(LoadInst *LI) {
   // array at the load (every array access has a bounds check, so without this
   // fold no array could stay virtual across a bounds check). Fold the
   // length load to the known ArrayLength constant. Sound even if the array
-  // later materializes: a materialized array is allocated with exactly
-  // ArrayLength elements, so the constant matches the real header length.
+  // later becomes materialized: the real array has exactly ArrayLength
+  // elements, so the constant matches its header length.
   if (VObj.isArray() && LI->getType()->isIntegerTy(32)) {
     if (auto LenOff = jeandle::pea::resolveFieldOffset(Ptr, DL)) {
       const jeandle::VMConstants VMConsts =
@@ -4270,9 +4234,9 @@ void Analyzer::processLoad(LoadInst *LI) {
     // other tracking site (FieldStates, alias map) to the materialized
     // pointer, and (b) at transform time, applyMaterialize records
     // OrigAlloc (reused) as the materialized value; the field-replay value
-    // is OrigAlloc (applyMaterialize stores `MatVal = cast<CallBase>(OrigAlloc)`
-    // in NewInvOf for the sibling's lock re-emit — see the materialization-model
-    // paragraph in the PartialEscapeTransform.cpp file header).
+    // is OrigAlloc (applyMaterialize records it in MaterializedAllocOf for a
+    // sibling lock replay — see the materialization model in
+    // PartialEscapeTransform.cpp).
     // (Belt-and-suspenders: the ReplaceLoad handler also resolves
     // E.Replacement through OrigAlloc directly.)
     jeandle::ObjectID InnerID = Existing->getVirtualRef();
@@ -4309,11 +4273,8 @@ void Analyzer::processLoad(LoadInst *LI) {
       jeandle::VirtualObject &InnerVO = *Result.VirtualObjects[InnerID];
       Repl = InnerVO.AllocationCall;
     }
-    // The fallback above must yield a value that actually exists in IR:
-    // OrigAlloc does, but a materialized-object merge-PHI shell or a per-pred
-    // placeholder is never inserted (its CreatePHI is skipped at apply), so
-    // forwarding the load to it would leave a use of a value with no parent.
-    // Keep the outer object real in that case.
+    // The fallback must yield a value that exists in IR. Keep the outer object
+    // real if the ObjectState invariant is violated.
     if (!Repl ||
         (isa<Instruction>(Repl) && !cast<Instruction>(Repl)->getParent())) {
       markIneligible(*BaseID);
@@ -4398,7 +4359,8 @@ void Analyzer::emitReplaceCall(CallBase *CB, Value *Replacement,
   // (inline-asm-with-goto, no called function) can never satisfy. Fail fast
   // at the producer so a callbr can never become a ReplaceCall target whose
   // successor edges ReplaceCallEffect::apply would mishandle.
-  assert(!isa<CallBrInst>(CB) && "PEA ReplaceCall targets are folded Jeandle "
+  assert(!isa<CallBrInst>(CB) &&
+         "PEA ReplaceCall targets are folded Jeandle "
          "JavaOps (CallInst/InvokeInst); a CallBrInst cannot reach here");
   auto E = std::make_unique<jeandle::ReplaceCallEffect>();
   E->Block = CB->getParent();
@@ -5217,8 +5179,8 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
     if (VObj.Klass == 0)
       return false; // no klass identity — cannot describe.
     if (VObj.isArray()) {
-      // Array VO descriptors use a T_ARRAY header and emit one wire entry per
-      // element 0..ArrayLength-1 (field_count == ArrayLength, including
+      // Array VO descriptors use a T_ARRAY header and emit one typed wire pair
+      // per element 0..ArrayLength-1 (field_count == ArrayLength, including
       // untouched defaults — HotSpot derives the array length from
       // field_values.size(), so emitting only touched elements would
       // miscompile the length). Building this requires a known element type
@@ -5282,8 +5244,8 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
       C.VORefID = FV.getVirtualRef();
     } else if (FV.isScalar()) {
       Value *SV = FV.getScalar();
-      if (auto InnerID = jeandle::pea::resolveVirtualRef(SV, CurrentState,
-                                                         Aliases, DL)) {
+      if (auto InnerID =
+              jeandle::pea::resolveVirtualRef(SV, CurrentState, Aliases, DL)) {
         // A scalar field whose value resolves to a virtual VO -> VORef by
         // identity (emitted as vo-id, no Value* in the bundle).
         // For an object array this is how an element holding another in-scope
@@ -5291,16 +5253,14 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
         // array element).
         C.Kind = Cell::VORef;
         C.VORefID = *InnerID;
-      } else if (FV.getDeclaredType() &&
-                 FV.getDeclaredType()->isPointerTy() &&
+      } else if (FV.getDeclaredType() && FV.getDeclaredType()->isPointerTy() &&
                  describeMaterializedOop(SV)) {
         // Reference field holding a non-VO wide oop (argument/null/
         // materialized external oop): describe it as a Scalar field whose
         // value is the live oop (RS4GC keeps it relocatable).
         C.Kind = Cell::Scalar;
         C.ScalarV = SV;
-      } else if (FV.getDeclaredType() &&
-                 FV.getDeclaredType()->isPointerTy()) {
+      } else if (FV.getDeclaredType() && FV.getDeclaredType()->isPointerTy()) {
         // Narrow-oop (addrspace 3) reference field, or a non-null constant
         // oop: not describable. TODO(compressed-oop): narrow-oop reference
         // fields are explicitly deferred (do NOT add handling).
@@ -5308,9 +5268,9 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
       } else {
         // Plain primitive scalar (int/float/long/double; also byte/char/short
         // elements, whose LLVM type widens to T_INT on the emit side). A
-        // touched long/double is described with ONE wire entry carrying the
-        // full i64/f64 value; the HotSpot parser's fill_one_scope_value
-        // T_LONG/T_DOUBLE branch expands it to the two field_values slots
+        // touched long/double is described with one typed wire pair carrying
+        // the full i64/f64 value; the HotSpot parser's fill_one_scope_value
+        // T_LONG/T_DOUBLE branch expands it to the two ScopeValue slots
         // reassign_fields_by_klass consumes.
         C.Kind = Cell::Scalar;
         C.ScalarV = SV;
@@ -5352,12 +5312,7 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
       // for byte/boolean arrays — each element is one normal T_INT slot.
       const DenseMap<int64_t, jeandle::FieldValue> *Touched =
           (ItFS != FieldStates.end()) ? &ItFS->second : nullptr;
-      bool IsObjectArray = VObj.ArrayElementType->isPointerTy();
-      Constant *Default =
-          IsObjectArray
-              ? cast<Constant>(ConstantPointerNull::get(
-                    cast<PointerType>(VObj.ArrayElementType)))
-              : ConstantInt::get(VObj.ArrayElementType, 0);
+      Constant *Default = Constant::getNullValue(VObj.ArrayElementType);
       for (uint32_t Idx = 0; Idx < VObj.ArrayLength; ++Idx) {
         int64_t Off = static_cast<int64_t>(VObj.ArrayBaseOffset) +
                       static_cast<int64_t>(Idx) *
@@ -5470,9 +5425,10 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
     }
     // At transform time a ReplaceLoad has RAUW'd an identity alias to OrigAlloc
     // (Pass-1 SeqNo order runs processLoad before this safepoint), so the
-    // slot-rewrite (V == OrigAlloc) in RewriteDeoptBundleEffect::apply fires for
-    // it. Mark it OrigAllocInBundle so the transform's root guard still holds
-    // (bail if, unexpectedly, the RAUW left OrigAlloc absent from the bundle).
+    // slot-rewrite (V == OrigAlloc) in RewriteDeoptBundleEffect::apply fires
+    // for it. Mark it OrigAllocInBundle so the transform's root guard still
+    // holds (bail if, unexpectedly, the RAUW left OrigAlloc absent from the
+    // bundle).
     OrigAllocInBundle.insert(*ID);
     RootOperandsMap[*ID].push_back(V);
     if (RootSeen.insert(*ID).second)
@@ -5875,8 +5831,8 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
   // (Graal EffectsClosure). No dominance check is needed: in STOP_NEW
   // *any* virtual object reaching materialization is outer-scope by
   // construction. The ensureVirtualized -> RetryableBailoutException branch
-  // (Graal PartialEscapeClosure) is intentionally deferred (deopt-adjacent); see TODO in
-  // processAllocation.
+  // (Graal PartialEscapeClosure) is intentionally deferred (deopt-adjacent);
+  // see TODO in processAllocation.
   if (CurrentMode == Mode::StopNewInLoopNest) {
     OverflowFlag = true;
     return;
@@ -5888,12 +5844,10 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
   //
   // GRAAL DIVERGENCE: Graal materializes a synthetic Case-C VO by materializing
   // each per-pred source VO (mergeObjectEntry / the processPhi fallback,
-  // Graal PartialEscapeClosure) and reusing the existing
-  // materializedValuePhi as the materialized value. Jeandle bails instead.
-  // TODO(cascade-materialize): implement (a) per-pred-source materialization
-  // that reuses each pred's OrigAlloc through the Case-C PHI (no fresh per-pred
-  // NewInv is created today — reuse-OrigAlloc) and reuses the existing
-  // materializedValuePhi as the materialized pointer, plus (b) the
+  // Graal PartialEscapeClosure) and reusing the Case-C pointer PHI as the
+  // materialized value. Jeandle bails instead.
+  // TODO(cascade-materialize): implement (a) per-pred-source replay that feeds
+  // each reused OrigAlloc through the Case-C pointer PHI, plus (b) the
   // materialize-placement + lock-model alignment noted at materializeAt /
   // foldMonitorEnter (synthetics' borrowed AllocationCall has no dominating
   // alloc point).
@@ -5912,8 +5866,7 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
   // Recursive prerequisite materialization: for each field holding a VirtualRef
   // to an inner virtual, materialize the inner first, then rewrite the outer's
   // FieldStates entry to a MaterializedRef at the inner's OrigAlloc. The
-  // field-replay value is OrigAlloc on every
-  // path (both MaterializedValue callbacks return OrigAlloc);
+  // field-replay value is OrigAlloc on every path;
   // OrigAlloc dominates every escape point by PEA's invariant (see
   // applyMaterialize, which asserts the materialized value equals
   // VObj.AllocationCall and documents the OrigAlloc-dominates-every-escape
@@ -5959,7 +5912,7 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
         if (!Eligible.lookup(InnerID))
           InnerVal = realValueOfKeptReal(InnerID);
         else
-          InnerVal = C.MaterializedValue(InnerID);
+          InnerVal = Result.VirtualObjects[InnerID]->AllocationCall;
         C.FieldStates[ID][Off] = jeandle::FieldValue::materializedRef(InnerVal);
         // updateStatesForMaterialized: every other still-tracked object whose
         // FieldStates references InnerID must also flip to MaterializedRef.
@@ -6102,7 +6055,7 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
   // Sweep sibling VOs whose FieldStates still hold a VirtualRef to this just-
   // materialised object, so a later store/load through a sibling field observes
   // the materialized pointer.
-  updateOtherStatesForMaterialized(ID, C.MaterializedValue(ID), C.FieldStates);
+  updateOtherStatesForMaterialized(ID, VObj.AllocationCall, C.FieldStates);
 }
 
 void Analyzer::materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
@@ -6136,35 +6089,30 @@ void Analyzer::materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
   auto ComputeSafeIP = [&]() -> Instruction * {
     // Escape-point placement (Graal materializeBefore=node,
     // PartialEscapeClosure.ensureMaterialized -> materializeBefore): always
-    // materialize at the instruction that triggered the escape. Graal never
-    // hoists a live-path materialize to the allocation's normal-dest, and
-    // neither do we.
+    // replay at the instruction that triggered the escape. Graal keeps this
+    // replay at the escape point, and so does Jeandle.
     //
     // Loop-body escape — the escape point sits in a loop that does not contain
-    // the allocation — does NOT require hoisting for soundness. The loop
+    // the allocation — does not require moving the replay point. The loop
     // fixpoint (processLoop) clears every loop-block effect on each retry
-    // (restoreLoopSnapshot), and the post-body mergeStates(Header) builds the
-    // Graal materializedValuePhi + a single materialize at the preheader end
-    // (materializeAndBuildPhi -> materializeAtPredFromExitInfo, SafeIP =
-    // PH->getTerminator() = Graal predecessor.getEndNode()). Concretely:
+    // (restoreLoopSnapshot), and the post-body mergeStates(Header) records one
+    // preheader replay (materializePredsAndMerge ->
+    // materializeAtPredFromExitInfo, SafeIP = PH->getTerminator()). OrigAlloc
+    // is the stable materialized value. Concretely:
     //   * Escape FLOWS TO THE LATCH (escape block is a loop block): the Iter-0
     //     escape-point Materialize is cleared on Iter 1; the header merge flips
-    //     the object to materialized{phi} so the body escape becomes a no-op
-    //     (resolveVirtualRef returns nullopt for a materialized object); on
-    //     convergence phi(M_pre, phi) is trivial (folds to M_pre via
-    //     CreatePHIEffect for the materialized-object merge PHI, SKIPPED at
-    //     apply (Case 1): OrigAlloc is the single incoming on every arm. This
-    //     is exactly Graal's materializedValuePhi at the loop header.
+    //     the object to materialized{OrigAlloc}, so the body escape becomes a
+    //     no-op (resolveVirtualRef returns nullopt for a materialized object).
     //   * Escape EXITS THE LOOP (escape block is not in the loop): the latch
     //     sees the object virtual, the header merge keeps it virtual
     //     (mergeFieldStates), and the escape-point Materialize persists only on
     //     the escape-exiting path — executed at most once because that path
     //     leaves the loop. The object stays scalar-replaced on the normal path:
     //     true partial escape.
-    // Nested loops are handled by the recursive processLoop: the outer fixpoint
-    // clears the inner-preheader Materialize and the outer materializedValuePhi
-    // propagates materialization into the inner loop, yielding a single
-    // materialize at the outermost preheader. Mode::StopNewInLoopNest +
+    // Nested loops are handled by recursive processLoop: the outer fixpoint
+    // clears the inner-preheader replay and propagates materialized{OrigAlloc}
+    // into the inner loop, leaving one replay at the outermost preheader.
+    // Mode::StopNewInLoopNest +
     // MATERIALIZE_ALL escalation remain the safety net for pathological nests.
     //
     // OrigAlloc uses that the escape-point materialization does not
@@ -6174,10 +6122,8 @@ void Analyzer::materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
     // invariant (see applyMaterialize, which asserts the materialized value
     // equals VObj.AllocationCall; see also the "Materialization model"
     // paragraph in the PartialEscapeTransform.cpp file header). The
-    // materialized-object merge PHI that would have carried per-arm
-    // pointers is SKIPPED at apply (CreatePHIEffect::apply
-    // Case 1), so OrigAlloc is reused directly post-merge.
-    // So escape-point placement is SSA-sound for every escape.
+    // OrigAlloc is reused directly post-merge, so escape-point replay is
+    // SSA-sound for every escape.
     return InsertBefore;
   };
   auto FlipState = [&](jeandle::ObjectID Oid) {
@@ -6191,10 +6137,6 @@ void Analyzer::materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
   auto CaptureLocksIntoEffect = [](ArrayRef<LockEnter> Stack, jeandle::ObjectID,
                                    jeandle::MaterializeEffect &E) {
     captureMaterializedLocks(Stack, E);
-  };
-  // Field-replay value: OrigAlloc (single global-RAUW materialize).
-  auto MaterializedValue = [&](jeandle::ObjectID Oid) {
-    return Result.VirtualObjects[Oid]->AllocationCall;
   };
   // NOTE: every callback is a named local (not a temporary in the aggregate
   // init) so each outlives C — function_ref does NOT own its callable, and a
@@ -6213,8 +6155,7 @@ void Analyzer::materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
                        CaptureLocksIntoEffect,
                        DropInnerAliases,
                        ComputeSafeIP,
-                       FlipState,
-                       MaterializedValue};
+                       FlipState};
   ensureMaterialized(ID, C);
 }
 
@@ -6384,8 +6325,7 @@ void Analyzer::commit() {
     DenseMap<jeandle::ObjectID, SmallDenseSet<jeandle::ObjectID>> DeoptRefDeps;
     for (const auto &Kv : Result.BlockEffects)
       for (const auto &E : Kv.second)
-        if (const auto *RE =
-                dyn_cast<jeandle::RewriteDeoptBundleEffect>(&E))
+        if (const auto *RE = dyn_cast<jeandle::RewriteDeoptBundleEffect>(&E))
           for (const auto &FE : RE->Fields)
             if (FE.Value.isVirtualRef())
               DeoptRefDeps[FE.Value.getVirtualRef()].insert(RE->ObjID);
@@ -6584,8 +6524,9 @@ void Analyzer::processStateBeforeLoopOnOverflow(Loop *L) {
   BasicBlock *PH = L->getLoopPreheader();
   if (!PH)
     return;
-  assert(!isa<InvokeInst>(PH->getTerminator()) &&
-         "loop preheader has exactly one successor; cannot terminate in invoke");
+  assert(
+      !isa<InvokeInst>(PH->getTerminator()) &&
+      "loop preheader has exactly one successor; cannot terminate in invoke");
   auto It = BlockExits.find(PH);
   if (It == BlockExits.end())
     return;
@@ -6616,8 +6557,9 @@ void Analyzer::materializePreheaderVirtualsForUnvisitedLoops() {
       // none exists, so the only sound action here is to skip.
       continue;
     }
-    assert(!isa<InvokeInst>(PH->getTerminator()) &&
-           "loop preheader has exactly one successor; cannot terminate in invoke");
+    assert(
+        !isa<InvokeInst>(PH->getTerminator()) &&
+        "loop preheader has exactly one successor; cannot terminate in invoke");
     // Strict gate on VisitedLoops. Every loop processLoop touched —
     // whether the body fixpoint converged, fell into the pessimistic
     // MATERIALIZE_ALL fallback, or hit the overflow-recovery retry path
@@ -6649,10 +6591,11 @@ void Analyzer::materializePreheaderVirtualsForUnvisitedLoops() {
 
 // Like materializeAt, but operates against a pred's BlockExitInfo snapshot
 // rather than the analyzer's current per-block state (which has moved on by
-// the time materializePreheaderVirtualsForUnvisitedLoops runs). The function-wide MaterializedAtPred
-// map dedups (and breaks cycles between) recursive nested-virtual
-// materializations within a single PH and across multiple call sites
-// (e.g. a mixed-state merge and a loop-preheader sweep at the same PH).
+// the time materializePreheaderVirtualsForUnvisitedLoops runs). The
+// function-wide MaterializedAtPred map dedups (and breaks cycles between)
+// recursive nested-virtual materializations within a single PH and across
+// multiple call sites (e.g. a mixed-state merge and a loop-preheader sweep at
+// the same PH).
 //
 // TargetMerge is the merge block this materialize is destined for (the
 // MergeProcessor::BB in scope), or null for a true block-end drain. It keys
@@ -6669,9 +6612,11 @@ void Analyzer::materializePreheaderVirtualsForUnvisitedLoops() {
 //  - Block-end drain (EdgeLocal=false): replay intentionally applies to every
 //    successor and the shared ExitInfo is flipped. Loop-preheader drains use
 //    this form to prevent virtual state crossing an unsupported loop boundary.
-void Analyzer::materializeAtPredFromExitInfo(
-    jeandle::ObjectID ID, BasicBlock *PH, BlockExitData &ExitInfo,
-    bool EdgeLocal, MatReason Reason, BasicBlock *TargetMerge) {
+void Analyzer::materializeAtPredFromExitInfo(jeandle::ObjectID ID,
+                                             BasicBlock *PH,
+                                             BlockExitData &ExitInfo,
+                                             bool EdgeLocal, MatReason Reason,
+                                             BasicBlock *TargetMerge) {
   // A per-predecessor materialization is an incoming-edge effect.  Most LLVM
   // terminators can be split by SplitBlockPredecessors, including invoke
   // unwind edges into landingpads.  IndirectBr and EH pads that explicitly
@@ -6688,8 +6633,7 @@ void Analyzer::materializeAtPredFromExitInfo(
     }
     if (!ReachesTarget ||
         (DistinctSuccessors.size() > 1 &&
-         (isa<IndirectBrInst>(Term) ||
-          !TargetMerge->canSplitPredecessors()))) {
+         (isa<IndirectBrInst>(Term) || !TargetMerge->canSplitPredecessors()))) {
       markIneligible(ID);
       return;
     }
@@ -6735,29 +6679,13 @@ void Analyzer::materializeAtPredFromExitInfo(
   };
 
   auto Recurse = [&](jeandle::ObjectID Oid, MatReason R) {
-    materializeAtPredFromExitInfo(Oid, PH, ExitInfo, EdgeLocal, R,
-                                  TargetMerge);
+    materializeAtPredFromExitInfo(Oid, PH, ExitInfo, EdgeLocal, R, TargetMerge);
   };
   auto CaptureLocksIntoEffect = [](ArrayRef<LockEnter> Stack, jeandle::ObjectID,
                                    jeandle::MaterializeEffect &E) {
     captureMaterializedLocks(Stack, E);
   };
   auto DropInnerAliasesNop = [](jeandle::ObjectID) {};
-  // Field-replay value: OrigAlloc, identical to the live path. Graal uses a
-  // distinct AllocatedObjectNode per predecessor as the field value
-  // (Graal PartialEscapeBlockState); LLVM's analysis/transform split forbids
-  // creating the concrete node during analysis, so the transform reuses
-  // OrigAlloc directly as the field-store replay value; OrigAlloc dominates
-  // every escape point by PEA's invariant (see applyMaterialize, which
-  // asserts the materialized value equals VObj.AllocationCall).
-  // reuse-OrigAlloc deliberately DROPPED Graal's per-pred distinctness —
-  // under reuse-OrigAlloc the per-pred materialize's value is OrigAlloc on
-  // every edge, and no materialized-object merge PHI is emitted. The
-  // per-pred SourceEffect identity (MaterializedAtPred[PH][TargetMerge])
-  // still keys the lock cascade.
-  auto MaterializedValue = [&](jeandle::ObjectID Oid) {
-    return Result.VirtualObjects[Oid]->AllocationCall;
-  };
   // NOTE: every callback is a named local (not a temporary) so each outlives C
   // — function_ref does not own its callable; a temporary would dangle after
   // the `C{...};` statement (see the matching note in materializeAt).
@@ -6778,8 +6706,7 @@ void Analyzer::materializeAtPredFromExitInfo(
                        CaptureLocksIntoEffect,
                        DropInnerAliasesNop,
                        ComputeSafeIP,
-                       FlipState,
-                       MaterializedValue};
+                       FlipState};
   ensureMaterialized(ID, C);
   // A block-end drain (!EdgeLocal) whose insertion point is a block-ending
   // invoke runs every replay side effect — field stores, lock re-emit, and
@@ -6829,9 +6756,9 @@ void Analyzer::materializeAtPredFromExitInfo(
 // virtuals on entry. A nested processLoop (depth>1) that observes overflow
 // does NOT recover locally — it returns so the outermost (depth==1) loop owns
 // the rollback + redo (Graal re-throws the overflow to depth==1,
-// Graal EffectsClosure). TooManyIterationsSeen is LOCAL per processLoop; a second
-// failure hard-bails (Graal throws GraalError, Graal EffectsClosure — Jeandle falls
-// back soundly by marking still-virtual VOs ineligible).
+// Graal EffectsClosure). TooManyIterationsSeen is LOCAL per processLoop; a
+// second failure hard-bails (Graal throws GraalError, Graal EffectsClosure —
+// Jeandle falls back soundly by marking still-virtual VOs ineligible).
 
 // Equality on BlockExitData (the per-object base data). Two payloads are
 // equivalent iff every per-object dimension (still-virtual set, materialized
@@ -7103,10 +7030,9 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
     //
     // "Materialize at every forward predecessor" is not implementable in our
     // effects model: each Materialize records OrigAlloc (reused) as its
-    // materialized value in NewInvOf; the materialized-object merge PHI
-    // that would have combined multiple per-pred values is SKIPPED at apply -
-    // OrigAlloc is the single dominating def on every edge (the existing
-    // Case-A pattern works only because an explicit PHI already exists).
+    // materialized value in MaterializedAllocOf. OrigAlloc is the single
+    // dominating def on every edge (the existing Case-A pattern works only
+    // because an explicit PHI already exists).
     //
     // Sound fallback: mark every VO still virtual at any forward predecessor
     // INELIGIBLE. commit() drops its effects and the original IR survives
@@ -7165,9 +7091,9 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
 
     // OverflowFlag is deliberately NOT cleared here: if processLoopBodyOnePass
     // latched it (a nested loop overflowed), it propagates conservatively up so
-    // any enclosing loop context also bails. Every loop entry polls it (depth==1
-    // clears it, a nested entry short-circuits on it), so a stale flag can only
-    // make us more conservative, never unsound.
+    // any enclosing loop context also bails. Every loop entry polls it
+    // (depth==1 clears it, a nested entry short-circuits on it), so a stale
+    // flag can only make us more conservative, never unsound.
     return;
   }
 
@@ -7235,10 +7161,10 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
   // Single-state B fixpoint context (Graal lastMergedState) as
   // LOCALS — each processLoop call is its own C++ stack frame, so nesting is
   // isolated without a shared member (the outer's locals are untouched while a
-  // recursive processLoop(inner) runs). B := A (Graal EffectsClosure): Jeandle has no
-  // PEA-level killed-location strip (PEReadEliminationClosure machinery), so
-  // the entry state is just the preheader's exit data, populated by the outer
-  // RPO walk before processLoop is dispatched.
+  // recursive processLoop(inner) runs). B := A (Graal EffectsClosure): Jeandle
+  // has no PEA-level killed-location strip (PEReadEliminationClosure
+  // machinery), so the entry state is just the preheader's exit data, populated
+  // by the outer RPO walk before processLoop is dispatched.
   BlockExitData LastMergedState =
       static_cast<const BlockExitData &>(BlockExits[Preheader]);
   BlockExitData NewMergedState; // B' each pass (post-body header merge result)
@@ -7305,8 +7231,9 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
         snapshotExitStateInto(NewMergedState); // B'
         PendingMergePhis[Header].clear();
       }
-      // B' vs B (Graal's loop fixpoint equivalentTo). No iteration gate: with the post-body
-      // merge, iteration 0 already has a true B' to compare against B := A.
+      // B' vs B (Graal's loop fixpoint equivalentTo). No iteration gate: with
+      // the post-body merge, iteration 0 already has a true B' to compare
+      // against B := A.
       if (exitDataEquivalent(LastMergedState, NewMergedState)) {
         Converged = true;
         LLVM_DEBUG(dbgs() << "PEA: loop @ " << Header->getName()

@@ -2,12 +2,12 @@
 
 ; A never-escaping VO with TOUCHED long/double fields is still described
 ; by a ScalarValueType descriptor in the deopt bundle. The emit carries ONE
-; wire entry per touched field regardless of width:
+; typed wire pair per touched field regardless of width:
 ;   int    field: enc(offset, LocalType, T_INT)    + i32 value   (1 slot)
 ;   long   field: enc(offset, LocalType, T_LONG)   + i64 value   (parse expands to 2 field_values slots)
 ;   double field: enc(offset, LocalType, T_DOUBLE) + f64 value   (parse expands to 2 field_values slots)
 ; The HotSpot parser's fill_one_scope_value T_LONG/T_DOUBLE branch produces
-; the two field_values entries (ConstantIntValue(0) hi placeholder +
+; the two ScopeValue slots (ConstantIntValue(0) hi placeholder +
 ; ConstantLongValue/ConstantDoubleValue lo) that reassign_fields_by_klass
 ; consumes (it reads two slots per T_LONG/T_DOUBLE layout field and uses the
 ; lo slot's full 64-bit intptr_t on LP64). This test pins the wire side; the
@@ -63,8 +63,8 @@ u:
 ; field 0 (offset 8, LocalType/T_INT): (8<<32)|10 = 34359738378 -> value %x
 ; CHECK-SAME: i64 34359738378, i32 %x,
 ; field 1 (offset 16, LocalType/T_LONG): (16<<32)|11 = 68719476747 -> value %y
-; (ONE wire entry carries the full i64; the parse side expands it to two
-; field_values slots.)
+; (One typed wire pair carries the full i64; the parse side expands it to two
+; ScopeValue slots.)
 ; CHECK-SAME: i64 68719476747, i64 %y,
 ; field 2 (offset 24, LocalType/T_DOUBLE): (24<<32)|7 = 103079215111 -> value %z
 ; CHECK-SAME: i64 103079215111, double %z,

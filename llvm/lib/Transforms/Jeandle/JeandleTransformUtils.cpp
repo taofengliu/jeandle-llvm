@@ -56,8 +56,8 @@ DeoptScopeInfo findCurrentDeoptScope(const CallBase &CB) {
   std::optional<unsigned> Start =
       jeandle::pea::findInnermostDeoptScopeBCIPairStart(CB);
   if (!Start)
-    reportInvalidDeoptBundle(CB,
-                             "missing or mismatched adjacent i32 deopt bci pair");
+    reportInvalidDeoptBundle(
+        CB, "missing or mismatched adjacent i32 deopt bci pair");
   return {*Start, 0};
 }
 
@@ -215,7 +215,9 @@ void appendVirtualObjectDescriptor(SmallVectorImpl<Value *> &Args,
   // Single emit chokepoint for PEA deopt VO descriptors. See the contract on
   // DeoptValueEncoding::ScalarValueType (include/llvm/IR/Jeandle/
   // Deoptimization.h) and appendVirtualObjectDescriptor in the header. The
-  // parser consumes (3 + 2*field_count) locations for one descriptor.
+  // parser consumes (3 + 2*field_count) wire locations for one descriptor.
+  // Each field or array element is one typed wire pair. For T_LONG/T_DOUBLE,
+  // HotSpot expands that pair to two ScopeValue slots.
   LLVMContext &Ctx = B.getContext();
 
   // [header] DeoptValueEncoding(VObjID, ScalarValueType, T_ARRAY|T_OBJECT).
@@ -224,10 +226,10 @@ void appendVirtualObjectDescriptor(SmallVectorImpl<Value *> &Args,
   // instance (T_OBJECT, fields matched to an InstanceKlass layout walk).
   jeandle::HotspotBasicType HeaderBT =
       IsArray ? jeandle::T_ARRAY : jeandle::T_OBJECT;
-  uint64_t Header = jeandle::DeoptValueEncoding(
-                        VObjID, jeandle::DeoptValueEncoding::ScalarValueType,
-                        HeaderBT)
-                        .encode();
+  uint64_t Header =
+      jeandle::DeoptValueEncoding(
+          VObjID, jeandle::DeoptValueEncoding::ScalarValueType, HeaderBT)
+          .encode();
   Args.push_back(ConstantInt::get(Type::getInt64Ty(Ctx), Header));
 
   // [klass] raw InstanceKlass / ArrayKlass identity

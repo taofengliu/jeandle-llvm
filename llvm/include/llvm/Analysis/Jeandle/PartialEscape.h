@@ -89,7 +89,7 @@ struct MonitorIdRef {
 // DELETES the original enter from IR — the transform cannot depend on
 // the original call's lifetime. Callee is the jeandle.monitorenter_*
 // function; NonReceiverArgs are operands 1..N (e.g. the BasicLock); the
-// receiver (operand 0) is the freshly materialized pointer by construction.
+// receiver (operand 0) is the reused OrigAlloc pointer.
 // BytecodeDepth is the ascending re-emit sort key (Graal getLockDepth).
 struct MaterializedLock {
   Function *Callee = nullptr;
@@ -104,9 +104,9 @@ struct MaterializedLock {
 // analog of Graal's `allocations[commit.getObjectIndex(monitorId)]`) —
 // strictly more precise than an OrigAlloc key, which would be last-write-wins
 // across per-pred materializations of the same object. The transform resolves
-// the receiver via the single map `NewInvOf[SourceEffect]` (set once per
-// effect to OrigAlloc in applyMaterialize, read by the lock-cascade re-emit
-// path); reuse-OrigAlloc materialization never spawns a per-pred invoke, so
+// the receiver via `MaterializedAllocOf[SourceEffect]` (set once per effect to
+// OrigAlloc in applyMaterialize, read by the lock-cascade re-emit path);
+// reuse-OrigAlloc materialization never spawns a per-pred invoke, so
 // the per-effect key disambiguates cascade members without any fallback chain.
 // See PEAResult::LockReplayBatches.
 class MaterializeEffect;
@@ -661,7 +661,7 @@ public:
 // every escape point — reuse-OrigAlloc materialization does NOT emit a fresh
 // allocation invoke. OrigAlloc is the materialized value itself (see
 // applyMaterialize: `MatVal = cast<CallBase>(OrigAlloc)`, recorded in
-// `NewInvOf[&E]`). Non-cfgKill (Pass 1).
+// `MaterializedAllocOf[&E]`). Non-cfgKill (Pass 1).
 // Graal analog: the one `Effect("materializeBefore")` appended by
 // PartialEscapeBlockState.materializeBefore.
 class MaterializeEffect : public Effect {
@@ -705,10 +705,9 @@ public:
   // moves every replay operation to that edge before building batches. Null
   // for live-path materializations and true block-end drains.
   BasicBlock *ReplayTarget = nullptr;
-  // Under reuse-OrigAlloc, incoming-edge materialization reuses OrigAlloc as
-  // the value and emits no materialized-object merge PHI. Field and lock replay
-  // retain edge provenance, and per-pred receiver identity survives via the
-  // per-effect NewInvOf[SourceEffect] lookup.
+  // Incoming-edge replay reuses OrigAlloc as the materialized value. Field and
+  // lock replay retain edge provenance, and per-pred receiver identity
+  // survives via MaterializedAllocOf[SourceEffect].
 
   Kind getKind() const override { return Kind::Materialize; }
   static bool classof(const Effect *E) {
@@ -735,11 +734,9 @@ public:
 // incomings. Non-cfgKill (Pass 1). Graal analog: addFloatingNode + setPhiInput
 // (initializePhiInput).
 //
-// All CreatePHIEffects are field-value PHIs (merging a per-offset field VALUE
-// across preds / around a loop, emitted by mergeFieldStates and
-// synthesizeCaseC). The former "materialized-object merge PHI" variant
-// (RAUWOrigToPHI) was a no-op at apply time under reuse-OrigAlloc — OrigAlloc
-// is the single SSA value on every path — and has been removed.
+// CreatePHIEffects are field-value PHIs that merge a per-offset field value
+// across predecessors or around a loop. They are emitted by mergeFieldStates
+// and synthesizeCaseC.
 class CreatePHIEffect : public Effect {
 public:
   Type *PHIType = nullptr;
@@ -968,7 +965,7 @@ public:
   // from the highest-SeqNo MaterializeEffect among those SHARING the SAME
   // edge-normalized, pre-Pass1 InsertBefore pointer (the locked re-emit loop
   // in applyMaterialize, gated on E.SeqNo == Batch.EmitterSeqNo). Each lock's
-  // receiver is resolved via the single map NewInvOf[ML.SourceEffect], asserted
+  // receiver is resolved via MaterializedAllocOf[ML.SourceEffect], asserted
   // non-empty — NO fallback chain.
   //
   // GROUPING RULE: the transform first normalizes each multi-successor

@@ -34,7 +34,8 @@
 // When several objects escape at one escape point, their interleaved locks on
 // the runtime lock stack MUST be re-emitted as ONE globally depth-sorted list
 // (computeEscapePointLocks), emitted once by the highest-SeqNo materialize at
-// that point, each receiver resolved to the sibling's OrigAlloc via NewInvOf.
+// that point, each receiver resolved to the sibling's original/materialized
+// allocation via MaterializedAllocOf.
 // Per-object lock emission would mis-order re-entrant interleaved lock stacks.
 //
 // After both passes: ConstantFoldTerminator, a trivial-PHI fold, a dead-code
@@ -45,8 +46,8 @@
 #include "llvm/Transforms/Jeandle/PartialEscapeTransform.h"
 
 #include "llvm/ADT/PostOrderIterator.h"
-#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/Jeandle/PartialEscape.h"
 #include "llvm/Analysis/Jeandle/PartialEscapeAnalysis.h"
@@ -111,7 +112,7 @@ static bool splitReplayEdges(jeandle::PEAResult &Result) {
             Candidate.Target == ME->ReplayTarget) {
           Plan = &Candidate;
           break;
-      }
+        }
       if (!Plan) {
         Instruction *Term = ME->ReplaySource->getTerminator();
         unsigned SuccessorIndex = Term->getNumSuccessors();
@@ -122,8 +123,11 @@ static bool splitReplayEdges(jeandle::PEAResult &Result) {
           }
         assert(SuccessorIndex != Term->getNumSuccessors() &&
                "replay source must reach its recorded target");
-        Plans.push_back({ME->ReplaySource, ME->ReplayTarget, SuccessorIndex,
-                         ME->SeqNo, {}});
+        Plans.push_back({ME->ReplaySource,
+                         ME->ReplayTarget,
+                         SuccessorIndex,
+                         ME->SeqNo,
+                         {}});
         Plan = &Plans.back();
       }
       Plan->MinSeqNo = std::min(Plan->MinSeqNo, ME->SeqNo);
@@ -156,11 +160,10 @@ static bool splitReplayEdges(jeandle::PEAResult &Result) {
         if (PE && LandingPadTargets.count(PE->Block))
           DeferredPhis.push_back(PE);
       }
-    llvm::sort(DeferredPhis,
-               [](const jeandle::CreatePHIEffect *A,
-                  const jeandle::CreatePHIEffect *B) {
-                 return A->SeqNo < B->SeqNo;
-               });
+    llvm::sort(DeferredPhis, [](const jeandle::CreatePHIEffect *A,
+                                const jeandle::CreatePHIEffect *B) {
+      return A->SeqNo < B->SeqNo;
+    });
     for (jeandle::CreatePHIEffect *PE : DeferredPhis) {
       PHINode *Phi = PE->PhiInst;
       assert(Phi && !Phi->getParent() &&
@@ -168,8 +171,7 @@ static bool splitReplayEdges(jeandle::PEAResult &Result) {
       Phi->insertBefore(PE->Block->getFirstNonPHIIt());
       assert(PE->PHIIncomingValues.size() == PE->PHIIncomingBlocks.size());
       for (unsigned I = 0; I < PE->PHIIncomingValues.size(); ++I)
-        Phi->addIncoming(PE->PHIIncomingValues[I],
-                         PE->PHIIncomingBlocks[I]);
+        Phi->addIncoming(PE->PHIIncomingValues[I], PE->PHIIncomingBlocks[I]);
     }
   }
 
@@ -193,8 +195,8 @@ static bool splitReplayEdges(jeandle::PEAResult &Result) {
     assert(!isa<IndirectBrInst>(Plan.Source->getTerminator()) &&
            CurrentTarget->canSplitPredecessors() &&
            "analysis must keep unsplittable replay edges real");
-    BasicBlock *Edge = SplitBlockPredecessors(
-        CurrentTarget, {Plan.Source}, ".pea.replay");
+    BasicBlock *Edge =
+        SplitBlockPredecessors(CurrentTarget, {Plan.Source}, ".pea.replay");
     assert(Edge && Edge->getTerminator() &&
            "splittable replay edge must produce an insertion block");
 
@@ -402,9 +404,10 @@ static bool matchExistingReplaySuffix(
     // non-tail call, and identical operands sitting in the contiguous replay
     // suffix before the escape point. The emitter adds no call-site attributes
     // or metadata, so any present on the candidate were added by other passes
-    // (e.g. InstCombine strengthening operands between outer iterations) and are
-    // intentionally ignored — matching on them would reject PEA's own replay
-    // after such a strengthening and force a delete/rebuild churn every round.
+    // (e.g. InstCombine strengthening operands between outer iterations) and
+    // are intentionally ignored — matching on them would reject PEA's own
+    // replay after such a strengthening and force a delete/rebuild churn every
+    // round.
     auto *Call = dyn_cast_or_null<CallInst>(Cursor);
     if (!Call || Call->getCalledFunction() != Op.LockCallee ||
         Call->getCallingConv() != CallingConv::Hotspot_JIT ||
@@ -524,7 +527,8 @@ static bool eraseAllocation(Instruction *Target) {
     BasicBlock *Normal = II->getNormalDest();
     BasicBlock *Unwind = II->getUnwindDest();
     BasicBlock *Parent = II->getParent();
-    assert(Normal != Unwind && "PEA drops an allocation invoke's unwind edge; "
+    assert(Normal != Unwind &&
+           "PEA drops an allocation invoke's unwind edge; "
            "normal and unwind dests must differ (a Jeandle allocation's unwind "
            "is an OOM handler distinct from its normal successor)");
 
@@ -650,12 +654,12 @@ static void spliceUnparentedAt(Instruction *IP, Value *V) {
       I->insertBefore(IP->getIterator());
 }
 
-static bool applyMaterialize(
-    Function &F, const jeandle::PEAResult &Result,
-    const jeandle::MaterializeEffect &E,
-    DenseMap<const jeandle::MaterializeEffect *, CallBase *> &NewInvOf,
-    const DenseMap<const jeandle::MaterializeEffect *, Instruction *>
-        &OrigInsertBefore) {
+static bool applyMaterialize(Function &F, const jeandle::PEAResult &Result,
+                             const jeandle::MaterializeEffect &E,
+                             DenseMap<const jeandle::MaterializeEffect *,
+                                      CallBase *> &MaterializedAllocOf,
+                             const DenseMap<const jeandle::MaterializeEffect *,
+                                            Instruction *> &OrigInsertBefore) {
   assert(E.ObjID != jeandle::InvalidObjectID);
   assert(E.Target && "Materialize effect must carry the original allocation");
 
@@ -676,7 +680,7 @@ static bool applyMaterialize(
   // own self-loop header (an invoke's normal dest is always a distinct block)
   // — so cast to CallBase, not InvokeInst.
   CallBase *MatVal = cast<CallBase>(OrigAlloc);
-  NewInvOf[&E] = MatVal;
+  MaterializedAllocOf[&E] = MatVal;
 
   Instruction *InsertBefore = dyn_cast_or_null<Instruction>(E.InsertBefore);
   assert(InsertBefore &&
@@ -694,9 +698,10 @@ static bool applyMaterialize(
   // store or re-emitted at least one lock). MaterializeEffect::apply gates
   // Ctx.Changed on this so an all-idle round (PartiallyEscapes VO with no
   // field stores and no surviving locks) does not needlessly keep the
-  // iterative driver from converging. NewInvOf population below is not an IR
-  // mutation, and spliceUnparentedAt runs only inside the store loop (gated
-  // by a store), so store/lock creation is the complete set of mutations.
+  // iterative driver from converging. MaterializedAllocOf population above is
+  // not an IR mutation, and spliceUnparentedAt runs only inside the store loop
+  // (gated by a store), so store/lock creation is the complete set of
+  // mutations.
   bool Emitted = false;
 
   // Replay this object's tracked field stores onto OrigAlloc, immediately
@@ -789,16 +794,16 @@ static bool applyMaterialize(
              "BytecodeDepth (Graal lastDepth < getLockDepth guarantee)");
       First = false;
       LastDepth = ML.BytecodeDepth;
-      auto NIt = NewInvOf.find(ML.SourceEffect);
-      assert(NIt != NewInvOf.end() &&
+      auto NIt = MaterializedAllocOf.find(ML.SourceEffect);
+      assert(NIt != MaterializedAllocOf.end() &&
              "every sibling's OrigAlloc must be recorded before the tail "
              "emits locks");
       Emitted |= EmitLock(NIt->second, ML.Callee, ML.NonReceiverArgs);
     }
   }
 
-  // Only NewInvOf (set above) is needed: it is consumed by the lock re-emit's
-  // per-object receiver resolution at multi-object escape points.
+  // MaterializedAllocOf is consumed by the lock re-emit's per-object receiver
+  // resolution at multi-object escape points.
   return Emitted;
 }
 
@@ -817,7 +822,7 @@ struct jeandle::TransformContext {
   // effect -> OrigAlloc (CallBase) it materializes onto. Filled incrementally
   // as each Materialize applies; consumed by the tail effect at a multi-object
   // escape point to resolve each MergedLock's receiver.
-  DenseMap<const jeandle::MaterializeEffect *, CallBase *> &NewInvOf;
+  DenseMap<const jeandle::MaterializeEffect *, CallBase *> &MaterializedAllocOf;
 
   // Reverse index: live InsertBefore -> Materialize effects keyed on it.
   DenseMap<Instruction *, SmallVector<jeandle::MaterializeEffect *, 4>>
@@ -934,7 +939,7 @@ void jeandle::ReplaceCallEffect::apply(jeandle::TransformContext &Ctx) {
     BasicBlock *Unwind = II->getUnwindDest();
     BasicBlock *Parent = II->getParent();
     assert(Normal != Unwind && "PEA drops a folded JavaOp invoke's unwind "
-           "edge; normal and unwind dests must differ");
+                               "edge; normal and unwind dests must differ");
     Unwind->removePredecessor(Parent, /*KeepOneInputPHIs=*/true);
     BranchInst::Create(Normal, Parent);
     // Eager-update: re-aim any Materialize keyed on `II` to the freshly-created
@@ -1004,10 +1009,10 @@ void jeandle::MaterializeEffect::apply(jeandle::TransformContext &Ctx) {
   // it Changed would needlessly prevent the iterative driver from converging.
   if (Ctx.ReusedMaterializations.count(this)) {
     auto *OrigAlloc = cast<CallBase>((Value *)Target);
-    Ctx.NewInvOf[this] = OrigAlloc;
+    Ctx.MaterializedAllocOf[this] = OrigAlloc;
     return;
   }
-  if (applyMaterialize(Ctx.F, Ctx.Result, *this, Ctx.NewInvOf,
+  if (applyMaterialize(Ctx.F, Ctx.Result, *this, Ctx.MaterializedAllocOf,
                        Ctx.OrigInsertBefore))
     Ctx.Changed = true;
 }
@@ -1020,13 +1025,6 @@ void jeandle::CreatePHIEffect::apply(jeandle::TransformContext &Ctx) {
   // recorded (PHIIncomingValues[I], PHIIncomingBlocks[I]) are valid as-is:
   // each incoming is a dominating field value, and a materialized-ref
   // incoming is the peer VO's OrigAlloc, which is kept alive.
-  //
-  // (The former "materialized-object merge PHI" variant — RAUWOrigToPHI ==
-  // true, emitted by materializeAndBuildPhi — was a no-op at apply time
-  // under reuse-OrigAlloc: OrigAlloc is the single SSA value on every path,
-  // so every incoming would have been OrigAlloc and the PHI would have
-  // trivially folded. The emission site and the RAUWOrigToPHI field have
-  // been removed; only this live field-value-PHI path remains.)
   PHINode *Phi = PhiInst;
   assert(Phi && "CreatePHI effect requires a PhiInst");
   if (Phi->getParent()) {
@@ -1117,8 +1115,7 @@ void jeandle::RewriteDeoptBundleEffect::apply(jeandle::TransformContext &Ctx) {
                "deopt descriptor field value must be a constant, argument, "
                "or in-IR instruction");
       }
-      FieldPairs.push_back(
-          {FE.Offset, BT, /*IsVORef=*/false, FieldV, 0});
+      FieldPairs.push_back({FE.Offset, BT, /*IsVORef=*/false, FieldV, 0});
     }
   }
 
@@ -1298,7 +1295,7 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
   // effect -> OrigAlloc (the CallBase each Materialize replays onto). Filled
   // incrementally as each Materialize applies; consumed by the tail effect at
   // a multi-object escape point to resolve each MergedLock's receiver.
-  DenseMap<const jeandle::MaterializeEffect *, CallBase *> NewInvOf;
+  DenseMap<const jeandle::MaterializeEffect *, CallBase *> MaterializedAllocOf;
 
   // Normalize incoming-edge materializations before RPO and before replay
   // batches capture their physical insertion sites.  SplitBlockPredecessors
@@ -1368,7 +1365,7 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
   jeandle::TransformContext Ctx{F,
                                 Result,
                                 Changed,
-                                NewInvOf,
+                                MaterializedAllocOf,
                                 InsertBeforeDependents,
                                 OrigInsertBefore,
                                 PreservedReplayInstructions,
@@ -1428,14 +1425,14 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
 
   // Fold trivial PHIs. No materialized-object PHI is created (OrigAlloc is the
   // single value), but field-value PHIs created by CreatePHIEffect can still
-  // collapse to a single value when every incoming agrees (e.g. a loop field-PHI
-  // whose only back-edge incoming is the same value as the preheader incoming),
-  // and nested loops can leave dead PHI cycles. PHINode::hasConstantValue
-  // collapses both phi(X,X) and phi(self, X) to X; iterate to fixpoint so a
-  // fold that makes an enclosing phi trivial is caught. The trivially-dead
-  // sweep below cannot break a PHI cycle (each phi is "used" by the next), so
-  // this runs first. (Mirrors downstream GVN/InstCombine; doing it here keeps
-  // PEA output clean.)
+  // collapse to a single value when every incoming agrees (e.g. a loop
+  // field-PHI whose only back-edge incoming is the same value as the preheader
+  // incoming), and nested loops can leave dead PHI cycles.
+  // PHINode::hasConstantValue collapses both phi(X,X) and phi(self, X) to X;
+  // iterate to fixpoint so a fold that makes an enclosing phi trivial is
+  // caught. The trivially-dead sweep below cannot break a PHI cycle (each phi
+  // is "used" by the next), so this runs first. (Mirrors downstream
+  // GVN/InstCombine; doing it here keeps PEA output clean.)
   bool FoldedPhi = true;
   while (FoldedPhi) {
     FoldedPhi = false;
