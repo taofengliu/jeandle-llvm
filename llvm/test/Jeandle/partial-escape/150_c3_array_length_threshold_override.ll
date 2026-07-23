@@ -3,7 +3,7 @@
 
 ; PEA: the MaximumEscapeAnalysisArrayLength cap is exposed as the
 ; -jeandle-pea-max-array-length cl::opt. An array of length 9 is below
-; the default cap of 32, so the allocation virtualizes and a follow-up
+; the default cap of 128, so the allocation virtualizes and a follow-up
 ; jeandle.arraylength folds to a constant. With -jeandle-pea-max-array-length=8
 ; the same array exceeds the cap, processAllocation refuses to register a
 ; virtual, and both the allocation and the array_length call survive.
@@ -26,7 +26,7 @@ u:
   resume i64 %lp
 }
 
-; Default cap (32): length-9 array virtualizes, allocation & array_length fold away.
+; Default cap (128): length-9 array virtualizes, allocation & array_length fold away.
 ; DEFAULT-LABEL: define i32 @test_len9
 ; DEFAULT-NOT: jeandle.new_array
 ; DEFAULT-NOT: jeandle.arraylength
