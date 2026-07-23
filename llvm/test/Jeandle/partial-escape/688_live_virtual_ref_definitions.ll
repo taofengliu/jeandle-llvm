@@ -447,4 +447,67 @@ alloc.unwind:
 ; CHECK-NEXT: %lp = landingpad i64
 ; CHECK-NEXT: cleanup
 
+; Once a root becomes ineligible, later stores target the real original
+; allocation.  They must not receive new elimination effects.
+define void @store_after_ineligible_root() gc "hotspotgc"
+    personality ptr @__gxx_personality_v0 {
+entry:
+  %outer = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68895 to ptr), i32 24)
+      to label %body unwind label %unwind
+body:
+  %is.vb = call hotspotcc i1 @jeandle.check_if_value_based(
+      ptr addrspace(1) %outer)
+  call void @use_bool(i1 %is.vb)
+  %slot = getelementptr inbounds i8, ptr addrspace(1) %outer, i64 16
+  store atomic i32 42, ptr addrspace(1) %slot unordered, align 4
+  call void @sink_owner(ptr addrspace(1) %outer)
+  ret void
+unwind:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
+; CHECK-LABEL: define void @store_after_ineligible_root(
+; CHECK-COUNT-1: inttoptr (i64 68895 to ptr)
+; CHECK: call hotspotcc i1 @jeandle.check_if_value_based
+; CHECK: store atomic i32 42
+; CHECK-NEXT: call void @sink_owner(ptr addrspace(1) %outer)
+
+; The store path is visited before the sibling path makes the root ineligible.
+; At the merge, the real sink must still observe that branch-local store.
+define void @branch_store_other_branch_bails(i1 %bail) gc "hotspotgc"
+    personality ptr @__gxx_personality_v0 {
+entry:
+  %outer = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68896 to ptr), i32 24)
+      to label %choose unwind label %unwind
+choose:
+  %slot = getelementptr inbounds i8, ptr addrspace(1) %outer, i64 16
+  br i1 %bail, label %bail.path, label %store.path
+store.path:
+  store atomic i32 77, ptr addrspace(1) %slot unordered, align 4
+  br label %merge
+bail.path:
+  %is.vb = call hotspotcc i1 @jeandle.check_if_value_based(
+      ptr addrspace(1) %outer)
+  call void @use_bool(i1 %is.vb)
+  br label %merge
+merge:
+  call void @sink_owner(ptr addrspace(1) %outer)
+  ret void
+unwind:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
+; CHECK-LABEL: define void @branch_store_other_branch_bails(
+; CHECK-COUNT-1: inttoptr (i64 68896 to ptr)
+; CHECK: store.path:
+; CHECK-NEXT: store atomic i32 77
+; CHECK: bail.path:
+; CHECK: call hotspotcc i1 @jeandle.check_if_value_based
+; CHECK: merge:
+; CHECK-NEXT: call void @sink_owner(ptr addrspace(1) %outer)
+
 !java-method-compilation = !{}

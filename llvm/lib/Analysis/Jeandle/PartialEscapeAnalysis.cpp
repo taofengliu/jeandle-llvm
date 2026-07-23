@@ -884,6 +884,7 @@ private:
     jeandle::EffectList MergeEffects;
 
     void intersectVirtualObjects();
+    void mergeIneligibleFieldDefinitions();
     bool mergeObjectState(jeandle::ObjectID ID);
     bool mergeFieldStates(jeandle::ObjectID ID);
     bool materializePredsAndMerge(jeandle::ObjectID ID);
@@ -1672,9 +1673,14 @@ void Analyzer::inheritFromExit(const BlockExitData &Exit) {
     FieldStates[Kv.first] = Kv.second;
   }
   for (auto &Kv : Exit.FieldDefinitions) {
-    if (!Eligible.lookup(Kv.first))
-      continue;
     FieldDefinitions[Kv.first] = Kv.second;
+    // An ineligible object is real in the final IR, but reaching definitions
+    // of stores provisionally eliminated before the bail still need to flow to
+    // later consumers. Keep a virtual marker only for ObjectID resolution; all
+    // folds and store elimination remain gated by Eligible.
+    if (!Eligible.lookup(Kv.first) && !Kv.second.empty() &&
+        !CurrentState.hasObjectState(Kv.first))
+      CurrentState.addObject(Kv.first, jeandle::ObjectState());
   }
   for (auto &Kv : Exit.LockCounts) {
     if (!Eligible.lookup(Kv.first))
@@ -2022,6 +2028,8 @@ void Analyzer::MergeProcessor::run() {
       }
     }
 
+    mergeIneligibleFieldDefinitions();
+
     for (jeandle::ObjectID ID : IDs) {
       if (!Eligible.lookup(ID))
         continue;
@@ -2074,6 +2082,30 @@ void Analyzer::MergeProcessor::intersectVirtualObjects() {
   }
   IDs.assign(Intersect.begin(), Intersect.end());
   llvm::sort(IDs); // deterministic order for ineligibility/marking effects.
+}
+
+void Analyzer::MergeProcessor::mergeIneligibleFieldDefinitions() {
+  SmallDenseSet<jeandle::ObjectID, 8> IDsWithDefinitions;
+  for (const BlockExitData *P : Preds) {
+    for (const auto &IDKV : P->FieldDefinitions) {
+      jeandle::ObjectID ID = IDKV.first;
+      if (Eligible.lookup(ID))
+        continue;
+      for (const auto &OffKV : IDKV.second) {
+        FieldDefinitionSet &Defs = FieldDefinitions[ID][OffKV.first];
+        Defs.insert(OffKV.second.begin(), OffKV.second.end());
+        if (!Defs.empty())
+          IDsWithDefinitions.insert(ID);
+      }
+    }
+  }
+
+  // The marker lets downstream pointer resolution find the abandoned root so
+  // a real consumer can observe the reaching eliminated definitions. It does
+  // not make the object eligible for any virtual fold or store elimination.
+  for (jeandle::ObjectID ID : IDsWithDefinitions)
+    if (!CurrentState.hasObjectState(ID))
+      CurrentState.addObject(ID, jeandle::ObjectState());
 }
 
 // Graal per-object loop body in merge(): decide virtual/materialized/phi for
@@ -2636,6 +2668,14 @@ void Analyzer::snapshotExitStateInto(BlockExitData &Data) {
       Data.Materialized.insert(ID);
     }
   }
+
+  // Eligibility is function-wide, but store liveness remains point-sensitive.
+  // Preserve ghost reaching definitions after a bail so later blocks and
+  // reconvergent merges can still identify which provisional store
+  // eliminations a real consumer observes.
+  for (const auto &Kv : FieldDefinitions)
+    if (!Eligible.lookup(Kv.first) && !Kv.second.empty())
+      Data.FieldDefinitions[Kv.first] = Kv.second;
 }
 
 void Analyzer::snapshotExitState(BasicBlock *BB) {
@@ -4046,8 +4086,7 @@ bool Analyzer::processStore(StoreInst *SI) {
   // upstream. The debug assert below verifies the invariant so a future change
   // that re-opens the blind spot fails loudly instead of silently poisoning.
   // See the resolve_cap_01 / resolve_cap_02 lit tests.
-  auto materializeOperandsAtStore = [&] {
-    materializeAt(*BaseID, SI, MatReason::Unhandled);
+  auto materializeStoredValue = [&] {
     if (auto RefID =
             jeandle::pea::resolveVirtualRef(Val, CurrentState, Aliases, DL)) {
       materializeAt(*RefID, SI, MatReason::Unhandled);
@@ -4057,6 +4096,19 @@ bool Analyzer::processStore(StoreInst *SI) {
              "materialization regressed (resolve-cap-blind-spot)");
     }
   };
+  auto materializeOperandsAtStore = [&] {
+    materializeAt(*BaseID, SI, MatReason::Unhandled);
+    materializeStoredValue();
+  };
+
+  // A function-wide bail keeps the original allocation and every subsequent
+  // store real. The virtual marker may remain solely to carry reaching
+  // definitions from stores eliminated before the bail; never add a new
+  // EliminateStoreEffect after eligibility has been lost.
+  if (!Eligible.lookup(*BaseID)) {
+    materializeStoredValue();
+    return true;
+  }
 
   if (SI->isVolatile()) {
     materializeOperandsAtStore();
@@ -4146,6 +4198,26 @@ void Analyzer::processLoad(LoadInst *LI) {
   if (!BaseID)
     return;
 
+  jeandle::VirtualObject &VObj = *Result.VirtualObjects[*BaseID];
+
+  if (!Eligible.lookup(*BaseID)) {
+    // The load itself stays real. Preserve every reaching eliminated
+    // definition whose tracked byte range overlaps this access; an unresolved
+    // access may read any tracked cell, so it observes all definitions.
+    std::optional<int64_t> Offset = resolveAccess(Ptr, *BaseID);
+    TypeSize LoadSize = DL.getTypeStoreSize(LI->getType());
+    if (!Offset || LoadSize.isScalable() || LoadSize.getFixedValue() == 0 ||
+        LoadSize.getFixedValue() > std::numeric_limits<uint8_t>::max()) {
+      observeFieldDefinitions(*BaseID, FieldDefinitions);
+      return;
+    }
+    uint8_t LoadBytes = static_cast<uint8_t>(LoadSize.getFixedValue());
+    for (const jeandle::VirtualObject::FieldDesc &Field : VObj.Fields)
+      if (Field.overlaps(*Offset, LoadBytes))
+        observeFieldDefinition(*BaseID, Field.Offset, FieldDefinitions);
+    return;
+  }
+
   // LLVM volatile is an observable access (and can denote MMIO); it is not
   // Java volatile. Preserve the load exactly and materialize its virtual
   // receiver immediately before it.
@@ -4153,8 +4225,6 @@ void Analyzer::processLoad(LoadInst *LI) {
     materializeAt(*BaseID, LI, MatReason::Unhandled);
     return;
   }
-
-  jeandle::VirtualObject &VObj = *Result.VirtualObjects[*BaseID];
 
   // Array length load (e.g. a bounds check): the length lives in the array
   // header at ArrayLengthOffset, which resolveAccess's header guard rejects as
@@ -4491,6 +4561,8 @@ bool Analyzer::foldArrayLength(CallBase *CB) {
                                                 CurrentState, Aliases, DL);
   if (!BaseID)
     return false;
+  if (!Eligible.lookup(*BaseID))
+    return false;
 
   jeandle::VirtualObject &VObj = *Result.VirtualObjects[*BaseID];
   if (!VObj.isArray())
@@ -4507,6 +4579,8 @@ bool Analyzer::foldLoadKlass(CallBase *CB) {
   auto BaseID = jeandle::pea::resolveVirtualRef(CB->getArgOperand(0),
                                                 CurrentState, Aliases, DL);
   if (!BaseID)
+    return false;
+  if (!Eligible.lookup(*BaseID))
     return false;
   jeandle::VirtualObject &VObj = *Result.VirtualObjects[*BaseID];
   if (VObj.Klass == 0)
@@ -4535,6 +4609,8 @@ bool Analyzer::foldGetClass(CallBase *CB) {
   auto BaseID = jeandle::pea::resolveVirtualRef(CB->getArgOperand(0),
                                                 CurrentState, Aliases, DL);
   if (!BaseID)
+    return false;
+  if (!Eligible.lookup(*BaseID))
     return false;
   jeandle::VirtualObject &VObj = *Result.VirtualObjects[*BaseID];
   if (VObj.Klass == 0)
@@ -4571,6 +4647,8 @@ bool Analyzer::foldCheckCast(CallBase *CB) {
                                                 CurrentState, Aliases, DL);
   if (!BaseID)
     return false;
+  if (!Eligible.lookup(*BaseID))
+    return false;
   jeandle::VirtualObject &VObj = *Result.VirtualObjects[*BaseID];
   if (VObj.Klass == 0)
     return false;
@@ -4596,6 +4674,8 @@ bool Analyzer::foldInstanceOf(CallBase *CB) {
   auto BaseID = jeandle::pea::resolveVirtualRef(CB->getArgOperand(1),
                                                 CurrentState, Aliases, DL);
   if (!BaseID)
+    return false;
+  if (!Eligible.lookup(*BaseID))
     return false;
   jeandle::VirtualObject &VObj = *Result.VirtualObjects[*BaseID];
   if (VObj.Klass == 0)
@@ -4744,6 +4824,8 @@ bool Analyzer::foldMonitorExit(CallBase *CB) {
                                                 CurrentState, Aliases, DL);
   if (!BaseID)
     return false;
+  if (!Eligible.lookup(*BaseID))
+    return false;
   auto It = LockCounts.find(*BaseID);
   if (It == LockCounts.end() || It->second == 0) {
     // Unbalanced monitorexit (release without acquire on this virtual). Mark
@@ -4794,6 +4876,8 @@ bool Analyzer::foldArrayStoreCheck(CallBase *CB) {
                                                  CurrentState, Aliases, DL);
   if (!ArrayID)
     return false; // array not virtual — a virtual VALUE operand still escapes.
+  if (!Eligible.lookup(*ArrayID))
+    return false;
   jeandle::VirtualObject &ArrayObj = *Result.VirtualObjects[*ArrayID];
 
   const jeandle::VMCallbacks *VMCB = jeandle::getVMCallbacks();
@@ -4826,6 +4910,8 @@ bool Analyzer::foldArrayStoreCheck(CallBase *CB) {
   uintptr_t ValueKlass = 0;
   if (auto ValueID =
           jeandle::pea::resolveVirtualRef(Val, CurrentState, Aliases, DL)) {
+    if (!Eligible.lookup(*ValueID))
+      return false;
     // Virtual values carry an exact, concrete klass.
     ValueKlass = Result.VirtualObjects[*ValueID]->Klass;
   } else {
@@ -4870,6 +4956,8 @@ bool Analyzer::foldPostBarrier(CallBase *CB) {
                                                 CurrentState, Aliases, DL);
   if (!BaseID)
     return false;
+  if (!Eligible.lookup(*BaseID))
+    return false;
 
   // A post barrier for a store into a virtual object has no concrete card to
   // mark. The store is replayed as initialization when the object is
@@ -4904,6 +4992,8 @@ bool Analyzer::foldCheckIfValueBased(CallBase *CB) {
   auto BaseID = jeandle::pea::resolveVirtualRef(CB->getArgOperand(0),
                                                 CurrentState, Aliases, DL);
   if (!BaseID)
+    return false;
+  if (!Eligible.lookup(*BaseID))
     return false;
   jeandle::VirtualObject &VObj = *Result.VirtualObjects[*BaseID];
   if (VObj.Klass == 0) {
@@ -4953,6 +5043,8 @@ bool Analyzer::foldRegisterFinalizerIfNeeded(CallBase *CB) {
   auto BaseID = jeandle::pea::resolveVirtualRef(CB->getArgOperand(0),
                                                 CurrentState, Aliases, DL);
   if (!BaseID)
+    return false;
+  if (!Eligible.lookup(*BaseID))
     return false;
   jeandle::VirtualObject &VObj = *Result.VirtualObjects[*BaseID];
   if (VObj.Klass == 0)
@@ -5060,6 +5152,8 @@ bool Analyzer::foldICmpEquality(ICmpInst *ICmp) {
   Value *Op1 = ICmp->getOperand(1);
   auto V0 = jeandle::pea::resolveVirtualRef(Op0, CurrentState, Aliases, DL);
   auto V1 = jeandle::pea::resolveVirtualRef(Op1, CurrentState, Aliases, DL);
+  if ((V0 && !Eligible.lookup(*V0)) || (V1 && !Eligible.lookup(*V1)))
+    return false;
   bool Op0IsNull = isa<ConstantPointerNull>(Op0);
   bool Op1IsNull = isa<ConstantPointerNull>(Op1);
   bool Folded = false;
@@ -5268,6 +5362,8 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
   // the virtual-at-safepoint gate; commit()'s end-of-analysis LockCounts!=0
   // gate separately drops genuinely unbalanced-lock VOs.
   auto structurallyEligible = [&](jeandle::ObjectID ID) -> bool {
+    if (!Eligible.lookup(ID))
+      return false;
     if (ID >= Result.VirtualObjects.size())
       return false;
     jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
@@ -5995,9 +6091,12 @@ bool Analyzer::isValueAvailableAt(Value *Root, Instruction *IP) {
 void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
   if (C.MaterializedSet.count(ID))
     return; // idempotent — first escape wins; also breaks nested-cycles.
+  // Reaching definitions must be observed even after a function-wide bail:
+  // the virtual marker can survive only to keep pre-bail store liveness
+  // point-sensitive across later blocks and reconvergent control flow.
+  observeFieldDefinitions(ID, C.FieldDefinitions);
   if (!Eligible.lookup(ID))
     return; // already gave up on this object; nothing to materialize.
-  observeFieldDefinitions(ID, C.FieldDefinitions);
   // No dead-block guard here: pre-PEA LLVM cleanup (SimplifyCFG + ADCE,
   // see Pipeline.cpp) removes unreachable blocks via
   // removeUnreachableBlock, so every block that reaches PEA is reachable.
