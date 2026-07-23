@@ -6584,6 +6584,8 @@ void Analyzer::processStateBeforeLoopOnOverflow(Loop *L) {
   BasicBlock *PH = L->getLoopPreheader();
   if (!PH)
     return;
+  assert(!isa<InvokeInst>(PH->getTerminator()) &&
+         "loop preheader has exactly one successor; cannot terminate in invoke");
   auto It = BlockExits.find(PH);
   if (It == BlockExits.end())
     return;
@@ -6614,6 +6616,8 @@ void Analyzer::materializePreheaderVirtualsForUnvisitedLoops() {
       // none exists, so the only sound action here is to skip.
       continue;
     }
+    assert(!isa<InvokeInst>(PH->getTerminator()) &&
+           "loop preheader has exactly one successor; cannot terminate in invoke");
     // Strict gate on VisitedLoops. Every loop processLoop touched —
     // whether the body fixpoint converged, fell into the pessimistic
     // MATERIALIZE_ALL fallback, or hit the overflow-recovery retry path
@@ -6776,25 +6780,26 @@ void Analyzer::materializeAtPredFromExitInfo(
                        ComputeSafeIP,
                        FlipState,
                        MaterializedValue};
-  // Record whether this VO carries locks before ensureMaterialized clears the
-  // state. A block-end drain at an invoke also updates the already-stashed
-  // unwind snapshot below.
-  bool HadLocks = false;
-  if (auto It = ExitInfo.LiveLockEnters.find(ID);
-      It != ExitInfo.LiveLockEnters.end() && !It->second.empty())
-    HadLocks = true;
   ensureMaterialized(ID, C);
-  // A block-end drain with locks may be placed at a predecessor invoke after
-  // processBlock already stashed its UnwindData. The lock re-emit executes
-  // before the invoke on BOTH edges, so the already-stashed UnwindData must
-  // also show the VO materialized-with-locks-cleared — otherwise the unwind
-  // successor sees a still-virtual locked VO and re-emits the same locks
-  // (double acquire) or drops the matching exit (leak). A lockless drain does
-  // not require this state patch. The live-path analog
-  // (invoke-triggered materialize during processBlock) is patched in
-  // processBlock itself; cascade members recurse through this function and
-  // are covered individually.
-  if (HadLocks && !EdgeLocal && isa<InvokeInst>(PH->getTerminator())) {
+  // A block-end drain (!EdgeLocal) whose insertion point is a block-ending
+  // invoke runs every replay side effect — field stores, lock re-emit, and
+  // real-object exposure — on BOTH the normal and unwind edges, so the unwind
+  // snapshot already stashed for that invoke (BlockExits[PH].UnwindData) must
+  // also reflect this VO materialized with its locks cleared. Otherwise the
+  // unwind successor observes a still-virtual VO and either re-emits the same
+  // locks (double acquire) or drops the matching exit (leak). This mirrors the
+  // location-based patch on the live per-block walk in processBlock, where
+  // every MaterializeEffect whose InsertBefore == the block's invoke terminator
+  // patches PreInvokeSnapshot; cascade members recurse through this function
+  // and are covered individually. An edge-local (incoming-edge) materialize
+  // splits the edge and does not execute at the invoke, so it needs no
+  // unwind-snapshot patch.
+  //
+  // Today both !EdgeLocal callers pass PH = L->getLoopPreheader(), whose single
+  // successor cannot terminate in an invoke (asserted at the callers), so this
+  // branch is dead. It is kept general so any future non-preheader block-end
+  // drain stays correct.
+  if (!EdgeLocal && isa<InvokeInst>(PH->getTerminator())) {
     auto BEIt = BlockExits.find(PH);
     if (BEIt != BlockExits.end() && BEIt->second.UnwindData)
       markObjectMaterializedInExitData(*BEIt->second.UnwindData, ID);

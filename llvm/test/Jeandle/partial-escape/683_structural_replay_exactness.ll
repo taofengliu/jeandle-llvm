@@ -131,7 +131,7 @@ unwind:
 ; TAIL-NEXT: {{^  call hotspotcc void @jeandle\.monitorenter_with_lightweight_lock\(.*\)$}}
 ; TAIL-NEXT: call void @sink
 
-define void @attributed_monitorenter_is_not_replay(i1 %escape)
+define void @attributed_monitorenter_is_replay(i1 %escape)
     gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   %lock = alloca i64, align 8
@@ -154,10 +154,13 @@ unwind:
   resume i64 %lp
 }
 
-; ATTR-LABEL: define void @attributed_monitorenter_is_not_replay(
+; ATTR-LABEL: define void @attributed_monitorenter_is_replay(
 ; ATTR: escape.block:
-; ATTR-NEXT: {{^  call hotspotcc void @jeandle\.monitorenter_with_lightweight_lock\(.*\)$}}
+; The matcher ignores call-site attributes (PEA's emitter adds none), so the
+; attributed monitorenter is reused verbatim as the replay, #0 preserved.
+; ATTR-NEXT: {{^  call hotspotcc void @jeandle\.monitorenter_with_lightweight_lock\(.*\) #0$}}
 ; ATTR-NEXT: call void @sink
+; ATTR-NOT: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock
 
 ; The store is still immediately preceded by its GEP. The assume after the
 ; escape is a known nonescaping intrinsic use of the same pointer, so only the
@@ -316,7 +319,7 @@ unwind:
 
 ; TRACE-BUNDLE: PEA: ReplaceCall function=@bundled_monitorenter_is_not_replay
 
-define void @metadata_monitorenter_is_not_replay(i1 %escape)
+define void @metadata_monitorenter_is_replay(i1 %escape)
     gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   %lock = alloca i64, align 8
@@ -339,11 +342,13 @@ unwind:
   resume i64 %lp
 }
 
-; CALLMETA-LABEL: define void @metadata_monitorenter_is_not_replay(
+; CALLMETA-LABEL: define void @metadata_monitorenter_is_replay(
 ; CALLMETA: escape.block:
-; CALLMETA-NEXT: {{^  call hotspotcc void @jeandle\.monitorenter_with_lightweight_lock\(.*\)$}}
+; The matcher ignores call metadata (PEA's emitter adds none), so the annotated
+; monitorenter is reused verbatim as the replay, !annotation preserved.
+; CALLMETA-NEXT: {{^  call hotspotcc void @jeandle\.monitorenter_with_lightweight_lock\(.*\), !annotation ![0-9]+$}}
 ; CALLMETA-NEXT: call void @sink
-; CALLMETA-NOT: !annotation
+; CALLMETA-NOT: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock
 
 ; Only the second store is in the materialized field state. The preceding
 ; store makes the apparent one-store suffix overlong, so the tail must be

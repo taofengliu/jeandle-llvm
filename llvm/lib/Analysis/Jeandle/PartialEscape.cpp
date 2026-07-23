@@ -619,7 +619,7 @@ void PEAResult::computeEscapePointLocks() {
         else
           llvm::dbgs() << "<unknown>";
         llvm::dbgs() << " logical_escape=" << GetLogicalEscapeID(LogicalEscape)
-                     << " batch=" << BatchID << " emit_site=" << BatchID
+                     << " batch=" << BatchID
                      << " source=" << Batch.SourceID << " receiver_vo="
                      << static_cast<unsigned>(ML.SourceEffect->ObjID)
                      << " depth=" << ML.BytecodeDepth << " ordinal=" << Ordinal

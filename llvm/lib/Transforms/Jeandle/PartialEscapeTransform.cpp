@@ -319,22 +319,6 @@ static bool isReplayLikePrefix(Instruction *I,
   return false;
 }
 
-static bool hasCanonicalReplayCallAttributes(const CallInst &Call) {
-  AttributeList Attrs = Call.getAttributes();
-  if (Attrs.hasFnAttrs() || Attrs.hasRetAttrs())
-    return false;
-  // InstCombine may annotate the exact allocation and BasicLock operands as
-  // nonnull between PEA rounds.  It does not add those attributes in the
-  // emitter itself, but they are a canonical strengthening of these same SSA
-  // operands.  All other call-site attributes change semantics the matcher
-  // does not reconstruct and therefore force ordinary delete-and-replay.
-  for (unsigned Arg = 0; Arg < Call.arg_size(); ++Arg)
-    for (Attribute Attr : Attrs.getParamAttrs(Arg))
-      if (!Attr.hasKindAsEnum() || Attr.getKindAsEnum() != Attribute::NonNull)
-        return false;
-  return true;
-}
-
 // A later outer PEA round sees the stores and monitorenters emitted by the
 // preceding round as ordinary virtualizable operations. Replacing an identical
 // replay sequence would mutate the IR forever without making semantic
@@ -413,13 +397,19 @@ static bool matchExistingReplaySuffix(
   SmallVector<Instruction *, 16> MatchedReverse;
   Instruction *Cursor = previousNonDebugInstruction(InsertBefore);
   auto matchLock = [&](const ExpectedReplayOperation &Op) {
+    // A replay lock is identified by the structural form PEA itself emits: the
+    // same callee, the Hotspot_JIT calling convention, no operand bundles, a
+    // non-tail call, and identical operands sitting in the contiguous replay
+    // suffix before the escape point. The emitter adds no call-site attributes
+    // or metadata, so any present on the candidate were added by other passes
+    // (e.g. InstCombine strengthening operands between outer iterations) and are
+    // intentionally ignored — matching on them would reject PEA's own replay
+    // after such a strengthening and force a delete/rebuild churn every round.
     auto *Call = dyn_cast_or_null<CallInst>(Cursor);
     if (!Call || Call->getCalledFunction() != Op.LockCallee ||
         Call->getCallingConv() != CallingConv::Hotspot_JIT ||
         Call->hasOperandBundles() || Call->arg_size() != Op.LockArgs.size() ||
-        Call->getTailCallKind() != CallInst::TCK_None ||
-        !hasCanonicalReplayCallAttributes(*Call) ||
-        Call->hasMetadataOtherThanDebugLoc())
+        Call->getTailCallKind() != CallInst::TCK_None)
       return false;
     for (unsigned Arg = 0; Arg < Op.LockArgs.size(); ++Arg)
       if (Call->getArgOperand(Arg) != Op.LockArgs[Arg])

@@ -35,7 +35,7 @@ unwind:
   resume i64 %lp
 }
 
-; TRACE: PEA: LockReplay function=@trace_single_replay logical_escape=[[SINGLE_LOGICAL:[0-9]+]] batch=[[SINGLE_BATCH:[0-9]+]] emit_site=[[SINGLE_BATCH]] source=[[SINGLE_SOURCE:[0-9]+]] receiver_vo=[[SINGLE_VO:[0-9]+]] depth=0 ordinal=0
+; TRACE: PEA: LockReplay function=@trace_single_replay logical_escape=[[SINGLE_LOGICAL:[0-9]+]] batch=[[SINGLE_BATCH:[0-9]+]] source=[[SINGLE_SOURCE:[0-9]+]] receiver_vo=[[SINGLE_VO:[0-9]+]] depth=0 ordinal=0
 
 define void @trace_same_site_cascade() gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
@@ -80,10 +80,10 @@ unwind:
 
 ; One physical batch is globally depth-sorted. The repeated receiver VO at
 ; depths 0 and 2 proves receiver identity independently of emitted SSA names.
-; TRACE: PEA: LockReplay function=@trace_same_site_cascade logical_escape=[[CASCADE_LOGICAL:[0-9]+]] batch=[[CASCADE_BATCH:[0-9]+]] emit_site=[[CASCADE_BATCH]] source=[[CASCADE_SOURCE:[0-9]+]] receiver_vo=[[CASCADE_A:[0-9]+]] depth=0 ordinal=0
-; TRACE-NEXT: PEA: LockReplay function=@trace_same_site_cascade logical_escape=[[CASCADE_LOGICAL]] batch=[[CASCADE_BATCH]] emit_site=[[CASCADE_BATCH]] source=[[CASCADE_SOURCE]] receiver_vo=[[CASCADE_B:[0-9]+]] depth=1 ordinal=1
-; TRACE-NEXT: PEA: LockReplay function=@trace_same_site_cascade logical_escape=[[CASCADE_LOGICAL]] batch=[[CASCADE_BATCH]] emit_site=[[CASCADE_BATCH]] source=[[CASCADE_SOURCE]] receiver_vo=[[CASCADE_A]] depth=2 ordinal=2
-; TRACE-NEXT: PEA: LockReplay function=@trace_same_site_cascade logical_escape=[[CASCADE_LOGICAL]] batch=[[CASCADE_BATCH]] emit_site=[[CASCADE_BATCH]] source=[[CASCADE_SOURCE]] receiver_vo=[[CASCADE_C:[0-9]+]] depth=3 ordinal=3
+; TRACE: PEA: LockReplay function=@trace_same_site_cascade logical_escape=[[CASCADE_LOGICAL:[0-9]+]] batch=[[CASCADE_BATCH:[0-9]+]] source=[[CASCADE_SOURCE:[0-9]+]] receiver_vo=[[CASCADE_A:[0-9]+]] depth=0 ordinal=0
+; TRACE-NEXT: PEA: LockReplay function=@trace_same_site_cascade logical_escape=[[CASCADE_LOGICAL]] batch=[[CASCADE_BATCH]] source=[[CASCADE_SOURCE]] receiver_vo=[[CASCADE_B:[0-9]+]] depth=1 ordinal=1
+; TRACE-NEXT: PEA: LockReplay function=@trace_same_site_cascade logical_escape=[[CASCADE_LOGICAL]] batch=[[CASCADE_BATCH]] source=[[CASCADE_SOURCE]] receiver_vo=[[CASCADE_A]] depth=2 ordinal=2
+; TRACE-NEXT: PEA: LockReplay function=@trace_same_site_cascade logical_escape=[[CASCADE_LOGICAL]] batch=[[CASCADE_BATCH]] source=[[CASCADE_SOURCE]] receiver_vo=[[CASCADE_C:[0-9]+]] depth=3 ordinal=3
 
 define void @trace_alternative_predecessors(i1 %choose,
                                              ptr addrspace(1) %guard)
@@ -136,11 +136,10 @@ unwind:
 ; there is no cross-path lock mixing.
 ; TRACE: PEA: LockReplay function=@trace_alternative_predecessors logical_escape=[[#ALT_LOGICAL:]]
 ; TRACE-SAME: batch=[[#ALT_FIRST_BATCH:]]
-; TRACE-SAME: emit_site=[[#ALT_FIRST_BATCH]]
 ; TRACE-SAME: source=[[#ALT_FIRST_SOURCE:]]
 ; TRACE-SAME: receiver_vo=[[#ALT_VO:]] depth=0 ordinal=0
-; TRACE-NEXT: PEA: LockReplay function=@trace_alternative_predecessors logical_escape=[[#ALT_LOGICAL]] batch=[[#ALT_FIRST_BATCH]] emit_site=[[#ALT_FIRST_BATCH]] source=[[#ALT_FIRST_SOURCE]] receiver_vo=[[#ALT_VO]] depth=1 ordinal=1
-; TRACE-NEXT: PEA: LockReplay function=@trace_alternative_predecessors logical_escape=[[#ALT_LOGICAL]] batch=[[#ALT_FIRST_BATCH+1]] emit_site=[[#ALT_FIRST_BATCH+1]] source=[[#ALT_FIRST_SOURCE+1]] receiver_vo=[[#ALT_VO]] depth=1 ordinal=0
+; TRACE-NEXT: PEA: LockReplay function=@trace_alternative_predecessors logical_escape=[[#ALT_LOGICAL]] batch=[[#ALT_FIRST_BATCH]] source=[[#ALT_FIRST_SOURCE]] receiver_vo=[[#ALT_VO]] depth=1 ordinal=1
+; TRACE-NEXT: PEA: LockReplay function=@trace_alternative_predecessors logical_escape=[[#ALT_LOGICAL]] batch=[[#ALT_FIRST_BATCH+1]] source=[[#ALT_FIRST_SOURCE+1]] receiver_vo=[[#ALT_VO]] depth=1 ordinal=0
 
 ; A single predecessor can feed two independent merge consumers. Here %p
 ; contributes locked %x to %merge.m, while it also contributes field-only %y
@@ -206,11 +205,11 @@ unwind:
 ; not replace the lock-contributing logical consumer. Batch ordinals remain
 ; physical-batch-wide and restart at zero for both predecessor plans.
 ; TRACE: PEA: LockReplay function=@trace_mixed_consumers_same_site logical_escape=[[MIXED_DIRECT_LOGICAL:[0-9]+]] batch=[[#MIXED_DIRECT_BATCH:]]
-; TRACE-SAME: emit_site=[[#MIXED_DIRECT_BATCH]] source=[[MIXED_DIRECT_SOURCE:[0-9]+]] receiver_vo=[[MIXED_X:[0-9]+]] depth=0 ordinal=0
+; TRACE-SAME: source=[[MIXED_DIRECT_SOURCE:[0-9]+]] receiver_vo=[[MIXED_X:[0-9]+]] depth=0 ordinal=0
 ; TRACE-NEXT: PEA: LockReplay function=@trace_mixed_consumers_same_site logical_escape=[[MIXED_M_LOGICAL:[0-9]+]] batch=[[#MIXED_P_BATCH:MIXED_DIRECT_BATCH+1]]
-; TRACE-SAME: emit_site=[[#MIXED_P_BATCH]] source=[[MIXED_P_SOURCE:[0-9]+]] receiver_vo=[[MIXED_X]] depth=0 ordinal=0
+; TRACE-SAME: source=[[MIXED_P_SOURCE:[0-9]+]] receiver_vo=[[MIXED_X]] depth=0 ordinal=0
 ; TRACE-NEXT: PEA: LockReplay function=@trace_mixed_consumers_same_site logical_escape=[[MIXED_M_LOGICAL]] batch=[[#MIXED_Q_BATCH:MIXED_DIRECT_BATCH+2]]
-; TRACE-SAME: emit_site=[[#MIXED_Q_BATCH]] source=[[MIXED_Q_SOURCE:[0-9]+]] receiver_vo=[[MIXED_X]] depth=0 ordinal=0
+; TRACE-SAME: source=[[MIXED_Q_SOURCE:[0-9]+]] receiver_vo=[[MIXED_X]] depth=0 ordinal=0
 
 ; Two distinct locked objects can also materialize for two different merge
 ; consumers reached from one multi-successor predecessor. Both monitorenters
@@ -275,17 +274,17 @@ unwind:
 ; while p->merge.n replays the required x,y cascade. The %q and p->merge.m x
 ; associations share one logical ID; p->merge.n has the other consumer ID.
 ; TRACE: PEA: LockReplay function=@trace_multiple_lock_consumers_same_site logical_escape=[[MC_REAL_N:[0-9]+]] batch=[[#MC_FIRST_BATCH:]]
-; TRACE-SAME: emit_site=[[#MC_FIRST_BATCH]] source=[[MC_REAL_N_SOURCE:[0-9]+]] receiver_vo=[[MC_X:[0-9]+]] depth=0 ordinal=0
-; TRACE-NEXT: PEA: LockReplay function=@trace_multiple_lock_consumers_same_site logical_escape=[[MC_REAL_N]] batch=[[#MC_FIRST_BATCH]] emit_site=[[#MC_FIRST_BATCH]] source=[[MC_REAL_N_SOURCE]] receiver_vo=[[MC_Y:[0-9]+]] depth=1 ordinal=1
+; TRACE-SAME: source=[[MC_REAL_N_SOURCE:[0-9]+]] receiver_vo=[[MC_X:[0-9]+]] depth=0 ordinal=0
+; TRACE-NEXT: PEA: LockReplay function=@trace_multiple_lock_consumers_same_site logical_escape=[[MC_REAL_N]] batch=[[#MC_FIRST_BATCH]] source=[[MC_REAL_N_SOURCE]] receiver_vo=[[MC_Y:[0-9]+]] depth=1 ordinal=1
 ; TRACE-NEXT: PEA: LockReplay function=@trace_multiple_lock_consumers_same_site logical_escape=[[MC_REAL_M:[0-9]+]] batch=[[#MC_REAL_M_BATCH:MC_FIRST_BATCH+1]]
-; TRACE-SAME: emit_site=[[#MC_REAL_M_BATCH]] source=[[MC_REAL_M_SOURCE:[0-9]+]] receiver_vo=[[MC_X]] depth=0 ordinal=0
+; TRACE-SAME: source=[[MC_REAL_M_SOURCE:[0-9]+]] receiver_vo=[[MC_X]] depth=0 ordinal=0
 ; TRACE-NEXT: PEA: LockReplay function=@trace_multiple_lock_consumers_same_site logical_escape=[[MC_M:[0-9]+]] batch=[[#MC_Q_BATCH:MC_FIRST_BATCH+2]]
-; TRACE-SAME: emit_site=[[#MC_Q_BATCH]] source=[[MC_Q_SOURCE:[0-9]+]] receiver_vo=[[MC_X]] depth=0 ordinal=0
+; TRACE-SAME: source=[[MC_Q_SOURCE:[0-9]+]] receiver_vo=[[MC_X]] depth=0 ordinal=0
 ; TRACE-NEXT: PEA: LockReplay function=@trace_multiple_lock_consumers_same_site logical_escape=[[MC_M]] batch=[[#MC_P_BATCH:MC_FIRST_BATCH+3]]
-; TRACE-SAME: emit_site=[[#MC_P_BATCH]] source=[[MC_P_SOURCE:[0-9]+]] receiver_vo=[[MC_X]] depth=0 ordinal=0
+; TRACE-SAME: source=[[MC_P_SOURCE:[0-9]+]] receiver_vo=[[MC_X]] depth=0 ordinal=0
 ; TRACE-NEXT: PEA: LockReplay function=@trace_multiple_lock_consumers_same_site logical_escape=[[MC_N:[0-9]+]] batch=[[#MC_N_BATCH:MC_P_BATCH+1]]
-; TRACE-SAME: emit_site=[[#MC_N_BATCH]] source=[[MC_N_SOURCE:[0-9]+]] receiver_vo=[[MC_X]] depth=0 ordinal=0
-; TRACE-NEXT: PEA: LockReplay function=@trace_multiple_lock_consumers_same_site logical_escape=[[MC_N]] batch=[[#MC_N_BATCH]] emit_site=[[#MC_N_BATCH]] source=[[MC_N_SOURCE]] receiver_vo=[[MC_Y]] depth=1 ordinal=1
+; TRACE-SAME: source=[[MC_N_SOURCE:[0-9]+]] receiver_vo=[[MC_X]] depth=0 ordinal=0
+; TRACE-NEXT: PEA: LockReplay function=@trace_multiple_lock_consumers_same_site logical_escape=[[MC_N]] batch=[[#MC_N_BATCH]] source=[[MC_N_SOURCE]] receiver_vo=[[MC_Y]] depth=1 ordinal=1
 
 ; The two physical batches recorded for %p must also be consumed on their
 ; respective outgoing edges. Nothing is replayed unconditionally in %p:
