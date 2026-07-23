@@ -1328,7 +1328,7 @@ private:
                                   DenseSet<jeandle::ObjectID> &FullyObserved);
   // Whether a field/entry value can be produced at a program point (used by
   // ensureMaterialized's materialization gate and by the deopt-bundle
-  // descriptor's scalar-cell sanity assert).
+  // descriptor's release-build correctness gate).
   bool isValueAvailableAt(Value *Root, Instruction *IP);
   void propagatePointerAlias(Instruction *I);
 
@@ -5443,10 +5443,6 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
   //     (CompressedOops deferred), or a non-null constant oop (would trip
   //     fill_one_scope_value's ShouldNotReachHere on a stackmap constant; null
   //     is fine). A VO with any Bad cell is wholly undescribable.
-  // A describable oop field value's def dominates the safepoint for free under
-  // reuse-OrigAlloc: a MaterializedRef carries OrigAlloc or a merge-PHI over
-  // OrigAllocs (both dominate), and an external oop's def dominates its store
-  // which dominates the safepoint (analyzer per-field dominance invariant).
   auto describeMaterializedOop = [&](Value *V) -> bool {
     auto *PT = dyn_cast<PointerType>(V->getType());
     if (!PT || PT->getAddressSpace() != jeandle::AddrSpace::JavaHeapAddrSpace)
@@ -5760,6 +5756,22 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
     Plan &P = PIt->second;
     Order.push_back(ID);
     planFields(ID, P);
+    // Descriptor operands are real SSA uses at CB after the transform rewrites
+    // the bundle. A structurally describable value is therefore still Bad if
+    // it cannot be produced at this safepoint.  This is a release-build
+    // correctness gate, not merely an assertion: parented values must dominate
+    // CB, analyzer-built instruction chains must bottom out in dominating
+    // leaves, and analyzer-built PHIs must have a home block that dominates
+    // CB. MaterializedRef cells reach this check as Scalar cells, so a
+    // non-dominating materialized oop takes the same coherent fallback as a
+    // primitive scalar.
+    for (Cell &C : P.Cells)
+      if (C.Kind == Cell::Scalar &&
+          (!C.ScalarV || !isValueAvailableAt(C.ScalarV, CB))) {
+        C.Kind = Cell::Bad;
+        C.ScalarV = nullptr;
+        break;
+      }
   }
 
   // ---- Step 3: coherent descriptor/materialization closure. Seed malformed
@@ -5803,9 +5815,9 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
   }
 
   // ---- Step 4: record one RewriteDeoptBundleEffect per describable VO.
-  // Each Scalar cell's backing def dominates the safepoint (the
-  // analyzer only snapshots dominating stores). VORef cells carry no Value*
-  // — only the vo-id — so they are inherently transform-safe.
+  // Each surviving Scalar cell passed the release-build availability gate
+  // above. VORef cells carry no Value* — only the vo-id — so they are
+  // inherently transform-safe.
   for (jeandle::ObjectID ID : Order) {
     if (Fallback.count(ID))
       continue;
@@ -5825,13 +5837,8 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
                  C.VORefID,
                  Result.VirtualObjects[C.VORefID]->AllocationCall->getType())});
       } else {
-        // A Scalar cell's backing def must dominate the safepoint — the
-        // analyzer only snapshots dominating stores (block-state inheritance
-        // follows the dominance chain; merges synthesize a PHI or default at
-        // divergence). No DT query guards this today, so assert the invariant
-        // the way ensureMaterialized's availability gate enforces it: a
-        // silent regression in the merge logic would otherwise write a
-        // non-dominating value into the bundle.
+        // The release-build gate above already rejected unavailable cells.
+        // Keep the assertion as a local postcondition for debug builds.
         assert(isValueAvailableAt(C.ScalarV, CB) &&
                "deopt descriptor scalar cell must be available at the "
                "safepoint");
