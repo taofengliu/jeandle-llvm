@@ -89,7 +89,8 @@ struct MonitorIdRef {
 // DELETES the original enter from IR — the transform cannot depend on
 // the original call's lifetime. Callee is the jeandle.monitorenter_*
 // function; NonReceiverArgs are operands 1..N (e.g. the BasicLock); the
-// receiver (operand 0) is the reused OrigAlloc pointer.
+// receiver (operand 0) is the effect's real receiver: OrigAlloc or
+// SyntheticPhi.
 // BytecodeDepth is the ascending re-emit sort key (Graal getLockDepth).
 struct MaterializedLock {
   Function *Callee = nullptr;
@@ -104,9 +105,9 @@ struct MaterializedLock {
 // analog of Graal's `allocations[commit.getObjectIndex(monitorId)]`) —
 // strictly more precise than an OrigAlloc key, which would be last-write-wins
 // across per-pred materializations of the same object. The transform resolves
-// the receiver via `MaterializedAllocOf[SourceEffect]` (set once per effect to
-// OrigAlloc in applyMaterialize, read by the lock-cascade re-emit path);
-// reuse-OrigAlloc materialization never spawns a per-pred invoke, so
+// the receiver via `MaterializedReceiverOf[SourceEffect]` (set once per effect
+// to OrigAlloc or SyntheticPhi in applyMaterialize, read by the lock-cascade
+// re-emit path). Materialization never spawns a per-pred invoke, so
 // the per-effect key disambiguates cascade members without any fallback chain.
 // See PEAResult::LockReplayBatches.
 class MaterializeEffect;
@@ -160,14 +161,15 @@ public:
   // resolves uses through the point-sensitive `aliases` map; there is no
   // persistent "OrigAlloc". Jeandle's Analysis pass cannot mutate IR (LLVM's
   // Analysis/Transform split), so OrigAlloc persists as a real invoke until the
-  // Transform, where it is either eliminated (NeverEscapes) or KEPT and reused
-  // as the materialized value itself for PartiallyEscapes. The analysis
-  // rewrites every VirtualRef → MaterializedRef(OrigAlloc) during prerequisite
-  // materialization (see processLoad/processStore/resolveVirtualRef), so the
-  // transform only replays field stores and re-emits locks onto OrigAlloc — no
-  // per-use DT alias resolution pass runs, because OrigAlloc dominates every
-  // escape point by the SSA invariant (see applyMaterialize's assert that the
-  // materialized value equals VObj.AllocationCall).
+  // Transform, where an ordinary VO is either eliminated (NeverEscapes) or
+  // KEPT and reused as the materialized value itself for PartiallyEscapes. The
+  // synthetic Case-C form is documented below and uses SyntheticPhi instead.
+  // The analysis
+  // rewrites every VirtualRef to the referenced object's real identity during
+  // prerequisite materialization (see processLoad/processStore/
+  // resolveVirtualRef), so the transform only replays field stores and
+  // re-emits locks onto the selected receiver. Ordinary receivers are
+  // OrigAlloc; prepared Case-C receivers are SyntheticPhi.
   // Behaviorally equivalent: OrigAlloc's role is a pure identity token / the
   // single sound SSA materialized value, never a fresh allocation in the final
   // IR.
@@ -198,10 +200,10 @@ public:
   // non-null (cloned from the first per-pred VO) but MUST NOT be erased or
   // used as a Materialize effect target. SyntheticSourceIDs holds the
   // per-pred VOs in PHI-incoming order; SyntheticPhi is the merge-block
-  // PHINode the VO is aliased to. A later attempt to materialize a synthetic
-  // VO conservatively marks it and every per-pred source VO ineligible so
-  // the original allocations and stores survive.
-  // TODO(cascade-materialize): see PartialEscapeAnalysis.cpp materializeAt().
+  // PHINode the VO is aliased to. If the synthetic identity later escapes,
+  // every real leaf allocation is retained at its original allocation site
+  // and the complete current state is replayed once onto SyntheticPhi. No
+  // allocation is created for the synthetic itself.
   bool IsSynthetic = false;
   SmallVector<ObjectID, 4> SyntheticSourceIDs;
   PHINode *SyntheticPhi = nullptr;
@@ -520,9 +522,9 @@ public:
   // insertAll(...,0)). Jeandle marshals effects into a per-block map and
   // re-sorts at apply time, so it needs an explicit ordering key. The
   // deferred-CreatePHI trick (emit at SeqNo=0, reassign a fresh nextSeqNo()
-  // at drain) is load-bearing for the self-loop back-edge ordering invariant
-  // (CreatePHI must sort strictly after per-pred Materialize in the same
-  // block).
+  // at drain) is load-bearing for the ordinary self-loop back-edge ordering
+  // invariant (CreatePHI sorts after merge-time per-pred Materialize in the
+  // same block).
   // TODO(list-order): adopting Graal's pure list-order would require reworking
   // merge/loop emission; SeqNo + the deferred-CreatePHI trick covers ordering
   // meanwhile.
@@ -657,11 +659,12 @@ public:
 };
 
 // Materialize an escape point by replaying tracked field stores and re-emitting
-// surviving monitorenters ONTO OrigAlloc (VObj.AllocationCall), which dominates
-// every escape point — reuse-OrigAlloc materialization does NOT emit a fresh
-// allocation invoke. OrigAlloc is the materialized value itself (see
-// applyMaterialize: `MatVal = cast<CallBase>(OrigAlloc)`, recorded in
-// `MaterializedAllocOf[&E]`). Non-cfgKill (Pass 1).
+// surviving monitorenters onto the real identity. For an ordinary VO this is
+// OrigAlloc (VObj.AllocationCall), which dominates every escape point. For a
+// prepared synthetic Case-C VO, it is SyntheticPhi. Neither form emits a fresh
+// allocation invoke. The receiver is recorded in
+// `MaterializedReceiverOf[&E]`.
+// Non-cfgKill (Pass 1).
 // Graal analog: the one `Effect("materializeBefore")` appended by
 // PartialEscapeBlockState.materializeBefore.
 class MaterializeEffect : public Effect {
@@ -683,10 +686,9 @@ public:
   // handle is NOT recomputed at apply time; WeakTrackingVH is only there to
   // fail loudly rather than dangling.
   WeakTrackingVH InsertBefore;
-  // The original allocation (OrigAlloc). WeakTrackingVH: follows the clone a
-  // RewriteDeoptBundleEffect makes of an allocation invoke whose deopt bundle
-  // is rewritten (Pass 1); the assert in applyMaterialize compares it against
-  // VObj.AllocationCall, which follows the same RAUW.
+  // Replay receiver: OrigAlloc for an ordinary VO, SyntheticPhi for a
+  // synthetic Case-C VO. WeakTrackingVH follows the clone a
+  // RewriteDeoptBundleEffect can make of an ordinary allocation invoke.
   WeakTrackingVH Target;
   SmallVector<FieldEntry, 8> FieldEntries;
   // Surviving (unbalanced) monitorenters to re-emit at the materialize point
@@ -705,9 +707,9 @@ public:
   // moves every replay operation to that edge before building batches. Null
   // for live-path materializations and true block-end drains.
   BasicBlock *ReplayTarget = nullptr;
-  // Incoming-edge replay reuses OrigAlloc as the materialized value. Field and
-  // lock replay retain edge provenance, and per-pred receiver identity
-  // survives via MaterializedAllocOf[SourceEffect].
+  // Incoming-edge replay uses the effect's real receiver. Field and lock replay
+  // retain edge provenance, and per-pred receiver identity survives via
+  // MaterializedReceiverOf[SourceEffect].
 
   Kind getKind() const override { return Kind::Materialize; }
   static bool classof(const Effect *E) {
@@ -722,7 +724,7 @@ public:
   }
   // Block and InsertBefore are assigned at emission. Before apply, the
   // transform re-aims both to a dedicated edge block when ReplaySource has
-  // another distinct successor; OrigAlloc remains the materialized value and
+  // another distinct successor; the replay receiver remains unchanged and
   // dominates the normalized insertion point by SSA.
   // Defined out-of-line: assigning to the WeakTrackingVH needs Instruction to
   // be a complete type (Instruction* → Value* derived-to-base), which it is
@@ -965,7 +967,7 @@ public:
   // from the highest-SeqNo MaterializeEffect among those SHARING the SAME
   // edge-normalized, pre-Pass1 InsertBefore pointer (the locked re-emit loop
   // in applyMaterialize, gated on E.SeqNo == Batch.EmitterSeqNo). Each lock's
-  // receiver is resolved via MaterializedAllocOf[ML.SourceEffect], asserted
+  // receiver is resolved via MaterializedReceiverOf[ML.SourceEffect], asserted
   // non-empty — NO fallback chain.
   //
   // GROUPING RULE: the transform first normalizes each multi-successor

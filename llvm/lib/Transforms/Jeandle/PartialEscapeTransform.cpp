@@ -21,21 +21,20 @@
 //
 // Materialization model: a PartiallyEscapes VO materializes by replaying its
 // tracked field stores and re-emitting its surviving monitorenters onto its
-// ORIGINAL allocation (OrigAlloc = VObj.AllocationCall), which dominates every
-// escape point and is kept alive (EliminateAllocation is suppressed for
-// PartiallyEscapes). OrigAlloc already carries the correct allocation-site
-// deopt operand bundle. NeverEscapes VOs are eliminated (OrigAlloc erased) and
-// described by a deopt-bundle descriptor (HotSpot reallocs at deopt). OrigAlloc
-// is cast to CallBase, not InvokeInst: a self-loop-header alloc uses the call
-// form (an invoke's normal dest is always a distinct block). The InsertBefore
-// eager-update hook (relocateDependentMaterializes) is retained because a
-// sibling fold can still erase E.InsertBefore.
+// real identity. For an ordinary VO this is its ORIGINAL allocation
+// (OrigAlloc = VObj.AllocationCall); for a prepared synthetic Case-C VO it is
+// SyntheticPhi. Both dominate their escape points. Ordinary PartiallyEscapes
+// allocations are kept alive, so their original allocation-site deopt bundles
+// remain intact. NeverEscapes VOs are eliminated (OrigAlloc erased) and
+// described by a deopt-bundle descriptor (HotSpot reallocs at deopt). The
+// InsertBefore eager-update hook (relocateDependentMaterializes) is retained
+// because a sibling fold can still erase E.InsertBefore.
 //
 // When several objects escape at one escape point, their interleaved locks on
 // the runtime lock stack MUST be re-emitted as ONE globally depth-sorted list
 // (computeEscapePointLocks), emitted once by the highest-SeqNo materialize at
 // that point, each receiver resolved to the sibling's original/materialized
-// allocation via MaterializedAllocOf.
+// replay receiver via MaterializedReceiverOf.
 // Per-object lock emission would mis-order re-entrant interleaved lock stacks.
 //
 // After both passes: ConstantFoldTerminator, a trivial-PHI fold, a dead-code
@@ -193,6 +192,7 @@ static bool splitReplayEdges(jeandle::PEAResult &Result) {
       continue;
 
     assert(!isa<IndirectBrInst>(Plan.Source->getTerminator()) &&
+           !isa<CallBrInst>(Plan.Source->getTerminator()) &&
            CurrentTarget->canSplitPredecessors() &&
            "analysis must keep unsplittable replay edges real");
     BasicBlock *Edge =
@@ -562,12 +562,12 @@ static bool eraseAllocation(Instruction *Target) {
 }
 
 // Emit the materialization sequence for a single Materialize effect: replay
-// tracked field stores and re-emit surviving monitorenters onto OrigAlloc
-// immediately before the escape point (see file header for the
-// materialization model). The downstream GC-statepoint pipeline
-// (PEA → InsertGCBarriers → ... → RewriteStatepointsForGC) wraps the original
-// allocation invoke with gc.statepoint/gc.result/gc.relocate; the replayed
-// stores land before the escape point and OrigAlloc dominates them.
+// tracked field stores and re-emit surviving monitorenters onto the real
+// receiver immediately before the escape point (see the file header). The
+// downstream GC-statepoint pipeline
+// (PEA → InsertGCBarriers → ... → RewriteStatepointsForGC) wraps ordinary
+// allocation invokes with gc.statepoint/gc.result/gc.relocate; every replay
+// receiver dominates its emitted stores.
 // See `partial-escape/310_full_pipeline_statepoint.ll`.
 
 // Eager-update hook: call this BEFORE erasing `Dying` from IR. Re-aims every
@@ -657,30 +657,31 @@ static void spliceUnparentedAt(Instruction *IP, Value *V) {
 static bool applyMaterialize(Function &F, const jeandle::PEAResult &Result,
                              const jeandle::MaterializeEffect &E,
                              DenseMap<const jeandle::MaterializeEffect *,
-                                      CallBase *> &MaterializedAllocOf,
+                                      Value *> &MaterializedReceiverOf,
                              const DenseMap<const jeandle::MaterializeEffect *,
                                             Instruction *> &OrigInsertBefore) {
   assert(E.ObjID != jeandle::InvalidObjectID);
-  assert(E.Target && "Materialize effect must carry the original allocation");
+  assert(E.Target && "Materialize effect must carry a replay receiver");
 
   jeandle::VirtualObject &VObj = *Result.VirtualObjects[E.ObjID];
   CallBase *OrigAlloc = cast_or_null<CallBase>((Value *)VObj.AllocationCall);
-  assert((Value *)OrigAlloc == (Value *)E.Target);
+  Value *MatVal = E.Target;
+  if (VObj.IsSynthetic)
+    assert(MatVal == VObj.SyntheticPhi &&
+           "synthetic materialization must replay onto SyntheticPhi");
+  else
+    assert((Value *)OrigAlloc == MatVal &&
+           "ordinary materialization must replay onto OrigAlloc");
 
   Module *M = F.getParent();
   LLVMContext &Ctx = M->getContext();
   const DataLayout &DL = M->getDataLayout();
 
-  // The materialization value is OrigAlloc (VObj.AllocationCall); see the file
-  // header for the model. applyMaterialize is reached only for PartiallyEscapes
-  // VOs (NeverEscapes go to EliminateAllocation; AlwaysEscapes effects were
-  // dropped by the analyzer). OrigAlloc is a CallBase: typically an InvokeInst
-  // (a Jeandle allocation intrinsic carries an OOM unwind edge), but the
-  // frontend emits a call-form allocation when the alloc must live inside its
-  // own self-loop header (an invoke's normal dest is always a distinct block)
-  // — so cast to CallBase, not InvokeInst.
-  CallBase *MatVal = cast<CallBase>(OrigAlloc);
-  MaterializedAllocOf[&E] = MatVal;
+  // applyMaterialize is reached only for PartiallyEscapes VOs (NeverEscapes go
+  // to EliminateAllocation; AlwaysEscapes effects were dropped by the
+  // analyzer). Ordinary receivers are OrigAlloc; synthetic receivers are the
+  // prepared SyntheticPhi.
+  MaterializedReceiverOf[&E] = MatVal;
 
   Instruction *InsertBefore = dyn_cast_or_null<Instruction>(E.InsertBefore);
   assert(InsertBefore &&
@@ -698,15 +699,16 @@ static bool applyMaterialize(Function &F, const jeandle::PEAResult &Result,
   // store or re-emitted at least one lock). MaterializeEffect::apply gates
   // Ctx.Changed on this so an all-idle round (PartiallyEscapes VO with no
   // field stores and no surviving locks) does not needlessly keep the
-  // iterative driver from converging. MaterializedAllocOf population above is
-  // not an IR mutation, and spliceUnparentedAt runs only inside the store loop
-  // (gated by a store), so store/lock creation is the complete set of
+  // iterative driver from converging. MaterializedReceiverOf population above
+  // is not an IR mutation, and spliceUnparentedAt runs only inside the store
+  // loop (gated by a store), so store/lock creation is the complete set of
   // mutations.
   bool Emitted = false;
 
-  // Replay this object's tracked field stores onto OrigAlloc, immediately
-  // before the escape point, so the object's fields hold their current values
-  // when it escapes. OrigAlloc and every field value dominate this point
+  // Replay this object's tracked field stores onto its real receiver,
+  // immediately before the escape point, so the object's fields hold their
+  // current values when it escapes. The receiver and every field value
+  // dominate this point
   // (analyzer per-field dominance invariant). A nested/peer virtual's field
   // value is its own OrigAlloc (the analyzer rewrites
   // VirtualRef→MaterializedRef during prerequisite materialization), which also
@@ -763,10 +765,10 @@ static bool applyMaterialize(Function &F, const jeandle::PEAResult &Result,
       Args.push_back(A);
     CallInst *Enter = SB.CreateCall(Callee, Args);
     Enter->setCallingConv(CallingConv::Hotspot_JIT);
-    // The re-emitted monitorenter is a REAL held lock on OrigAlloc (never a
-    // deopt safepoint), so it MUST carry no "deopt" operand bundle — a bundle
-    // here would describe a MATERIALIZED VO's lock as a safepoint state,
-    // double-counting it against the deopt-bundle monitor section.
+    // The re-emitted monitorenter is a REAL held lock on the replay receiver
+    // (never a deopt safepoint), so it MUST carry no "deopt" operand bundle —
+    // a bundle here would describe a MATERIALIZED VO's lock as a safepoint
+    // state, double-counting it against the deopt-bundle monitor section.
     assert(!Enter->hasOperandBundles() &&
            "re-emitted monitorenter must be bare");
     return true;
@@ -794,15 +796,15 @@ static bool applyMaterialize(Function &F, const jeandle::PEAResult &Result,
              "BytecodeDepth (Graal lastDepth < getLockDepth guarantee)");
       First = false;
       LastDepth = ML.BytecodeDepth;
-      auto NIt = MaterializedAllocOf.find(ML.SourceEffect);
-      assert(NIt != MaterializedAllocOf.end() &&
-             "every sibling's OrigAlloc must be recorded before the tail "
-             "emits locks");
+      auto NIt = MaterializedReceiverOf.find(ML.SourceEffect);
+      assert(NIt != MaterializedReceiverOf.end() &&
+             "every sibling's replay receiver must be recorded before the "
+             "tail emits locks");
       Emitted |= EmitLock(NIt->second, ML.Callee, ML.NonReceiverArgs);
     }
   }
 
-  // MaterializedAllocOf is consumed by the lock re-emit's per-object receiver
+  // MaterializedReceiverOf is consumed by the lock re-emit's receiver
   // resolution at multi-object escape points.
   return Emitted;
 }
@@ -819,10 +821,10 @@ struct jeandle::TransformContext {
   jeandle::PEAResult &Result;
   bool &Changed;
 
-  // effect -> OrigAlloc (CallBase) it materializes onto. Filled incrementally
-  // as each Materialize applies; consumed by the tail effect at a multi-object
-  // escape point to resolve each MergedLock's receiver.
-  DenseMap<const jeandle::MaterializeEffect *, CallBase *> &MaterializedAllocOf;
+  // effect -> real replay receiver (OrigAlloc or SyntheticPhi). Filled as each
+  // Materialize applies; consumed by the tail effect at a multi-object escape
+  // point to resolve each MergedLock's receiver.
+  DenseMap<const jeandle::MaterializeEffect *, Value *> &MaterializedReceiverOf;
 
   // Reverse index: live InsertBefore -> Materialize effects keyed on it.
   DenseMap<Instruction *, SmallVector<jeandle::MaterializeEffect *, 4>>
@@ -1002,17 +1004,16 @@ void jeandle::EliminateAllocationEffect::apply(jeandle::TransformContext &Ctx) {
 }
 
 void jeandle::MaterializeEffect::apply(jeandle::TransformContext &Ctx) {
-  // Replay field stores and re-emit locks onto OrigAlloc (kept alive for
-  // PartiallyEscapes) — see applyMaterialize and the file header. Gate Changed
-  // on whether applyMaterialize actually emitted anything: an all-idle round
-  // (no field stores, no surviving locks) leaves the IR untouched, and marking
-  // it Changed would needlessly prevent the iterative driver from converging.
+  // Replay field stores and re-emit locks onto the real receiver — see
+  // applyMaterialize and the file header. Gate Changed on whether
+  // applyMaterialize actually emitted anything: an all-idle round (no field
+  // stores, no surviving locks) leaves the IR untouched, and marking it
+  // Changed would needlessly prevent the iterative driver from converging.
   if (Ctx.ReusedMaterializations.count(this)) {
-    auto *OrigAlloc = cast<CallBase>((Value *)Target);
-    Ctx.MaterializedAllocOf[this] = OrigAlloc;
+    Ctx.MaterializedReceiverOf[this] = Target;
     return;
   }
-  if (applyMaterialize(Ctx.F, Ctx.Result, *this, Ctx.MaterializedAllocOf,
+  if (applyMaterialize(Ctx.F, Ctx.Result, *this, Ctx.MaterializedReceiverOf,
                        Ctx.OrigInsertBefore))
     Ctx.Changed = true;
 }
@@ -1292,10 +1293,10 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
 
   bool Changed = false;
 
-  // effect -> OrigAlloc (the CallBase each Materialize replays onto). Filled
-  // incrementally as each Materialize applies; consumed by the tail effect at
-  // a multi-object escape point to resolve each MergedLock's receiver.
-  DenseMap<const jeandle::MaterializeEffect *, CallBase *> MaterializedAllocOf;
+  // effect -> real replay receiver (OrigAlloc or SyntheticPhi). Filled as each
+  // Materialize applies; consumed by the tail effect at a multi-object escape
+  // point to resolve each MergedLock's receiver.
+  DenseMap<const jeandle::MaterializeEffect *, Value *> MaterializedReceiverOf;
 
   // Normalize incoming-edge materializations before RPO and before replay
   // batches capture their physical insertion sites.  SplitBlockPredecessors
@@ -1365,7 +1366,7 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
   jeandle::TransformContext Ctx{F,
                                 Result,
                                 Changed,
-                                MaterializedAllocOf,
+                                MaterializedReceiverOf,
                                 InsertBeforeDependents,
                                 OrigInsertBefore,
                                 PreservedReplayInstructions,

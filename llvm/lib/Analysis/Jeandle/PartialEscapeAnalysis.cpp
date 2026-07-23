@@ -29,9 +29,9 @@
 // Case A (a non-virtual incoming or a Case-C bail) materializes each virtual
 // incoming at its pred; Case B (uniform ObjectID, still virtual) registers the
 // PHI as an alias; Case C (distinct but compatible IDs) synthesizes one VO
-// cloned from the first per-pred VO. A synthetic VO that later needs
-// materialization is dropped together with its per-pred sources (see
-// TODO(cascade-materialize) in materializeAt).
+// cloned from the first per-pred VO. If that synthetic later escapes, its
+// ordinary leaf allocations remain at their original sites and its complete
+// current state is replayed once onto the pointer PHI.
 //
 //===----------------------------------------------------------------------===//
 
@@ -665,6 +665,18 @@ private:
   // materialized on every incoming carry the Materialized state forward.
   DenseSet<jeandle::ObjectID> Materialized;
 
+  // Synthetic Case-C identity DAGs whose PHIs and backing ordinary allocation
+  // sites have passed the complete prepare preflight. This set records only
+  // identity readiness; virtual/materialized object state remains path-local.
+  DenseSet<jeandle::ObjectID> PreparedSyntheticIDs;
+  // Candidate ordinary leaf allocations that back a prepared synthetic
+  // identity DAG. At commit, only leaves reachable from a surviving synthetic
+  // Materialize effect are classified PartiallyEscapes and kept at their
+  // original allocation sites. No source field or lock replay is emitted: the
+  // synthetic's point-local MaterializeEffect replays the complete current
+  // state once onto SyntheticPhi.
+  DenseSet<jeandle::ObjectID> KeptSyntheticSourceAllocations;
+
   // Per-block exit snapshots, keyed by the block that produced them.
   DenseMap<BasicBlock *, BlockExitInfo> BlockExits;
 
@@ -1051,6 +1063,22 @@ private:
                                      MatReason Reason = MatReason::Merge,
                                      BasicBlock *TargetMerge = nullptr);
 
+  // Prepare a Case-C identity without targeting its borrowed AllocationCall.
+  // A complete read-only DAG preflight precedes the monotonic commit: each
+  // synthetic PHI is recorded as a valid real replay receiver and every
+  // ordinary leaf allocation is retained at its original allocation site.
+  // Fields and locks are replayed only by the current MaterializeContext.
+  bool prepareSyntheticDAG(jeandle::ObjectID ID);
+  bool canPrepareSyntheticDAG(jeandle::ObjectID ID,
+                              DenseSet<jeandle::ObjectID> &Visiting,
+                              DenseSet<jeandle::ObjectID> &Planned,
+                              DenseSet<jeandle::ObjectID> &Leaves);
+  void commitPreparedSyntheticDAG(jeandle::ObjectID ID,
+                                  DenseSet<jeandle::ObjectID> &Committing);
+  bool isReplayEdgeSupported(BasicBlock *PH, BasicBlock *TargetMerge) const;
+  void observeSyntheticSourceDefinitions(jeandle::ObjectID ID,
+                                         DenseSet<jeandle::ObjectID> &Visited);
+
   // Real loop fixpoint. processLoop runs the fixpoint over L (which
   // includes its sub-loops; nested loops are dispatched recursively when
   // their header is encountered in the RPO walk). On convergence, all blocks
@@ -1363,18 +1391,14 @@ private:
   // pure cycle defense. The SyntheticPhi alias is reset for every synthetic so
   // downstream resolveVirtualRef stops folding through it. Safe on
   // non-synthetic VOs (degenerates to Eligible[ID] = false). Single source of
-  // truth for the synthetic cascade; the mixed-merge bail and the two
-  // materialization paths call through here.
+  // truth for the conservative synthetic cascade used when identity-DAG
+  // preparation fails preflight.
   void markIneligible(jeandle::ObjectID ID);
 
-  // The real SSA value denoting a kept-real (ineligible) VO in the surviving
-  // IR: the original allocation for an ordinary VO (its allocation survives),
-  // or the Case-C merge PHI for a synthetic VO (its per-pred source
-  // allocations survive via markIneligible's cascade, so the PHI merges real
-  // values). Used to replay a field whose VirtualRef inner can no longer be
-  // materialized as a virtual — Graal's materializeWithCommit contributes the
-  // already-materialized entry's value the same way.
-  Value *realValueOfKeptReal(jeandle::ObjectID ID);
+  // The real SSA identity of a VO: OrigAlloc for an ordinary object, or the
+  // Case-C merge PHI for a synthetic.  The latter applies both to conservative
+  // ineligibility and to successful prepared point-local replay.
+  Value *realIdentityOf(jeandle::ObjectID ID);
 };
 
 void Analyzer::observeFieldDefinition(jeandle::ObjectID ID, int64_t Offset,
@@ -1452,7 +1476,7 @@ void Analyzer::markIneligible(jeandle::ObjectID ID) {
   }
 }
 
-Value *Analyzer::realValueOfKeptReal(jeandle::ObjectID ID) {
+Value *Analyzer::realIdentityOf(jeandle::ObjectID ID) {
   jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
   if (VObj.IsSynthetic)
     return VObj.SyntheticPhi;
@@ -1509,10 +1533,11 @@ void Analyzer::processBlock(BasicBlock *BB) {
   auto It = PendingMergePhis.find(BB);
   if (It != PendingMergePhis.end()) {
     jeandle::EffectList &Phis = It->second;
-    for (auto &PE : Phis)
-      PE.SeqNo = Result.nextSeqNo();
-    while (!Phis.empty())
-      Result.addBlockEffect(Phis.spliceOut(0));
+    while (!Phis.empty()) {
+      std::unique_ptr<jeandle::Effect> Effect = Phis.spliceOut(0);
+      Effect->SeqNo = Result.nextSeqNo();
+      Result.addBlockEffect(std::move(Effect));
+    }
     PendingMergePhis.erase(It);
   }
 
@@ -1690,11 +1715,10 @@ void Analyzer::inheritFromExit(const BlockExitData &Exit) {
   for (jeandle::ObjectID ID : Exit.Materialized) {
     if (!Eligible.lookup(ID))
       continue;
-    jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
     jeandle::ObjectState OS;
-    // Under reuse-OrigAlloc the materialized value is OrigAlloc on every
-    // edge (it dominates every escape point by SSA).
-    OS.escape(VObj.AllocationCall);
+    // Ordinary VOs reuse OrigAlloc.  A materialized Case-C identity uses its
+    // defining pointer PHI, which dominates every exit carrying its ID.
+    OS.escape(realIdentityOf(ID));
     CurrentState.addObject(ID, std::move(OS));
     Materialized.insert(ID);
   }
@@ -2169,9 +2193,8 @@ bool Analyzer::MergeProcessor::mergeObjectState(jeandle::ObjectID ID) {
     // materialize, but the common path records OrigAlloc for downstream
     // consumers and the loop-fixpoint convergence check).
     if (Preds.size() == 1) {
-      jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
       jeandle::ObjectState OS;
-      OS.escape(VObj.AllocationCall);
+      OS.escape(A.realIdentityOf(ID));
       CurrentState.addObject(ID, std::move(OS));
       Materialized.insert(ID);
       return false;
@@ -2201,17 +2224,6 @@ bool Analyzer::MergeProcessor::mergeObjectState(jeandle::ObjectID ID) {
     // a materializedValuePhi; Jeandle reuses the one dominating OrigAlloc on
     // every edge. Field and lock replay remains edge-local.
     //
-    // Synthetic VOs (Case-C, borrowed AllocationCall) still bail: they have no
-    // per-pred allocation to materialize from. TODO(cascade-materialize):
-    // per-pred source materialization + PHI reuse (see ensureMaterialized).
-    if (Result.VirtualObjects[ID]->IsSynthetic) {
-      for (jeandle::ObjectID SourceID :
-           Result.VirtualObjects[ID]->SyntheticSourceIDs)
-        for (const BlockExitData *P : Preds)
-          A.observeFieldDefinitions(SourceID, P->FieldDefinitions);
-      A.markIneligible(ID); // cascades transitively over nested synthetics.
-      return false;
-    }
     return materializePredsAndMerge(ID);
   }
 
@@ -2306,9 +2318,8 @@ bool Analyzer::MergeProcessor::materializePredsAndMerge(jeandle::ObjectID ID) {
   // Install the unique materialized value directly. OrigAlloc dominates every
   // edge, so its identity is stable across loop-fixpoint retries and no
   // analyzer-only placeholder is needed.
-  jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
   jeandle::ObjectState OS;
-  OS.escape(VObj.AllocationCall);
+  OS.escape(A.realIdentityOf(ID));
   CurrentState.addObject(ID, std::move(OS));
   Materialized.insert(ID);
   return Mat;
@@ -2569,30 +2580,16 @@ bool Analyzer::MergeProcessor::mergeFieldStates(jeandle::ObjectID ID) {
                                         /*TargetMerge=*/BB);
         if (Result.NextSeqNo != PreSeqNo)
           Changed = true;
-        // If the inner can no longer be materialized as a virtual (a
-        // synthetic Case-C VO, or an object that hit an availability bail of
-        // its own), its real value survives in IR and is used as this pred's
-        // input directly — Graal contributes the already-materialized entry's
-        // value the same way. That value must dominate this pred's edge: an
-        // ordinary VO's OrigAlloc does, but a synthetic VO's Case-C merge
-        // PHI may not (it only dominates the region that inherited a
-        // reference to it) — in that case fall to the whole-object
-        // incompatible tail below. Otherwise the field's effective input is
-        // OrigAlloc(inner) — OrigAlloc is the value at apply (no
-        // substitution — the materialized-object / merge PHI is skipped).
-        Value *InnerVal = nullptr;
-        if (!Eligible.lookup(InnerID)) {
-          Value *Real = A.realValueOfKeptReal(InnerID);
-          auto *RealI = dyn_cast_or_null<Instruction>(Real);
-          if (RealI && RealI->getParent() &&
-              A.DT.dominates(RealI, PredBBs[i]->getTerminator()))
-            InnerVal = Real;
-          else {
+        // The real input is OrigAlloc for an ordinary inner or SyntheticPhi
+        // for a Case-C inner.  It must dominate this predecessor edge; a
+        // synthetic PHI only dominates the region that inherited it.
+        Value *InnerVal = A.realIdentityOf(InnerID);
+        if (auto *RealI = dyn_cast_or_null<Instruction>(InnerVal)) {
+          if (!RealI->getParent() ||
+              !A.DT.dominates(RealI, PredBBs[i]->getTerminator())) {
             LocalBail = true;
             break;
           }
-        } else {
-          InnerVal = Result.VirtualObjects[InnerID]->AllocationCall;
         }
         // Defensively rewrite this pred's outer-VO FieldStates entry for the
         // just-materialized inner to MaterializedRef so a sibling successor
@@ -2944,6 +2941,15 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
       if (!Eligible.lookup(OID))
         continue; // a prior/sibling incoming already made this object
                   // ineligible.
+      // A successfully materialized synthetic is represented by its defining
+      // SyntheticPhi, not by the AllocationCall borrowed from one source.
+      // The incoming therefore already is the correct real identity and must
+      // not enter the ordinary derived-from-OrigAlloc validation below.
+      if (Result.VirtualObjects[OID]->IsSynthetic) {
+        assert(PreparedSyntheticIDs.count(OID) &&
+               "eligible synthetic Case-A input must be materialized");
+        continue;
+      }
       Value *V = Phi.getIncomingValue(I);
       Value *OrigAlloc = Result.VirtualObjects[OID]->AllocationCall;
       if (V == OrigAlloc)
@@ -2979,7 +2985,10 @@ bool Analyzer::hasObservableIdentityUse(jeandle::ObjectID ID, PHINode *CaseCPhi,
                                         ArrayRef<BlockExitData *> ExitInfos) {
   jeandle::VirtualObject &VO = *Result.VirtualObjects[ID];
   CallBase *OrigAlloc = cast_or_null<CallBase>((Value *)VO.AllocationCall);
-  if (!OrigAlloc)
+  Value *IdentityRoot = VO.IsSynthetic ? static_cast<Value *>(VO.SyntheticPhi)
+                                       : static_cast<Value *>(OrigAlloc);
+  auto *IdentityDef = dyn_cast_or_null<Instruction>(IdentityRoot);
+  if (!IdentityRoot || !IdentityDef)
     return true;
 
   DenseSet<Instruction *> InternalTargets;
@@ -2989,14 +2998,16 @@ bool Analyzer::hasObservableIdentityUse(jeandle::ObjectID ID, PHINode *CaseCPhi,
         if (Instruction *Target = E.getTarget())
           InternalTargets.insert(Target);
 
-  // LLVM has explicit pointer-derivation instructions between an allocation
-  // and its consumers. Follow every alias-preserving derivation with a known
-  // byte offset so a later identity use cannot hide behind a zero-GEP/freeze
-  // chain. Constant non-zero derivations are followed as access paths: they
-  // are harmless only when every leaf is a planned virtual load/store effect.
-  // Symbolic offsets are opaque and therefore observing. PHIs and selects are
-  // merge points, not wrappers; only the exact Case-C PHI is internal.
-  SmallVector<Value *, 8> Worklist(1, OrigAlloc);
+  // LLVM has explicit pointer-derivation instructions between an identity
+  // root and its consumers. The root is OrigAlloc for an ordinary VO and its
+  // defining SyntheticPhi for a nested Case-C VO. Follow every
+  // alias-preserving derivation with a known byte offset so a later identity
+  // use cannot hide behind a zero-GEP/freeze chain. Constant non-zero
+  // derivations are followed as access paths: they are harmless only when
+  // every leaf is a planned virtual load/store effect. Symbolic offsets are
+  // opaque and therefore observing. PHIs and selects are merge points, not
+  // wrappers; only the exact outer Case-C PHI is internal.
+  SmallVector<Value *, 8> Worklist(1, IdentityRoot);
   SmallPtrSet<Value *, 16> Visited;
   while (!Worklist.empty()) {
     Value *Current = Worklist.pop_back_val();
@@ -3020,11 +3031,11 @@ bool Analyzer::hasObservableIdentityUse(jeandle::ObjectID ID, PHINode *CaseCPhi,
         if (CB->isBundleOperand(Operand) &&
             CB->getOperandBundleForOperand(Operand).isDeoptOperandBundle()) {
           // In a loop, the safepoint can be CFG-reachable from this PHI only
-          // after executing OrigAlloc again, in which case it describes the
-          // next dynamic allocation rather than the identity collapsed here.
-          // Excluding the allocation block models that redefinition barrier.
+          // after executing the identity definition again, in which case it
+          // describes the next dynamic identity rather than the one collapsed
+          // here. Excluding the definition block models that barrier.
           SmallPtrSet<BasicBlock *, 1> AllocationBarrier;
-          AllocationBarrier.insert(OrigAlloc->getParent());
+          AllocationBarrier.insert(IdentityDef->getParent());
           if (!isPotentiallyReachable(CaseCPhi, CB, &AllocationBarrier, &DT,
                                       &LI))
             continue;
@@ -3087,8 +3098,8 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
                                jeandle::EffectList &Out) {
   // TODO(ensure-virtualized): when an EnsureVirtualized bit lands on
   // ObjectState, downgrade it here per-pred (Graal setEnsureVirtualized(false)
-  // where not all preds agree). This entry routes the Case-C per-pred
-  // materialisations through materializeAtPredFromExitInfo.
+  // where not all preds agree). Differing VirtualRef fields below still route
+  // their child materializations through materializeAtPredFromExitInfo.
   const unsigned N = Phi->getNumIncomingValues();
   assert(InIDs.size() == N);
 
@@ -3309,6 +3320,31 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
       MergedDefinitions.erase(Off);
   }
 
+  // A differing VirtualRef field requires materializing each referenced
+  // object on the corresponding incoming edge before the merged field PHI is
+  // created.  Preflight every such edge before emitting any child
+  // materialization: if one edge is unsplittable, retaining only a prefix of
+  // the children would leave a half-committed Case-C plan.  Keep the complete
+  // owner/child group real instead.
+  bool UnsupportedVirtualRefEdge = false;
+  for (const OffsetPlan &P : Plans) {
+    if (P.AllSame)
+      continue;
+    for (unsigned I = 0; I < N; ++I)
+      if (P.PerPredFVs[I].isVirtualRef() &&
+          !isReplayEdgeSupported(Preds[I], BB))
+        UnsupportedVirtualRefEdge = true;
+  }
+  if (UnsupportedVirtualRefEdge) {
+    for (jeandle::ObjectID ID : PerPredIDs)
+      markIneligible(ID);
+    for (const OffsetPlan &P : Plans)
+      for (const jeandle::FieldValue &FV : P.PerPredFVs)
+        if (FV.isVirtualRef())
+          markIneligible(FV.getVirtualRef());
+    return false;
+  }
+
   // Synthesize (or REUSE on cache hit) the new VirtualObject. On a
   // cache hit we reuse the existing ID (and existing VirtualObjects slot)
   // and merely refresh its synthetic metadata. On a miss we duplicate Ref,
@@ -3329,10 +3365,9 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
     NewVO.SyntheticPhi = Phi;
   }
   // Note: NewVO.AllocationCall is shared with Ref (the first per-pred VO).
-  // It MUST NOT be used as a Materialize target or for RAUW — the synthetic
-  // guard in materializeAt prevents that. We keep the field non-null only
-  // because some accessors don't tolerate null AllocationCall (no current
-  // path reaches them for a synthetic VO).
+  // It MUST NOT be used as a Materialize target or for RAUW. SyntheticPhi is
+  // the replay receiver; AllocationCall remains non-null only because
+  // structural accessors shared with ordinary VOs expect it.
 
   // Rebuild the synthetic VO's Fields as the UNION of every per-pred VO's
   // Fields. duplicate() only copied Ref's (pred-0's) Fields, but the merged
@@ -3361,9 +3396,8 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
   }
 
   // Materialize inner virtuals if any per-pred entry is a VirtualRef. This
-  // happens BEFORE we emit CreatePHI effects so the PHI inputs point at the
-  // inner VO's original allocation (which the transform later RAUWs onto the
-  // OrigAlloc, reused directly as the materialized value). Any failure here
+  // happens BEFORE we emit CreatePHI effects so the PHI inputs point at each
+  // inner VO's real identity (OrigAlloc or SyntheticPhi). Any failure here
   // marks the VO ineligible and returns false; the per-entry CreatePHI effects
   // we add below (for NewID) get dropped at commit. Inner materializations may
   // have side-effects on snapshot state, but those are independently sound.
@@ -3411,10 +3445,10 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
         }
         // Same defensive ExitInfo rewrite as the merge per-VO loop; see the
         // matching comment in mergeStates.
+        Value *InnerValue = realIdentityOf(InnerID);
         ExitInfos[i]->FieldStates[PerPredIDs[i]][P.Off] =
-            jeandle::FieldValue::materializedRef(
-                Result.VirtualObjects[InnerID]->AllocationCall);
-        In = Result.VirtualObjects[InnerID]->AllocationCall;
+            jeandle::FieldValue::materializedRef(InnerValue);
+        In = InnerValue;
       } else {
         Eligible[NewID] = false;
         return false;
@@ -4428,7 +4462,7 @@ void Analyzer::processLoad(LoadInst *LI) {
     // other tracking site (FieldStates, alias map) to the materialized
     // pointer, and (b) at transform time, applyMaterialize records
     // OrigAlloc (reused) as the materialized value; the field-replay value
-    // is OrigAlloc (applyMaterialize records it in MaterializedAllocOf for a
+    // is OrigAlloc (applyMaterialize records it in MaterializedReceiverOf for a
     // sibling lock replay — see the materialization model in
     // PartialEscapeTransform.cpp).
     // (Belt-and-suspenders: the ReplaceLoad handler also resolves
@@ -6119,6 +6153,110 @@ bool Analyzer::isValueAvailableAt(Value *Root, Instruction *IP) {
   return true;
 }
 
+bool Analyzer::canPrepareSyntheticDAG(jeandle::ObjectID ID,
+                                      DenseSet<jeandle::ObjectID> &Visiting,
+                                      DenseSet<jeandle::ObjectID> &Planned,
+                                      DenseSet<jeandle::ObjectID> &Leaves) {
+  if (PreparedSyntheticIDs.count(ID) || Planned.count(ID))
+    return true;
+  if (ID >= Result.VirtualObjects.size() || !Eligible.lookup(ID))
+    return false;
+  jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
+  PHINode *Phi = VObj.SyntheticPhi;
+  if (!VObj.IsSynthetic || !Phi || !Phi->getParent() ||
+      VObj.SyntheticSourceIDs.size() != Phi->getNumIncomingValues())
+    return false;
+  if (!Visiting.insert(ID).second)
+    return false;
+
+  for (jeandle::ObjectID SourceID : VObj.SyntheticSourceIDs) {
+    if (SourceID >= Result.VirtualObjects.size()) {
+      Visiting.erase(ID);
+      return false;
+    }
+    jeandle::VirtualObject &Source = *Result.VirtualObjects[SourceID];
+    if (Source.IsSynthetic) {
+      if (!canPrepareSyntheticDAG(SourceID, Visiting, Planned, Leaves)) {
+        Visiting.erase(ID);
+        return false;
+      }
+      continue;
+    }
+    if (!Source.AllocationCall) {
+      Visiting.erase(ID);
+      return false;
+    }
+    Leaves.insert(SourceID);
+  }
+
+  Visiting.erase(ID);
+  Planned.insert(ID);
+  return true;
+}
+
+void Analyzer::observeSyntheticSourceDefinitions(
+    jeandle::ObjectID ID, DenseSet<jeandle::ObjectID> &Visited) {
+  if (!Visited.insert(ID).second)
+    return;
+  jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
+  if (!VObj.IsSynthetic || !VObj.SyntheticPhi)
+    return;
+  BasicBlock *Merge = VObj.SyntheticPhi->getParent();
+  for (unsigned I = 0; I < VObj.SyntheticSourceIDs.size(); ++I) {
+    jeandle::ObjectID SourceID = VObj.SyntheticSourceIDs[I];
+    BasicBlock *Pred = VObj.SyntheticPhi->getIncomingBlock(I);
+    if (BlockExitData *Exit = exitDataFor(Pred, Merge))
+      observeFieldDefinitions(SourceID, Exit->FieldDefinitions);
+    if (Result.VirtualObjects[SourceID]->IsSynthetic)
+      observeSyntheticSourceDefinitions(SourceID, Visited);
+  }
+}
+
+void Analyzer::commitPreparedSyntheticDAG(
+    jeandle::ObjectID ID, DenseSet<jeandle::ObjectID> &Committing) {
+  if (PreparedSyntheticIDs.count(ID))
+    return;
+  bool Inserted = Committing.insert(ID).second;
+  assert(Inserted && "preflight must reject a cyclic synthetic DAG");
+  (void)Inserted;
+
+  jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
+  for (jeandle::ObjectID SourceID : VObj.SyntheticSourceIDs)
+    if (Result.VirtualObjects[SourceID]->IsSynthetic)
+      commitPreparedSyntheticDAG(SourceID, Committing);
+  PreparedSyntheticIDs.insert(ID);
+  Result.EscapeClassification.erase(ID);
+  Committing.erase(ID);
+}
+
+bool Analyzer::prepareSyntheticDAG(jeandle::ObjectID ID) {
+  if (PreparedSyntheticIDs.count(ID))
+    return false;
+  if (CurrentMode == Mode::StopNewInLoopNest) {
+    OverflowFlag = true;
+    return false;
+  }
+  DenseSet<jeandle::ObjectID> Visiting;
+  DenseSet<jeandle::ObjectID> Planned;
+  DenseSet<jeandle::ObjectID> Leaves;
+  if (!canPrepareSyntheticDAG(ID, Visiting, Planned, Leaves)) {
+    DenseSet<jeandle::ObjectID> Observed;
+    observeSyntheticSourceDefinitions(ID, Observed);
+    markIneligible(ID);
+    return false;
+  }
+  // The read-only preflight above covers the complete DAG. Commit the backing
+  // allocation retention only after every synthetic node and ordinary leaf
+  // has been validated, so a malformed nested source cannot leave a partial
+  // prepare plan.
+  for (jeandle::ObjectID Leaf : Leaves)
+    KeptSyntheticSourceAllocations.insert(Leaf);
+
+  DenseSet<jeandle::ObjectID> Committing;
+  commitPreparedSyntheticDAG(ID, Committing);
+  return true;
+}
+
 // Graal PartialEscapeClosure.ensureMaterialized -> materializeBefore ->
 // materializeWithCommit (Graal PartialEscapeBlockState): the single
 // materialization algorithm shared by the escape-point path (materializeAt) and
@@ -6167,23 +6305,14 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
     return;
   }
 
-  // PHI Case-C synthetic VOs cannot be materialized (no per-pred allocation to
-  // RAUW from). Conservatively drop the synthetic and every per-pred source to
-  // ineligible so the original allocations and stores survive.
-  //
-  // GRAAL DIVERGENCE: Graal materializes a synthetic Case-C VO by materializing
-  // each per-pred source VO (mergeObjectEntry / the processPhi fallback,
-  // Graal PartialEscapeClosure) and reusing the Case-C pointer PHI as the
-  // materialized value. Jeandle bails instead.
-  // TODO(cascade-materialize): implement (a) per-pred-source replay that feeds
-  // each reused OrigAlloc through the Case-C pointer PHI, plus (b) the
-  // materialize-placement + lock-model alignment noted at materializeAt /
-  // foldMonitorEnter (synthetics' borrowed AllocationCall has no dominating
-  // alloc point).
+  // A Case-C synthetic has no allocation of its own. Prepare its complete
+  // identity DAG so every ordinary leaf allocation remains at its original
+  // allocation site, then continue through the common point-local field/lock
+  // replay path with SyntheticPhi as the receiver.
   if (VObj.IsSynthetic) {
-    markIneligible(ID); // cascades transitively over nested synthetics.
-    C.MaterializedSet.insert(ID); // idempotent guard for re-entries.
-    return;
+    prepareSyntheticDAG(ID);
+    if (!Eligible.lookup(ID) || OverflowFlag)
+      return;
   }
 
   // Cycle prevention: insert BEFORE recursing on any nested VirtualRef
@@ -6192,19 +6321,12 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
   // too.
   C.MaterializedSet.insert(ID);
 
-  // Recursive prerequisite materialization: for each field holding a VirtualRef
-  // to an inner virtual, materialize the inner first, then rewrite the outer's
-  // FieldStates entry to a MaterializedRef at the inner's OrigAlloc. The
-  // field-replay value is OrigAlloc on every path;
-  // OrigAlloc dominates every escape point by PEA's invariant (see
-  // applyMaterialize, which asserts the materialized value equals
-  // VObj.AllocationCall and documents the OrigAlloc-dominates-every-escape
-  // model). reuse-OrigAlloc deliberately
-  // DROPPED Graal's per-pred distinctness (there is exactly one
-  // allocation, no per-pred spawn) — the transform replays field
-  // stores onto OrigAlloc with no per-use resolution, Jeandle's
-  // sound analog of Graal getAliasAndResolve under the LLVM
-  // analysis/transform split.
+  // Recursive prerequisite materialization: for each field holding a
+  // VirtualRef to an inner virtual, materialize the inner first, then rewrite
+  // the outer's FieldStates entry to a MaterializedRef at the inner's real
+  // identity. Ordinary inner objects use OrigAlloc; prepared Case-C inner
+  // objects use SyntheticPhi. Both identities dominate the replay point, as
+  // checked below.
   {
     auto FSIt = C.FieldStates.find(ID);
     if (FSIt != C.FieldStates.end()) {
@@ -6237,11 +6359,7 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
         // (OrigAlloc dominates every escape point; a Case-C PHI dominates
         // every block that inherited a reference to it) — verified by the
         // availability gate below.
-        Value *InnerVal = nullptr;
-        if (!Eligible.lookup(InnerID))
-          InnerVal = realValueOfKeptReal(InnerID);
-        else
-          InnerVal = Result.VirtualObjects[InnerID]->AllocationCall;
+        Value *InnerVal = realIdentityOf(InnerID);
         C.FieldStates[ID][Off] = jeandle::FieldValue::materializedRef(InnerVal);
         // updateStatesForMaterialized: every other still-tracked object whose
         // FieldStates references InnerID must also flip to MaterializedRef.
@@ -6253,6 +6371,16 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
   // Safe materialization insertion point (path-specific).
   Instruction *SafeIP = C.ComputeSafeIP();
   assert(SafeIP && "materialization requires a safe insertion point");
+
+  // The real replay receiver must itself be available at the insertion point.
+  // OrigAlloc satisfies this by the ordinary SSA invariant; a synthetic
+  // receiver can be a cached or loop-carried PHI, so validate it explicitly
+  // for every legal LLVM CFG before mutating any lock state.
+  Value *ReplayReceiver = realIdentityOf(ID);
+  if (!isValueAvailableAt(ReplayReceiver, SafeIP)) {
+    markIneligible(ID);
+    return;
+  }
 
   // Per-field availability gate: after VirtualRef rewriting, every Scalar /
   // MaterializedRef field value must be AVAILABLE at SafeIP (a snapshot
@@ -6352,7 +6480,7 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
   E->Block = SafeIP->getParent();
   E->SeqNo = Result.nextSeqNo();
   E->InsertBefore = SafeIP;
-  E->Target = VObj.AllocationCall;
+  E->Target = ReplayReceiver;
   E->ObjID = ID;
   E->LogicalEscape = C.LogicalEscape;
   E->ReplaySource = C.ReplaySource;
@@ -6382,7 +6510,7 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
   // Sweep sibling VOs whose FieldStates still hold a VirtualRef to this just-
   // materialised object, so a later store/load through a sibling field observes
   // the materialized pointer.
-  updateOtherStatesForMaterialized(ID, VObj.AllocationCall, C.FieldStates);
+  updateOtherStatesForMaterialized(ID, ReplayReceiver, C.FieldStates);
 }
 
 void Analyzer::materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
@@ -6446,8 +6574,7 @@ void Analyzer::materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
     return InsertBefore;
   };
   auto FlipState = [&](jeandle::ObjectID Oid) {
-    CurrentState.getObjectStateForModification(Oid).escape(
-        Result.VirtualObjects[Oid]->AllocationCall);
+    CurrentState.getObjectStateForModification(Oid).escape(realIdentityOf(Oid));
   };
 
   auto Recurse = [&](jeandle::ObjectID Oid, MatReason R) {
@@ -6735,11 +6862,67 @@ void Analyzer::commit() {
         HasSurvivingMaterialize.insert(E.ObjID);
     }
   }
+
+  // Synthetic preparation is monotonic so loop retries can reuse validated
+  // identity DAGs, but allocation retention is a property of the final effect
+  // plan.  Starting from the synthetic Materialize effects that actually
+  // survived loop rollback, compute the exact prepared-synthetic/source-leaf
+  // closure needed by the committed transform.  A prepared DAG whose
+  // speculative materialization was rolled back must not keep otherwise
+  // non-escaping source allocations alive.
+  DenseSet<jeandle::ObjectID> LivePreparedSyntheticIDs;
+  DenseSet<jeandle::ObjectID> LiveKeptSyntheticSourceAllocations;
+  SmallVector<jeandle::ObjectID, 8> SyntheticWorklist;
+  for (jeandle::ObjectID ID : HasSurvivingMaterialize) {
+    jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
+    if (VObj.IsSynthetic && PreparedSyntheticIDs.count(ID))
+      SyntheticWorklist.push_back(ID);
+  }
+  while (!SyntheticWorklist.empty()) {
+    jeandle::ObjectID ID = SyntheticWorklist.pop_back_val();
+    if (!LivePreparedSyntheticIDs.insert(ID).second)
+      continue;
+    jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
+    assert(VObj.IsSynthetic && PreparedSyntheticIDs.count(ID) &&
+           "live synthetic materialization requires a prepared identity DAG");
+    for (jeandle::ObjectID SourceID : VObj.SyntheticSourceIDs) {
+      jeandle::VirtualObject &Source = *Result.VirtualObjects[SourceID];
+      if (Source.IsSynthetic) {
+        assert(PreparedSyntheticIDs.count(SourceID) &&
+               "prepared synthetic DAG must be transitively complete");
+        SyntheticWorklist.push_back(SourceID);
+      } else {
+        assert(KeptSyntheticSourceAllocations.count(SourceID) &&
+               "prepared synthetic DAG must retain every ordinary leaf");
+        LiveKeptSyntheticSourceAllocations.insert(SourceID);
+      }
+    }
+  }
+
   for (auto &VObjUP : Result.VirtualObjects) {
     jeandle::ObjectID ID = VObjUP->getID();
     // dropEffectsFor stamped AlwaysEscapes; skip those VOs.
     if (Result.EscapeClassification.count(ID))
       continue;
+    // A live prepared synthetic DAG routes these ordinary allocations through
+    // one or more SyntheticPhi identities. Keep the original allocation
+    // invokes (and therefore their allocation-site deopt bundles) without
+    // replaying source fields or locks; the synthetic's point-local
+    // MaterializeEffect performs the one complete replay when that identity
+    // actually escapes.
+    if (LiveKeptSyntheticSourceAllocations.count(ID)) {
+      Result.EscapeClassification[ID] =
+          jeandle::PEAResult::EscapeKind::PartiallyEscapes;
+      continue;
+    }
+    // Classify every live synthetic node in the prepared identity closure as
+    // partial so downstream Case-B pointer PHIs keep routing its now-real
+    // SyntheticPhi identity instead of being erased as poison.
+    if (VObjUP->IsSynthetic && LivePreparedSyntheticIDs.count(ID)) {
+      Result.EscapeClassification[ID] =
+          jeandle::PEAResult::EscapeKind::PartiallyEscapes;
+      continue;
+    }
     Result.EscapeClassification[ID] =
         HasSurvivingMaterialize.count(ID)
             ? jeandle::PEAResult::EscapeKind::PartiallyEscapes
@@ -6776,7 +6959,8 @@ void Analyzer::commit() {
   // EscapeClassification early-return.
   unsigned EliminatedAllocs = 0;
   for (const auto &Kv : Result.EscapeClassification)
-    if (Kv.second == jeandle::PEAResult::EscapeKind::NeverEscapes)
+    if (!Result.VirtualObjects[Kv.first]->IsSynthetic &&
+        Kv.second == jeandle::PEAResult::EscapeKind::NeverEscapes)
       ++EliminatedAllocs;
   JeandlePEAEliminated += EliminatedAllocs;
 
@@ -6786,6 +6970,10 @@ void Analyzer::commit() {
   if (JeandleDumpPEAStats) {
     unsigned NeverEsc = 0, PartialEsc = 0, AlwaysEsc = 0;
     for (const auto &Kv : Result.EscapeClassification) {
+      // Synthetic Case-C VOs have no allocation site.  Count only the real
+      // source allocations in allocation escape statistics.
+      if (Result.VirtualObjects[Kv.first]->IsSynthetic)
+        continue;
       switch (Kv.second) {
       case jeandle::PEAResult::EscapeKind::NeverEscapes:
         ++NeverEsc;
@@ -6900,6 +7088,27 @@ void Analyzer::materializePreheaderVirtualsForUnvisitedLoops() {
   }
 }
 
+bool Analyzer::isReplayEdgeSupported(BasicBlock *PH,
+                                     BasicBlock *TargetMerge) const {
+  if (!PH || !TargetMerge)
+    return false;
+  Instruction *Term = PH->getTerminator();
+  SmallVector<BasicBlock *, 4> DistinctSuccessors;
+  bool ReachesTarget = false;
+  for (BasicBlock *Succ : successors(PH)) {
+    ReachesTarget |= Succ == TargetMerge;
+    if (!llvm::is_contained(DistinctSuccessors, Succ))
+      DistinctSuccessors.push_back(Succ);
+  }
+  // A callbr is itself side-effecting: even with one distinct destination,
+  // replay before its terminator is not equivalent to replay on the outgoing
+  // edge after the asm call.
+  if (!ReachesTarget || isa<CallBrInst>(Term))
+    return false;
+  return DistinctSuccessors.size() <= 1 ||
+         (!isa<IndirectBrInst>(Term) && TargetMerge->canSplitPredecessors());
+}
+
 // Like materializeAt, but operates against a pred's BlockExitInfo snapshot
 // rather than the analyzer's current per-block state (which has moved on by
 // the time materializePreheaderVirtualsForUnvisitedLoops runs). The
@@ -6934,17 +7143,7 @@ void Analyzer::materializeAtPredFromExitInfo(jeandle::ObjectID ID,
   // reject predecessor splitting cannot carry an edge-local replay safely;
   // keep the object real before emitting any cascade, field, or lock effect.
   if (EdgeLocal && TargetMerge) {
-    Instruction *Term = PH->getTerminator();
-    SmallVector<BasicBlock *, 4> DistinctSuccessors;
-    bool ReachesTarget = false;
-    for (BasicBlock *Succ : successors(PH)) {
-      ReachesTarget |= Succ == TargetMerge;
-      if (!llvm::is_contained(DistinctSuccessors, Succ))
-        DistinctSuccessors.push_back(Succ);
-    }
-    if (!ReachesTarget ||
-        (DistinctSuccessors.size() > 1 &&
-         (isa<IndirectBrInst>(Term) || !TargetMerge->canSplitPredecessors()))) {
+    if (!isReplayEdgeSupported(PH, TargetMerge)) {
       observeFieldDefinitions(ID, ExitInfo.FieldDefinitions);
       markIneligible(ID);
       return;
@@ -6971,9 +7170,8 @@ void Analyzer::materializeAtPredFromExitInfo(jeandle::ObjectID ID,
   auto ComputeSafeIP = [&]() -> Instruction * {
     // Per-predecessor placement (Graal predecessor.getEndNode(),
     // Graal PartialEscapeClosure merge): materialize at the predecessor's
-    // terminator. The allocation (in PH or a dominator) precedes the terminator
-    // by SSA, so this is a valid IP. Synthetic VOs (borrowed AllocationCall)
-    // bail to ineligible in ensureMaterialized before reaching here.
+    // terminator. The replay receiver (OrigAlloc or an already-defined
+    // SyntheticPhi) dominates the terminator, so this is a valid IP.
     return PH->getTerminator();
   };
   auto FlipState = [&](jeandle::ObjectID Oid) {
@@ -7288,6 +7486,7 @@ void Analyzer::restoreLoopSnapshot(
       Result.BlockEffects[BB] = SF->second.clone();
     else
       Result.BlockEffects.erase(BB);
+
     auto SM = S.SavedMaterializedAtPred.find(BB);
     if (S.HadMaterializedAtPred.count(BB))
       MaterializedAtPred[BB] = SM->second;
@@ -7363,7 +7562,7 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
     //
     // "Materialize at every forward predecessor" is not implementable in our
     // effects model: each Materialize records OrigAlloc (reused) as its
-    // materialized value in MaterializedAllocOf. OrigAlloc is the single
+    // replay receiver in MaterializedReceiverOf. OrigAlloc is the single
     // dominating def on every edge (the existing Case-A pattern works only
     // because an explicit PHI already exists).
     //
