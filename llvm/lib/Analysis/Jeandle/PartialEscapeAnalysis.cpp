@@ -4741,8 +4741,17 @@ bool Analyzer::foldArrayStoreCheck(CallBase *CB) {
     ValueKlass = JT.Klass;
   }
 
-  if (ValueKlass == 0)
+  if (ValueKlass == 0) {
+    // Every Java reference is assignable to java.lang.Object. This is the one
+    // reference-array case that does not require klass information for the
+    // stored value.
+    if (VMCB->IsObjectKlass && VMCB->IsObjectKlass(ElementKlass)) {
+      Constant *True = ConstantInt::getTrue(CB->getType());
+      emitReplaceCall(CB, True, *ArrayID);
+      return true;
+    }
     return false; // unknown value klass — cannot prove elidable.
+  }
 
   auto Folded = evalSubtypeRelation(ValueKlass, ElementKlass);
   if (!Folded)

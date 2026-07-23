@@ -3,8 +3,9 @@
 ; Virtual Object[] (array klass 8888, element klass 4444) where the
 ; stored value comes from an opaque function argument with no
 ; java-klass attribute — getJavaType returns unknown, ValueKlass=0.
-; foldArrayStoreCheck bails conservatively: mark the array ineligible so
-; the alloc and the surviving array_store_check both stay in IR.
+; The element klass is not java.lang.Object, so foldArrayStoreCheck bails
+; conservatively: mark the array ineligible so the alloc and the surviving
+; array_store_check both stay in IR.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare hotspotcc i1 @jeandle.array_store_check(ptr addrspace(1), ptr addrspace(1))
