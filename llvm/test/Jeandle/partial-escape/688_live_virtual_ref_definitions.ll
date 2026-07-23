@@ -510,4 +510,242 @@ unwind:
 ; CHECK: merge:
 ; CHECK-NEXT: call void @sink_owner(ptr addrspace(1) %outer)
 
+; Making the owner real also exposes the current child object.  The child's
+; fields must retain the definitions that reach the same observation point.
+define void @nested_state_before_link_bail() gc "hotspotgc"
+    personality ptr @__gxx_personality_v0 {
+entry:
+  %child = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68897 to ptr), i32 24)
+      to label %alloc.outer unwind label %unwind
+alloc.outer:
+  %outer = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68898 to ptr), i32 24)
+      to label %body unwind label %unwind
+body:
+  %child.value = getelementptr inbounds i8, ptr addrspace(1) %child, i64 16
+  store atomic i32 42, ptr addrspace(1) %child.value unordered, align 4
+  %outer.child = getelementptr inbounds i8, ptr addrspace(1) %outer, i64 16
+  store atomic ptr addrspace(1) %child, ptr addrspace(1) %outer.child unordered, align 8
+  %is.vb = call hotspotcc i1 @jeandle.check_if_value_based(
+      ptr addrspace(1) %outer)
+  call void @use_bool(i1 %is.vb)
+  call void @sink_owner(ptr addrspace(1) %outer)
+  ret void
+unwind:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
+; CHECK-LABEL: define void @nested_state_before_link_bail(
+; CHECK-COUNT-1: inttoptr (i64 68897 to ptr)
+; CHECK-COUNT-1: inttoptr (i64 68898 to ptr)
+; CHECK: store atomic i32 42
+; CHECK: store atomic ptr addrspace(1) %child
+; CHECK: call hotspotcc i1 @jeandle.check_if_value_based
+; CHECK: call void @sink_owner(ptr addrspace(1) %outer)
+
+; The child's reaching definition is sampled when the owner is observed, not
+; when the owner.child link was first stored.
+define void @nested_state_after_link_bail() gc "hotspotgc"
+    personality ptr @__gxx_personality_v0 {
+entry:
+  %child = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68899 to ptr), i32 24)
+      to label %alloc.outer unwind label %unwind
+alloc.outer:
+  %outer = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68900 to ptr), i32 24)
+      to label %body unwind label %unwind
+body:
+  %outer.child = getelementptr inbounds i8, ptr addrspace(1) %outer, i64 16
+  store atomic ptr addrspace(1) %child, ptr addrspace(1) %outer.child unordered, align 8
+  %child.value = getelementptr inbounds i8, ptr addrspace(1) %child, i64 16
+  store atomic i32 43, ptr addrspace(1) %child.value unordered, align 4
+  %is.vb = call hotspotcc i1 @jeandle.check_if_value_based(
+      ptr addrspace(1) %outer)
+  call void @use_bool(i1 %is.vb)
+  call void @sink_owner(ptr addrspace(1) %outer)
+  ret void
+unwind:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
+; CHECK-LABEL: define void @nested_state_after_link_bail(
+; CHECK-COUNT-1: inttoptr (i64 68899 to ptr)
+; CHECK-COUNT-1: inttoptr (i64 68900 to ptr)
+; CHECK: store atomic ptr addrspace(1) %child
+; CHECK: store atomic i32 43
+; CHECK: call hotspotcc i1 @jeandle.check_if_value_based
+; CHECK: call void @sink_owner(ptr addrspace(1) %outer)
+
+; A merge observation exposes every reaching child-field definition.
+define void @nested_state_diamond_bail(i1 %choose) gc "hotspotgc"
+    personality ptr @__gxx_personality_v0 {
+entry:
+  %child = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68901 to ptr), i32 24)
+      to label %alloc.outer unwind label %unwind
+alloc.outer:
+  %outer = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68902 to ptr), i32 24)
+      to label %choose.block unwind label %unwind
+choose.block:
+  %outer.child = getelementptr inbounds i8, ptr addrspace(1) %outer, i64 16
+  store atomic ptr addrspace(1) %child, ptr addrspace(1) %outer.child unordered, align 8
+  %child.value = getelementptr inbounds i8, ptr addrspace(1) %child, i64 16
+  br i1 %choose, label %left, label %right
+left:
+  store atomic i32 51, ptr addrspace(1) %child.value unordered, align 4
+  br label %merge
+right:
+  store atomic i32 52, ptr addrspace(1) %child.value unordered, align 4
+  br label %merge
+merge:
+  %is.vb = call hotspotcc i1 @jeandle.check_if_value_based(
+      ptr addrspace(1) %outer)
+  call void @use_bool(i1 %is.vb)
+  call void @sink_owner(ptr addrspace(1) %outer)
+  ret void
+unwind:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
+; CHECK-LABEL: define void @nested_state_diamond_bail(
+; CHECK-COUNT-1: inttoptr (i64 68901 to ptr)
+; CHECK-COUNT-1: inttoptr (i64 68902 to ptr)
+; CHECK: store atomic ptr addrspace(1) %child
+; CHECK: store atomic i32 51
+; CHECK: store atomic i32 52
+; CHECK: call hotspotcc i1 @jeandle.check_if_value_based
+; CHECK: call void @sink_owner(ptr addrspace(1) %outer)
+
+; The point-specific observation closure handles both arbitrary depth and
+; cycles.  Reaching leaf.value must survive together with all three links.
+define void @nested_state_multilevel_cycle_bail() gc "hotspotgc"
+    personality ptr @__gxx_personality_v0 {
+entry:
+  %leaf = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68903 to ptr), i32 32)
+      to label %alloc.middle unwind label %unwind
+alloc.middle:
+  %middle = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68904 to ptr), i32 24)
+      to label %alloc.outer unwind label %unwind
+alloc.outer:
+  %outer = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68905 to ptr), i32 24)
+      to label %body unwind label %unwind
+body:
+  %leaf.value = getelementptr inbounds i8, ptr addrspace(1) %leaf, i64 16
+  store atomic i32 61, ptr addrspace(1) %leaf.value unordered, align 4
+  %leaf.outer = getelementptr inbounds i8, ptr addrspace(1) %leaf, i64 24
+  store atomic ptr addrspace(1) %outer, ptr addrspace(1) %leaf.outer unordered, align 8
+  %middle.leaf = getelementptr inbounds i8, ptr addrspace(1) %middle, i64 16
+  store atomic ptr addrspace(1) %leaf, ptr addrspace(1) %middle.leaf unordered, align 8
+  %outer.middle = getelementptr inbounds i8, ptr addrspace(1) %outer, i64 16
+  store atomic ptr addrspace(1) %middle, ptr addrspace(1) %outer.middle unordered, align 8
+  %is.vb = call hotspotcc i1 @jeandle.check_if_value_based(
+      ptr addrspace(1) %outer)
+  call void @use_bool(i1 %is.vb)
+  call void @sink_owner(ptr addrspace(1) %outer)
+  ret void
+unwind:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
+; CHECK-LABEL: define void @nested_state_multilevel_cycle_bail(
+; CHECK-COUNT-1: inttoptr (i64 68903 to ptr)
+; CHECK-COUNT-1: inttoptr (i64 68904 to ptr)
+; CHECK-COUNT-1: inttoptr (i64 68905 to ptr)
+; CHECK: store atomic i32 61
+; CHECK: store atomic ptr addrspace(1) %outer
+; CHECK: store atomic ptr addrspace(1) %leaf
+; CHECK: store atomic ptr addrspace(1) %middle
+; CHECK: call void @sink_owner(ptr addrspace(1) %outer)
+
+; An invoke consuming an already-ineligible ghost owner must expose the same
+; complete nested state on its normal and unwind edges.
+define void @nested_state_invoke_after_bail() gc "hotspotgc"
+    personality ptr @__gxx_personality_v0 {
+entry:
+  %child = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68906 to ptr), i32 24)
+      to label %alloc.outer unwind label %alloc.unwind
+alloc.outer:
+  %outer = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68907 to ptr), i32 24)
+      to label %body unwind label %alloc.unwind
+body:
+  %child.value = getelementptr inbounds i8, ptr addrspace(1) %child, i64 16
+  store atomic i32 71, ptr addrspace(1) %child.value unordered, align 4
+  %outer.child = getelementptr inbounds i8, ptr addrspace(1) %outer, i64 16
+  store atomic ptr addrspace(1) %child, ptr addrspace(1) %outer.child unordered, align 8
+  %is.vb = call hotspotcc i1 @jeandle.check_if_value_based(
+      ptr addrspace(1) %outer)
+  call void @use_bool(i1 %is.vb)
+  invoke void @observe_owner(ptr addrspace(1) %outer)
+      to label %normal unwind label %handler
+normal:
+  ret void
+handler:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+alloc.unwind:
+  %alloc.lp = landingpad i64 cleanup
+  resume i64 %alloc.lp
+}
+
+; CHECK-LABEL: define void @nested_state_invoke_after_bail(
+; CHECK-COUNT-1: inttoptr (i64 68906 to ptr)
+; CHECK-COUNT-1: inttoptr (i64 68907 to ptr)
+; CHECK: store atomic i32 71
+; CHECK: store atomic ptr addrspace(1) %child
+; CHECK: call hotspotcc i1 @jeandle.check_if_value_based
+; CHECK: invoke void @observe_owner(ptr addrspace(1) %outer)
+; CHECK-NEXT: to label %normal unwind label %handler
+; CHECK: handler:
+; CHECK-NEXT: %lp = landingpad i64
+; CHECK-NEXT: cleanup
+
+; An overwritten reference is not part of the observation closure.  Its child
+; and the child's state remain dead even though the owner itself becomes real.
+define void @nested_state_overwritten_before_bail() gc "hotspotgc"
+    personality ptr @__gxx_personality_v0 {
+entry:
+  %child = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68908 to ptr), i32 24)
+      to label %alloc.outer unwind label %unwind
+alloc.outer:
+  %outer = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 68909 to ptr), i32 24)
+      to label %body unwind label %unwind
+body:
+  %child.value = getelementptr inbounds i8, ptr addrspace(1) %child, i64 16
+  store atomic i32 81, ptr addrspace(1) %child.value unordered, align 4
+  %outer.child = getelementptr inbounds i8, ptr addrspace(1) %outer, i64 16
+  store atomic ptr addrspace(1) %child, ptr addrspace(1) %outer.child unordered, align 8
+  store atomic ptr addrspace(1) null, ptr addrspace(1) %outer.child unordered, align 8
+  %is.vb = call hotspotcc i1 @jeandle.check_if_value_based(
+      ptr addrspace(1) %outer)
+  call void @use_bool(i1 %is.vb)
+  call void @sink_owner(ptr addrspace(1) %outer)
+  ret void
+unwind:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
+; CHECK-LABEL: define void @nested_state_overwritten_before_bail(
+; CHECK-NOT: inttoptr (i64 68908 to ptr)
+; CHECK-COUNT-1: inttoptr (i64 68909 to ptr)
+; CHECK-NOT: store atomic i32 81
+; CHECK-NOT: store atomic ptr addrspace(1) %child
+; CHECK: store atomic ptr addrspace(1) null
+; CHECK: call hotspotcc i1 @jeandle.check_if_value_based
+; CHECK: call void @sink_owner(ptr addrspace(1) %outer)
+
 !java-method-compilation = !{}

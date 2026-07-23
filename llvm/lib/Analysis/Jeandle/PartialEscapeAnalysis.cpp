@@ -1323,6 +1323,12 @@ private:
                               const FieldDefinitionMap &Definitions);
   void observeFieldDefinitions(jeandle::ObjectID ID,
                                const FieldDefinitionMap &Definitions);
+  // Observing a live VirtualRef store exposes the referenced object's complete
+  // state at the same program point. The per-call set bounds cycles without
+  // suppressing a later observation that carries newer reaching definitions.
+  void observeAllFieldDefinitions(jeandle::ObjectID ID,
+                                  const FieldDefinitionMap &Definitions,
+                                  DenseSet<jeandle::ObjectID> &FullyObserved);
   // Whether a field/entry value can be produced at a program point (used by
   // ensureMaterialized's materialization gate and by the deopt-bundle
   // descriptor's scalar-cell sanity assert).
@@ -1382,16 +1388,44 @@ void Analyzer::observeFieldDefinition(jeandle::ObjectID ID, int64_t Offset,
   auto OIt = DIt->second.find(Offset);
   if (OIt == DIt->second.end())
     return;
-  ObservedFieldStores.insert(OIt->second.begin(), OIt->second.end());
+  // The root load observes only this cell. A VirtualRef stored in the cell
+  // exposes its referenced object, so recursive nodes are observed in full.
+  // Do not seed FullyObserved with ID: a cycle back to the root exposes the
+  // root object itself and must upgrade it to a full observation.
+  DenseSet<jeandle::ObjectID> FullyObserved;
+  for (StoreInst *SI : OIt->second) {
+    ObservedFieldStores.insert(SI);
+    auto RIt = VirtualRefStoreTargets.find(SI);
+    if (RIt != VirtualRefStoreTargets.end())
+      observeAllFieldDefinitions(RIt->second, Definitions, FullyObserved);
+  }
 }
 
 void Analyzer::observeFieldDefinitions(jeandle::ObjectID ID,
                                        const FieldDefinitionMap &Definitions) {
-  auto DIt = Definitions.find(ID);
-  if (DIt == Definitions.end())
-    return;
-  for (const auto &Off : DIt->second)
-    ObservedFieldStores.insert(Off.second.begin(), Off.second.end());
+  DenseSet<jeandle::ObjectID> FullyObserved;
+  observeAllFieldDefinitions(ID, Definitions, FullyObserved);
+}
+
+void Analyzer::observeAllFieldDefinitions(
+    jeandle::ObjectID ID, const FieldDefinitionMap &Definitions,
+    DenseSet<jeandle::ObjectID> &FullyObserved) {
+  SmallVector<jeandle::ObjectID, 8> Worklist(1, ID);
+  while (!Worklist.empty()) {
+    jeandle::ObjectID Current = Worklist.pop_back_val();
+    if (!FullyObserved.insert(Current).second)
+      continue;
+    auto DIt = Definitions.find(Current);
+    if (DIt == Definitions.end())
+      continue;
+    for (const auto &Off : DIt->second)
+      for (StoreInst *SI : Off.second) {
+        ObservedFieldStores.insert(SI);
+        auto RIt = VirtualRefStoreTargets.find(SI);
+        if (RIt != VirtualRefStoreTargets.end())
+          Worklist.push_back(RIt->second);
+      }
+  }
 }
 
 void Analyzer::markIneligible(jeandle::ObjectID ID) {
