@@ -1270,7 +1270,7 @@ private:
   // idempotency set, and callbacks for the per-path I/O. The two wrappers
   // (materializeAt / materializeAtPredFromExitInfo) each build a context and
   // delegate the shared cascade/lock-capture/prereq/dominance/emit/flip
-  // algorithm here, localizing the ~8 genuine per-path differences in the
+  // algorithm here, localizing the genuine per-path differences in the
   // callbacks
   // instead of scattering `if (isPredPath)` through the body.
   struct MaterializeContext {
@@ -1309,9 +1309,6 @@ private:
     function_ref<void(ArrayRef<LockEnter>, jeandle::ObjectID,
                       jeandle::MaterializeEffect &E)>
         CaptureLocksIntoEffect;
-    // Drop alias-map entries resolving to a just-materialized inner (live
-    // only).
-    function_ref<void(jeandle::ObjectID)> DropInnerAliases;
     // Compute the safe materialization insertion point.
     function_ref<Instruction *()> ComputeSafeIP;
     // Flip the per-object state to materialized (live CurrentState vs
@@ -6242,8 +6239,6 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
         // updateStatesForMaterialized: every other still-tracked object whose
         // FieldStates references InnerID must also flip to MaterializedRef.
         updateOtherStatesForMaterialized(InnerID, InnerVal, C.FieldStates);
-        // Drop alias-map entries resolving to InnerID (live path only).
-        C.DropInnerAliases(InnerID);
       }
     }
   }
@@ -6403,14 +6398,6 @@ void Analyzer::materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
         OS.clearLocks();
     }
   };
-  auto DropInnerAliases = [&](jeandle::ObjectID InnerID) {
-    SmallVector<Value *, 4> ToDrop;
-    for (auto &AKv : Aliases.virtualAliasesView())
-      if (AKv.second == InnerID)
-        ToDrop.push_back(AKv.first);
-    for (Value *V : ToDrop)
-      Aliases.resetAlias(V);
-  };
   auto ComputeSafeIP = [&]() -> Instruction * {
     // Escape-point placement (Graal materializeBefore=node,
     // PartialEscapeClosure.ensureMaterialized -> materializeBefore): always
@@ -6467,14 +6454,13 @@ void Analyzer::materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
   // init) so each outlives C — function_ref does NOT own its callable, and a
   // temporary would be destroyed at the end of the `C{...};` statement, leaving
   // a dangling ref for the ensureMaterialized call on the next line.
-  MaterializeContext C{FieldStates,      FieldDefinitions,
-                       LockCounts,       LiveLockEnters,
-                       Materialized,     Reason,
-                       InsertBefore,     InsertBefore->getParent(),
-                       nullptr,          Recurse,
-                       ClearLockState,   CaptureLocksIntoEffect,
-                       DropInnerAliases, ComputeSafeIP,
-                       FlipState};
+  MaterializeContext C{FieldStates,    FieldDefinitions,
+                       LockCounts,     LiveLockEnters,
+                       Materialized,   Reason,
+                       InsertBefore,   InsertBefore->getParent(),
+                       nullptr,        Recurse,
+                       ClearLockState, CaptureLocksIntoEffect,
+                       ComputeSafeIP,  FlipState};
   ensureMaterialized(ID, C);
 }
 
@@ -7005,7 +6991,6 @@ void Analyzer::materializeAtPredFromExitInfo(jeandle::ObjectID ID,
                                    jeandle::MaterializeEffect &E) {
     captureMaterializedLocks(Stack, E);
   };
-  auto DropInnerAliasesNop = [](jeandle::ObjectID) {};
   // NOTE: every callback is a named local (not a temporary) so each outlives C
   // — function_ref does not own its callable; a temporary would dangle after
   // the `C{...};` statement (see the matching note in materializeAt).
@@ -7025,7 +7010,6 @@ void Analyzer::materializeAtPredFromExitInfo(jeandle::ObjectID ID,
                        Recurse,
                        ClearLockState,
                        CaptureLocksIntoEffect,
-                       DropInnerAliasesNop,
                        ComputeSafeIP,
                        FlipState};
   ensureMaterialized(ID, C);
