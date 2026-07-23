@@ -212,6 +212,10 @@ struct LockEnter {
   uint32_t BytecodeDepth;
 };
 
+using FieldDefinitionSet = SmallDenseSet<StoreInst *, 2>;
+using FieldDefinitionMap =
+    DenseMap<jeandle::ObjectID, DenseMap<int64_t, FieldDefinitionSet>>;
+
 // Function-wide monitor nesting reconstructed from the current LLVM CFG.
 // EnterRelativeDepth records the signed depth immediately before each
 // monitorenter. EntryDepth is normally zero; OSR roots may infer a uniform
@@ -409,6 +413,12 @@ struct BlockExitData {
   DenseSet<jeandle::ObjectID> Materialized;
   DenseMap<jeandle::ObjectID, DenseMap<int64_t, jeandle::FieldValue>>
       FieldStates;
+  // Reaching virtualized stores for each current field definition. A store
+  // replaces this set in straight-line code; merges union predecessor sets.
+  // The values let commit distinguish a dead overwritten store from a
+  // definition that a load, materialization, deopt snapshot, or conservative
+  // fallback actually observed.
+  FieldDefinitionMap FieldDefinitions;
   DenseMap<jeandle::ObjectID, unsigned> LockCounts;
   // Per-object live monitorenter stack at block exit. Each entry is an
   // unbalanced monitorenter call site (i.e. its matching monitorexit hasn't
@@ -469,6 +479,7 @@ static void markObjectMaterializedInExitData(BlockExitData &Data,
   Data.Virtuals.erase(ID);
   Data.Materialized.insert(ID);
   Data.FieldStates.erase(ID);
+  Data.FieldDefinitions.erase(ID);
   Data.LockCounts.erase(ID);
   Data.LiveLockEnters.erase(ID);
 }
@@ -596,6 +607,19 @@ private:
   DenseMap<jeandle::ObjectID, DenseMap<int64_t, jeandle::FieldValue>>
       FieldStates;
 
+  // Reaching virtualized-store definitions for FieldStates. This map has the
+  // same path-sensitive lifecycle as FieldStates. A straight-line store
+  // replaces the reaching set and a merge unions predecessor sets.
+  FieldDefinitionMap FieldDefinitions;
+  // Definitions observed by a folded load, materialization, deopt snapshot,
+  // or explicit fallback. If their owner becomes ineligible, their original
+  // stores must survive. Other EliminateStore effects remain valid dead-store
+  // elimination even though the owner's allocation is kept real.
+  DenseSet<StoreInst *> ObservedFieldStores;
+  // Nested identity written by each virtual-reference store. Commit consults
+  // this only for observed definitions, avoiding historical append-only edges.
+  DenseMap<StoreInst *, jeandle::ObjectID> VirtualRefStoreTargets;
+
   // Per-object eligibility flag. Function-wide: starts true at allocation;
   // flipped to false ONLY where keeping the original IR is semantically
   // required — merge/loop hazards (retry cap, synthetic-VO mixed merge,
@@ -606,21 +630,6 @@ private:
   // (commit() drops every recorded effect for the object), while
   // materialize preserves every fold recorded so far.
   DenseMap<jeandle::ObjectID, bool> Eligible;
-
-  // Persistent cross-block VirtualRef edge set: an edge
-  // Outer -> Inner means "Outer's field was recorded as VirtualRef(Inner) at
-  // some point", i.e. a surviving real store into Outer's field may write
-  // Inner's OrigAlloc. The commit() ineligibility cascade must propagate
-  // Outer-real -> Inner-real through these edges. FieldStates itself cannot
-  // serve as the edge source: it is rebuilt per block (resetPerBlockState),
-  // so the cascade reading it at commit only ever sees the LAST processed
-  // block's edges — a cross-block shape (edge recorded in an earlier block)
-  // left the inner NeverEscapes and its OrigAlloc was RAUW'd to poison into
-  // the surviving store. Append-only, never rolled back (loop fixpoint):
-  // stale edges are conservative-sound — they only ever ADD ineligibility,
-  // and dragging an already-materialized inner to AlwaysEscapes keeps its
-  // eliminated stores alive as real stores.
-  DenseMap<jeandle::ObjectID, SmallDenseSet<jeandle::ObjectID>> VirtualRefEdges;
 
   // ObjectIDs whose OrigAlloc appears in the CURRENTLY-processed
   // instruction's "deopt" bundle AND was recorded as a scoped virtual
@@ -862,6 +871,7 @@ private:
     jeandle::PEABlockState &CurrentState;
     DenseMap<jeandle::ObjectID, DenseMap<int64_t, jeandle::FieldValue>>
         &FieldStates;
+    FieldDefinitionMap &FieldDefinitions;
     DenseMap<jeandle::ObjectID, bool> &Eligible;
     DenseMap<jeandle::ObjectID, unsigned> &LockCounts;
     DenseMap<jeandle::ObjectID, SmallVector<LockEnter, 4>> &LiveLockEnters;
@@ -1076,6 +1086,9 @@ private:
     jeandle::AliasMap Aliases;
     DenseMap<jeandle::ObjectID, DenseMap<int64_t, jeandle::FieldValue>>
         FieldStates;
+    FieldDefinitionMap FieldDefinitions;
+    DenseSet<StoreInst *> ObservedFieldStores;
+    DenseMap<StoreInst *, jeandle::ObjectID> VirtualRefStoreTargets;
     DenseMap<jeandle::ObjectID, unsigned> LockCounts;
     DenseMap<jeandle::ObjectID, SmallVector<LockEnter, 4>> LiveLockEnters;
     DenseSet<jeandle::ObjectID> Materialized;
@@ -1262,6 +1275,7 @@ private:
   struct MaterializeContext {
     DenseMap<jeandle::ObjectID, DenseMap<int64_t, jeandle::FieldValue>>
         &FieldStates;
+    FieldDefinitionMap &FieldDefinitions;
     DenseMap<jeandle::ObjectID, unsigned> &LockCounts;
     DenseMap<jeandle::ObjectID, SmallVector<LockEnter, 4>> &LiveLockEnters;
     // Idempotency set: has this ObjectID already been materialized in this call
@@ -1304,6 +1318,10 @@ private:
     function_ref<void(jeandle::ObjectID)> FlipState;
   };
   void ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C);
+  void observeFieldDefinition(jeandle::ObjectID ID, int64_t Offset,
+                              const FieldDefinitionMap &Definitions);
+  void observeFieldDefinitions(jeandle::ObjectID ID,
+                               const FieldDefinitionMap &Definitions);
   // Whether a field/entry value can be produced at a program point (used by
   // ensureMaterialized's materialization gate and by the deopt-bundle
   // descriptor's scalar-cell sanity assert).
@@ -1355,14 +1373,34 @@ private:
   Value *realValueOfKeptReal(jeandle::ObjectID ID);
 };
 
+void Analyzer::observeFieldDefinition(jeandle::ObjectID ID, int64_t Offset,
+                                      const FieldDefinitionMap &Definitions) {
+  auto DIt = Definitions.find(ID);
+  if (DIt == Definitions.end())
+    return;
+  auto OIt = DIt->second.find(Offset);
+  if (OIt == DIt->second.end())
+    return;
+  ObservedFieldStores.insert(OIt->second.begin(), OIt->second.end());
+}
+
+void Analyzer::observeFieldDefinitions(jeandle::ObjectID ID,
+                                       const FieldDefinitionMap &Definitions) {
+  auto DIt = Definitions.find(ID);
+  if (DIt == Definitions.end())
+    return;
+  for (const auto &Off : DIt->second)
+    ObservedFieldStores.insert(Off.second.begin(), Off.second.end());
+}
+
 void Analyzer::markIneligible(jeandle::ObjectID ID) {
   // Fast marking only: clear Eligible and cascade through synthetic sources
   // (a synthetic VO's real-allocation sources must also be kept real, else the
   // merge PHI of a dropped synthetic would be left with all-OrigAlloc
   // incomings — poison). The VirtualRef (outer-real -> inner-real) cascade is
   // NOT walked here by design: it is commit()-time, where commit() seeds from
-  // every Eligible[ID]==false and walks the persistent VirtualRefEdges member
-  // to fixpoint, subsuming anything this fast marker would need to propagate.
+  // every Eligible[ID]==false and walks dependencies derived from observed
+  // reaching store definitions.
   SmallVector<jeandle::ObjectID, 8> Worklist;
   DenseSet<jeandle::ObjectID> Visited;
   Worklist.push_back(ID);
@@ -1370,6 +1408,7 @@ void Analyzer::markIneligible(jeandle::ObjectID ID) {
     jeandle::ObjectID Cur = Worklist.pop_back_val();
     if (!Visited.insert(Cur).second)
       continue;
+    observeFieldDefinitions(Cur, FieldDefinitions);
     Eligible[Cur] = false;
     jeandle::VirtualObject &VObj = *Result.VirtualObjects[Cur];
     if (VObj.IsSynthetic) {
@@ -1553,6 +1592,7 @@ void Analyzer::processBlock(BasicBlock *BB) {
 void Analyzer::resetPerBlockState() {
   CurrentState = jeandle::PEABlockState();
   FieldStates.clear();
+  FieldDefinitions.clear();
   LockCounts.clear();
   LiveLockEnters.clear();
   Materialized.clear();
@@ -1630,6 +1670,11 @@ void Analyzer::inheritFromExit(const BlockExitData &Exit) {
     if (!Eligible.lookup(Kv.first))
       continue;
     FieldStates[Kv.first] = Kv.second;
+  }
+  for (auto &Kv : Exit.FieldDefinitions) {
+    if (!Eligible.lookup(Kv.first))
+      continue;
+    FieldDefinitions[Kv.first] = Kv.second;
   }
   for (auto &Kv : Exit.LockCounts) {
     if (!Eligible.lookup(Kv.first))
@@ -1820,9 +1865,9 @@ Value *Analyzer::coerceToType(Value *V, Type *LoadTy,
 
 Analyzer::MergeProcessor::MergeProcessor(Analyzer &A, BasicBlock *BB)
     : A(A), BB(BB), CurrentState(A.CurrentState), FieldStates(A.FieldStates),
-      Eligible(A.Eligible), LockCounts(A.LockCounts),
-      LiveLockEnters(A.LiveLockEnters), Materialized(A.Materialized),
-      Aliases(A.Aliases), Result(A.Result),
+      FieldDefinitions(A.FieldDefinitions), Eligible(A.Eligible),
+      LockCounts(A.LockCounts), LiveLockEnters(A.LiveLockEnters),
+      Materialized(A.Materialized), Aliases(A.Aliases), Result(A.Result),
       PendingMergePhis(A.PendingMergePhis) {}
 
 void Analyzer::mergeStates(BasicBlock *BB) {
@@ -1907,6 +1952,7 @@ void Analyzer::MergeProcessor::run() {
       // NextSeqNo all carry over by design.)
       CurrentState = jeandle::PEABlockState();
       FieldStates.clear();
+      FieldDefinitions.clear();
       LockCounts.clear();
       LiveLockEnters.clear();
       Materialized.clear();
@@ -1920,8 +1966,11 @@ void Analyzer::MergeProcessor::run() {
       LLVM_DEBUG(dbgs() << "PEA: mergeStates retry cap (" << MaxRetries
                         << ") reached at BB '" << BB->getName()
                         << "'; bailing all VOs at merge.\n");
-      for (jeandle::ObjectID ID : IDs)
+      for (jeandle::ObjectID ID : IDs) {
+        for (const BlockExitData *P : Preds)
+          A.observeFieldDefinitions(ID, P->FieldDefinitions);
         A.markIneligible(ID);
+      }
       return;
     }
     ++Iter;
@@ -2093,6 +2142,10 @@ bool Analyzer::MergeProcessor::mergeObjectState(jeandle::ObjectID ID) {
     // per-pred allocation to materialize from. TODO(cascade-materialize):
     // per-pred source materialization + PHI reuse (see ensureMaterialized).
     if (Result.VirtualObjects[ID]->IsSynthetic) {
+      for (jeandle::ObjectID SourceID :
+           Result.VirtualObjects[ID]->SyntheticSourceIDs)
+        for (const BlockExitData *P : Preds)
+          A.observeFieldDefinitions(SourceID, P->FieldDefinitions);
       A.markIneligible(ID); // cascades transitively over nested synthetics.
       return false;
     }
@@ -2234,6 +2287,21 @@ bool Analyzer::MergeProcessor::mergeFieldStates(jeandle::ObjectID ID) {
   llvm::sort(SortedOffsets); // determinism
   bool BailObject = false;
   DenseMap<int64_t, jeandle::FieldValue> Merged;
+  DenseMap<int64_t, FieldDefinitionSet> MergedDefinitions;
+  for (int64_t Off : SortedOffsets) {
+    FieldDefinitionSet &Defs = MergedDefinitions[Off];
+    for (const auto *P : Preds) {
+      auto DIt = P->FieldDefinitions.find(ID);
+      if (DIt == P->FieldDefinitions.end())
+        continue;
+      auto OIt = DIt->second.find(Off);
+      if (OIt == DIt->second.end())
+        continue;
+      Defs.insert(OIt->second.begin(), OIt->second.end());
+    }
+    if (Defs.empty())
+      MergedDefinitions.erase(Off);
+  }
   // Snapshot of newly-emitted CreatePHI effects for this object's fields;
   // committed to Result only if every offset succeeds.
   jeandle::EffectList PendingPhiEffects;
@@ -2527,6 +2595,8 @@ bool Analyzer::MergeProcessor::mergeFieldStates(jeandle::ObjectID ID) {
   CurrentState.addObject(ID, jeandle::ObjectState());
   if (!Merged.empty())
     FieldStates[ID] = std::move(Merged);
+  if (!MergedDefinitions.empty())
+    FieldDefinitions[ID] = std::move(MergedDefinitions);
   if (RefLC != 0) {
     LockCounts[ID] = RefLC;
     // The merged live stack is identical to (any) pred's stack, since the
@@ -2551,6 +2621,9 @@ void Analyzer::snapshotExitStateInto(BlockExitData &Data) {
       auto FIt = FieldStates.find(ID);
       if (FIt != FieldStates.end() && !FIt->second.empty())
         Data.FieldStates[ID] = FIt->second;
+      auto DIt = FieldDefinitions.find(ID);
+      if (DIt != FieldDefinitions.end() && !DIt->second.empty())
+        Data.FieldDefinitions[ID] = DIt->second;
       auto LIt = LockCounts.find(ID);
       if (LIt != LockCounts.end() && LIt->second != 0)
         Data.LockCounts[ID] = LIt->second;
@@ -3149,6 +3222,22 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
     Plans.push_back(std::move(P));
   }
 
+  DenseMap<int64_t, FieldDefinitionSet> MergedDefinitions;
+  for (int64_t Off : Offsets) {
+    FieldDefinitionSet &Defs = MergedDefinitions[Off];
+    for (unsigned I = 0; I < N; ++I) {
+      auto DIt = ExitInfos[I]->FieldDefinitions.find(PerPredIDs[I]);
+      if (DIt == ExitInfos[I]->FieldDefinitions.end())
+        continue;
+      auto OIt = DIt->second.find(Off);
+      if (OIt == DIt->second.end())
+        continue;
+      Defs.insert(OIt->second.begin(), OIt->second.end());
+    }
+    if (Defs.empty())
+      MergedDefinitions.erase(Off);
+  }
+
   // Synthesize (or REUSE on cache hit) the new VirtualObject. On a
   // cache hit we reuse the existing ID (and existing VirtualObjects slot)
   // and merely refresh its synthetic metadata. On a miss we duplicate Ref,
@@ -3213,11 +3302,6 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
   for (const OffsetPlan &P : Plans) {
     if (P.AllSame) {
       Merged[P.Off] = P.SoleValue;
-      // The synthetic VO inherits a per-pred VirtualRef as-is: a NEW edge
-      // NewID -> inner that no processStore registration covers (the commit
-      // cascade must still reach inner when NewID goes real).
-      if (P.SoleValue.isVirtualRef())
-        VirtualRefEdges[NewID].insert(P.SoleValue.getVirtualRef());
       continue;
     }
     // Compute per-pred Value* for the synthesized PHI.
@@ -3303,6 +3387,8 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
   Eligible[NewID] = true;
   if (!Merged.empty())
     FieldStates[NewID] = std::move(Merged);
+  if (!MergedDefinitions.empty())
+    FieldDefinitions[NewID] = std::move(MergedDefinitions);
   if (RefLC != 0) {
     LockCounts[NewID] = RefLC;
     const auto &RefStack = ExitInfos[0]->LiveLockEnters.lookup(PerPredIDs[0]);
@@ -4025,9 +4111,10 @@ bool Analyzer::processStore(StoreInst *SI) {
     // reference here and let materializeAt rewrite it later.
     FieldStates[*BaseID][*Offset] =
         jeandle::FieldValue::virtualRef(*RefID, Val->getType());
-    // Register the persistent edge for commit()'s cross-block cascade (see
-    // the VirtualRefEdges member comment).
-    VirtualRefEdges[*BaseID].insert(*RefID);
+    FieldDefinitionSet &Defs = FieldDefinitions[*BaseID][*Offset];
+    Defs.clear();
+    Defs.insert(SI);
+    VirtualRefStoreTargets[SI] = *RefID;
 
     auto E = std::make_unique<jeandle::EliminateStoreEffect>();
     E->Block = SI->getParent();
@@ -4038,6 +4125,10 @@ bool Analyzer::processStore(StoreInst *SI) {
     return true;
   }
   FieldStates[*BaseID][*Offset] = jeandle::FieldValue::scalar(Val);
+  FieldDefinitionSet &Defs = FieldDefinitions[*BaseID][*Offset];
+  Defs.clear();
+  Defs.insert(SI);
+  VirtualRefStoreTargets.erase(SI);
 
   auto E = std::make_unique<jeandle::EliminateStoreEffect>();
   E->Block = SI->getParent();
@@ -4169,6 +4260,8 @@ void Analyzer::processLoad(LoadInst *LI) {
     if (It2 != It->second.end())
       Existing = &It2->second;
   }
+  if (Existing)
+    observeFieldDefinition(*BaseID, EntryOffset, FieldDefinitions);
 
   // FieldValue::unknown() is the local default initializer used transiently
   // in merge/Case-C synthesis (see the P.AllSame / PerPredFVs paths), but it
@@ -5321,6 +5414,29 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
       // for byte/boolean arrays — each element is one normal T_INT slot.
       const DenseMap<int64_t, jeandle::FieldValue> *Touched =
           (ItFS != FieldStates.end()) ? &ItFS->second : nullptr;
+      if (Touched) {
+        const int64_t Base = static_cast<int64_t>(VObj.ArrayBaseOffset);
+        const int64_t Scale = static_cast<int64_t>(VObj.ArrayIndexScale);
+        for (const auto &OffKV : *Touched) {
+          const int64_t Delta = OffKV.first - Base;
+          Type *TouchedType = OffKV.second.getDeclaredType();
+          bool Canonical =
+              Delta >= 0 && Scale > 0 && Delta % Scale == 0 &&
+              static_cast<uint64_t>(Delta / Scale) < VObj.ArrayLength;
+          bool ExactElementType =
+              TouchedType && TouchedType == VObj.ArrayElementType;
+          if (!Canonical || !ExactElementType) {
+            // A descriptor cannot omit, truncate, reinterpret, or overlap a
+            // touched byte cell. Feed the failure through the ordinary Cell
+            // fixpoint so any outer VORef plan also becomes Bad.
+            Cell C;
+            C.Offset = OffKV.first;
+            C.Kind = Cell::Bad;
+            P.Cells.push_back(C);
+            return;
+          }
+        }
+      }
       Constant *Default = Constant::getNullValue(VObj.ArrayElementType);
       for (uint32_t Idx = 0; Idx < VObj.ArrayLength; ++Idx) {
         int64_t Off = static_cast<int64_t>(VObj.ArrayBaseOffset) +
@@ -5504,6 +5620,7 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
     Plan &P = Plans[ID];
     if (P.Bad)
       continue;
+    observeFieldDefinitions(ID, FieldDefinitions);
     SmallVector<jeandle::MaterializeEffect::FieldEntry, 8> Snap;
     for (const Cell &C : P.Cells) {
       if (C.Kind == Cell::VORef) {
@@ -5815,6 +5932,7 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
     return; // idempotent — first escape wins; also breaks nested-cycles.
   if (!Eligible.lookup(ID))
     return; // already gave up on this object; nothing to materialize.
+  observeFieldDefinitions(ID, C.FieldDefinitions);
   // No dead-block guard here: pre-PEA LLVM cleanup (SimplifyCFG + ADCE,
   // see Pipeline.cpp) removes unreachable blocks via
   // removeUnreachableBlock, so every block that reaches PEA is reachable.
@@ -6151,19 +6269,13 @@ void Analyzer::materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
   // init) so each outlives C — function_ref does NOT own its callable, and a
   // temporary would be destroyed at the end of the `C{...};` statement, leaving
   // a dangling ref for the ensureMaterialized call on the next line.
-  MaterializeContext C{FieldStates,
-                       LockCounts,
-                       LiveLockEnters,
-                       Materialized,
-                       Reason,
-                       InsertBefore,
-                       InsertBefore->getParent(),
-                       nullptr,
-                       Recurse,
-                       ClearLockState,
-                       CaptureLocksIntoEffect,
-                       DropInnerAliases,
-                       ComputeSafeIP,
+  MaterializeContext C{FieldStates,      FieldDefinitions,
+                       LockCounts,       LiveLockEnters,
+                       Materialized,     Reason,
+                       InsertBefore,     InsertBefore->getParent(),
+                       nullptr,          Recurse,
+                       ClearLockState,   CaptureLocksIntoEffect,
+                       DropInnerAliases, ComputeSafeIP,
                        FlipState};
   ensureMaterialized(ID, C);
 }
@@ -6174,6 +6286,10 @@ void Analyzer::dropEffectsFor(jeandle::ObjectID ID) {
     Kv.second.eraseIf([&](const jeandle::Effect &E) {
       if (E.ObjID != ID)
         return false;
+      if (const auto *SE = dyn_cast<jeandle::EliminateStoreEffect>(&E))
+        if (auto *SI = dyn_cast_or_null<StoreInst>(SE->getTarget()))
+          if (!ObservedFieldStores.count(SI))
+            return false;
       if (isa<jeandle::EliminateAllocationEffect>(E))
         DroppedAllocation = true;
       return true;
@@ -6214,42 +6330,26 @@ void Analyzer::commit() {
     if (isDeoptContinuation(Kv.first))
       continue;
     for (auto &LC : Kv.second.LockCounts)
-      if (LC.second != 0)
+      if (LC.second != 0) {
+        observeFieldDefinitions(LC.first, Kv.second.FieldDefinitions);
         markIneligible(LC.first);
+      }
   }
 
   // -------------------------------------------------------------------------
   // Unified ineligibility fixpoint, iterated until the set is stable. Three
   // producers:
   //
-  //  (a) Transitive ineligibility cascade over the PERSISTENT VirtualRefEdges
-  //      set plus the synthetic-Case-C source cascade. Any virtual referenced
-  //      by a kept-real (ineligible) object's field must also be kept real: a
-  //      surviving real store into that field (its EliminateStoreEffect was
-  //      dropped by dropEffectsFor below) would otherwise write a
-  //      NeverEscapes object's OrigAlloc, which Pass 2 RAUWs to poison ->
-  //      miscompile. The edges are recorded at every VirtualRef write
-  //      (processStore, synthesizeCaseC) into the append-only VirtualRefEdges
-  //      member, which holds edges across ALL processed blocks. This is
-  //      the complete backstop for objects made ineligible by NON-store /
-  //      NON-load paths — e.g. unbalanced locking at a function exit, merge
-  //      hazards, the availability sweep, the deopt cascade, and the
-  //      defensive / consistency bails (the processLoad inner-ineligible /
-  //      ObjectState-missing / unparented-Repl / null-MaterializedRef
-  //      guards): store-time hazards materialize at the store
-  //      (processStore), untrackable loads materialize at the load
-  //      (processLoad), symbolic-offset icmps materialize at the icmp
-  //      (foldICmpEquality), and every other virtual operand is materialized
-  //      at its use by the generic gate (materializeAllVirtualOperands /
-  //      materializeVirtualCallArgs) — each of which recursively
-  //      materializes nested VirtualRefs and needs no commit-time help. It
-  //      catches VirtualRefs recorded at ANY point — before the object was
-  //      markIneligible'd AND after (recorded because processStore does not
-  //      check Eligible). Graal has no analog: it
-  //      materializes in place at the escape point, so the recursive entry
-  //      cascade (materializeWithCommit, Graal PartialEscapeBlockState) runs
-  //      at the very point the outer is committed; Jeandle's
-  //      analysis/transform split defers classification to here.
+  //  (a) Transitive ineligibility cascade over LIVE reaching VirtualRef store
+  //      definitions plus the synthetic-Case-C source cascade. A definition
+  //      becomes live when a load, materialization, deopt snapshot, or
+  //      conservative fallback observes it. If its outer is kept real, the
+  //      referenced inner must also be real; otherwise the restored store
+  //      would write an OrigAlloc that Pass 2 RAUWs to poison. A definition
+  //      overwritten before every observation is absent from this relation
+  //      and its EliminateStore effect survives outer fallback. This mirrors
+  //      Graal's point-sensitive ObjectState entries while retaining
+  //      Jeandle's deferred analysis/transform split.
   //
   //  (b) Deopt-descriptor dependency cascade: a
   //      RewriteDeoptBundleEffect whose Fields hold a VORef to an ineligible
@@ -6328,6 +6428,17 @@ void Analyzer::commit() {
     return true;
   };
   {
+    DenseMap<jeandle::ObjectID, SmallDenseSet<jeandle::ObjectID>>
+        LiveVirtualRefDeps;
+    for (const auto &Kv : Result.BlockEffects)
+      for (const auto &E : Kv.second)
+        if (const auto *SE = dyn_cast<jeandle::EliminateStoreEffect>(&E))
+          if (auto *SI = dyn_cast_or_null<StoreInst>(SE->getTarget()))
+            if (ObservedFieldStores.count(SI))
+              if (auto RIt = VirtualRefStoreTargets.find(SI);
+                  RIt != VirtualRefStoreTargets.end())
+                LiveVirtualRefDeps[E.ObjID].insert(RIt->second);
+
     // (b) Deopt-descriptor dependency map, built from the effects as they
     // stand at commit start (a RewriteDeoptBundleEffect's VirtualRef fields
     // point from the effect's ObjID/outer to the referenced inner).
@@ -6366,9 +6477,9 @@ void Analyzer::commit() {
             for (jeandle::ObjectID Src :
                  Result.VirtualObjects[Cur]->SyntheticSourceIDs)
               WList.push_back(Src);
-          // Persistent cross-block VirtualRef edges.
-          if (auto EIt = VirtualRefEdges.find(Cur);
-              EIt != VirtualRefEdges.end())
+          // Path-sensitive live VirtualRef definitions.
+          if (auto EIt = LiveVirtualRefDeps.find(Cur);
+              EIt != LiveVirtualRefDeps.end())
             for (jeandle::ObjectID Inner : EIt->second)
               WList.push_back(Inner);
           // Deopt-descriptor dependents.
@@ -6643,6 +6754,7 @@ void Analyzer::materializeAtPredFromExitInfo(jeandle::ObjectID ID,
     if (!ReachesTarget ||
         (DistinctSuccessors.size() > 1 &&
          (isa<IndirectBrInst>(Term) || !TargetMerge->canSplitPredecessors()))) {
+      observeFieldDefinitions(ID, ExitInfo.FieldDefinitions);
       markIneligible(ID);
       return;
     }
@@ -6684,6 +6796,7 @@ void Analyzer::materializeAtPredFromExitInfo(jeandle::ObjectID ID,
     ExitInfo.Virtuals.erase(Oid);
     ExitInfo.Materialized.insert(Oid);
     ExitInfo.FieldStates.erase(Oid);
+    ExitInfo.FieldDefinitions.erase(Oid);
     ExitInfo.LockCounts.erase(Oid);
   };
 
@@ -6703,6 +6816,7 @@ void Analyzer::materializeAtPredFromExitInfo(jeandle::ObjectID ID,
                              ? static_cast<Value *>(TargetMerge)
                              : static_cast<Value *>(PH->getTerminator());
   MaterializeContext C{ExitInfo.FieldStates,
+                       ExitInfo.FieldDefinitions,
                        ExitInfo.LockCounts,
                        ExitInfo.LiveLockEnters,
                        MatSet,
@@ -6801,6 +6915,21 @@ bool Analyzer::exitDataEquivalent(const BlockExitData &A,
         return false;
     }
   }
+  if (A.FieldDefinitions.size() != B.FieldDefinitions.size())
+    return false;
+  for (const auto &Kv : A.FieldDefinitions) {
+    auto It = B.FieldDefinitions.find(Kv.first);
+    if (It == B.FieldDefinitions.end() || Kv.second.size() != It->second.size())
+      return false;
+    for (const auto &Off : Kv.second) {
+      auto OIt = It->second.find(Off.first);
+      if (OIt == It->second.end() || Off.second.size() != OIt->second.size())
+        return false;
+      for (StoreInst *Def : Off.second)
+        if (!OIt->second.count(Def))
+          return false;
+    }
+  }
   if (A.LockCounts.size() != B.LockCounts.size())
     return false;
   for (auto &Kv : A.LockCounts) {
@@ -6831,6 +6960,9 @@ void Analyzer::takeLoopSnapshot(
   S.CurrentState = CurrentState;
   S.Aliases = Aliases.snapshot();
   S.FieldStates = FieldStates;
+  S.FieldDefinitions = FieldDefinitions;
+  S.ObservedFieldStores = ObservedFieldStores;
+  S.VirtualRefStoreTargets = VirtualRefStoreTargets;
   S.LockCounts = LockCounts;
   S.LiveLockEnters = LiveLockEnters;
   S.Materialized = Materialized;
@@ -6872,6 +7004,9 @@ void Analyzer::restoreLoopSnapshot(
   CurrentState = S.CurrentState;
   Aliases.restore(S.Aliases);
   FieldStates = S.FieldStates;
+  FieldDefinitions = S.FieldDefinitions;
+  ObservedFieldStores = S.ObservedFieldStores;
+  VirtualRefStoreTargets = S.VirtualRefStoreTargets;
   LockCounts = S.LockCounts;
   LiveLockEnters = S.LiveLockEnters;
   Materialized = S.Materialized;
@@ -7072,6 +7207,7 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
         continue;
       BlockExitInfo &PExit = It->second;
       for (jeandle::ObjectID ID : PExit.Virtuals) {
+        observeFieldDefinitions(ID, PExit.FieldDefinitions);
         markIneligible(ID);
       }
     }
@@ -7236,7 +7372,7 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
       {
         resetPerBlockState();
         mergeStates(Header);
-        NewMergedState = BlockExitData{};
+        NewMergedState = BlockExitData();
         snapshotExitStateInto(NewMergedState); // B'
         PendingMergePhis[Header].clear();
       }
@@ -7318,8 +7454,10 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
       auto EIt = BlockExits.find(BB);
       if (EIt == BlockExits.end())
         continue;
-      for (jeandle::ObjectID ID : EIt->second.Virtuals)
+      for (jeandle::ObjectID ID : EIt->second.Virtuals) {
+        observeFieldDefinitions(ID, EIt->second.FieldDefinitions);
         markIneligible(ID);
+      }
     }
     if (L->getLoopDepth() == 1)
       CurrentMode = SavedModeForNest;
@@ -7377,8 +7515,10 @@ jeandle::PEAResult Analyzer::run() {
       auto It = BlockExits.find(P);
       if (It == BlockExits.end())
         continue;
-      for (jeandle::ObjectID ID : It->second.Virtuals)
+      for (jeandle::ObjectID ID : It->second.Virtuals) {
+        observeFieldDefinitions(ID, It->second.FieldDefinitions);
         markIneligible(ID);
+      }
     }
     BlockExits.erase(BB);
   };
