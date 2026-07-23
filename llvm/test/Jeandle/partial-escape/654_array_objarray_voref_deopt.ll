@@ -11,6 +11,8 @@
 ; mix of array descriptor (T_ARRAY) + instance descriptor (T_OBJECT) is emitted
 ; in the same VO section.
 
+@arrayOopDesc.element_size.object = private constant i32 8
+
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(i32)
@@ -31,10 +33,10 @@ body:
   ; point: offset 8 = int %val.
   %pf = getelementptr inbounds i8, ptr addrspace(1) %point, i64 8
   store atomic i32 %val, ptr addrspace(1) %pf unordered, align 4
-  ; arr[0] = %point (a VORef element). objArray base 16, scale 4: index 0 @ 16.
+  ; arr[0] = %point (a VORef element). objArray base 16, scale 8: index 0 @ 16.
   %base = getelementptr inbounds i8, ptr addrspace(1) %arr, i32 16
   %e0 = getelementptr inbounds ptr addrspace(1), ptr addrspace(1) %base, i64 0
-  store atomic ptr addrspace(1) %point, ptr addrspace(1) %e0 unordered, align 4
+  store atomic ptr addrspace(1) %point, ptr addrspace(1) %e0 unordered, align 8
   ; Use point's field value so it is not dead.
   %pv = load atomic i32, ptr addrspace(1) %pf unordered, align 4
   ; %arr lives ONLY in the deopt bundle; %point lives ONLY via arr[0].
@@ -64,9 +66,9 @@ u:
 ; CHECK-SAME: i64 262157, i64 54004, i32 2,
 ; arr elem 0 @ offset 16 (VORef to point id 1): (16<<32)|(8<<16)|12 = 68720001036
 ; CHECK-SAME: i64 68720001036, i32 1,
-; arr elem 1 @ offset 20 (untouched default null), LocalType/T_OBJECT:
-;   (20<<32)|12 = 85899345932
-; CHECK-SAME: i64 85899345932, ptr addrspace(1) null,
+; arr elem 1 @ offset 24 (untouched default null), LocalType/T_OBJECT:
+;   (24<<32)|12 = 103079215116
+; CHECK-SAME: i64 103079215116, ptr addrspace(1) null,
 ; the OrigAlloc locals slot -> VORefLocalType (vo_id=0): 524300
 ; CHECK-SAME: i64 524300, i32 0) ]
 ; CHECK-NOT: addrspace(1) %arr

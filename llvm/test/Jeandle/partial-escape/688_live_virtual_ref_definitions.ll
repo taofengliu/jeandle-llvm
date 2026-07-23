@@ -420,7 +420,8 @@ body:
   store atomic ptr addrspace(1) %child, ptr addrspace(1) %slot unordered, align 8
   invoke void @observe_owner(ptr addrspace(1) %outer)
       [ "deopt"(i32 94, i32 94, i64 12,
-                 ptr addrspace(1) %outer, ptr addrspace(1) %child) ]
+                 ptr addrspace(1) %outer,
+                 i64 4294967308, ptr addrspace(1) %child) ]
       to label %normal unwind label %handler
 normal:
   ret void
@@ -439,7 +440,8 @@ alloc.unwind:
 ; CHECK-NEXT: store atomic ptr addrspace(1) %child, ptr addrspace(1) %[[SLOT]] unordered, align 8
 ; CHECK-NEXT: invoke void @observe_owner(ptr addrspace(1) %outer)
 ; CHECK-SAME: [ "deopt"(i32 94, i32 94, i64 12,
-; CHECK-SAME: ptr addrspace(1) %outer, ptr addrspace(1) %child) ]
+; CHECK-SAME: ptr addrspace(1) %outer,
+; CHECK-SAME: i64 4294967308, ptr addrspace(1) %child) ]
 ; CHECK-NEXT: to label %normal unwind label %handler
 ; CHECK: handler:
 ; CHECK-NEXT: %lp = landingpad i64

@@ -217,8 +217,13 @@ VirtualObject::matchArrayElementGEP(GetElementPtrInst *GEP,
   // Pattern A: typed GEP with sourceElementType == ArrayElementType. The
   // typed GEP's pointer operand must reach the alloc base with a constant
   // accumulated byte offset equal to ArrayBaseOffset (Jeandle emits this
-  // as a preceding i8 + base-offset GEP).
-  if (GEPOp->getSourceElementType() == ArrayElementType &&
+  // as a preceding i8 + base-offset GEP). The LLVM typed stride must exactly
+  // match the VM scale; otherwise converting the recovered index back with
+  // ArrayIndexScale would change the original byte address.
+  TypeSize TypedStride = DL.getTypeAllocSize(ArrayElementType);
+  bool ExactTypedStride = !TypedStride.isScalable() &&
+                          TypedStride.getFixedValue() == ArrayIndexScale;
+  if (ExactTypedStride && GEPOp->getSourceElementType() == ArrayElementType &&
       GEPOp->getNumIndices() == 1) {
     int64_t BaseOff = 0;
     bool NonConst = false;

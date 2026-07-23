@@ -14,3 +14,4 @@ HasFinalizer 68910 = false
 CanVirtualize 68910 = true
 HasFinalizer 68911 = false
 CanVirtualize 68911 = true
+ElementBasicTypeOfArrayKlass 68912 = 5

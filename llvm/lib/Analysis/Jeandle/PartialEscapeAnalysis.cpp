@@ -5422,7 +5422,25 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
               static_cast<uint64_t>(Delta / Scale) < VObj.ArrayLength;
           bool ExactElementType =
               TouchedType && TouchedType == VObj.ArrayElementType;
-          if (!Canonical || !ExactElementType) {
+          bool ExactStoreSize = false;
+          bool FullByteRange = false;
+          if (TouchedType) {
+            TypeSize StoreSize = DL.getTypeStoreSize(TouchedType);
+            if (!StoreSize.isScalable()) {
+              uint64_t FixedStoreSize = StoreSize.getFixedValue();
+              ExactStoreSize = FixedStoreSize == static_cast<uint64_t>(Scale);
+              if (Delta >= 0 && Scale > 0) {
+                uint64_t ArrayBytes =
+                    static_cast<uint64_t>(VObj.ArrayLength) *
+                    static_cast<uint64_t>(VObj.ArrayIndexScale);
+                uint64_t Start = static_cast<uint64_t>(Delta);
+                FullByteRange =
+                    Start <= ArrayBytes && FixedStoreSize <= ArrayBytes - Start;
+              }
+            }
+          }
+          if (!Canonical || !ExactElementType || !ExactStoreSize ||
+              !FullByteRange) {
             // A descriptor cannot omit, truncate, reinterpret, or overlap a
             // touched byte cell. Feed the failure through the ordinary Cell
             // fixpoint so any outer VORef plan also becomes Bad.
