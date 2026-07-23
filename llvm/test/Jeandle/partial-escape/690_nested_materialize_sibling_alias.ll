@@ -51,6 +51,10 @@ unwind:
 ; CHECK-NOT: load atomic i32
 ; CHECK: ret i32 42
 ; CHECK: escape:
+; CHECK: %[[CHILD_SLOT:.*]] = getelementptr inbounds i8, ptr addrspace(1) %child, i64 16
+; CHECK-NEXT: store atomic i32 42, ptr addrspace(1) %[[CHILD_SLOT]] unordered, align 4
+; CHECK: %[[HOLDER_SLOT:.*]] = getelementptr inbounds i8, ptr addrspace(1) %holder, i64 16
+; CHECK-NEXT: store atomic ptr addrspace(1) %child, ptr addrspace(1) %[[HOLDER_SLOT]] unordered, align 8
 ; CHECK: call void @sink(ptr addrspace(1) %holder)
 
 ; A second layout keeps one child shared by two parents and Object[].  The
@@ -119,6 +123,10 @@ unwind:
 
 ; CHECK-LABEL: define i32 @shared_array_escape_before_virtual_sibling(
 ; CHECK: escape:
+; CHECK: %[[SHARED_CHILD_SLOT:.*]] = getelementptr inbounds i8, ptr addrspace(1) %child, i64 16
+; CHECK-NEXT: store atomic i32 42, ptr addrspace(1) %[[SHARED_CHILD_SLOT]] unordered, align 4
+; CHECK: %[[FIRST_SLOT:.*]] = getelementptr inbounds i8, ptr addrspace(1) %first, i64 16
+; CHECK-NEXT: store atomic ptr addrspace(1) %child, ptr addrspace(1) %[[FIRST_SLOT]] unordered, align 8
 ; CHECK: call void @sink(ptr addrspace(1) %first)
 ; CHECK: virtual:
 ; CHECK-NOT: load atomic

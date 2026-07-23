@@ -6117,8 +6117,8 @@ bool Analyzer::isValueAvailableAt(Value *Root, Instruction *IP) {
 // materialization algorithm shared by the escape-point path (materializeAt) and
 // the merge-driven per-predecessor path (materializeAtPredFromExitInfo). The
 // per-path differences are supplied via MaterializeContext C (operative state
-// maps, idempotency set, recursion target, lock-capture phase-2 timing, alias
-// drop, safe IP, effect flags, state flip), keeping this body path-agnostic.
+// maps, idempotency set, recursion target, lock-capture phase-2 timing, safe
+// IP, effect flags, state flip), keeping this body path-agnostic.
 void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
   if (C.MaterializedSet.count(ID))
     return; // idempotent — first escape wins; also breaks nested-cycles.
