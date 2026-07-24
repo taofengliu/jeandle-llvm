@@ -1,10 +1,12 @@
 ; RUN: opt -disable-output -verify-each \
 ; RUN:   -passes="require<partial-escape-analysis>" -jeandle-trace-pea \
 ; RUN:   -jeandle-dump-pea-stats -jeandle-pea-analyze-function=casea_invoke_normal_edge \
-; RUN:   %s 2>&1 | FileCheck %s --check-prefix=TRACE
+; RUN:   %s 2>&1 | FileCheck %s --check-prefix=TRACE \
+; RUN:     --implicit-check-not='PEA: Materialize function=@casea_invoke_normal_edge'
 ; RUN: opt -S -verify-each \
 ; RUN:   -passes="require<partial-escape-analysis>,partial-escape-transform" \
-; RUN:   %s | FileCheck %s --check-prefix=FINAL
+; RUN:   %s | FileCheck %s --check-prefix=FINAL \
+; RUN:     --implicit-check-not='invoke hotspotcc ptr addrspace(1) @jeandle.new_instance'
 
 ; The selected PHI cannot use Case C because %a remains independently
 ; observable at sink2.  Case A must materialize each virtual incoming on its
