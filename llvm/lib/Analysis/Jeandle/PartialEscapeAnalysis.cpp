@@ -1357,7 +1357,9 @@ private:
   // Whether a field/entry value can be produced at a program point (used by
   // ensureMaterialized's materialization gate and by the deopt-bundle
   // descriptor's release-build correctness gate).
-  bool isValueAvailableAt(Value *Root, Instruction *IP);
+  bool isValueAvailableAt(Value *Root, Instruction *IP,
+                          BasicBlock *ReplaySource = nullptr,
+                          BasicBlock *ReplayTarget = nullptr);
   void propagatePointerAlias(Instruction *I);
 
   // Walk every other VO's FieldStates in the supplied map and rewrite
@@ -5577,8 +5579,16 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
           bool Canonical =
               Delta >= 0 && Scale > 0 && Delta % Scale == 0 &&
               static_cast<uint64_t>(Delta / Scale) < VObj.ArrayLength;
+          // boolean[] has an i1 logical element type, but its VM storage
+          // scale is one byte and the front end accesses that storage as i8.
+          // Both forms map to the same T_INT deopt computational type.  Keep
+          // every other kind exact so a same-width reinterpretation cannot
+          // enter the descriptor.
           bool ExactElementType =
-              TouchedType && TouchedType == VObj.ArrayElementType;
+              TouchedType &&
+              (TouchedType == VObj.ArrayElementType ||
+               (VObj.ArrayElementType->isIntegerTy(1) &&
+                TouchedType->isIntegerTy(8) && VObj.ArrayIndexScale == 1));
           bool ExactStoreSize = false;
           bool FullByteRange = false;
           if (TouchedType) {
@@ -6122,10 +6132,15 @@ static void captureMaterializedLocks(ArrayRef<LockEnter> Stack,
 // available (checked recursively); an unparented analyzer-built PHI shell
 // (merge field-PHI / Case-C PHI) is inserted by its CreatePHI effect into
 // its PhiHome block — sound iff that home block dominates IP's block;
-// Constants / Arguments are always available. Querying DT.dominates on an
-// unparented instruction directly is ill-defined (it is in no domtree
-// node), so it must never reach the raw DT query.
-bool Analyzer::isValueAvailableAt(Value *Root, Instruction *IP) {
+// Constants / Arguments are always available.  A replay on an invoke's normal
+// edge may also use the invoke result: it is unavailable before the terminator
+// but defined on that exact edge, where splitReplayEdges places any real replay
+// operations. Querying DT.dominates on an unparented instruction directly is
+// ill-defined (it is in no domtree node), so it must never reach the raw DT
+// query.
+bool Analyzer::isValueAvailableAt(Value *Root, Instruction *IP,
+                                  BasicBlock *ReplaySource,
+                                  BasicBlock *ReplayTarget) {
   SmallPtrSet<Value *, 8> Visited;
   SmallVector<Value *, 8> Worklist(1, Root);
   while (!Worklist.empty()) {
@@ -6136,7 +6151,13 @@ bool Analyzer::isValueAvailableAt(Value *Root, Instruction *IP) {
     if (!I)
       continue; // Constant / Argument: always available.
     if (I->getParent()) {
-      if (!DT.dominates(I, IP))
+      if (DT.dominates(I, IP))
+        continue;
+      auto *Invoke = dyn_cast<InvokeInst>(IP);
+      bool AvailableOnNormalEdge =
+          ReplaySource && ReplayTarget && IP == ReplaySource->getTerminator() &&
+          I == Invoke && Invoke->getNormalDest() == ReplayTarget;
+      if (!AvailableOnNormalEdge)
         return false;
       continue;
     }
@@ -6372,19 +6393,22 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
   Instruction *SafeIP = C.ComputeSafeIP();
   assert(SafeIP && "materialization requires a safe insertion point");
 
-  // The real replay receiver must itself be available at the insertion point.
-  // OrigAlloc satisfies this by the ordinary SSA invariant; a synthetic
-  // receiver can be a cached or loop-carried PHI, so validate it explicitly
-  // for every legal LLVM CFG before mutating any lock state.
+  // The real replay receiver must itself be available at the semantic replay
+  // point. OrigAlloc normally satisfies this by dominance. An allocation
+  // invoke result is instead defined on its normal edge; edge-local replay is
+  // placed there by the transform. A synthetic receiver can be a cached or
+  // loop-carried PHI, so validate every shape explicitly before mutating any
+  // lock state.
   Value *ReplayReceiver = realIdentityOf(ID);
-  if (!isValueAvailableAt(ReplayReceiver, SafeIP)) {
+  if (!isValueAvailableAt(ReplayReceiver, SafeIP, C.ReplaySource,
+                          C.ReplayTarget)) {
     markIneligible(ID);
     return;
   }
 
   // Per-field availability gate: after VirtualRef rewriting, every Scalar /
-  // MaterializedRef field value must be AVAILABLE at SafeIP (a snapshot
-  // value that does not exist at the materialize point would replay as a
+  // MaterializedRef field value must be available at the same semantic replay
+  // point (a snapshot value that does not exist there would replay as a
   // dangling reference).
   auto FSIt = C.FieldStates.find(ID);
   if (FSIt != C.FieldStates.end()) {
@@ -6399,7 +6423,7 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
         continue;
       if (!V)
         continue;
-      if (!isValueAvailableAt(V, SafeIP)) {
+      if (!isValueAvailableAt(V, SafeIP, C.ReplaySource, C.ReplayTarget)) {
         markIneligible(ID);
         return;
       }
@@ -7170,8 +7194,10 @@ void Analyzer::materializeAtPredFromExitInfo(jeandle::ObjectID ID,
   auto ComputeSafeIP = [&]() -> Instruction * {
     // Per-predecessor placement (Graal predecessor.getEndNode(),
     // Graal PartialEscapeClosure merge): materialize at the predecessor's
-    // terminator. The replay receiver (OrigAlloc or an already-defined
-    // SyntheticPhi) dominates the terminator, so this is a valid IP.
+    // terminator. The replay receiver normally dominates the terminator. An
+    // allocation invoke result is instead available on its normal edge; the
+    // availability gate recognizes that exact edge and the transform splits
+    // it before emitting any replay operations.
     return PH->getTerminator();
   };
   auto FlipState = [&](jeandle::ObjectID Oid) {

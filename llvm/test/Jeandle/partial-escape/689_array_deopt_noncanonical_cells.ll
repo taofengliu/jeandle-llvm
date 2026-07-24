@@ -9,9 +9,11 @@
 
 ; A virtual-array descriptor represents exactly one canonical cell per Java
 ; element.  Any touched byte cell that cannot be mapped to
-; base + index*scale with the array's exact element type must reject the whole
-; descriptor.  The fallback reuses the original allocation, replays the
-; tracked store before the safepoint, and leaves the real oop in the bundle.
+; base + index*scale with the array's element storage representation must
+; reject the whole descriptor.  boolean[] uses i8 physical storage for its i1
+; logical element type; all other kinds require the exact element type.  The
+; fallback reuses the original allocation, replays the tracked store before the
+; safepoint, and leaves the real oop in the bundle.
 
 @arrayOopDesc.element_size.object = private constant i32 8
 @arrayOopDesc.element_size.long = private constant i32 4
@@ -124,6 +126,40 @@ unwind:
 ; CHECK-SAME: i64 262157, i64 68904, i32 2,
 ; CHECK-SAME: i64 68719476746, i32 0,
 ; CHECK-SAME: i64 85899345930, i32 99,
+; CHECK-SAME: i64 524300, i32 0) ]
+
+; A boolean[] has one-byte physical cells even though its logical LLVM element
+; type is i1.  The front end therefore uses i8 loads and stores.  That exact
+; storage representation is canonical for a VM boolean element and must remain
+; eligible for a deopt descriptor.
+define void @boolean_i8_cells_are_canonical() gc "hotspotgc"
+    personality ptr @__gxx_personality_v0 {
+entry:
+  %arr = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(
+      ptr inttoptr (i64 68913 to ptr), i32 3, i32 24, i32 16, i32 1048576)
+      to label %body unwind label %unwind
+body:
+  %base = getelementptr inbounds i8, ptr addrspace(1) %arr, i64 16
+  store atomic i8 1, ptr addrspace(1) %base unordered, align 1
+  %last = getelementptr inbounds i8, ptr addrspace(1) %base, i64 2
+  store atomic i8 1, ptr addrspace(1) %last unordered, align 1
+  call void @safepoint()
+      [ "deopt"(i32 14, i32 14, i64 12, ptr addrspace(1) %arr) ]
+  ret void
+unwind:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
+; CHECK-LABEL: define void @boolean_i8_cells_are_canonical(
+; CHECK-NOT: @jeandle.new_array
+; CHECK-NOT: store atomic
+; CHECK: call void @safepoint()
+; CHECK-SAME: [ "deopt"(i32 14, i32 14,
+; CHECK-SAME: i64 262157, i64 68913, i32 3,
+; CHECK-SAME: i64 68719476746, i8 1,
+; CHECK-SAME: i64 73014444042, i1 false,
+; CHECK-SAME: i64 77309411338, i8 1,
 ; CHECK-SAME: i64 524300, i32 0) ]
 
 define void @symbolic_offset_materializes_before_deopt(i64 %index)
