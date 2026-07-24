@@ -1081,8 +1081,15 @@ void jeandle::RewriteDeoptBundleEffect::apply(jeandle::TransformContext &Ctx) {
     return; // bundle gone — nothing to rewrite.
 
   jeandle::VirtualObject &VObj = *Ctx.Result.VirtualObjects[ObjID];
-  Value *OrigAlloc = VObj.AllocationCall;
-  assert(OrigAlloc && "virtual VO missing OrigAlloc");
+  // The root identity matched in bundle slots: SyntheticPhi for a synthetic
+  // VO, AllocationCall (OrigAlloc) for an ordinary VO. A synthetic's
+  // AllocationCall is BORROWED from a source and MUST NOT be matched here —
+  // matching it would cross-rewrite a source's own bundle slot when pred-0
+  // dominates the safepoint (e.g. a loop-preheader Case-C shape). Mirrors
+  // applyMaterialize, which replays a synthetic onto SyntheticPhi.
+  Value *RootIdentity =
+      VObj.IsSynthetic ? VObj.SyntheticPhi : VObj.AllocationCall;
+  assert(RootIdentity && "virtual VO missing root identity");
   uint64_t Klass = VObj.Klass;
   unsigned VObjID = ObjID;
 
@@ -1128,16 +1135,19 @@ void jeandle::RewriteDeoptBundleEffect::apply(jeandle::TransformContext &Ctx) {
   // sections — is scanned for slots to rewrite.
   unsigned InsertPos = getDeoptScopeVOInsertPos(*CB);
 
-  // A bundle operand denotes this VO iff it is the OrigAlloc OR one of the
+  // A bundle operand denotes this VO iff it is the RootIdentity (SyntheticPhi
+  // for a synthetic, OrigAlloc for an ordinary VO) OR one of the
   // analysis-recorded RootOperands (identity aliases: Case-B PHI / freeze /
   // offset-0 select / offset-0 GEP / load-through result — see
-  // RewriteDeoptBundleEffect::RootOperands in PartialEscape.h). A
-  // load-through alias is RAUW'd to OrigAlloc by its ReplaceLoad before this
-  // effect applies (covered by the OrigAlloc match); the other shapes are
-  // never RAUW'd and are covered by RootOperands (WeakTrackingVH, so each
-  // handle follows any earlier RAUW).
+  // RewriteDeoptBundleEffect::RootOperands in PartialEscape.h). A load-through
+  // alias is RAUW'd to OrigAlloc by its ReplaceLoad before this effect applies
+  // (covered by the RootIdentity match for an ordinary VO); the other shapes
+  // are never RAUW'd and are covered by RootOperands (WeakTrackingVH, so each
+  // handle follows any earlier RAUW). A synthetic's SyntheticPhi is itself an
+  // identity alias registered by synthesizeCaseC, so it appears in RootOperands
+  // as well as being the RootIdentity.
   auto IsRootOperand = [&](Value *V) {
-    if (V == OrigAlloc)
+    if (V == RootIdentity)
       return true;
     for (const WeakTrackingVH &RO : RootOperands)
       if ((Value *)RO == V)
@@ -1198,7 +1208,7 @@ void jeandle::RewriteDeoptBundleEffect::apply(jeandle::TransformContext &Ctx) {
     Value *V = Deopt->Inputs[i].get();
     if (IsRootOperand(V)) {
       assert(i > InsertPos && !Args.empty() &&
-             "OrigAlloc slot missing its preceding encoding");
+             "root-identity slot missing its preceding encoding");
       assert(isa<ConstantInt>(Args.back()) &&
              "deopt slot encoding must be a ConstantInt");
       uint64_t SlotEnc = cast<ConstantInt>(Args.back())->getZExtValue();
@@ -1224,7 +1234,7 @@ void jeandle::RewriteDeoptBundleEffect::apply(jeandle::TransformContext &Ctx) {
         // slot.
         assert((SlotVT == jeandle::DeoptValueEncoding::LocalType ||
                 SlotVT == jeandle::DeoptValueEncoding::StackType) &&
-               "OrigAlloc deopt slot must be Local/Stack/Monitor");
+               "root-identity deopt slot must be Local/Stack/Monitor");
         Args.pop_back();
         auto RefVT = (SlotVT == jeandle::DeoptValueEncoding::LocalType)
                          ? jeandle::DeoptValueEncoding::VORefLocalType

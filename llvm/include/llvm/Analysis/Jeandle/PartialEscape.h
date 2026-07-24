@@ -775,17 +775,18 @@ public:
 // ObjectValue + id back-ref). Scope of
 // the current implementation: instance objects AND arrays (whose element kind
 // the VMCallback could classify — ArrayElementType != nullptr &&
-// ArrayIndexScale != 0), not synthetic, referenced as the OrigAlloc (not a
-// derived bundle operand), with fields/elements that are plain scalars,
-// VORefs to other describable VOs, or describable wide-oop (addrspace-1)
-// reference values to non-VO (argument/null/materialized-external) oops. A
-// touched long/double field is described with ONE wire entry carrying the
-// full i64/f64 value; the HotSpot parser's fill_one_scope_value T_LONG/
-// T_DOUBLE branch expands it to the two field_values slots. A VO HOLDING A
-// LOCK at the safepoint IS described: its PEA-eliminated lock is
-// reconstructed at deopt by rewriting the bundle's monitor entry to
-// eliminated=true with a VORef owner (the transform handles monitor-object
-// OrigAlloc slots in step 3).
+// ArrayIndexScale != 0), including synthetic (Case-C merge) objects, referenced
+// by object identity (the OrigAlloc for an ordinary VO, SyntheticPhi for a
+// synthetic; not a derived bundle operand), with fields/elements that are plain
+// scalars, VORefs to other describable VOs, or describable wide-oop
+// (addrspace-1) reference values to non-VO
+// (argument/null/materialized-external) oops. A touched long/double field is
+// described with ONE wire entry carrying the full i64/f64 value; the HotSpot
+// parser's fill_one_scope_value T_LONG/ T_DOUBLE branch expands it to the two
+// field_values slots. A VO HOLDING A LOCK at the safepoint IS described: its
+// PEA-eliminated lock is reconstructed at deopt by rewriting the bundle's
+// monitor entry to eliminated=true with a VORef owner (the transform handles
+// monitor-object OrigAlloc slots in step 3).
 //
 // Intentionally deferred — the analyzer bails these (and contagiously bails
 // any VO referencing a bailed VO, so no dangling VORef is ever emitted):
@@ -816,13 +817,14 @@ public:
   CallBase *Safepoint = nullptr;
   WeakTrackingVH SafepointVH;
   // Every "deopt" bundle operand of the safepoint that denotes THIS VO by
-  // object identity (the OrigAlloc itself, or an alias-map virtual-alias such
-  // as a Case-B PHI / freeze / offset-0 select / offset-0 GEP / load-through
-  // result). The transform rewrites slots matching OrigAlloc OR any of these
-  // operands (a load-through alias is RAUW'd to OrigAlloc by its ReplaceLoad
-  // before this effect applies, so the OrigAlloc match covers it; the other
-  // shapes are never RAUW'd and are covered by RootOperands). WeakTrackingVH:
-  // follows any RAUW of the operand.
+  // object identity (the OrigAlloc itself for an ordinary VO, SyntheticPhi for
+  // a synthetic, or an alias-map virtual-alias such as a Case-B PHI / freeze /
+  // offset-0 select / offset-0 GEP / load-through result). The transform
+  // rewrites slots matching the VO's root identity (OrigAlloc or SyntheticPhi)
+  // OR any of these operands (a load-through alias is RAUW'd to OrigAlloc by
+  // its ReplaceLoad before this effect applies, so the root-identity match
+  // covers it; the other shapes are never RAUW'd and are covered by
+  // RootOperands). WeakTrackingVH: follows any RAUW of the operand.
   SmallVector<WeakTrackingVH, 2> RootOperands;
   // Per-offset snapshot of the object's field values at the safepoint (read
   // from the analyzer's FieldStates keyed by (ObjectID, byte-offset)). Each

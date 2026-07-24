@@ -397,11 +397,13 @@ merge:
 ; IR-NOT: call void @sink
 ; IR-NOT: poison
 
-; A deopt operand makes the synthetic identity observable at the safepoint
-; before its later ordinary escape.  The source allocations still remain at
-; their original sites.  The complete then-current state is replayed onto %p
-; immediately before the safepoint; a later store and @sink operate on the
-; now-real identity without another replay.
+; A deopt operand referencing a Case-C synthetic BEFORE its later ordinary
+; escape: the synthetic is still virtual at the safepoint, so it is DESCRIBED
+; there (VO descriptor + VORef slot) rather than materialized — Graal treats a
+; synthetic VO identically to a normal VO in deopt.  The source allocations
+; remain at their original sites because the synthetic later escapes at @sink;
+; the complete then-current state is replayed onto %p once, at that escape
+; point (not before the safepoint).
 define void @casec_deopt_then_escape(i1 %choose) gc "hotspotgc" {
 entry:
   br i1 %choose, label %left, label %right
@@ -429,25 +431,32 @@ merge:
 }
 
 ; IR-LABEL: define void @casec_deopt_then_escape(
-; IR: left:
-; IR-NEXT: %a = call hotspotcc ptr addrspace(1) @jeandle.new_instance{{.*}}[ "deopt"(i32 692101) ]
+; Sources stay real: the synthetic escapes at @sink, so its source allocations
+; remain at their original sites.
+; IR: %a = call hotspotcc ptr addrspace(1) @jeandle.new_instance{{.*}}[ "deopt"(i32 692101) ]
+; IR: %b = call hotspotcc ptr addrspace(1) @jeandle.new_instance{{.*}}[ "deopt"(i32 692102) ]
+; IR: %p = phi ptr addrspace(1) [ %a, %left ], [ %b, %right ]
+; IR: %[[DFIELD:pea.casec.field.phi[^ ]*]] = phi i32 [ 301, %left ], [ 302, %right ]
+; The synthetic is VIRTUAL at the safepoint (it escapes only at @sink AFTER):
+; no replay before the safepoint — it is DESCRIBED there.  Descriptor header
+; (vo_id=2, ScalarValueType, T_OBJECT) + klass 69210 + field_count 2; field
+; offset 8 = merged PHI, field offset 16 = 303 (the value AT the safepoint);
+; the %p slot is rewritten to a VORefLocalType reference (vo_id=2).
+; IR-NOT: pea.matslot
 ; IR-NOT: store atomic
-; IR-NEXT: br label %merge
-; IR: right:
-; IR-NEXT: %b = call hotspotcc ptr addrspace(1) @jeandle.new_instance{{.*}}[ "deopt"(i32 692102) ]
-; IR-NOT: store atomic
-; IR-NEXT: br label %merge
-; IR: merge:
-; IR-NEXT: %p = phi ptr addrspace(1) [ %a, %left ], [ %b, %right ]
-; IR-NEXT: %[[DFIELD:pea.casec.field.phi[^ ]*]] = phi i32 [ 301, %left ], [ 302, %right ]
-; IR-NEXT: %[[POST:[^ ]+]] = getelementptr inbounds i8, ptr addrspace(1) %p, i64 16
-; IR-NEXT: %[[DSLOT8:pea.matslot[^ ]*]] = getelementptr inbounds i8, ptr addrspace(1) %p, i64 8
-; IR-NEXT: store atomic i32 %[[DFIELD]], ptr addrspace(1) %[[DSLOT8]] unordered, align 4
-; IR-NEXT: %[[DSLOT16:pea.matslot[^ ]*]] = getelementptr inbounds i8, ptr addrspace(1) %p, i64 16
-; IR-NEXT: store atomic i32 303, ptr addrspace(1) %[[DSLOT16]] unordered, align 4
-; IR-NEXT: call void @safepoint() [ "deopt"(i32 77, i32 77, i64 12, ptr addrspace(1) %p) ]
-; IR-NEXT: store atomic i32 304, ptr addrspace(1) %[[POST]] unordered, align 4
-; IR-NEXT: call void @sink(ptr addrspace(1) %p)
+; IR: call void @safepoint() [ "deopt"(
+; IR-SAME: i32 77, i32 77,
+; IR-SAME: i64 8590196748, i64 69210, i32 2,
+; IR-SAME: i64 34359738378, i32 %[[DFIELD]],
+; IR-SAME: i64 68719476746, i32 303,
+; IR-SAME: i64 8590458892, i32 2) ]
+; @sink escape: materialize ONCE here. offset 8 = merged PHI, offset 16 = 304
+; (the value at the escape point).
+; IR: %[[SLOT8:pea.matslot[^ ]*]] = getelementptr inbounds i8, ptr addrspace(1) %p, i64 8
+; IR: store atomic i32 %[[DFIELD]], ptr addrspace(1) %[[SLOT8]] unordered, align 4
+; IR: %[[SLOT16:pea.matslot[^ ]*]] = getelementptr inbounds i8, ptr addrspace(1) %p, i64 16
+; IR: store atomic i32 304, ptr addrspace(1) %[[SLOT16]] unordered, align 4
+; IR: call void @sink(ptr addrspace(1) %p)
 ; IR-NOT: pea.matslot
 ; IR-NOT: store atomic
 ; IR-NOT: call void @safepoint

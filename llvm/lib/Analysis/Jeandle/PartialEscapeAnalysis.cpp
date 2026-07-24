@@ -1227,9 +1227,9 @@ private:
                                           uintptr_t SuperKlass);
   void emitReplaceCall(CallBase *CB, Value *Replacement, jeandle::ObjectID ID);
   // PEA deopt support. Scan CB's "deopt" operand bundle for references to
-  // still-virtual OrigAllocs and, for each that meets the scoped criteria
+  // still-virtual objects and, for each that meets the scoped criteria
   // (single never-escaping instance OR array of known element kind, virtual
-  // at the safepoint, OrigAlloc-not-derived, not synthetic), record a
+  // at the safepoint, identity-not-derived), record a
   // RewriteDeoptBundleEffect snapshotting per-offset/per-element FieldValues
   // (long/double as a single wire entry; materialized wide-oop reference
   // values as live-oop Scalar cells; array elements as one wire entry each
@@ -5422,9 +5422,10 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
   DenseMap<jeandle::ObjectID, Plan> Plans;
   SmallVector<jeandle::ObjectID, 4> Order; // insertion order for stable emit
 
-  // Basic structural eligibility (instance, not synthetic, klass). Locks are
-  // not a bail: a VO holding a lock at this safepoint is still described,
-  // and its PEA-eliminated lock is reconstructed at deopt as a monitor entry
+  // Basic structural eligibility (eligible, klass [and a known array element
+  // kind for arrays]). Locks are not a bail: a VO holding a lock at this
+  // safepoint is still described, and its PEA-eliminated lock is reconstructed
+  // at deopt as a monitor entry
   // (eliminated=true, owner=VORef). isVirtualHere (checked in the worklist) is
   // the virtual-at-safepoint gate; commit()'s end-of-analysis LockCounts!=0
   // gate separately drops genuinely unbalanced-lock VOs.
@@ -5436,8 +5437,12 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
     jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
     if (VObj.AllocationCall == nullptr)
       return false;
-    if (VObj.IsSynthetic)
-      return false; // synthetic (merge-aliased) VO out of scope.
+    // Synthetic (Case-C merge) VOs are describable like ordinary VOs — Graal
+    // treats a synthetic VO identically to a normal VO in deopt. A synthetic's
+    // AllocationCall is BORROWED from a source (see synthesizeCaseC) and is NOT
+    // its identity; the transform matches a synthetic by its SyntheticPhi
+    // (RewriteDeoptBundleEffect's RootIdentity), so the borrowed allocation is
+    // never rewritten as the synthetic's bundle slot.
     if (VObj.Klass == 0)
       return false; // no klass identity — cannot describe.
     if (VObj.isArray()) {
