@@ -49,15 +49,24 @@
 
 using namespace llvm;
 
-// Default 2 rounds. The convergence break in run() makes round 2 a no-op
-// when round 1 already reached fixed point; the hard cap is
-// HardIterationCap (16). Lit tests that pin -jeandle-pea-iterations=N are
-// unaffected.
+// Default 2 rounds. Some shapes — notably Case C (synthesizeCaseC: two
+// distinct but compatible virtuals merged into one synthetic VO) — need a 3rd
+// outer iteration to reach a transform-idle fixpoint: round 0 conservatively
+// materializes both virtuals at the merge, round 1 re-analyzes and synthesizes
+// the synthetic VO, round 2 settles. With default 2 such shapes stop one round
+// short of fixpoint (still correct, just not fully canonicalized), so tests
+// that must assert convergence for them request -jeandle-pea-iterations=3..4.
+// The default is kept at 2 because raising it to 3 adds a trailing idle round
+// to every method that converges at round 2, which broke ~11 existing jtreg
+// tests whose per-round shape assertions were calibrated to the 2-round output.
+// The convergence break in run() stops the loop as soon as a round is idle;
+// the hard cap is HardIterationCap (16). Lit tests that pin
+// -jeandle-pea-iterations=N are unaffected.
 static cl::opt<unsigned> JeandlePEAIterations(
     "jeandle-pea-iterations", cl::init(2), cl::Hidden,
     cl::desc("PEA: maximum number of analyze+transform+canonicalize rounds "
-             "in the outer fixpoint. Default 2. Set to 1 for "
-             "single-round semantics, 3-4 for aggressive re-fold."));
+             "in the outer fixpoint. Default 2. Set to 1 for single-round "
+             "semantics, 3-4 for shapes that need it (e.g. Case C)."));
 
 // PEA-only IR dump hook. When non-empty and matching F.getName(), dumps F
 // to errs() before and after each PartialEscapeTransform round. Filter with
