@@ -139,6 +139,9 @@ enum class JeandleInlineReason : int {
   def(IsObjectKlass, bool, Bool,                                                 \
       (uintptr_t a1), (a1),                                                      \
       (VMCallbackValueType::Uintptr), 1)                                         \
+  def(IsUnverifiedInterface, bool, Bool,                                         \
+      (uintptr_t a1), (a1),                                                      \
+      (VMCallbackValueType::Uintptr), 1)                                         \
   def(IsEffectivelyFinal, bool, Bool,                                            \
       (uintptr_t a1), (a1),                                                      \
       (VMCallbackValueType::Uintptr), 1)                                         \
@@ -224,11 +227,21 @@ enum class JeandleInlineReason : int {
 ///   IsSubtype           — Returns true if SubKlass is a subtype of SuperKlass.
 ///   GetCommonSuperKlass — Given two klass pointers, return their lowest common
 ///                         ancestor. Returns 0 if unknown.
-///   GetFieldType        — Given a klass pointer and byte offset, return the
-///                         field's declared type klass pointer. Returns 0 if
-///                         unknown.
+///   GetFieldType        — Given an instance klass pointer and byte offset,
+///                         return the declared type klass pointer of the field
+///                         stored at that offset, searching the class's own
+///                         fields and inherited fields up the superclass chain.
+///                         Returns 0 if no field exists at that offset in the
+///                         hierarchy (including for non-instance klasses such
+///                         as arrays) or if the field's type is primitive.
 ///   IsInterface         — Returns true if the klass is an interface.
 ///   IsObjectKlass       — Returns true if the klass is java.lang.Object.
+///   IsUnverifiedInterface
+///                       — Returns true if the klass is an interface type whose
+///                         type the bytecode verifier does not enforce. Covers
+///                         interface instance klasses and objArray klasses
+///                         whose bottom element is such an interface. Type info
+///                         must not be attached to values of these types.
 ///   IsEffectivelyFinal  — Returns true if no subclass can exist at runtime.
 ///   RequiresStrictLockOrder — Returns 1 if the runtime requires strict
 ///                         monitor-stack nesting at materialization

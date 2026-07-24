@@ -24,6 +24,7 @@
 #include "llvm/Transforms/Jeandle/JeandleNarrowOopMarker.h"
 #include "llvm/Transforms/Jeandle/PartialEscapeIterative.h"
 #include "llvm/Transforms/Jeandle/PartialEscapeTransform.h"
+#include "llvm/Transforms/Jeandle/RecoverTypeInfo.h"
 #include "llvm/Transforms/Jeandle/RepeatedConstantFolding.h"
 #include "llvm/Transforms/Jeandle/TLSPointerRewrite.h"
 #include "llvm/Transforms/Jeandle/TypeCheckElimination.h"
@@ -78,6 +79,7 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   PM.addPass(JavaOperationLower(0));
   FunctionPassManager PreCHACleanup;
   PreCHACleanup.addPass(InstSimplifyPass());
+  PreCHACleanup.addPass(RecoverTypeInfo());
   PreCHACleanup.addPass(TypeCheckElimination());
   PreCHACleanup.addPass(RepeatedConstantFolding());
   PreCHACleanup.addPass(EarlyCSEPass());
@@ -85,6 +87,7 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   PreCHACleanup.addPass(SimplifyCFGPass());
   PreCHACleanup.addPass(ADCEPass());
   PM.addPass(createModuleToFunctionPassAdaptor(std::move(PreCHACleanup)));
+  PM.addPass(createModuleToFunctionPassAdaptor(RecoverTypeInfo()));
   PM.addPass(createModuleToFunctionPassAdaptor(CHADevirtualization()));
   // JeandleInlineDriver owns the inline-specific loop. Devirtualization
   // refinement between inline rounds should be wired inside the driver so
@@ -207,11 +210,17 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
     //       materializations exposed by InstCombine+SimplifyCFG+ADCE between
     //       rounds.
     PM.addPass(createModuleToFunctionPassAdaptor(PartialEscapeIterative()));
-    PM.addPass(createModuleToFunctionPassAdaptor(InstSimplifyPass()));
-    PM.addPass(createModuleToFunctionPassAdaptor(TypeCheckElimination()));
-    PM.addPass(createModuleToFunctionPassAdaptor(RepeatedConstantFolding()));
-    PM.addPass(createModuleToFunctionPassAdaptor(TypeCheckElimination()));
   }
+  // Post-inline type recovery + TCE — unconditional. Runs for both PEA-on
+  // (cleans up PEA's materializations) and PEA-off (the default config) so
+  // RecoverTypeInfo re-attaches !java-klass metadata stripped by the inline
+  // driver's load CSE (EarlyCSE/InstCombine) before each TypeCheckElimination
+  // round and TCE sees the recovered declared field types.
+  PM.addPass(createModuleToFunctionPassAdaptor(InstSimplifyPass()));
+  PM.addPass(createModuleToFunctionPassAdaptor(RecoverTypeInfo()));
+  PM.addPass(createModuleToFunctionPassAdaptor(TypeCheckElimination()));
+  PM.addPass(createModuleToFunctionPassAdaptor(RepeatedConstantFolding()));
+  PM.addPass(createModuleToFunctionPassAdaptor(TypeCheckElimination()));
   // TODO: InsertGCBarriers currently inserts high-level barrier calls before
   // O3 because it cannot handle O3 generated memory intrinsics and vector
   // instructions. But the uninlined barrier calls can still block useful
