@@ -9,9 +9,11 @@
 // Outer fixpoint. Re-runs PartialEscapeAnalysis + PartialEscapeTransform,
 // interleaving the standard canonicalization passes (ADCE + SimplifyCFG +
 // LoopSimplify + InstCombine) between rounds, until the IR is stable. Each
-// round may materialize a virtual at an escape point; after DCE removes the
-// now-dead branch, the next round can re-virtualize the freshly emitted
-// `jeandle.new_instance` invoke because its field stores are still in IR.
+// MaterializeEffect reuses the allocation call at its original site and only
+// emits field/lock replay at the escape point; it never creates or relocates
+// an allocation. PEA can delete fully non-escaping allocations. A deopt-bundle
+// rewrite may replace an allocation call in place, without adding an
+// allocation or changing its site.
 //
 // Convergence (see `run()`): the transform is idle AND the remaining alloc
 // count AND both analyser deltas (VirtualizationDelta, AllocationDelta) are
@@ -49,28 +51,20 @@
 
 using namespace llvm;
 
-// Default 2 rounds. Some shapes — notably Case C (synthesizeCaseC: two
-// distinct but compatible virtuals merged into one synthetic VO) — need a 3rd
-// outer iteration to reach a transform-idle fixpoint: round 0 conservatively
-// materializes both virtuals at the merge, round 1 re-analyzes and synthesizes
-// the synthetic VO, round 2 settles. With default 2 such shapes stop one round
-// short of fixpoint (still correct, just not fully canonicalized), so tests
-// that must assert convergence for them request -jeandle-pea-iterations=3..4.
-// The default is kept at 2 because raising it to 3 adds a trailing idle round
-// to every method that converges at round 2, which broke ~11 existing jtreg
-// tests whose per-round shape assertions were calibrated to the 2-round output.
-// The convergence break in run() stops the loop as soon as a round is idle;
-// the hard cap is HardIterationCap (16). Lit tests that pin
-// -jeandle-pea-iterations=N are unaffected.
+// Default 2 rounds, matching Graal. A nested virtual-reference merge can use
+// both productive rounds: the first materializes predecessor effects and the
+// second re-analyzes the resulting explicit Phi for Case C. A later idle round
+// is only a convergence probe; it is not required to complete that rewrite.
+// The hard cap is HardIterationCap (16).
 static cl::opt<unsigned> JeandlePEAIterations(
     "jeandle-pea-iterations", cl::init(2), cl::Hidden,
     cl::desc("PEA: maximum number of analyze+transform+canonicalize rounds "
              "in the outer fixpoint. Default 2. Set to 1 for single-round "
-             "semantics, 3-4 for shapes that need it (e.g. Case C)."));
+             "semantics or higher to observe an idle convergence probe."));
 
 // PEA-only IR dump hook. When non-empty and matching F.getName(), dumps F
-// to errs() before and after each PartialEscapeTransform round. Filter with
-// `2>&1 | grep PEA-DUMP` to isolate PEA IR transitions.
+// to errs() before and after each PartialEscapeTransform round, followed by
+// a summary. Filter with `2>&1 | grep PEA-` to isolate PEA diagnostics.
 static cl::opt<std::string> JeandleDumpPEAIR(
     "jeandle-dump-pea-ir", cl::init(""), cl::Hidden,
     cl::desc("PEA: dump function IR to errs() before AND after every "
@@ -156,6 +150,8 @@ PartialEscapeIterative::run(Function &F, FunctionAnalysisManager &FAM) {
       JeandleDumpPEAIR.empty() || F.getName().contains(JeandleDumpPEAIR);
   const bool DumpThisFunc = HasDumpFilter && LegacyDumpMatches &&
                             matchesExactDumpFunction(F.getName());
+  unsigned ExecutedRounds = 0;
+  bool ReachedFixpoint = false;
 
   for (unsigned Iter = 0; Iter < IterCap; ++Iter) {
     if (DumpThisFunc) {
@@ -179,6 +175,7 @@ PartialEscapeIterative::run(Function &F, FunctionAnalysisManager &FAM) {
     FAM.invalidate(F, TransformPA);
     const bool TransformIdle = TransformPA.areAllPreserved();
     AnyChanged |= !TransformIdle;
+    ExecutedRounds = Iter + 1;
 
     if (DumpThisFunc) {
       errs() << ";; PEA-DUMP after iter=" << Iter << " function "
@@ -217,8 +214,10 @@ PartialEscapeIterative::run(Function &F, FunctionAnalysisManager &FAM) {
     // Convergence: transform idle, alloc count and both analyser deltas
     // stable, and the previous round's canonicalization did not mutate IR.
     if (TransformIdle && AllocsUnchanged && VDeltaUnchanged && ADeltaUnchanged &&
-        !PrevCanonChanged)
+        !PrevCanonChanged) {
+      ReachedFixpoint = true;
       break;
+    }
 
     PrevVDelta = CurVDelta;
     PrevADelta = CurADelta;
@@ -245,6 +244,12 @@ PartialEscapeIterative::run(Function &F, FunctionAnalysisManager &FAM) {
     // convergence check.
     PrevCanonChanged = CanonChanged;
   }
+
+  if (DumpThisFunc)
+    errs() << ";; PEA-SUMMARY function " << F.getName()
+           << " rounds=" << ExecutedRounds
+           << " stop=" << (ReachedFixpoint ? "fixpoint" : "iteration-cap")
+           << "\n";
 
   return AnyChanged ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }

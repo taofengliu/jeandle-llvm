@@ -10,9 +10,10 @@
 // Partial Escape Analysis. Tracks Java objects as addrspace(1) pointers that
 // are allocated at InvokeInst sites to jeandle.new_instance / jeandle.new_array
 // and have not yet escaped. On an escape point (generic call, ret, store into
-// non-virtual memory, ...) a Materialize effect is recorded; the transform
-// re-emits the allocation immediately before the escape, replays tracked field
-// stores, and re-emits surviving monitorenters. Effects are Graal-style
+// non-virtual memory, ...) a Materialize effect is recorded. The transform
+// reuses the original allocation at its original site, then replays tracked
+// field stores and surviving monitorenters before the escape. NeverEscape
+// source allocations can instead be deleted. Effects are Graal-style
 // polymorphic records (jeandle::Effect subclasses). isCfgKill() orders the
 // transform's two apply passes and is true ONLY for EliminateAllocation;
 // "control-flow-rewriting" (Materialize's splitBasicBlock, CreatePHI's PHI

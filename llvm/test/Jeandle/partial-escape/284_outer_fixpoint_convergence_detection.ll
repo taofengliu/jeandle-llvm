@@ -1,9 +1,9 @@
 ; RUN: opt -S -passes="partial-escape-iterative" -jeandle-pea-iterations=4 \
 ; RUN:   -jeandle-dump-pea-ir-function=test_convergence_detection %s 2>&1 \
-; RUN:   | grep '^;; PEA-DUMP' | FileCheck %s --check-prefix=HIGH
+; RUN:   | grep '^;; PEA-' | FileCheck %s --check-prefix=HIGH
 ; RUN: opt -S -passes="partial-escape-iterative" -jeandle-pea-iterations=16 \
 ; RUN:   -jeandle-dump-pea-ir-function=test_convergence_detection %s 2>&1 \
-; RUN:   | grep '^;; PEA-DUMP' | FileCheck %s --check-prefix=HIGH
+; RUN:   | grep '^;; PEA-' | FileCheck %s --check-prefix=HIGH
 ; RUN: opt -S -passes="partial-escape-iterative" -jeandle-pea-iterations=4 \
 ; RUN:   %s -o %t.cap4.ll
 ; RUN: opt -S -passes="partial-escape-iterative" -jeandle-pea-iterations=16 \
@@ -376,7 +376,8 @@ u:
 ; HIGH-NEXT: ;; PEA-DUMP after iter=2 function test_convergence_detection transform_idle=1
 ; HIGH-NEXT: ;; PEA-DUMP before iter=3 function test_convergence_detection
 ; HIGH-NEXT: ;; PEA-DUMP after iter=3 function test_convergence_detection transform_idle=1
-; HIGH-NOT: ;; PEA-DUMP
+; HIGH-NEXT: ;; PEA-SUMMARY function test_convergence_detection rounds=4 stop=fixpoint
+; HIGH-NOT: ;; PEA-
 
 ; REPEAT: ;; PEA-DUMP before iter=0 function test_convergence_detection
 ; REPEAT-NEXT: ;; PEA-DUMP after iter=0 function test_convergence_detection transform_idle=1

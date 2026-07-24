@@ -23,7 +23,10 @@
 ; RUN:   '-jeandle-dump-pea-ir-function=filter.Target.work()V' \
 ; RUN:   '-jeandle-dump-pea-ir-function=filter.Target.work()V.extra' \
 ; RUN:   %s 2>&1 | FileCheck %s --check-prefix=DUMP-EXACT \
-; RUN:     --implicit-check-not='PEA-DUMP before iter=0 function filter.Target.work()V.extra.decoy'
+; RUN:     --implicit-check-not='PEA-DUMP before iter=0 function filter.Target.work()V.extra.decoy' \
+; RUN:     --implicit-check-not='PEA-SUMMARY function filter.Target.work()V.extra.decoy'
+; RUN: opt -disable-output -passes="partial-escape-iterative" \
+; RUN:   -jeandle-pea-iterations=1 %s 2>&1 | not grep 'PEA-SUMMARY'
 ; RUN: opt -disable-output -passes="partial-escape-iterative" \
 ; RUN:   -jeandle-pea-iterations=1 -jeandle-dump-pea-ir=.extra \
 ; RUN:   '-jeandle-dump-pea-ir-function=filter.Target.work()V' \
@@ -94,7 +97,11 @@ unwind:
 ; ANALYZE-LEGACY: PEA: EliminateAllocation function=@"filter.Target.work()V.extra.decoy" [VO=0]
 
 ; DUMP-EXACT: ;; PEA-DUMP before iter=0 function filter.Target.work()V{{$}}
+; DUMP-EXACT: ;; PEA-SUMMARY function filter.Target.work()V rounds=1 stop=iteration-cap
+; DUMP-EXACT-NOT: ;; PEA-SUMMARY function filter.Target.work()V rounds=
 ; DUMP-EXACT: ;; PEA-DUMP before iter=0 function filter.Target.work()V.extra{{$}}
+; DUMP-EXACT: ;; PEA-SUMMARY function filter.Target.work()V.extra rounds=1 stop=iteration-cap
+; DUMP-EXACT-NOT: ;; PEA-SUMMARY
 
 ; DUMP-AND: ;; PEA-DUMP before iter=0 function filter.Target.work()V.extra{{$}}
 
