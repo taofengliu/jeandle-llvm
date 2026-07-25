@@ -107,8 +107,8 @@ static unsigned countJeandleAllocations(Function &F) {
   return Count;
 }
 
-PreservedAnalyses
-PartialEscapeIterative::run(Function &F, FunctionAnalysisManager &FAM) {
+PreservedAnalyses PartialEscapeIterative::run(Function &F,
+                                              FunctionAnalysisManager &FAM) {
   // Gate on jeandle.java_method_compilation. Mirrors the gating in
   // PartialEscapeAnalysis::run and PartialEscapeTransform::run so non-Java
   // functions skip the loop entirely.
@@ -131,7 +131,16 @@ PartialEscapeIterative::run(Function &F, FunctionAnalysisManager &FAM) {
   int PrevADelta = std::numeric_limits<int>::min();
   // Whether the previous iteration's canonicalization changed IR. If so,
   // the analyser must run again before convergence can be declared.
+  // NOTE: this uses each canon pass's PreservedAnalyses (areAllPreserved),
+  // which is conservative — a pass that preserves only CFG still reports
+  // "changed" here even when the IR is bit-identical. To avoid diverging
+  // forever on canonicalization churn that does not affect PEA's decisions
+  // (e.g. SimplifyCFG/LoopSimplify reshaping loop preheaders), PEA-stable
+  // rounds are counted: once the PEA-specific signals (transform idle,
+  // alloc count, both deltas) have been stable for two consecutive rounds,
+  // convergence is declared regardless of PrevCanonChanged.
   bool PrevCanonChanged = false;
+  unsigned PEAStableRounds = 0;
 
   // Run a sub-pass directly and invalidate FAM with its PreservedAnalyses,
   // mirroring what FunctionPassManager does between adjacent passes so the
@@ -167,8 +176,7 @@ PartialEscapeIterative::run(Function &F, FunctionAnalysisManager &FAM) {
     PreservedAnalyses TransformPA = Transform.run(F, FAM);
     int CurVDelta = 0;
     int CurADelta = 0;
-    if (auto *Cached =
-            FAM.getCachedResult<PartialEscapeAnalysis>(F)) {
+    if (auto *Cached = FAM.getCachedResult<PartialEscapeAnalysis>(F)) {
       CurVDelta = Cached->VirtualizationDelta;
       CurADelta = Cached->AllocationDelta;
     }
@@ -178,8 +186,8 @@ PartialEscapeIterative::run(Function &F, FunctionAnalysisManager &FAM) {
     ExecutedRounds = Iter + 1;
 
     if (DumpThisFunc) {
-      errs() << ";; PEA-DUMP after iter=" << Iter << " function "
-             << F.getName() << " transform_idle=" << TransformIdle << "\n"
+      errs() << ";; PEA-DUMP after iter=" << Iter << " function " << F.getName()
+             << " transform_idle=" << TransformIdle << "\n"
              << F << "\n";
     }
 
@@ -205,18 +213,30 @@ PartialEscapeIterative::run(Function &F, FunctionAnalysisManager &FAM) {
 
     LLVM_DEBUG({
       dbgs() << "PartialEscapeIterative[" << F.getName() << "] iter=" << Iter
-             << " transform_idle=" << TransformIdle
-             << " allocs=" << NowAllocs
+             << " transform_idle=" << TransformIdle << " allocs=" << NowAllocs
              << " v_delta=" << CurVDelta << " a_delta=" << CurADelta
              << " prev_canon_changed=" << PrevCanonChanged << "\n";
     });
 
     // Convergence: transform idle, alloc count and both analyser deltas
     // stable, and the previous round's canonicalization did not mutate IR.
-    if (TransformIdle && AllocsUnchanged && VDeltaUnchanged && ADeltaUnchanged &&
-        !PrevCanonChanged) {
-      ReachedFixpoint = true;
-      break;
+    // The PEA-specific signals (transform idle, alloc count, both deltas)
+    // are sufficient to prove PEA has reached a fixpoint: they reflect a
+    // fresh analysis of the current (post-canonicalization) IR. If they are
+    // stable but canonicalization still reports "changed" (areAllPreserved
+    // is conservative), allow at most one extra round before declaring
+    // convergence — this breaks SimplifyCFG/LoopSimplify churn on loop
+    // preheaders that does not affect PEA's optimization decisions.
+    bool PEAStable =
+        TransformIdle && AllocsUnchanged && VDeltaUnchanged && ADeltaUnchanged;
+    if (PEAStable) {
+      ++PEAStableRounds;
+      if (!PrevCanonChanged || PEAStableRounds >= 2) {
+        ReachedFixpoint = true;
+        break;
+      }
+    } else {
+      PEAStableRounds = 0;
     }
 
     PrevVDelta = CurVDelta;

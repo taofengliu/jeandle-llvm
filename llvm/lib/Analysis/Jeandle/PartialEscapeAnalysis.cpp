@@ -42,6 +42,7 @@
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/PostOrderIterator.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallBitVector.h"
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/CFG.h"
@@ -915,6 +916,11 @@ private:
                                    const Twine &Name);
 
   void processBlock(BasicBlock *BB);
+  // Drain a block's deferred merge-PHI effects (PendingMergePhis[BB]) into
+  // Result.BlockEffects[BB], assigning each a fresh SeqNo at drain time so
+  // the transform's SeqNo order is per-pred Materialize, CreatePHI, then
+  // body effects. Shared by processBlock and processLoop's post-body merges.
+  void drainPendingMergePhis(BasicBlock *BB);
   void processInstruction(Instruction *I);
 
   // Per-block state helpers.
@@ -975,37 +981,33 @@ private:
   // boundaries, while access paths ending at planned scalar-replacement
   // effects are internal to the virtual object.
   bool hasObservableIdentityUse(jeandle::ObjectID ID, PHINode *CaseCPhi,
-                                ArrayRef<BlockExitData *> ExitInfos);
+                                ArrayRef<BlockExitData *> ExitInfos,
+                                ArrayRef<jeandle::ObjectID> CaseCSourceIDs);
 
-  // In-loop cache for Case C — keyed on (mergeBB, source-IDs in incoming
-  // order). The cache exists so an iterative merge stabilization re-visiting
-  // an in-loop merge block doesn't synthesize a fresh VO every iteration
-  // (otherwise VirtualObjects grows unboundedly and the fixpoint never
-  // closes). Cache value is the synthesized VO id; the caller looks it up
-  // and reuses the existing VO + alias rather than calling createVirtualObject.
+  // In-loop Case-C synthetic VO cache, keyed by the merge PHI (Graal
+  // valueObjectVirtuals, PartialEscapeClosure: the duplicate
+  // VirtualObjectNode is cached per phi at loop headers). The cache exists
+  // so an iterative merge stabilization re-visiting an in-loop merge block
+  // doesn't synthesize a fresh VO every iteration (otherwise VirtualObjects
+  // grows unboundedly and the fixpoint never closes). Cache value is the
+  // synthesized VO id; the caller looks it up and reuses the existing VO +
+  // alias rather than calling createVirtualObject, REFRESHING the source
+  // set on every hit.
   //
   // Under processLoop's body fixpoint the cache hits on iter >= 1: it
   // survives across iterations (not snapshotted by take/restoreLoopSnapshot)
-  // so the same synthetic VO ID is reused at the block. Combined with
-  // LoopFieldPhiCache (stable per-offset PHI shells), this keeps FieldStates
-  // structurally equal across iterations, which the single-state B-vs-B'
-  // convergence check requires.
-  struct CaseCKey {
-    BasicBlock *Block;
-    SmallVector<jeandle::ObjectID, 4> SourceIDs;
-    bool operator==(const CaseCKey &O) const {
-      return Block == O.Block && SourceIDs == O.SourceIDs;
-    }
-  };
-  struct CaseCKeyHash {
-    size_t operator()(const CaseCKey &K) const {
-      hash_code H = hash_value(K.Block);
-      for (jeandle::ObjectID ID : K.SourceIDs)
-        H = hash_combine(H, ID);
-      return static_cast<size_t>(H);
-    }
-  };
-  std::unordered_map<CaseCKey, jeandle::ObjectID, CaseCKeyHash> CaseCVOCache;
+  // so the same synthetic VO ID is reused for the same PHI even as its
+  // source set evolves (loop-carried conditional replacement: the join's
+  // synthetic becomes the header merge's source on the next pass). Combined
+  // with LoopFieldPhiCache (stable per-offset PHI shells), this keeps
+  // FieldStates structurally equal across iterations, which the single-state
+  // B-vs-B' convergence check requires. Keying by the PHI (not by the
+  // source-ID set) is what lets the source set evolve without minting a
+  // fresh ObjectID every pass; two different PHIs at the same block still
+  // get distinct synthetics. The same map doubles as the memo that lets a
+  // later body pass re-resolve a loop-header PHI's back-edge incoming to
+  // the previous pass's synthetic (see processBlockPhis).
+  DenseMap<PHINode *, jeandle::ObjectID> CaseCVOCache;
 
   PHINode *createUnparentedPhi(Type *Ty, unsigned N, const Twine &Name);
 
@@ -1156,6 +1158,16 @@ private:
   void
   restoreLoopSnapshot(const llvm::SmallPtrSetImpl<BasicBlock *> &LoopBlocks,
                       const LoopSnapshot &S);
+
+  // Active loop-body-pass context (processLoopBodyOnePass): the loop being
+  // re-processed and the blocks already processed in this pass. Consulted by
+  // processBlockPhis to distinguish a loop-header PHI's not-yet-processed
+  // back-edge predecessor (unknown — its aliases were rolled back and will
+  // be re-registered later in this pass) from a genuinely non-virtual
+  // incoming (divergence). Saved and restored around nested processLoop
+  // recursion; null when no body pass is active.
+  Loop *ActiveBodyPassLoop = nullptr;
+  llvm::SmallPtrSet<BasicBlock *, 16> BodyPassProcessed;
 
   // Structural equivalence of the BlockExitData base (the per-object
   // book-keeping). The loop fixpoint's single-state B-vs-B' convergence test
@@ -1486,6 +1498,25 @@ Value *Analyzer::realIdentityOf(jeandle::ObjectID ID) {
   return VObj.AllocationCall;
 }
 
+void Analyzer::drainPendingMergePhis(BasicBlock *BB) {
+  // Effects that have already been recorded into this block's BlockEffects
+  // received their sequence numbers while the merge was stabilized; assign
+  // the deferred CreatePHI effects sequence numbers now so the resulting
+  // order is per-pred Materialize, CreatePHI, then body effects. A body
+  // Materialize can consequently replay a merged field PHI that is already
+  // present in the IR.
+  auto It = PendingMergePhis.find(BB);
+  if (It == PendingMergePhis.end())
+    return;
+  jeandle::EffectList &Phis = It->second;
+  while (!Phis.empty()) {
+    std::unique_ptr<jeandle::Effect> Effect = Phis.spliceOut(0);
+    Effect->SeqNo = Result.nextSeqNo();
+    Result.addBlockEffect(std::move(Effect));
+  }
+  PendingMergePhis.erase(It);
+}
+
 void Analyzer::processBlock(BasicBlock *BB) {
   ScopedEdgeExitViews EdgeViews(*this);
 
@@ -1527,22 +1558,8 @@ void Analyzer::processBlock(BasicBlock *BB) {
   }
 
   // Merge effects precede effects produced while walking the block body, as
-  // in Graal's EffectsClosure.merge. Per-pred Materialize effects already
-  // received their sequence numbers while the merge was stabilized; assign
-  // the deferred CreatePHI effects sequence numbers now so the resulting
-  // order is per-pred Materialize, CreatePHI, then body effects. A body
-  // Materialize can consequently replay a merged field PHI that is already
-  // present in the IR.
-  auto It = PendingMergePhis.find(BB);
-  if (It != PendingMergePhis.end()) {
-    jeandle::EffectList &Phis = It->second;
-    while (!Phis.empty()) {
-      std::unique_ptr<jeandle::Effect> Effect = Phis.spliceOut(0);
-      Effect->SeqNo = Result.nextSeqNo();
-      Result.addBlockEffect(std::move(Effect));
-    }
-    PendingMergePhis.erase(It);
-  }
+  // in Graal's EffectsClosure.merge.
+  drainPendingMergePhis(BB);
 
   // Exception edge state splitting. If the block ends in an InvokeInst,
   // snapshot the per-object state immediately BEFORE applying the invoke.
@@ -2811,6 +2828,52 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
             AnyDerived = true;
         }
       }
+      // During a loop body pass, an incoming of the loop-header PHI whose
+      // predecessor is inside the loop but has not yet been processed in
+      // THIS pass cannot be trusted as a divergence: the virtual alias that
+      // would resolve it was registered inside the loop during the previous
+      // pass and rolled back by restoreLoopSnapshot, while the pred's
+      // BlockExits is deliberately preserved (so !PredED does not fire
+      // here). First try to re-resolve the incoming through the phi-keyed
+      // Case-C cache: a previous pass's post-body merge recorded which
+      // source VO occupied this incoming slot, and the stale pred exit
+      // still tracks that VO. Re-resolving lets the header Case C fire
+      // again with the SAME synthetic (Graal: the body traversal sees the
+      // last merged state, where the header phi already aliases the cached
+      // merged VO) — the loop body's field effects are then built on the
+      // merged identity, which is required for semantic correctness (a body
+      // load/store through the header phi must read/write the MERGED field
+      // state, not one source's). If the memo does not cover this slot, the
+      // incoming is UNKNOWN (the same abstain as the !PredED path above —
+      // Graal processPhi returns false without materializing when a
+      // predecessor's ObjectState is missing); the post-body merge
+      // re-derives the decision with complete latch data after the body
+      // pass. Treating it as a resolved non-virtual instead would send the
+      // PHI to the Case-A fallback and materialize the remaining virtual
+      // incomings at their preds — at the preheader that materialization is
+      // outside the loop and never rolled back, so one pass's incomplete
+      // information would permanently defeat the header Case C. Restricted
+      // to the loop header: non-header blocks get no post-body re-merge, so
+      // an optimistic decision there could never be corrected. SelfCarry
+      // keeps precedence: a carry that strips back to this PHI itself is
+      // structural and needs no alias.
+      if (!Found && !SelfCarry.test(I) && ActiveBodyPassLoop &&
+          BB == ActiveBodyPassLoop->getHeader() &&
+          ActiveBodyPassLoop->contains(Pred) &&
+          !BodyPassProcessed.count(Pred)) {
+        auto MemoIt = CaseCVOCache.find(&Phi);
+        if (MemoIt != CaseCVOCache.end() && Eligible.lookup(MemoIt->second)) {
+          const jeandle::VirtualObject &MemoVO =
+              *Result.VirtualObjects[MemoIt->second];
+          if (MemoVO.IsSynthetic && I < MemoVO.SyntheticSourceIDs.size()) {
+            jeandle::ObjectID Cand = MemoVO.SyntheticSourceIDs[I];
+            if (Eligible.lookup(Cand) && PredED->Virtuals.count(Cand))
+              Found = Cand;
+          }
+        }
+        if (!Found)
+          Unresolved.set(I);
+      }
       InIDs.push_back(Found);
       if (Found)
         AnyVirtual = true;
@@ -2885,12 +2948,24 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
     // checks) we fall through to Case A.
     bool TryCaseC = (First /* at least one virtual */) &&
                     !AllSame; // Case B already returned if AllSame succeeded.
+    LLVM_DEBUG(dbgs() << "PEA-PHI-DECIDE: phi '" << Phi.getName() << "' in "
+                      << BB->getName() << ": AllSame=" << AllSame
+                      << " First=" << (First ? (int)*First : -1)
+                      << " AnyDerived=" << AnyDerived
+                      << " TryCaseC=" << TryCaseC << "\n");
     if (TryCaseC && !AnyDerived) {
       bool EveryInputVirtual = true;
-      for (auto &O : InIDs) {
-        if (!O) {
-          EveryInputVirtual = false;
-          break;
+      {
+        unsigned DbgIdx = 0;
+        for (auto &O : InIDs) {
+          if (!O) {
+            LLVM_DEBUG(dbgs() << "PEA-PHI-DECIDE: phi '" << Phi.getName()
+                              << "' incoming[" << DbgIdx << "] not virtual ("
+                              << *Phi.getIncomingValue(DbgIdx) << ")\n");
+            EveryInputVirtual = false;
+            break;
+          }
+          DbgIdx++;
         }
       }
       if (EveryInputVirtual && synthesizeCaseC(BB, &Phi, InIDs, Out))
@@ -2924,6 +2999,9 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
         continue;
       // The PHI consumes this object on one incoming edge. OrigAlloc already
       // supplies the SSA value; materialization replay remains edge-local.
+      LLVM_DEBUG(dbgs() << "PEA-CASEA-MAT: phi '" << Phi.getName()
+                        << "' incoming[" << I << "] materializes VO="
+                        << *InIDs[I] << " at pred " << Pred->getName() << "\n");
       materializeAtPredFromExitInfo(*InIDs[I], Pred, *PredED,
                                     /*EdgeLocal=*/true, MatReason::Phi,
                                     /*TargetMerge=*/BB);
@@ -2984,8 +3062,10 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
   }
 }
 
-bool Analyzer::hasObservableIdentityUse(jeandle::ObjectID ID, PHINode *CaseCPhi,
-                                        ArrayRef<BlockExitData *> ExitInfos) {
+bool Analyzer::hasObservableIdentityUse(
+    jeandle::ObjectID ID, PHINode *CaseCPhi,
+    ArrayRef<BlockExitData *> ExitInfos,
+    ArrayRef<jeandle::ObjectID> CaseCSourceIDs) {
   jeandle::VirtualObject &VO = *Result.VirtualObjects[ID];
   CallBase *OrigAlloc = cast_or_null<CallBase>((Value *)VO.AllocationCall);
   Value *IdentityRoot = VO.IsSynthetic ? static_cast<Value *>(VO.SyntheticPhi)
@@ -2999,7 +3079,35 @@ bool Analyzer::hasObservableIdentityUse(jeandle::ObjectID ID, PHINode *CaseCPhi,
     for (const auto &E : KV.second)
       if (E.ObjID == ID)
         if (Instruction *Target = E.getTarget())
-          InternalTargets.insert(Target);
+          // A folded identity compare records the icmp as an effect target,
+          // but the compare still observes this VO's identity: the fold is
+          // valid only while the VO keeps a distinct identity (Graal
+          // refuses Case C when identity is observed). Keep icmps visible
+          // to the walk below.
+          if (!isa<ICmpInst>(Target))
+            InternalTargets.insert(Target);
+
+  // The Case-C group, transitively closed through synthetic sources: a
+  // nested synthetic's own sources belong to the same identity flow, so a
+  // carrier PHI may route them as well (loop-carried replacement: the
+  // header Case C merges [VO0, S] where the join synthetic S covers
+  // [VO1, VO0]; the join PHI carrying VO1 is then a transparent carrier
+  // for the header merge too).
+  SmallDenseSet<jeandle::ObjectID, 8> CaseCGroup(CaseCSourceIDs.begin(),
+                                                 CaseCSourceIDs.end());
+  {
+    SmallVector<jeandle::ObjectID, 8> GroupWorklist(CaseCSourceIDs.begin(),
+                                                    CaseCSourceIDs.end());
+    while (!GroupWorklist.empty()) {
+      jeandle::ObjectID G = GroupWorklist.pop_back_val();
+      const jeandle::VirtualObject &GVO = *Result.VirtualObjects[G];
+      if (!GVO.IsSynthetic)
+        continue;
+      for (jeandle::ObjectID S : GVO.SyntheticSourceIDs)
+        if (CaseCGroup.insert(S).second)
+          GroupWorklist.push_back(S);
+    }
+  }
 
   // LLVM has explicit pointer-derivation instructions between an identity
   // root and its consumers. The root is OrigAlloc for an ordinary VO and its
@@ -3008,18 +3116,110 @@ bool Analyzer::hasObservableIdentityUse(jeandle::ObjectID ID, PHINode *CaseCPhi,
   // use cannot hide behind a zero-GEP/freeze chain. Constant non-zero
   // derivations are followed as access paths: they are harmless only when
   // every leaf is a planned virtual load/store effect. Symbolic offsets are
-  // opaque and therefore observing. PHIs and selects are merge points, not
-  // wrappers; only the exact outer Case-C PHI is internal.
+  // opaque and therefore observing. PHIs are merge points, not wrappers;
+  // the Case-C PHI and carrier PHIs whose incomings all belong to the
+  // (transitive) Case-C group are traversed through to their consumers.
   SmallVector<Value *, 8> Worklist(1, IdentityRoot);
   SmallPtrSet<Value *, 16> Visited;
+  // Values that denote the group's merged identity without carrying a
+  // registered alias at walk time: the Case-C PHI itself plus every carrier
+  // PHI the walk pushed as transparent. During an in-pass header merge the
+  // carrier's own alias (registered later in the same pass, or in a block
+  // outside the loop) is not yet available, so structural recognition must
+  // go through this set. Field-address derivations of these values are
+  // internal access paths, not identity observations.
+  SmallPtrSet<Value *, 8> GroupCarriers;
+  GroupCarriers.insert(CaseCPhi);
+  // The identity root denotes this source by construction; its alias may be
+  // unavailable mid-merge (a synthetic's SyntheticPhi registered later in
+  // the pass), so root derivations must be recognized structurally.
+  GroupCarriers.insert(IdentityRoot);
+  // Values reached by crossing the Case-C PHI (or a carrier of it). A use
+  // reached from one of these observes the MERGED identity — the Case-C PHI
+  // is itself the real per-path identity of the merged object, so the use
+  // is sound under the merge: downstream processing materializes the
+  // synthetic at that use (Graal: only a usage of the source allocation
+  // OTHER than the phi blocks the merge, isSingleUsageAllocation). A use
+  // reached directly from a source root (never crossing the phi) observes
+  // the SOURCE identity independently and must block the merge.
+  SmallPtrSet<Value *, 16> CrossedMerge;
+  CrossedMerge.insert(CaseCPhi);
+  // Decides whether a pointer PHI routes only Case-C group identities:
+  // every incoming is the CaseCPhi, the PHI itself, a group member (alias),
+  // an already-recognized carrier, an offset-0 wrapper of a source VO's
+  // identity root, or (recursively) another transparent carrier PHI.
+  // Recursive because a carrier chain may route the group through several
+  // PHIs (nested loops: outer header phi via outer latch phi via join phi),
+  // and a not-yet-aliased carrier's transparency can only be decided from
+  // its own incomings. A cycle back to a PHI already being evaluated is
+  // transparent (it routes the group's own identity around); any non-group
+  // incoming is still found on its own path.
+  SmallPtrSet<PHINode *, 8> CarrierEvalStack;
+  std::function<bool(PHINode *)> IsTransparentCarrier =
+      [&](PHINode *P) -> bool {
+    for (unsigned I = 0, E = P->getNumIncomingValues(); I < E; ++I) {
+      Value *IV = P->getIncomingValue(I);
+      if (IV == P || IV == CaseCPhi)
+        continue;
+      auto IAID = Aliases.getVirtualAlias(IV);
+      if (IAID && CaseCGroup.count(*IAID))
+        continue;
+      if (GroupCarriers.count(IV))
+        continue;
+      if (auto *IPhi = dyn_cast<PHINode>(IV)) {
+        if (!CarrierEvalStack.insert(IPhi).second)
+          continue; // carrier cycle: routes the group's own identity.
+        bool Sub = IsTransparentCarrier(IPhi);
+        CarrierEvalStack.erase(IPhi);
+        if (Sub) {
+          GroupCarriers.insert(IPhi);
+          continue;
+        }
+      } else {
+        int64_t IOff = 0;
+        bool INonConst = false;
+        Value *IBase = jeandle::pea::stripPointerCastsAndOffsets(IV, DL, &IOff,
+                                                                 &INonConst);
+        if (!INonConst && IOff == 0) {
+          bool IsSourceRoot = false;
+          for (jeandle::ObjectID SID : CaseCGroup) {
+            const jeandle::VirtualObject &SVO = *Result.VirtualObjects[SID];
+            Value *SRoot = SVO.IsSynthetic
+                               ? static_cast<Value *>(SVO.SyntheticPhi)
+                               : static_cast<Value *>(SVO.AllocationCall);
+            if (IBase == SRoot) {
+              IsSourceRoot = true;
+              break;
+            }
+          }
+          if (IsSourceRoot)
+            continue;
+        }
+      }
+      LLVM_DEBUG(dbgs() << "PEA-CASEC-BAIL: carrier phi '" << P->getName()
+                        << "' not transparent for VO=" << ID << "; incoming '"
+                        << IV->getName() << "' not in Case-C group\n");
+      return false;
+    }
+    return true;
+  };
   while (!Worklist.empty()) {
     Value *Current = Worklist.pop_back_val();
     if (!Visited.insert(Current).second)
       continue;
     for (Use &Use : Current->uses()) {
       User *U = Use.getUser();
-      if (U == CaseCPhi)
+      // The Case-C PHI itself routes the source identity into the merged
+      // object; it is a transparent carrier by construction (its incomings
+      // are exactly the Case-C group). Traverse THROUGH it: an
+      // identity-observing consumer of the PHI's result (an
+      // identity-dependent equality compare, a leak) observes the merged
+      // identity of every source, while field accesses and further
+      // carrier PHIs remain internal.
+      if (U == CaseCPhi) {
+        Worklist.push_back(U);
         continue;
+      }
       auto *UI = dyn_cast<Instruction>(U);
       if (!UI)
         return true;
@@ -3033,6 +3233,16 @@ bool Analyzer::hasObservableIdentityUse(jeandle::ObjectID ID, PHINode *CaseCPhi,
         unsigned Operand = Use.getOperandNo();
         if (CB->isBundleOperand(Operand) &&
             CB->getOperandBundleForOperand(Operand).isDeoptOperandBundle()) {
+          // A safepoint in the identity definition's own block, after the
+          // definition, references the CURRENT dynamic instance of the
+          // identity (Graal's virtual mapping): every path from the Case-C
+          // PHI to it passes through the definition. Handle this case
+          // explicitly — isPotentiallyReachable reports "reachable" when
+          // the target sits inside the excluded block, because it checks
+          // the stop set before the exclusion set.
+          if (CB->getParent() == IdentityDef->getParent() &&
+              IdentityDef->comesBefore(CB))
+            continue;
           // In a loop, the safepoint can be CFG-reachable from this PHI only
           // after executing the identity definition again, in which case it
           // describes the next dynamic identity rather than the one collapsed
@@ -3047,11 +3257,152 @@ bool Analyzer::hasObservableIdentityUse(jeandle::ObjectID ID, PHINode *CaseCPhi,
       if (InternalTargets.count(UI))
         continue;
 
+      // A load/store whose POINTER operand is a field-address derivation of
+      // any Case-C group member (or the Case-C PHI itself) is a field access
+      // of the merged object, not an identity observation. (A use as a
+      // store's VALUE operand publishes the identity instead — that is not
+      // a field access of this object and falls through to the observation
+      // checks below.) The derivation may sit in a block not yet processed
+      // (e.g. a loop exit analyzed after the loop fixpoint), so neither an
+      // effect nor an alias is registered for it yet — resolve the pointer
+      // structurally.
+      Value *AccessPtr = nullptr;
+      if (auto *Ld = dyn_cast<LoadInst>(UI))
+        AccessPtr = Ld->getPointerOperand();
+      else if (auto *St = dyn_cast<StoreInst>(UI))
+        AccessPtr = St->getPointerOperand();
+      if (AccessPtr && AccessPtr == Current) {
+        int64_t FSOff = 0;
+        bool FSNonConst = false;
+        Value *FSBase = jeandle::pea::stripPointerCastsAndOffsets(
+            AccessPtr, DL, &FSOff, &FSNonConst);
+        if (!FSNonConst) {
+          auto BaseAlias = Aliases.getVirtualAlias(FSBase);
+          if (GroupCarriers.count(FSBase) ||
+              (BaseAlias && CaseCGroup.count(*BaseAlias)))
+            continue;
+        }
+      }
+
+      // An equality compare observes runtime identity unless its result is
+      // fixed by allocation-site distinctness. The compare is
+      // identity-dependent iff the OTHER operand may denote a member of the
+      // Case-C group at runtime: unresolvable (e.g. a carried PHI whose
+      // alias is reset mid-merge), or resolving into the (transitive)
+      // group. A null check is identity-independent (virtuals are
+      // non-null), and a compare against a provably different ordinary VO
+      // or a non-virtual pointer stays constant whether or not Case C
+      // fires, so a folded result there remains sound.
+      if (auto *II = dyn_cast<ICmpInst>(UI)) {
+        if (II->isEquality()) {
+          Value *Other = II->getOperand(0) == Current ? II->getOperand(1)
+                                                      : II->getOperand(0);
+          if (isa<ConstantPointerNull>(Other))
+            continue;
+          auto OtherID =
+              jeandle::pea::resolveVirtualRef(Other, CurrentState, Aliases, DL);
+          if (!OtherID || CaseCGroup.count(*OtherID))
+            return true;
+          continue;
+        }
+        return true;
+      }
+
+      // A pointer PHI may route the source identity onward — to the Case-C
+      // merge, around a loop back-edge, or to field accesses — without
+      // introducing a new identity. Two crossing rules apply:
+      //  * Reached ACROSS the Case-C merge point (Current is the Case-C PHI
+      //    or a value already crossed): always cross. The PHI consumes the
+      //    merged identity; whatever its other incomings are (an external
+      //    pointer, another VO), downstream merge handling covers them
+      //    (mixed state materializes the synthetic there, or a nested Case
+      //    C re-merges it), exactly as if the merged object were the
+      //    original per-path allocation.
+      //  * Reached directly from a source root: cross only when every
+      //    incoming routes a group identity (IsTransparentCarrier), i.e.
+      //    the PHI is identity-preserving for the group. Its consumers
+      //    then observe the SOURCE identity (leaks and identity compares
+      //    must still block the merge — Graal isSingleUsageAllocation:
+      //    any usage of the source allocation other than the Case-C phi
+      //    blocks it).
+      // The PHI's own alias is not consulted: a carrier in a block
+      // processed later (e.g. the outer loop's latch during a nested loop's
+      // Case C) has no alias registered yet, and a carrier's alias (when
+      // present) denotes only one group member while the PHI may route the
+      // whole group.
+      if (auto *CarrierPhi = dyn_cast<PHINode>(UI)) {
+        if (CrossedMerge.count(Current) || IsTransparentCarrier(CarrierPhi)) {
+          GroupCarriers.insert(UI);
+          if (CrossedMerge.count(Current))
+            CrossedMerge.insert(UI);
+          Worklist.push_back(UI);
+          continue;
+        }
+        return true;
+      }
+
       auto AliasID = Aliases.getVirtualAlias(UI);
-      if (!AliasID || *AliasID != ID)
+      if (!AliasID || !CaseCGroup.count(*AliasID)) {
+        // A field-access GEP/BitCast in a block not yet processed (e.g. a
+        // loop exit, analyzed after the loop fixpoint) may not have its own
+        // alias registered yet. Resolve through its pointer operand: if the
+        // operand denotes the Case-C PHI or aliases to a group member
+        // (directly or via an offset-0 wrapper), this use is a field-access
+        // derivation, not an identity observer.
+        Value *Operand = nullptr;
+        if (auto *GEP = dyn_cast<GEPOperator>(UI))
+          Operand = GEP->getPointerOperand();
+        else if (auto *BC = dyn_cast<BitCastOperator>(UI))
+          Operand = BC->getOperand(0);
+        else if (auto *AC = dyn_cast<AddrSpaceCastOperator>(UI))
+          Operand = AC->getOperand(0);
+        else if (auto *FI = dyn_cast<FreezeInst>(UI))
+          Operand = FI->getOperand(0);
+        else if (auto *II = dyn_cast<IntrinsicInst>(UI)) {
+          Intrinsic::ID IID = II->getIntrinsicID();
+          if (IID == Intrinsic::launder_invariant_group ||
+              IID == Intrinsic::strip_invariant_group ||
+              IID == Intrinsic::ptr_annotation)
+            Operand = II->getArgOperand(0);
+        }
+        if (Operand == CaseCPhi || GroupCarriers.count(Operand)) {
+          AliasID = ID;
+        } else if (Operand) {
+          auto OpAlias = Aliases.getVirtualAlias(Operand);
+          if (!OpAlias) {
+            int64_t TOff = 0;
+            bool TNonConst = false;
+            Value *TBase = jeandle::pea::stripPointerCastsAndOffsets(
+                Operand, DL, &TOff, &TNonConst);
+            OpAlias = Aliases.getVirtualAlias(TBase);
+          }
+          if (OpAlias && CaseCGroup.count(*OpAlias))
+            AliasID = OpAlias;
+        }
+        if (!AliasID || !CaseCGroup.count(*AliasID)) {
+          // A use reached by crossing the Case-C PHI observes the merged
+          // identity, which the PHI itself legitimately represents on every
+          // path; the merge may proceed and the synthetic is materialized
+          // at this use downstream.
+          if (CrossedMerge.count(Current))
+            continue;
+          LLVM_DEBUG(dbgs() << "PEA-CASEC-BAIL: identity walk sees user ";
+                     UI->print(dbgs());
+                     dbgs() << " with alias=" << (AliasID ? (int)*AliasID : -1)
+                            << " (want VO=" << ID << ", isaPHI="
+                            << (isa<PHINode>(UI) ? 1 : 0) << ")\n");
+          return true;
+        }
+      }
+      // A select on the source identity is an observation (the per-arm
+      // identities cannot be tracked through it) — unless the select is
+      // reached across the Case-C PHI, where it consumes the merged
+      // identity and is materialized downstream.
+      if (isa<SelectInst>(UI)) {
+        if (CrossedMerge.count(Current))
+          continue;
         return true;
-      if (isa<PHINode>(UI) || isa<SelectInst>(UI))
-        return true;
+      }
 
       // Instruction-form ptrtoint is deliberately not transparent here: the
       // normal instruction dispatch treats the integer value as an identity
@@ -3068,8 +3419,13 @@ bool Analyzer::hasObservableIdentityUse(jeandle::ObjectID ID, PHINode *CaseCPhi,
                     IID == Intrinsic::ptr_annotation;
       }
       std::optional<int64_t> Offset = jeandle::pea::resolveFieldOffset(UI, DL);
-      if (!Traceable || !Offset)
+      if (!Traceable || !Offset) {
+        if (CrossedMerge.count(Current))
+          continue; // observes the merged identity; materialized downstream.
         return true;
+      }
+      if (CrossedMerge.count(Current))
+        CrossedMerge.insert(UI);
       Worklist.push_back(UI);
     }
   }
@@ -3124,17 +3480,28 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
     // which case Case C cannot synthesize a merged VO that depends on
     // that pred's data — bail.
     BlockExitData *ED = exitDataFor(P, BB);
-    if (!ED)
+    if (!ED) {
       return false;
+    }
     ExitInfos.push_back(ED);
     // Each per-pred VO must be eligible AND still virtual at pred exit.
-    if (!Eligible.lookup(PerPredIDs.back()))
+    if (!Eligible.lookup(PerPredIDs.back())) {
       return false;
-    if (!ExitInfos.back()->Virtuals.count(PerPredIDs.back()))
+    }
+    if (!ExitInfos.back()->Virtuals.count(PerPredIDs.back())) {
       return false;
+    }
   }
 
   // Compatibility check.
+  LLVM_DEBUG({
+    dbgs() << "PEA-CASEC-ENTRY: merge " << BB->getName() << ":";
+    for (unsigned i = 0; i < N; ++i)
+      dbgs() << " [VO=" << PerPredIDs[i] << "@" << Preds[i]->getName()
+             << " elig=" << (Eligible.lookup(PerPredIDs[i]) ? 1 : 0) << " virt="
+             << (ExitInfos[i]->Virtuals.count(PerPredIDs[i]) ? 1 : 0) << "]";
+    dbgs() << "\n";
+  });
   jeandle::VirtualObject &Ref = *Result.VirtualObjects[PerPredIDs[0]];
   for (unsigned i = 1; i < N; ++i) {
     jeandle::VirtualObject &VO = *Result.VirtualObjects[PerPredIDs[i]];
@@ -3192,41 +3559,40 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
   // pointer-use graph rather than only to OrigAlloc's direct users.
   for (unsigned i = 0; i < N; ++i) {
     jeandle::ObjectID PID = PerPredIDs[i];
-    if (hasObservableIdentityUse(PID, Phi, ExitInfos))
+    if (hasObservableIdentityUse(PID, Phi, ExitInfos, PerPredIDs)) {
+      LLVM_DEBUG(dbgs() << "PEA-CASEC-BAIL: identity observed for VO=" << PID
+                        << " at merge " << BB->getName() << "\n");
       return false;
+    }
   }
 
-  // In-loop cache lookup. The cache covers ANY in-loop merge block, not just
-  // loop headers (same reach as LoopFieldPhiCache): a non-header in-loop
-  // merge that synthesized a fresh VO every fixpoint iteration would never
-  // converge — each iteration's BlockExits would carry a different ObjectID,
-  // so the exit-state equivalence check never reports equality and the
-  // fixpoint burns through every retry into MATERIALIZE_ALL.
-  CaseCKey CacheKey;
-  CacheKey.Block = BB;
-  // The incoming ORDER is part of the key: two PHIs at the same block with
-  // the same source VOs in different orders need distinct synthetic VOs —
-  // the per-offset field PHIs are built in incoming order, so sharing one VO
-  // (and its field-PHI shells) would cross-wire the two merges. The order is
-  // stable across fixpoint iterations (PHI incoming order is fixed), so an
-  // ordered key still hits every iteration.
-  CacheKey.SourceIDs.assign(PerPredIDs.begin(), PerPredIDs.end());
-  // Peek the cache for an already-synthesised VO at this block. On a
+  // In-loop cache lookup, keyed by the merge PHI (Graal valueObjectVirtuals).
+  // The cache covers ANY in-loop merge block, not just loop headers (same
+  // reach as LoopFieldPhiCache): a non-header in-loop merge that synthesized
+  // a fresh VO every fixpoint iteration would never converge — each
+  // iteration's BlockExits would carry a different ObjectID, so the
+  // exit-state equivalence check never reports equality and the fixpoint
+  // burns through every retry into MATERIALIZE_ALL.
+  //
+  // Peek the cache for an already-synthesised VO for this PHI. On a
   // hit we fall through into the full synthesize path reusing CachedExistingID
   // as the ObjectID (rather than returning early), so FieldStates[Cached] is
-  // repopulated each iteration; the PHI emission below uses
+  // repopulated each iteration from the CURRENT per-pred exits (the source
+  // set may have evolved since the entry was created — the hit only fixes
+  // the ObjectID, matching Graal); the PHI emission below uses
   // getOrCreateLoopFieldPhi so per-offset PHI shells (and FieldStates' Value*)
   // stay stable across iterations.
   bool InLoop = LI.getLoopFor(BB) != nullptr;
   jeandle::ObjectID CachedExistingID = jeandle::InvalidObjectID;
   if (InLoop) {
-    auto CIt = CaseCVOCache.find(CacheKey);
+    auto CIt = CaseCVOCache.find(Phi);
     if (CIt != CaseCVOCache.end()) {
       jeandle::ObjectID Cached = CIt->second;
       if (Eligible.lookup(Cached))
         CachedExistingID = Cached;
       // If the cached ID was made ineligible (e.g. materialized in a previous
-      // top-level pass), fall through and synthesize a fresh VO.
+      // top-level pass), fall through and synthesize a fresh VO; the insert
+      // below overwrites the stale entry.
     }
   }
 
@@ -3493,10 +3859,12 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
   Out.addAll(PendingPhiEffects);
   CurrentState.addObject(NewID, jeandle::ObjectState());
   Eligible[NewID] = true;
-  if (!Merged.empty())
-    FieldStates[NewID] = std::move(Merged);
-  if (!MergedDefinitions.empty())
-    FieldDefinitions[NewID] = std::move(MergedDefinitions);
+  // Refresh the merged field state unconditionally: with the phi-keyed
+  // cache the same synthetic ID is reused across loop-fixpoint passes with
+  // an evolving source set, so a pass whose merge produces no differing
+  // entries must still overwrite the previous pass's entries.
+  FieldStates[NewID] = std::move(Merged);
+  FieldDefinitions[NewID] = std::move(MergedDefinitions);
   if (RefLC != 0) {
     LockCounts[NewID] = RefLC;
     const auto &RefStack = ExitInfos[0]->LiveLockEnters.lookup(PerPredIDs[0]);
@@ -3504,11 +3872,14 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
       LiveLockEnters[NewID] = RefStack;
   }
   Aliases.addVirtualAlias(Phi, NewID);
-  // Only insert if this is a fresh synthesis. On a cache hit the
-  // entry already exists for the same key; emplace would be a no-op but we
-  // skip explicitly to avoid the (CacheKey already moved-from) hazard above.
-  if (InLoop && CachedExistingID == jeandle::InvalidObjectID)
-    CaseCVOCache.emplace(std::move(CacheKey), NewID);
+  LLVM_DEBUG(dbgs() << "PEA-CASEC-SUCCESS: synthesized VO=" << NewID
+                    << " for phi '" << Phi->getName() << "' at merge "
+                    << BB->getName() << "\n");
+  // Record (or overwrite, when a stale entry's VO went ineligible) the
+  // phi-keyed cache entry. On a cache hit the entry already maps this PHI
+  // to NewID; assignment is idempotent.
+  if (InLoop)
+    CaseCVOCache[Phi] = NewID;
   return true;
 }
 
@@ -7545,9 +7916,24 @@ void Analyzer::processLoopBodyOnePass(Loop *L, ArrayRef<BasicBlock *> LoopRPO,
   // we don't re-process them in this pass. FunctionRPO is computed once by
   // Analyzer::run; LoopRPO is the filtered loop-local view reused across the
   // inner fixpoint iterations.
-  llvm::SmallPtrSet<BasicBlock *, 16> Done;
+  //
+  // Publish the active body pass (loop + blocks processed so far) so
+  // processBlockPhis can tell a loop-header PHI's not-yet-processed
+  // back-edge predecessor (unknown) from a genuinely non-virtual incoming
+  // (divergence). Stack semantics for the nested processLoop recursion
+  // below; restored on every exit, including the OverflowFlag early
+  // returns, so the post-body merge (which runs after this function
+  // returns) and any outer loop see their own context.
+  Loop *SavedBodyPassLoop = ActiveBodyPassLoop;
+  llvm::SmallPtrSet<BasicBlock *, 16> SavedBodyPassProcessed;
+  SavedBodyPassProcessed.swap(BodyPassProcessed);
+  ActiveBodyPassLoop = L;
+  auto RestoreBodyPass = llvm::make_scope_exit([&] {
+    ActiveBodyPassLoop = SavedBodyPassLoop;
+    BodyPassProcessed.swap(SavedBodyPassProcessed);
+  });
   for (BasicBlock *BB : LoopRPO) {
-    if (Done.count(BB))
+    if (BodyPassProcessed.count(BB))
       continue;
     Loop *Inner = LI.getLoopFor(BB);
     if (Inner && Inner != L && Inner->getHeader() == BB) {
@@ -7561,7 +7947,7 @@ void Analyzer::processLoopBodyOnePass(Loop *L, ArrayRef<BasicBlock *> LoopRPO,
       if (OverflowFlag)
         return;
       for (BasicBlock *SB : Inner->blocks())
-        Done.insert(SB);
+        BodyPassProcessed.insert(SB);
       continue;
     }
     processBlock(BB);
@@ -7570,7 +7956,7 @@ void Analyzer::processLoopBodyOnePass(Loop *L, ArrayRef<BasicBlock *> LoopRPO,
     // keep walking an overflowed nest.
     if (OverflowFlag)
       return;
-    Done.insert(BB);
+    BodyPassProcessed.insert(BB);
   }
 }
 
@@ -7652,7 +8038,12 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
     // its effects simply persist to commit().
     resetPerBlockState();
     mergeStates(Header);
-    PendingMergePhis[Header].clear();
+    // Drain the merge's deferred CreatePHI effects the same way the fixpoint
+    // path's post-body merge does: a one-shot post-body Case C (or a field
+    // merge) needs them to reach transform; clearing them here would leave
+    // the header PHI aliased to a synthetic whose field PHIs never get
+    // inserted.
+    drainPendingMergePhis(Header);
 
     // OverflowFlag is deliberately NOT cleared here: if processLoopBodyOnePass
     // latched it (a nested loop overflowed), it propagates conservatively up so
@@ -7785,16 +8176,25 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
       // snapshotted+restored via LoopSnapshot, and under reuse-OrigAlloc the
       // materialized value is OrigAlloc on every edge), so B' is stable and
       // the fixpoint converges rather than escalating to MATERIALIZE_ALL.
-      // PendingMergePhis[Header].clear() drops the re-run's CreatePHI effects
-      // (redundant with the in-pass merge's already-drained effects for
-      // before-loop objects; Case A records its materialize in
-      // BlockEffects[latch], not PendingMergePhis).
+      // PendingMergePhis[Header] is drained to BlockEffects[Header] so that
+      // Case-C CreatePHI effects from the post-body merge (e.g. a synthetic
+      // merge VO for a loop-carried conditional replacement) survive to
+      // transform. When the in-pass header merge also took Case C (the
+      // phi-keyed memo lets it hit the same synthetic), BlockEffects[Header]
+      // already holds that merge's CreatePHI effects for the SAME PHI
+      // shells, so this drain adds a second effect object per shell. That is
+      // benign: both merges compute identical incoming-value lists (the
+      // LoopFieldPhiCache shells and the phi-keyed Case-C cache make the
+      // in-pass and post-body field states agree), and CreatePHIEffect::
+      // apply is idempotent on an already-inserted PHI, so the in-pass
+      // effect (earlier SeqNo) wins and the duplicate no-ops. Case A records
+      // its materialize in BlockEffects[latch], not PendingMergePhis.
       {
         resetPerBlockState();
         mergeStates(Header);
         NewMergedState = BlockExitData();
         snapshotExitStateInto(NewMergedState); // B'
-        PendingMergePhis[Header].clear();
+        drainPendingMergePhis(Header);
       }
       // B' vs B (Graal's loop fixpoint equivalentTo). No iteration gate: with
       // the post-body merge, iteration 0 already has a true B' to compare
