@@ -199,11 +199,13 @@ public:
   // per-pred Fields. There is no backing allocation — AllocationCall is
   // non-null (cloned from the first per-pred VO) but MUST NOT be erased or
   // used as a Materialize effect target. SyntheticSourceIDs holds the
-  // per-pred VOs in PHI-incoming order; SyntheticPhi is the merge-block
-  // PHINode the VO is aliased to. If the synthetic identity later escapes,
-  // every real leaf allocation is retained at its original allocation site
-  // and the complete current state is replayed once onto SyntheticPhi. No
-  // allocation is created for the synthetic itself.
+  // per-pred VOs in original PHI-incoming order. A proven-dead structural
+  // incoming retains an InvalidObjectID slot until CFG cleanup removes it;
+  // Unseen loop inputs are backfilled by the loop fixpoint. SyntheticPhi is
+  // the merge-block PHINode the VO is aliased to. If the synthetic identity
+  // later escapes, every real leaf allocation is retained at its original
+  // allocation site and the complete current state is replayed once onto
+  // SyntheticPhi. No allocation is created for the synthetic itself.
   bool IsSynthetic = false;
   SmallVector<ObjectID, 4> SyntheticSourceIDs;
   PHINode *SyntheticPhi = nullptr;
@@ -416,14 +418,9 @@ public:
   unsigned getStateCount() const {
     return ObjectStates ? static_cast<unsigned>(ObjectStates->size()) : 0u;
   }
-  // Dead-block pruning is handled out of band: pre-PEA LLVM cleanup
-  // (SimplifyCFG + ADCE) removes unreachable blocks via
-  // removeUnreachableBlock, so every block that reaches PEA is reachable.
-  // Graal's killIfBranch marks a block dead so PEA can skip it; Jeandle has
-  // no in-PEA dead-block flag.
-  // TODO(in-pea-dead-block-flag): if Jeandle ever needs in-PEA dead-block
-  // marking, reintroduce a flag and wire foldICmpEquality / killIfBranch to
-  // set it.
+  // CFG liveness is target-specific rather than part of the shared virtual
+  // object state. The analyzer's BlockExitInfo and EdgeContribution classify
+  // structural predecessor inputs as Unseen, Dead, or Live.
 
 private:
   SmallVector<std::optional<ObjectState>, 8> *getArrayForModification();
@@ -1013,6 +1010,10 @@ public:
   int VirtualizationDelta = 0;
   int AllocationDelta = 0;
   uint32_t NextSeqNo = 0;
+  // Analysis proved that at least one structural CFG edge/terminator is dead.
+  // The transform must run its terminator and unreachable-block cleanup even
+  // when applying the surviving effects does not otherwise mutate the IR.
+  bool NeedsCFGCleanup = false;
 
   // PHI nodes created (unparented) by the analyzer for CreatePHI effects.
   // Stored as WeakTrackingVH so we can safely check for nullness in the

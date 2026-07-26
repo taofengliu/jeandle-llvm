@@ -763,6 +763,7 @@ bool PEAResult::hasOptimizationOpportunity() const {
   // always. VirtualizationDelta is never decremented below 0, so
   // VirtualizationDelta > 0 implies AllocationDelta != 0 — the latter term is
   // redundant and dropped. Kept: any virtualization, OR any escaped-materialize
-  // effect recorded (PartiallyEscapes / AlwaysEscapes need a transform pass).
-  return VirtualizationDelta > 0 || !BlockEffects.empty();
+  // effect recorded (PartiallyEscapes / AlwaysEscapes need a transform pass),
+  // OR an explicit CFG-cleanup obligation.
+  return VirtualizationDelta > 0 || !BlockEffects.empty() || NeedsCFGCleanup;
 }

@@ -430,7 +430,33 @@ struct BlockExitData {
   DenseMap<jeandle::ObjectID, SmallVector<LockEnter, 4>> LiveLockEnters;
 };
 
+enum class EdgeContributionKind : uint8_t { Unseen, Dead, Live };
+
+struct EdgeContribution {
+  EdgeContributionKind Kind = EdgeContributionKind::Unseen;
+  BlockExitData *Data = nullptr;
+
+  static EdgeContribution unseen() { return {}; }
+  static EdgeContribution dead() {
+    return {EdgeContributionKind::Dead, nullptr};
+  }
+  static EdgeContribution live(BlockExitData *Data) {
+    assert(Data && "live edge contribution requires exit data");
+    return {EdgeContributionKind::Live, Data};
+  }
+
+  bool isUnseen() const { return Kind == EdgeContributionKind::Unseen; }
+  bool isDead() const { return Kind == EdgeContributionKind::Dead; }
+  bool isLive() const { return Kind == EdgeContributionKind::Live; }
+};
+
 struct BlockExitInfo : BlockExitData {
+  // A block reached exclusively through proven-dead incoming edges publishes a
+  // dead exit instead of an empty live state. Every successor query then sees
+  // Dead and propagates that fact transitively until CFG cleanup removes the
+  // structural blocks.
+  bool IsDead = false;
+
   // Exception-edge state-splitting. Only meaningful when the block's
   // terminator is an InvokeInst (which has both a normal and an unwind
   // successor).
@@ -449,18 +475,15 @@ struct BlockExitInfo : BlockExitData {
   // prevents an unwind handler from folding a pre-call field value or
   // re-emitting locks, while leaving unrelated virtual objects untouched.
   //
-  // TerminatorInvoke / UnwindDest are stashed so the analyzer's pred-state
-  // lookup (exitDataFor) can detect "this pred's terminator is an invoke
-  // whose unwind dest equals the successor block I'm processing".
+  // TerminatorInvoke / UnwindDest are stashed so contributionFor can detect
+  // "this pred's terminator is an invoke whose unwind dest equals the
+  // successor block I'm processing".
   llvm::InvokeInst *TerminatorInvoke = nullptr;
   BasicBlock *UnwindDest = nullptr;
   // The invoke was fully virtualized (e.g. processJavaOp emitted a
-  // ReplaceCall effect on it). The transform replaces such invokes with
-  // an unconditional branch to the normal dest, so from the analyzer's
-  // perspective the unwind edge is dead — the handler is unreachable for
-  // analysis purposes. exitDataFor returns nullptr when a successor asks
-  // for a killed unwind edge, which makes the merge consumer treat the
-  // pred as contributing nothing on that path (mark-as-dead).
+  // ReplaceCall effect on it). The transform replaces such invokes with an
+  // unconditional branch to the normal dest, so the unwind successor receives
+  // a Dead contribution while the normal successor remains Live.
   bool UnwindEdgeKilled = false;
   // Pre-invoke snapshot of the per-object data. Captured by processBlock
   // immediately before applying the terminator-invoke, then stashed here
@@ -870,13 +893,16 @@ private:
     Analyzer &A;
     BasicBlock *BB;
     // Per-merge context (the Graal MergeProcessor's mergeBlock + caches).
-    // Preds[i] points at a stable target-local view of `BlockExits[Pred]` (or
-    // its UnwindData variant) returned by exitDataFor. Incoming-edge
-    // materialization flips this view without changing the shared predecessor
-    // state seen by sibling successors. The transform preserves Source->BB
-    // control dependence, while reuse-OrigAlloc supplies the SSA value.
+    // Preds/PredBBs contain Live contributions only. FullPredBBs and
+    // FullContributions retain every structural predecessor edge in original
+    // order so a deferred field PHI can keep verifier-correct arity while a
+    // proven-dead CFG edge still exists. LiveOriginalIndices maps each compact
+    // Preds slot back to that structural position.
     SmallVector<BlockExitData *, 4> Preds;
     SmallVector<BasicBlock *, 4> PredBBs;
+    SmallVector<BasicBlock *, 4> FullPredBBs;
+    SmallVector<EdgeContributionKind, 4> FullContributions;
+    SmallVector<unsigned, 4> LiveOriginalIndices;
     SmallVector<jeandle::ObjectID, 8> IDs;
 
     // References to the Analyzer's per-block state. They alias the member
@@ -902,6 +928,8 @@ private:
     bool mergeObjectState(jeandle::ObjectID ID);
     bool mergeFieldStates(jeandle::ObjectID ID);
     bool materializePredsAndMerge(jeandle::ObjectID ID);
+    void appendFullPhiInputs(jeandle::CreatePHIEffect &Effect,
+                             ArrayRef<Value *> LiveValues, Type *PhiType) const;
   };
 
   // Returns a stable PHI for the given (in-loop merge block, ID, offset)
@@ -945,15 +973,11 @@ private:
   // (loop-header-cached) is intentionally untouched.
   void deleteOwnedSince(size_t PhiMark, size_t InstMark);
 
-  // Resolve the per-pred BlockExitData a successor block should
-  // inherit. Returns nullptr when the predecessor's contribution is dead
-  // for this successor (either the pred has not been processed yet OR the
-  // pred's terminator is an InvokeInst whose unwind edge was killed
-  // because the invoke was virtualized away). Otherwise returns either
-  // the pred's normal exit data (base data) or — when the successor is
-  // the pred's invoke's unwind dest AND a pre-invoke snapshot was
-  // recorded — the pre-invoke unwind variant.
-  BlockExitData *exitDataFor(BasicBlock *Pred, BasicBlock *Succ);
+  // Resolve one predecessor-to-successor contribution. Unseen means the
+  // predecessor has not published an exit yet, Dead means this exact target
+  // edge (or the entire predecessor block) is proven unreachable, and Live
+  // carries the normal/unwind snapshot appropriate for this successor.
+  EdgeContribution contributionFor(BasicBlock *Pred, BasicBlock *Succ);
 
   // Has an incoming-edge/block-end materialize already been emitted for
   // (Pred, M, ID)?
@@ -973,7 +997,7 @@ private:
   // non-byte-array, non-two-slot entry cases.
   bool synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
                        ArrayRef<std::optional<jeandle::ObjectID>> InIDs,
-                       jeandle::EffectList &Out);
+                       const SmallBitVector &Dead, jeandle::EffectList &Out);
 
   // Case C may collapse different allocation identities only when the
   // selected source identity cannot reach an observing consumer. Follow
@@ -1486,7 +1510,8 @@ void Analyzer::markIneligible(jeandle::ObjectID ID) {
       if (VObj.SyntheticPhi)
         Aliases.resetAlias(VObj.SyntheticPhi);
       for (jeandle::ObjectID PID : VObj.SyntheticSourceIDs)
-        Worklist.push_back(PID);
+        if (PID != jeandle::InvalidObjectID)
+          Worklist.push_back(PID);
     }
   }
 }
@@ -1520,6 +1545,34 @@ void Analyzer::drainPendingMergePhis(BasicBlock *BB) {
 void Analyzer::processBlock(BasicBlock *BB) {
   ScopedEdgeExitViews EdgeViews(*this);
 
+  // Classify the block before rebuilding or walking any abstract state. A
+  // block with at least one Live predecessor is analyzed from Live inputs
+  // only. A block whose every published predecessor contribution is Dead
+  // publishes a dead exit without processing its instructions, and a block
+  // with no Live input but at least one Unseen input is deferred so a loop
+  // fixpoint can backfill it later.
+  if (BB != &F.getEntryBlock()) {
+    bool HasLive = false;
+    bool HasUnseen = false;
+    for (BasicBlock *Pred : predecessors(BB)) {
+      EdgeContribution Contribution = contributionFor(Pred, BB);
+      HasLive |= Contribution.isLive();
+      HasUnseen |= Contribution.isUnseen();
+    }
+    if (!HasLive) {
+      resetPerBlockState();
+      PendingMergePhis.erase(BB);
+      if (HasUnseen) {
+        BlockExits.erase(BB);
+        return;
+      }
+      BlockExitInfo DeadExit;
+      DeadExit.IsDead = true;
+      BlockExits[BB] = std::move(DeadExit);
+      return;
+    }
+  }
+
   // Rebuild per-block state from the predecessor snapshots before we walk
   // instructions. Entry block starts empty. A single-pred block without a
   // Java-heap pointer PHI can inherit directly; otherwise it runs the merge,
@@ -1545,8 +1598,10 @@ void Analyzer::processBlock(BasicBlock *BB) {
     // processBlockPhis only handles Java-heap pointer PHIs, so it cannot emit
     // Case-A materialization on this path and no merge retry is needed.
     BasicBlock *P = *predecessors(BB).begin();
-    if (BlockExitData *ED = exitDataFor(P, BB))
-      inheritFromExit(*ED);
+    EdgeContribution Contribution = contributionFor(P, BB);
+    assert(Contribution.isLive() &&
+           "single-predecessor block passed the live-entry gate");
+    inheritFromExit(*Contribution.Data);
     processBlockPhis(BB, PendingMergePhis[BB]);
   } else {
     // mergeStates wraps BOTH the per-VO loop AND the PHI loop in a
@@ -1621,8 +1676,8 @@ void Analyzer::processBlock(BasicBlock *BB) {
     // analyzer (e.g. processJavaOp emitted a ReplaceCall effect on it).
     // The transform rewrites such invokes as an unconditional branch to
     // the normal successor, so from PEA's perspective the unwind edge no
-    // longer exists. Mark the edge killed so exitDataFor reports no
-    // contribution to the unwind successor.
+    // longer exists. Mark the edge killed so contributionFor reports Dead to
+    // the unwind successor.
     bool Virtualized = false;
     auto EIt = Result.BlockEffects.find(BB);
     if (EIt != Result.BlockEffects.end()) {
@@ -1635,6 +1690,8 @@ void Analyzer::processBlock(BasicBlock *BB) {
       }
     }
     Info.UnwindEdgeKilled = Virtualized;
+    if (Virtualized)
+      Result.NeedsCFGCleanup = true;
 
     // Patch the pre-invoke snapshot for every VO materialized immediately
     // before this invoke. Field replay, lock re-emission, and exposure of the
@@ -1675,22 +1732,21 @@ void Analyzer::resetPerBlockState() {
   Materialized.clear();
 }
 
-BlockExitData *Analyzer::exitDataFor(BasicBlock *Pred, BasicBlock *Succ) {
+EdgeContribution Analyzer::contributionFor(BasicBlock *Pred, BasicBlock *Succ) {
   assert(EdgeExitViewScopeDepth != 0 &&
-         "exitDataFor requires a scoped edge-exit-view cache");
+         "contributionFor requires a scoped edge-exit-view cache");
   auto It = BlockExits.find(Pred);
   if (It == BlockExits.end())
-    return nullptr;
+    return EdgeContribution::unseen();
   BlockExitInfo &Info = It->second;
+  if (Info.IsDead)
+    return EdgeContribution::dead();
   // When the pred ends in an InvokeInst whose unwind dest is `Succ`,
   // the unwind edge participates in state-splitting.
   BlockExitData *Base = &Info;
   if (Info.TerminatorInvoke && Info.UnwindDest == Succ) {
-    if (Info.UnwindEdgeKilled) {
-      // Invoke was virtualized; the handler is unreachable for analysis.
-      // Return nullptr so the merge consumer drops this pred entirely.
-      return nullptr;
-    }
+    if (Info.UnwindEdgeKilled)
+      return EdgeContribution::dead();
     if (Info.UnwindData)
       Base = &*Info.UnwindData;
   }
@@ -1712,7 +1768,7 @@ BlockExitData *Analyzer::exitDataFor(BasicBlock *Pred, BasicBlock *Succ) {
             markObjectMaterializedInExitData(*Storage, ID);
     }
   }
-  return Storage.get();
+  return EdgeContribution::live(Storage.get());
 }
 
 bool Analyzer::isMaterializedAtPred(BasicBlock *Pred, BasicBlock *M,
@@ -1961,30 +2017,26 @@ void Analyzer::mergeStates(BasicBlock *BB) {
 // the degenerate fast paths, intersect the tracked IDs, then drive the do/while
 // merge fixpoint.
 void Analyzer::MergeProcessor::run() {
-  // Collect the snapshots of every predecessor we've already processed. RPO
-  // guarantees forward-edge preds are visited first; back-edge preds are not
-  // yet available and are silently skipped (the loop-preheader force-
-  // materialization sweep handles loop soundness). Preds[i] points at a
-  // stable target-local view of `BlockExits[P]` (or its UnwindData variant)
-  // returned by exitDataFor. Incoming-edge materialization flips that view,
-  // while the shared predecessor snapshot remains unchanged.
+  // Preserve the full structural predecessor order while compacting only Live
+  // snapshots into Preds. Dead entries remain in FullContributions so field
+  // PHIs receive poison at the same original slot; Unseen loop entries are
+  // omitted until the existing loop fixpoint revisits and backfills them.
   for (BasicBlock *P : predecessors(BB)) {
-    // When P ends in an InvokeInst whose unwind dest is BB,
-    // exitDataFor returns either the pre-invoke unwind variant (if
-    // recorded) or nullptr (if the invoke was virtualized and the
-    // unwind edge is dead — that pred contributes nothing).
-    BlockExitData *ED = A.exitDataFor(P, BB);
-    if (!ED)
+    unsigned OriginalIndex = FullPredBBs.size();
+    EdgeContribution Contribution = A.contributionFor(P, BB);
+    FullPredBBs.push_back(P);
+    FullContributions.push_back(Contribution.Kind);
+    if (!Contribution.isLive())
       continue;
     PredBBs.push_back(P);
-    Preds.push_back(ED);
+    Preds.push_back(Contribution.Data);
+    LiveOriginalIndices.push_back(OriginalIndex);
   }
   if (Preds.empty()) {
-    // Nothing to inherit; start empty. PHIs (if any) at this BB still need
-    // walking — none of their incomings have a live pred contribution, so
-    // processBlockPhis simply records nothing here, but we run it for
-    // consistency with the non-degenerate paths.
-    A.processBlockPhis(BB, PendingMergePhis[BB]);
+    // processBlock normally classifies this block as Dead or deferred before
+    // constructing a MergeProcessor. Direct loop post-body merges may still
+    // reach here while every input is Unseen; they contribute no state until
+    // the next fixpoint pass.
     return;
   }
   // identicalExitData fast path (Graal's identicalObjectStates,
@@ -2345,6 +2397,33 @@ bool Analyzer::MergeProcessor::materializePredsAndMerge(jeandle::ObjectID ID) {
   return Mat;
 }
 
+void Analyzer::MergeProcessor::appendFullPhiInputs(
+    jeandle::CreatePHIEffect &Effect, ArrayRef<Value *> LiveValues,
+    Type *PhiType) const {
+  assert(LiveValues.size() == Preds.size() &&
+         "one field value is required for every live contribution");
+  unsigned LiveIndex = 0;
+  for (unsigned OriginalIndex = 0; OriginalIndex < FullPredBBs.size();
+       ++OriginalIndex) {
+    EdgeContributionKind Kind = FullContributions[OriginalIndex];
+    if (Kind == EdgeContributionKind::Unseen)
+      continue;
+    Value *Incoming = nullptr;
+    if (Kind == EdgeContributionKind::Dead)
+      Incoming = PoisonValue::get(PhiType);
+    else {
+      assert(LiveIndex < LiveOriginalIndices.size() &&
+             LiveOriginalIndices[LiveIndex] == OriginalIndex &&
+             "live merge input lost its original predecessor index");
+      Incoming = LiveValues[LiveIndex++];
+    }
+    Effect.PHIIncomingValues.push_back(Incoming);
+    Effect.PHIIncomingBlocks.push_back(FullPredBBs[OriginalIndex]);
+  }
+  assert(LiveIndex == LiveValues.size() &&
+         "live-to-original predecessor mapping must be complete");
+}
+
 // Graal mergeObjectStates (Graal PartialEscapeClosure), COMPATIBLE
 // branch: per-offset field-PHI synthesis for a virtual object whose locks agree
 // across all predecessors. Identical entries flow straight into the merged
@@ -2643,10 +2722,7 @@ bool Analyzer::MergeProcessor::mergeFieldStates(jeandle::ObjectID ID) {
     PE->PhiInst = Phi;
     PE->PHIType = PhiType;
     PE->FieldOffset = Off;
-    for (unsigned i = 0; i < Preds.size(); ++i) {
-      PE->PHIIncomingValues.push_back(InValues[i]);
-      PE->PHIIncomingBlocks.push_back(PredBBs[i]);
-    }
+    appendFullPhiInputs(*PE, InValues, PhiType);
     PendingPhiEffects.add(std::move(PE));
 
     if (PhiType->isPointerTy())
@@ -2778,6 +2854,7 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
     // state.
     SmallVector<std::optional<jeandle::ObjectID>, 4> InIDs;
     SmallBitVector Unresolved(Phi.getNumIncomingValues(), false);
+    SmallBitVector Dead(Phi.getNumIncomingValues(), false);
     SmallBitVector SelfCarry(Phi.getNumIncomingValues(), false);
     bool AnyVirtual = false;
     bool AnyDerived = false; // a resolved incoming with a non-zero/non-constant
@@ -2787,12 +2864,18 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
       BasicBlock *Pred = Phi.getIncomingBlock(I);
       Value *V = Phi.getIncomingValue(I);
       std::optional<jeandle::ObjectID> Found;
-      BlockExitData *PredED = exitDataFor(Pred, BB);
-      if (!PredED) {
+      EdgeContribution Contribution = contributionFor(Pred, BB);
+      if (Contribution.isUnseen()) {
         Unresolved.set(I);
         InIDs.push_back(Found);
         continue;
       }
+      if (Contribution.isDead()) {
+        Dead.set(I);
+        InIDs.push_back(Found);
+        continue;
+      }
+      BlockExitData *PredED = Contribution.Data;
       auto AID = Aliases.getVirtualAlias(V);
       if (AID && PredED->Virtuals.count(*AID)) {
         Found = *AID;
@@ -2867,7 +2950,8 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
               *Result.VirtualObjects[MemoIt->second];
           if (MemoVO.IsSynthetic && I < MemoVO.SyntheticSourceIDs.size()) {
             jeandle::ObjectID Cand = MemoVO.SyntheticSourceIDs[I];
-            if (Eligible.lookup(Cand) && PredED->Virtuals.count(Cand))
+            if (Cand != jeandle::InvalidObjectID && Eligible.lookup(Cand) &&
+                PredED->Virtuals.count(Cand))
               Found = Cand;
           }
         }
@@ -2898,7 +2982,7 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
     bool AllSame = true;
     std::optional<jeandle::ObjectID> First;
     for (unsigned I = 0; I < InIDs.size(); ++I) {
-      if (Unresolved[I] || SelfCarry[I])
+      if (Dead[I] || Unresolved[I] || SelfCarry[I])
         continue;
       const auto &O = InIDs[I];
       if (!O) {
@@ -2914,10 +2998,12 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
     }
     if (AllSame && First)
       for (unsigned I = 0; I < InIDs.size(); ++I) {
-        if (!SelfCarry[I])
+        if (Dead[I] || Unresolved[I] || !SelfCarry[I])
           continue;
-        BlockExitData *PredED = exitDataFor(Phi.getIncomingBlock(I), BB);
-        if (!PredED || !PredED->Virtuals.count(*First)) {
+        EdgeContribution Contribution =
+            contributionFor(Phi.getIncomingBlock(I), BB);
+        if (!Contribution.isLive() ||
+            !Contribution.Data->Virtuals.count(*First)) {
           AllSame = false;
           break;
         }
@@ -2958,6 +3044,14 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
       {
         unsigned DbgIdx = 0;
         for (auto &O : InIDs) {
+          if (Dead[DbgIdx]) {
+            ++DbgIdx;
+            continue;
+          }
+          if (Unresolved[DbgIdx]) {
+            EveryInputVirtual = false;
+            break;
+          }
           if (!O) {
             LLVM_DEBUG(dbgs() << "PEA-PHI-DECIDE: phi '" << Phi.getName()
                               << "' incoming[" << DbgIdx << "] not virtual ("
@@ -2968,7 +3062,7 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
           DbgIdx++;
         }
       }
-      if (EveryInputVirtual && synthesizeCaseC(BB, &Phi, InIDs, Out))
+      if (EveryInputVirtual && synthesizeCaseC(BB, &Phi, InIDs, Dead, Out))
         continue;
     }
 
@@ -2978,14 +3072,17 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
     // virtual incoming's OrigAlloc use stays unchanged because OrigAlloc is
     // reused post-merge.
     for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I) {
+      if (Dead[I])
+        continue;
       if (!InIDs[I])
         continue;
       BasicBlock *Pred = Phi.getIncomingBlock(I);
-      BlockExitData *PredED = exitDataFor(Pred, BB);
-      if (!PredED) {
+      EdgeContribution Contribution = contributionFor(Pred, BB);
+      if (!Contribution.isLive()) {
         markIneligible(*InIDs[I]);
         continue;
       }
+      BlockExitData *PredED = Contribution.Data;
       // Skip if the VO is already materialized for THIS merge. Two cases:
       // (a) a true block-end drain already flipped the shared state (VO no
       // longer virtual in BlockExits[Pred]); (b) an incoming-edge mat for THIS
@@ -3104,7 +3201,7 @@ bool Analyzer::hasObservableIdentityUse(
       if (!GVO.IsSynthetic)
         continue;
       for (jeandle::ObjectID S : GVO.SyntheticSourceIDs)
-        if (CaseCGroup.insert(S).second)
+        if (S != jeandle::InvalidObjectID && CaseCGroup.insert(S).second)
           GroupWorklist.push_back(S);
     }
   }
@@ -3454,56 +3551,62 @@ bool Analyzer::hasObservableIdentityUse(
 
 bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
                                ArrayRef<std::optional<jeandle::ObjectID>> InIDs,
+                               const SmallBitVector &Dead,
                                jeandle::EffectList &Out) {
   // TODO(ensure-virtualized): when an EnsureVirtualized bit lands on
   // ObjectState, downgrade it here per-pred (Graal setEnsureVirtualized(false)
   // where not all preds agree). Differing VirtualRef fields below still route
   // their child materializations through materializeAtPredFromExitInfo.
-  const unsigned N = Phi->getNumIncomingValues();
-  assert(InIDs.size() == N);
+  const unsigned OriginalN = Phi->getNumIncomingValues();
+  assert(InIDs.size() == OriginalN && Dead.size() == OriginalN);
 
-  // Resolve per-pred VO ids, predecessor blocks, and their exit snapshots.
+  // Resolve Live VO ids, predecessor blocks, and their exit snapshots while
+  // retaining each original PHI slot. Dead slots carry InvalidObjectID in the
+  // synthetic metadata until CFG cleanup removes the matching PHI incoming.
   SmallVector<jeandle::ObjectID, 4> PerPredIDs;
-  PerPredIDs.reserve(N);
+  PerPredIDs.reserve(OriginalN);
   SmallVector<BasicBlock *, 4> Preds;
-  Preds.reserve(N);
+  Preds.reserve(OriginalN);
   SmallVector<BlockExitData *, 4> ExitInfos;
-  ExitInfos.reserve(N);
-  for (unsigned i = 0; i < N; ++i) {
+  ExitInfos.reserve(OriginalN);
+  SmallVector<unsigned, 4> PerPredOriginalIndices;
+  SmallVector<jeandle::ObjectID, 4> SourceIDsByOriginal(
+      OriginalN, jeandle::InvalidObjectID);
+  for (unsigned i = 0; i < OriginalN; ++i) {
+    if (Dead[i])
+      continue;
     if (!InIDs[i])
       return false;
     PerPredIDs.push_back(*InIDs[i]);
+    PerPredOriginalIndices.push_back(i);
+    SourceIDsByOriginal[i] = *InIDs[i];
     BasicBlock *P = Phi->getIncomingBlock(i);
     Preds.push_back(P);
-    // Respect state-split for unwind successors. exitDataFor returns
-    // nullptr if the pred's invoke was virtualized (unwind edge dead), in
-    // which case Case C cannot synthesize a merged VO that depends on
-    // that pred's data — bail.
-    BlockExitData *ED = exitDataFor(P, BB);
-    if (!ED) {
+    EdgeContribution Contribution = contributionFor(P, BB);
+    if (!Contribution.isLive())
       return false;
-    }
-    ExitInfos.push_back(ED);
+    ExitInfos.push_back(Contribution.Data);
     // Each per-pred VO must be eligible AND still virtual at pred exit.
-    if (!Eligible.lookup(PerPredIDs.back())) {
+    if (!Eligible.lookup(PerPredIDs.back()))
       return false;
-    }
-    if (!ExitInfos.back()->Virtuals.count(PerPredIDs.back())) {
+    if (!ExitInfos.back()->Virtuals.count(PerPredIDs.back()))
       return false;
-    }
   }
+  const unsigned LiveN = PerPredIDs.size();
+  if (LiveN == 0)
+    return false;
 
   // Compatibility check.
   LLVM_DEBUG({
     dbgs() << "PEA-CASEC-ENTRY: merge " << BB->getName() << ":";
-    for (unsigned i = 0; i < N; ++i)
+    for (unsigned i = 0; i < LiveN; ++i)
       dbgs() << " [VO=" << PerPredIDs[i] << "@" << Preds[i]->getName()
              << " elig=" << (Eligible.lookup(PerPredIDs[i]) ? 1 : 0) << " virt="
              << (ExitInfos[i]->Virtuals.count(PerPredIDs[i]) ? 1 : 0) << "]";
     dbgs() << "\n";
   });
   jeandle::VirtualObject &Ref = *Result.VirtualObjects[PerPredIDs[0]];
-  for (unsigned i = 1; i < N; ++i) {
+  for (unsigned i = 1; i < LiveN; ++i) {
     jeandle::VirtualObject &VO = *Result.VirtualObjects[PerPredIDs[i]];
     if (VO.getKind() != Ref.getKind())
       return false;
@@ -3523,13 +3626,13 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
 
   // Lock compatibility: the per-pred live lock counts must match.
   unsigned RefLC = ExitInfos[0]->LockCounts.lookup(PerPredIDs[0]);
-  for (unsigned i = 1; i < N; ++i) {
+  for (unsigned i = 1; i < LiveN; ++i) {
     if (ExitInfos[i]->LockCounts.lookup(PerPredIDs[i]) != RefLC)
       return false;
   }
   if (RefLC != 0) {
     const auto &RefStack = ExitInfos[0]->LiveLockEnters.lookup(PerPredIDs[0]);
-    for (unsigned i = 1; i < N; ++i) {
+    for (unsigned i = 1; i < LiveN; ++i) {
       const auto &S = ExitInfos[i]->LiveLockEnters.lookup(PerPredIDs[i]);
       if (S.size() != RefStack.size())
         return false;
@@ -3548,8 +3651,8 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
   // means the per-pred VO this slot resolves to is one that we're about
   // to synthesise *into* — there is no per-pred independent allocation
   // and the identity check cannot meaningfully proceed.
-  for (unsigned i = 0; i < N; ++i) {
-    if (Phi->getIncomingValue(i) == Phi)
+  for (unsigned OriginalIndex : PerPredOriginalIndices) {
+    if (Phi->getIncomingValue(OriginalIndex) == Phi)
       return false;
   }
 
@@ -3557,7 +3660,7 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
   // other observable use before Case C replaces its identity. LLVM aliases
   // are explicit SSA instructions, so apply the same rule to the transitive
   // pointer-use graph rather than only to OrigAlloc's direct users.
-  for (unsigned i = 0; i < N; ++i) {
+  for (unsigned i = 0; i < LiveN; ++i) {
     jeandle::ObjectID PID = PerPredIDs[i];
     if (hasObservableIdentityUse(PID, Phi, ExitInfos, PerPredIDs)) {
       LLVM_DEBUG(dbgs() << "PEA-CASEC-BAIL: identity observed for VO=" << PID
@@ -3601,7 +3704,7 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
   // creating the new VO so a type-mismatch bail leaves Result.VirtualObjects
   // unchanged.
   DenseSet<int64_t> OffsetsSet;
-  for (unsigned i = 0; i < N; ++i) {
+  for (unsigned i = 0; i < LiveN; ++i) {
     auto FIt = ExitInfos[i]->FieldStates.find(PerPredIDs[i]);
     if (FIt == ExitInfos[i]->FieldStates.end())
       continue;
@@ -3624,10 +3727,10 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
   for (int64_t Off : Offsets) {
     OffsetPlan P;
     P.Off = Off;
-    P.PerPredFVs.resize(N);
+    P.PerPredFVs.resize(LiveN);
     Type *PhiType = nullptr;
     bool AllPointer = true;
-    for (unsigned i = 0; i < N; ++i) {
+    for (unsigned i = 0; i < LiveN; ++i) {
       jeandle::FieldValue FV = jeandle::FieldValue::unknown();
       auto FIt = ExitInfos[i]->FieldStates.find(PerPredIDs[i]);
       if (FIt != ExitInfos[i]->FieldStates.end()) {
@@ -3664,7 +3767,7 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
     jeandle::FieldValue First = P.PerPredFVs[0];
     P.SoleValue = First;
     bool Same = true;
-    for (unsigned i = 1; i < N; ++i)
+    for (unsigned i = 1; i < LiveN; ++i)
       if (!First.shallowEquals(P.PerPredFVs[i])) {
         Same = false;
         break;
@@ -3676,7 +3779,7 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
   DenseMap<int64_t, FieldDefinitionSet> MergedDefinitions;
   for (int64_t Off : Offsets) {
     FieldDefinitionSet &Defs = MergedDefinitions[Off];
-    for (unsigned I = 0; I < N; ++I) {
+    for (unsigned I = 0; I < LiveN; ++I) {
       auto DIt = ExitInfos[I]->FieldDefinitions.find(PerPredIDs[I]);
       if (DIt == ExitInfos[I]->FieldDefinitions.end())
         continue;
@@ -3699,7 +3802,7 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
   for (const OffsetPlan &P : Plans) {
     if (P.AllSame)
       continue;
-    for (unsigned I = 0; I < N; ++I)
+    for (unsigned I = 0; I < LiveN; ++I)
       if (P.PerPredFVs[I].isVirtualRef() &&
           !isReplayEdgeSupported(Preds[I], BB))
         UnsupportedVirtualRefEdge = true;
@@ -3723,14 +3826,16 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
     NewID = CachedExistingID;
     jeandle::VirtualObject &VO = *Result.VirtualObjects[NewID];
     VO.IsSynthetic = true;
-    VO.SyntheticSourceIDs.assign(PerPredIDs.begin(), PerPredIDs.end());
+    VO.SyntheticSourceIDs.assign(SourceIDsByOriginal.begin(),
+                                 SourceIDsByOriginal.end());
     VO.SyntheticPhi = Phi;
   } else {
     auto NewVOUP = Ref.duplicate();
     NewID = Result.createVirtualObject(std::move(NewVOUP));
     jeandle::VirtualObject &NewVO = *Result.VirtualObjects[NewID];
     NewVO.IsSynthetic = true;
-    NewVO.SyntheticSourceIDs.assign(PerPredIDs.begin(), PerPredIDs.end());
+    NewVO.SyntheticSourceIDs.assign(SourceIDsByOriginal.begin(),
+                                    SourceIDsByOriginal.end());
     NewVO.SyntheticPhi = Phi;
   }
   // Note: NewVO.AllocationCall is shared with Ref (the first per-pred VO).
@@ -3753,7 +3858,7 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
   // have been committed at this point.
   {
     jeandle::VirtualObject &MergedVO = *Result.VirtualObjects[NewID];
-    for (unsigned i = 0; i < N; ++i) {
+    for (unsigned i = 0; i < LiveN; ++i) {
       const jeandle::VirtualObject &PVO = *Result.VirtualObjects[PerPredIDs[i]];
       for (const auto &FD : PVO.Fields) {
         if (MergedVO.getOrCreateFieldIndex(FD.Offset, FD.LLVMType, DL) < 0) {
@@ -3780,8 +3885,8 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
     }
     // Compute per-pred Value* for the synthesized PHI.
     SmallVector<Value *, 4> InValues;
-    InValues.reserve(N);
-    for (unsigned i = 0; i < N; ++i) {
+    InValues.reserve(LiveN);
+    for (unsigned i = 0; i < LiveN; ++i) {
       const jeandle::FieldValue &FV = P.PerPredFVs[i];
       Value *In = nullptr;
       if (FV.isUnknown()) {
@@ -3831,8 +3936,8 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
     // (OwnedLoopFieldPhis) so the preserved BlockExits[BB] does not reference
     // a PHI that rollback deletes. For BBs outside any loop the cache is
     // bypassed (getOrCreateLoopFieldPhi falls back to createUnparentedPhi).
-    PHINode *NewPhi = getOrCreateLoopFieldPhi(BB, NewID, P.Off, P.PhiType, N,
-                                              "pea.casec.field.phi");
+    PHINode *NewPhi = getOrCreateLoopFieldPhi(BB, NewID, P.Off, P.PhiType,
+                                              OriginalN, "pea.casec.field.phi");
     PhiHome[NewPhi] = BB;
     auto PE = std::make_unique<jeandle::CreatePHIEffect>();
     PE->Block = BB;
@@ -3842,10 +3947,22 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
     PE->PhiInst = NewPhi;
     PE->PHIType = P.PhiType;
     PE->FieldOffset = P.Off;
-    for (unsigned i = 0; i < N; ++i) {
-      PE->PHIIncomingValues.push_back(InValues[i]);
-      PE->PHIIncomingBlocks.push_back(Preds[i]);
+    unsigned LiveIndex = 0;
+    for (unsigned OriginalIndex = 0; OriginalIndex < OriginalN;
+         ++OriginalIndex) {
+      if (Dead[OriginalIndex]) {
+        PE->PHIIncomingValues.push_back(PoisonValue::get(P.PhiType));
+        PE->PHIIncomingBlocks.push_back(Phi->getIncomingBlock(OriginalIndex));
+        continue;
+      }
+      assert(LiveIndex < InValues.size() &&
+             PerPredOriginalIndices[LiveIndex] == OriginalIndex &&
+             "Case-C live input must retain its original PHI index");
+      PE->PHIIncomingValues.push_back(InValues[LiveIndex]);
+      PE->PHIIncomingBlocks.push_back(Preds[LiveIndex]);
+      ++LiveIndex;
     }
+    assert(LiveIndex == InValues.size());
     PendingPhiEffects.add(std::move(PE));
     if (P.PhiType->isPointerTy())
       Merged[P.Off] = jeandle::FieldValue::materializedRef(NewPhi);
@@ -6568,6 +6685,8 @@ bool Analyzer::canPrepareSyntheticDAG(jeandle::ObjectID ID,
     return false;
 
   for (jeandle::ObjectID SourceID : VObj.SyntheticSourceIDs) {
+    if (SourceID == jeandle::InvalidObjectID)
+      continue;
     if (SourceID >= Result.VirtualObjects.size()) {
       Visiting.erase(ID);
       return false;
@@ -6602,9 +6721,12 @@ void Analyzer::observeSyntheticSourceDefinitions(
   BasicBlock *Merge = VObj.SyntheticPhi->getParent();
   for (unsigned I = 0; I < VObj.SyntheticSourceIDs.size(); ++I) {
     jeandle::ObjectID SourceID = VObj.SyntheticSourceIDs[I];
+    if (SourceID == jeandle::InvalidObjectID)
+      continue;
     BasicBlock *Pred = VObj.SyntheticPhi->getIncomingBlock(I);
-    if (BlockExitData *Exit = exitDataFor(Pred, Merge))
-      observeFieldDefinitions(SourceID, Exit->FieldDefinitions);
+    EdgeContribution Contribution = contributionFor(Pred, Merge);
+    if (Contribution.isLive())
+      observeFieldDefinitions(SourceID, Contribution.Data->FieldDefinitions);
     if (Result.VirtualObjects[SourceID]->IsSynthetic)
       observeSyntheticSourceDefinitions(SourceID, Visited);
   }
@@ -6620,7 +6742,8 @@ void Analyzer::commitPreparedSyntheticDAG(
 
   jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
   for (jeandle::ObjectID SourceID : VObj.SyntheticSourceIDs)
-    if (Result.VirtualObjects[SourceID]->IsSynthetic)
+    if (SourceID != jeandle::InvalidObjectID &&
+        Result.VirtualObjects[SourceID]->IsSynthetic)
       commitPreparedSyntheticDAG(SourceID, Committing);
   PreparedSyntheticIDs.insert(ID);
   Result.EscapeClassification.erase(ID);
@@ -7195,7 +7318,8 @@ void Analyzer::commit() {
               Result.VirtualObjects[Cur]->IsSynthetic)
             for (jeandle::ObjectID Src :
                  Result.VirtualObjects[Cur]->SyntheticSourceIDs)
-              WList.push_back(Src);
+              if (Src != jeandle::InvalidObjectID)
+                WList.push_back(Src);
           // Path-sensitive live VirtualRef definitions.
           if (auto EIt = LiveVirtualRefDeps.find(Cur);
               EIt != LiveVirtualRefDeps.end())
@@ -7287,6 +7411,8 @@ void Analyzer::commit() {
     assert(VObj.IsSynthetic && PreparedSyntheticIDs.count(ID) &&
            "live synthetic materialization requires a prepared identity DAG");
     for (jeandle::ObjectID SourceID : VObj.SyntheticSourceIDs) {
+      if (SourceID == jeandle::InvalidObjectID)
+        continue;
       jeandle::VirtualObject &Source = *Result.VirtualObjects[SourceID];
       if (Source.IsSynthetic) {
         assert(PreparedSyntheticIDs.count(SourceID) &&
@@ -7525,9 +7651,9 @@ bool Analyzer::isReplayEdgeSupported(BasicBlock *PH,
 //
 // IR-form divergence from Graal (the core rule this function encodes):
 //  - Incoming-edge mat (EdgeLocal=true): analysis records PH->TargetMerge
-//    provenance and flips the target-local exitDataFor view, while leaving the
-//    shared `BlockExits[PH]` snapshot unchanged. The transform splits the edge
-//    when PH has another distinct successor, then emits every replay side
+//    provenance and flips the target-local contributionFor view, while leaving
+//    the shared `BlockExits[PH]` snapshot unchanged. The transform splits the
+//    edge when PH has another distinct successor, then emits every replay side
 //    effect in the dedicated block. OrigAlloc is reused as the value and
 //    already dominates the edge.
 //  - Block-end drain (EdgeLocal=false): replay intentionally applies to every
@@ -7579,8 +7705,8 @@ void Analyzer::materializeAtPredFromExitInfo(jeandle::ObjectID ID,
   };
   auto FlipState = [&](jeandle::ObjectID Oid) {
     // Incoming-edge replay flips only the target-local exit view supplied by
-    // exitDataFor. A block-end drain applies to every successor and flips the
-    // shared predecessor snapshot supplied directly by its caller.
+    // contributionFor. A block-end drain applies to every successor and flips
+    // the shared predecessor snapshot supplied directly by its caller.
     if (EdgeLocal) {
       markObjectMaterializedInExitData(ExitInfo, Oid);
       return;

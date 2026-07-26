@@ -1421,7 +1421,7 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
     Changed = true;
   }
 
-  if (!Changed)
+  if (!Changed && !Result.NeedsCFGCleanup)
     return PreservedAnalyses::all();
 
   // Folded JavaOps may have left behind `br i1 true|false, ...` terminators
@@ -1430,8 +1430,8 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
   // ConstantFoldTerminator to collapse those before the unreachable-block
   // sweep so the slow-path blocks of synchronized regions get cleaned up.
   for (BasicBlock &BB : llvm::make_early_inc_range(F)) {
-    ConstantFoldTerminator(&BB, /*DeleteDeadConditions=*/true,
-                           /*TLI=*/nullptr, /*DTU=*/nullptr);
+    Changed |= ConstantFoldTerminator(&BB, /*DeleteDeadConditions=*/true,
+                                      /*TLI=*/nullptr, /*DTU=*/nullptr);
   }
 
   // Fold trivial PHIs. No materialized-object PHI is created (OrigAlloc is the
@@ -1456,6 +1456,7 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
           PN->replaceAllUsesWith(V);
           PN->eraseFromParent();
           FoldedPhi = true;
+          Changed = true;
         }
       }
     }
@@ -1473,6 +1474,7 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
         if (isInstructionTriviallyDead(&I)) {
           I.eraseFromParent();
           LocalChanged = true;
+          Changed = true;
         }
       }
     }
@@ -1480,7 +1482,7 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
 
   // Clean up unwind blocks that became unreachable after invoke→br rewrites
   // and slow-path blocks orphaned by ConstantFoldTerminator above.
-  EliminateUnreachableBlocks(F);
+  Changed |= EliminateUnreachableBlocks(F);
 
   // Drop references on still-unparented OwnedInsts before verifyFunction: the
   // PEAResult destructor (which runs in the analysis manager, after the
@@ -1510,5 +1512,5 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
   }
 #endif
 
-  return PreservedAnalyses::none();
+  return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
