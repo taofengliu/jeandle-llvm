@@ -75,12 +75,11 @@
 
 using namespace llvm;
 
-// Per-statistic counters surfaced via LLVM's standard
-// `-stats` flag (Statistic.h). Counts are bumped at the analyzer's effect-
-// emission sites; a small drift vs. the final committed effect set is
-// possible when a late dropEffectsFor() strips a Materialize that was
-// already counted (Eligible flipped after emission). Treated as a
-// diagnostic, not an audit.
+// Per-statistic counters surfaced via LLVM's standard `-stats` flag
+// (Statistic.h). Emission sites bump attempt-local counters, which are
+// published only after the final effect plan validates. A small drift vs. the
+// committed effect set is still possible when late effect filtering strips a
+// Materialize already counted; these remain diagnostics, not an audit.
 STATISTIC(JeandlePEAVirtualized, "Number of virtual objects PEA created");
 STATISTIC(JeandlePEAEliminated,
           "Number of allocations eliminated (erased) by PEA");
@@ -450,6 +449,53 @@ struct EdgeContribution {
   bool isLive() const { return Kind == EdgeContributionKind::Live; }
 };
 
+enum class CFGDeadnessProofKind : uint8_t {
+  FoldedTerminatorCondition,
+  FoldedInvoke,
+  EliminatedAllocationInvoke,
+};
+
+// A non-literal fact used to classify one or more CFG edges as dead during an
+// analysis attempt. Killer is the stable, in-IR suppression key. Condition is
+// populated for branch/switch proofs and identifies the value whose surviving
+// replacement must still select the same successor after effect filtering.
+struct CFGDeadnessProof {
+  CFGDeadnessProofKind Kind;
+  Instruction *Killer;
+  Value *Condition = nullptr;
+  BasicBlock *ChosenSuccessor = nullptr;
+};
+
+struct PEAAttemptStatistics {
+  uint64_t Virtualized = 0;
+  uint64_t Eliminated = 0;
+  uint64_t Materialized = 0;
+  uint64_t MaterializedPHI = 0;
+  uint64_t MaterializedMerge = 0;
+  uint64_t MaterializedLoopExit = 0;
+  uint64_t MaterializedUnhandled = 0;
+  uint64_t LoopFixpointRetries = 0;
+  uint64_t OuterFixpointIterations = 0;
+  uint64_t ModeEscalations = 0;
+  uint64_t MaterializedCascade = 0;
+  uint64_t MaterializedNested = 0;
+
+  void publish() const {
+    JeandlePEAVirtualized += Virtualized;
+    JeandlePEAEliminated += Eliminated;
+    JeandlePEAMaterialized += Materialized;
+    JeandlePEAMaterializedPHI += MaterializedPHI;
+    JeandlePEAMaterializedMerge += MaterializedMerge;
+    JeandlePEAMaterializedLoopExit += MaterializedLoopExit;
+    JeandlePEAMaterializedUnhandled += MaterializedUnhandled;
+    JeandlePEALoopFixpointRetries += LoopFixpointRetries;
+    JeandlePEAOuterFixpointIterations += OuterFixpointIterations;
+    JeandlePEAModeEscalations += ModeEscalations;
+    JeandlePEAMaterializedCascade += MaterializedCascade;
+    JeandlePEAMaterializedNested += MaterializedNested;
+  }
+};
+
 struct BlockExitInfo : BlockExitData {
   // A block reached exclusively through proven-dead incoming edges publishes a
   // dead exit instead of an empty live state. Every successor query then sees
@@ -536,12 +582,17 @@ static bool resolveStrictLockOrder() {
 
 class Analyzer {
 public:
-  Analyzer(Function &F, DominatorTree &DT, LoopInfo &LI)
+  Analyzer(Function &F, DominatorTree &DT, LoopInfo &LI, bool StrictLockOrder,
+           const DenseSet<Instruction *> &SuppressedCFGProofs)
       : F(F), DT(DT), LI(LI), DL(F.getParent()->getDataLayout()),
         MonitorDepth(computeMonitorDepthInfo(F)),
-        StrictLockOrder(resolveStrictLockOrder()) {}
+        StrictLockOrder(StrictLockOrder),
+        SuppressedCFGProofs(SuppressedCFGProofs) {}
 
   jeandle::PEAResult run();
+  Instruction *getInvalidCFGProofKiller() const {
+    return InvalidCFGProofKiller;
+  }
 
   // Cap on iterations for the loop-fixpoint.
   static constexpr unsigned MaxLoopFixpointIters = 10;
@@ -579,10 +630,19 @@ private:
   LoopInfo &LI;
   const DataLayout &DL;
   const MonitorDepthInfo MonitorDepth;
-  // Cached "strict lock order" decision for this run; see
-  // resolveStrictLockOrder() for the precedence rules.
+  // Cached "strict lock order" decision shared by every fresh attempt in this
+  // analysis run; see resolveStrictLockOrder() for the precedence rules.
   const bool StrictLockOrder;
+  const DenseSet<Instruction *> &SuppressedCFGProofs;
   jeandle::PEAResult Result;
+  PEAAttemptStatistics AttemptStats;
+  Instruction *InvalidCFGProofKiller = nullptr;
+
+  // Attempt-local ledger of every non-literal CFG deadness proof actually
+  // consumed by contributionFor. RecordedCFGProofs deduplicates repeated
+  // successor queries for the same terminator.
+  SmallVector<CFGDeadnessProof, 8> CFGDeadnessProofs;
+  DenseSet<Instruction *> RecordedCFGProofs;
 
   // ---------------------------------------------------------------------
   // STATE MODEL — intentional divergence from Graal (documented so each
@@ -978,6 +1038,11 @@ private:
   // edge (or the entire predecessor block) is proven unreachable, and Live
   // carries the normal/unwind snapshot appropriate for this successor.
   EdgeContribution contributionFor(BasicBlock *Pred, BasicBlock *Succ);
+  std::optional<bool> foldedTerminatorEdgeIsLive(Instruction *Terminator,
+                                                 BasicBlock *Succ);
+  void recordCFGDeadnessProof(CFGDeadnessProofKind Kind, Instruction *Killer,
+                              Value *Condition = nullptr,
+                              BasicBlock *ChosenSuccessor = nullptr);
 
   // Has an incoming-edge/block-end materialize already been emitted for
   // (Pred, M, ID)?
@@ -1160,6 +1225,7 @@ private:
     uint32_t NextSeqNo = 0;
     size_t OwnedPhisSize = 0;
     size_t OwnedInstsSize = 0;
+    size_t CFGDeadnessProofCount = 0;
 
     // For each block in L, the prior BlockEffects[BB] (if any) and
     // MaterializedAtPred[BB] (if any), captured *before* the loop iteration
@@ -1414,10 +1480,12 @@ private:
   // Bump the appropriate per-reason Statistic. Always bumps the
   // total JeandlePEAMaterialized; the per-reason counter is bumped only for
   // the four reasons (Unhandled / Merge / LoopExit / PHI).
-  static void bumpMaterializeStat(MatReason R);
+  void bumpMaterializeStat(MatReason R);
 
   void commit();
   void dropEffectsFor(jeandle::ObjectID ID);
+  Instruction *validateCFGDeadnessProofs() const;
+  void publishAttemptOutputs();
 
   // Mark a VO ineligible, taking the TRANSITIVE closure over synthetic Case-C
   // sources. A synthetic VO has no real backing allocation (AllocationCall is
@@ -1672,26 +1740,34 @@ void Analyzer::processBlock(BasicBlock *BB) {
     Info.TerminatorInvoke = TermII;
     Info.UnwindDest = TermII->getUnwindDest();
 
-    // Detect whether the terminator-invoke was virtualized away by the
-    // analyzer (e.g. processJavaOp emitted a ReplaceCall effect on it).
-    // The transform rewrites such invokes as an unconditional branch to
-    // the normal successor, so from PEA's perspective the unwind edge no
-    // longer exists. Mark the edge killed so contributionFor reports Dead to
-    // the unwind successor.
-    bool Virtualized = false;
+    // Detect a provisional effect plan that removes this invoke: a folded
+    // JavaOp has a ReplaceCall effect, while a virtualized allocation has an
+    // EliminateAllocation effect. The latter kills its unwind edge only when
+    // final classification is NeverEscapes, so both forms are ledgered and
+    // revalidated after eligibility filtering.
+    bool FoldedInvoke = false;
+    bool EliminatedAllocationInvoke = false;
     auto EIt = Result.BlockEffects.find(BB);
     if (EIt != Result.BlockEffects.end()) {
       for (const auto &E : EIt->second) {
-        if (E.getTarget() == TermII &&
-            E.getKind() == jeandle::Effect::Kind::ReplaceCall) {
-          Virtualized = true;
-          break;
-        }
+        if (E.getTarget() != TermII)
+          continue;
+        if (E.getKind() == jeandle::Effect::Kind::ReplaceCall)
+          FoldedInvoke = true;
+        else if (E.getKind() == jeandle::Effect::Kind::EliminateAllocation)
+          EliminatedAllocationInvoke = true;
       }
     }
-    Info.UnwindEdgeKilled = Virtualized;
-    if (Virtualized)
+    bool KillUnwind = (FoldedInvoke || EliminatedAllocationInvoke) &&
+                      !SuppressedCFGProofs.count(TermII);
+    Info.UnwindEdgeKilled = KillUnwind;
+    if (KillUnwind) {
+      recordCFGDeadnessProof(
+          FoldedInvoke ? CFGDeadnessProofKind::FoldedInvoke
+                       : CFGDeadnessProofKind::EliminatedAllocationInvoke,
+          TermII);
       Result.NeedsCFGCleanup = true;
+    }
 
     // Patch the pre-invoke snapshot for every VO materialized immediately
     // before this invoke. Field replay, lock re-emission, and exposure of the
@@ -1712,12 +1788,12 @@ void Analyzer::processBlock(BasicBlock *BB) {
     }
 
     // Only stash the pre-invoke snapshot if (a) we actually took one
-    // (function has a personality), (b) the invoke wasn't virtualized
-    // (the kill flag already handles that case), AND (c) the snapshot
+    // (function has a personality), (b) the unwind edge remains live, AND
+    // (c) the snapshot
     // actually differs from the post-invoke base data. The last gate
     // avoids paying the DenseMap-copy cost (and the convergence-check
     // cost downstream) for invokes that triggered no PEA state change.
-    if (!Virtualized && PreInvokeSnapshot &&
+    if (!KillUnwind && PreInvokeSnapshot &&
         !exitDataEquivalent(Info, *PreInvokeSnapshot))
       Info.UnwindData = std::move(PreInvokeSnapshot);
   }
@@ -1732,6 +1808,68 @@ void Analyzer::resetPerBlockState() {
   Materialized.clear();
 }
 
+void Analyzer::recordCFGDeadnessProof(CFGDeadnessProofKind Kind,
+                                      Instruction *Killer, Value *Condition,
+                                      BasicBlock *ChosenSuccessor) {
+  assert(Killer && "CFG deadness proof requires a stable IR killer");
+  if (!RecordedCFGProofs.insert(Killer).second)
+    return;
+  CFGDeadnessProofs.push_back({Kind, Killer, Condition, ChosenSuccessor});
+}
+
+std::optional<bool>
+Analyzer::foldedTerminatorEdgeIsLive(Instruction *Terminator,
+                                     BasicBlock *Succ) {
+  Value *Condition = nullptr;
+  if (auto *BI = dyn_cast<BranchInst>(Terminator)) {
+    if (!BI->isConditional())
+      return std::nullopt;
+    Condition = BI->getCondition();
+  } else if (auto *SI = dyn_cast<SwitchInst>(Terminator)) {
+    Condition = SI->getCondition();
+  } else {
+    return std::nullopt;
+  }
+
+  Value *Resolved = Condition;
+  SmallPtrSet<Value *, 4> Seen;
+  while (Seen.insert(Resolved).second)
+    if (Value *Replacement = Aliases.getScalarAlias(Resolved))
+      Resolved = Replacement;
+    else
+      break;
+  auto *CI = dyn_cast<ConstantInt>(Resolved);
+  if (!CI)
+    return std::nullopt;
+
+  // Literal IR conditions need no transactional proof. Any condition reached
+  // through the attempt-local scalar replacement plan does: late eligibility
+  // filtering may remove the effect that made Resolved constant.
+  if (Resolved != Condition) {
+    if (SuppressedCFGProofs.count(Terminator))
+      return std::nullopt;
+  }
+
+  BasicBlock *Chosen = nullptr;
+  if (auto *BI = dyn_cast<BranchInst>(Terminator))
+    Chosen = BI->getSuccessor(CI->isZero() ? 1 : 0);
+  else
+    Chosen =
+        cast<SwitchInst>(Terminator)->findCaseValue(CI)->getCaseSuccessor();
+
+  bool KillsAnyEdge =
+      llvm::any_of(successors(Terminator->getParent()),
+                   [&](BasicBlock *Target) { return Target != Chosen; });
+  if (Resolved != Condition && KillsAnyEdge)
+    recordCFGDeadnessProof(CFGDeadnessProofKind::FoldedTerminatorCondition,
+                           Terminator, Condition, Chosen);
+
+  // Chosen is computed once for the whole terminator, so duplicate switch
+  // cases are aggregated by (Pred, Succ): any feasible case selecting Succ
+  // makes every query for that source/destination pair Live.
+  return Chosen == Succ;
+}
+
 EdgeContribution Analyzer::contributionFor(BasicBlock *Pred, BasicBlock *Succ) {
   assert(EdgeExitViewScopeDepth != 0 &&
          "contributionFor requires a scoped edge-exit-view cache");
@@ -1741,6 +1879,13 @@ EdgeContribution Analyzer::contributionFor(BasicBlock *Pred, BasicBlock *Succ) {
   BlockExitInfo &Info = It->second;
   if (Info.IsDead)
     return EdgeContribution::dead();
+  if (std::optional<bool> IsLive =
+          foldedTerminatorEdgeIsLive(Pred->getTerminator(), Succ)) {
+    if (!*IsLive) {
+      Result.NeedsCFGCleanup = true;
+      return EdgeContribution::dead();
+    }
+  }
   // When the pred ends in an InvokeInst whose unwind dest is `Succ`,
   // the unwind edge participates in state-splitting.
   BlockExitData *Base = &Info;
@@ -4495,7 +4640,7 @@ void Analyzer::processAllocation(CallBase *CB) {
   ++Result.VirtualizationDelta; // Graal effects.addVirtualizationDelta(1)
   --Result.AllocationDelta;
   // A new virtual object was registered.
-  ++JeandlePEAVirtualized;
+  ++AttemptStats.Virtualized;
 
   // Enqueue end-of-block materialise under VirtualiseThenMaterialise.
   // For an InvokeInst alloc the alloc IS the block terminator; drain in
@@ -6561,30 +6706,30 @@ void Analyzer::updateOtherStatesForMaterialized(
 }
 
 void Analyzer::bumpMaterializeStat(MatReason R) {
-  ++JeandlePEAMaterialized;
+  ++AttemptStats.Materialized;
   switch (R) {
   case MatReason::Unhandled:
-    ++JeandlePEAMaterializedUnhandled;
+    ++AttemptStats.MaterializedUnhandled;
     break;
   case MatReason::Cascade:
     // Cascade and nested still count toward the Unhandled
     // rollup (they are byproducts of an upstream Unhandled escape) but
     // are also bookkept in their own counter for fine-grained audits.
-    ++JeandlePEAMaterializedUnhandled;
-    ++JeandlePEAMaterializedCascade;
+    ++AttemptStats.MaterializedUnhandled;
+    ++AttemptStats.MaterializedCascade;
     break;
   case MatReason::Nested:
-    ++JeandlePEAMaterializedUnhandled;
-    ++JeandlePEAMaterializedNested;
+    ++AttemptStats.MaterializedUnhandled;
+    ++AttemptStats.MaterializedNested;
     break;
   case MatReason::Merge:
-    ++JeandlePEAMaterializedMerge;
+    ++AttemptStats.MaterializedMerge;
     break;
   case MatReason::LoopExit:
-    ++JeandlePEAMaterializedLoopExit;
+    ++AttemptStats.MaterializedLoopExit;
     break;
   case MatReason::Phi:
-    ++JeandlePEAMaterializedPHI;
+    ++AttemptStats.MaterializedPHI;
     break;
   }
 }
@@ -7489,11 +7634,107 @@ void Analyzer::commit() {
     if (!Result.VirtualObjects[Kv.first]->IsSynthetic &&
         Kv.second == jeandle::PEAResult::EscapeKind::NeverEscapes)
       ++EliminatedAllocs;
-  JeandlePEAEliminated += EliminatedAllocs;
+  AttemptStats.Eliminated += EliminatedAllocs;
+}
 
-  // -------------------------------------------------------------------------
-  // -jeandle-dump-pea-stats summary line on stderr.
-  // -------------------------------------------------------------------------
+Instruction *Analyzer::validateCFGDeadnessProofs() const {
+  auto EarliestReplacementEffect =
+      [&](Instruction *Target) -> const jeandle::Effect * {
+    const jeandle::Effect *Earliest = nullptr;
+    for (const auto &KV : Result.BlockEffects)
+      for (const jeandle::Effect &E : KV.second) {
+        if (E.getTarget() != Target)
+          continue;
+        if (!isa<jeandle::ReplaceLoadEffect>(E) &&
+            !isa<jeandle::ReplaceCallEffect>(E))
+          continue;
+        if (!Earliest || E.SeqNo < Earliest->SeqNo)
+          Earliest = &E;
+      }
+    return Earliest;
+  };
+
+  auto ResolveFinalReplacement = [&](Value *Root) -> Value * {
+    Value *Current = Root;
+    SmallPtrSet<Value *, 4> Seen;
+    while (Current && Seen.insert(Current).second) {
+      auto *Target = dyn_cast<Instruction>(Current);
+      if (!Target)
+        break;
+      const jeandle::Effect *E = EarliestReplacementEffect(Target);
+      if (!E)
+        break;
+      Value *Replacement = nullptr;
+      if (const auto *RE = dyn_cast<jeandle::ReplaceLoadEffect>(E))
+        Replacement = RE->Replacement;
+      else {
+        const auto *CallRE = cast<jeandle::ReplaceCallEffect>(E);
+        Replacement = CallRE->Replacement;
+      }
+      if (!Replacement)
+        break;
+      Current = Replacement;
+    }
+    return Current;
+  };
+
+  auto EarliestAllocationElimination =
+      [&](Instruction *Target) -> const jeandle::EliminateAllocationEffect * {
+    const jeandle::EliminateAllocationEffect *Earliest = nullptr;
+    for (const auto &KV : Result.BlockEffects)
+      for (const jeandle::Effect &E : KV.second) {
+        const auto *AE = dyn_cast<jeandle::EliminateAllocationEffect>(&E);
+        if (!AE || AE->getTarget() != Target)
+          continue;
+        if (!Earliest || AE->SeqNo < Earliest->SeqNo)
+          Earliest = AE;
+      }
+    return Earliest;
+  };
+
+  for (const CFGDeadnessProof &Proof : CFGDeadnessProofs) {
+    switch (Proof.Kind) {
+    case CFGDeadnessProofKind::FoldedTerminatorCondition: {
+      Value *Resolved = ResolveFinalReplacement(Proof.Condition);
+      auto *CI = dyn_cast_or_null<ConstantInt>(Resolved);
+      if (!CI)
+        return Proof.Killer;
+      BasicBlock *Chosen = nullptr;
+      if (auto *BI = dyn_cast<BranchInst>(Proof.Killer))
+        Chosen = BI->getSuccessor(CI->isZero() ? 1 : 0);
+      else if (auto *SI = dyn_cast<SwitchInst>(Proof.Killer))
+        Chosen = SI->findCaseValue(CI)->getCaseSuccessor();
+      else
+        return Proof.Killer;
+      if (Chosen != Proof.ChosenSuccessor)
+        return Proof.Killer;
+      break;
+    }
+    case CFGDeadnessProofKind::FoldedInvoke: {
+      const jeandle::Effect *E = EarliestReplacementEffect(Proof.Killer);
+      if (!E || !isa<jeandle::ReplaceCallEffect>(E))
+        return Proof.Killer;
+      break;
+    }
+    case CFGDeadnessProofKind::EliminatedAllocationInvoke: {
+      const auto *AE = EarliestAllocationElimination(Proof.Killer);
+      if (!AE)
+        return Proof.Killer;
+      auto CIt = Result.EscapeClassification.find(AE->ObjID);
+      if (CIt == Result.EscapeClassification.end() ||
+          CIt->second != jeandle::PEAResult::EscapeKind::NeverEscapes)
+        return Proof.Killer;
+      break;
+    }
+    }
+  }
+  return nullptr;
+}
+
+void Analyzer::publishAttemptOutputs() {
+  AttemptStats.publish();
+  Result.publishEffectTrace();
+
   if (JeandleDumpPEAStats) {
     unsigned NeverEsc = 0, PartialEsc = 0, AlwaysEsc = 0;
     for (const auto &Kv : Result.EscapeClassification) {
@@ -7891,6 +8132,7 @@ void Analyzer::takeLoopSnapshot(
   S.NextSeqNo = Result.NextSeqNo;
   S.OwnedPhisSize = Result.OwnedPhis.size();
   S.OwnedInstsSize = Result.OwnedInsts.size();
+  S.CFGDeadnessProofCount = CFGDeadnessProofs.size();
   S.SavedBlockEffects.clear();
   S.SavedMaterializedAtPred.clear();
   S.HadBlockEffects.clear();
@@ -7986,6 +8228,10 @@ void Analyzer::restoreLoopSnapshot(
   // via PEAResult::truncateOwnedTo.
   Result.truncateOwnedTo(S.OwnedPhisSize, S.OwnedInstsSize);
   Result.NextSeqNo = S.NextSeqNo;
+  CFGDeadnessProofs.resize(S.CFGDeadnessProofCount);
+  RecordedCFGProofs.clear();
+  for (const CFGDeadnessProof &Proof : CFGDeadnessProofs)
+    RecordedCFGProofs.insert(Proof.Killer);
 
   // Roll back per-loop-block ledgers.
   //
@@ -8197,7 +8443,7 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
   const Mode SavedModeForNest = CurrentMode;
   if (L->getLoopDepth() == 1) {
     // Count one outer-fixpoint entry per top-level processLoop call.
-    ++JeandlePEAOuterFixpointIterations;
+    ++AttemptStats.OuterFixpointIterations;
 
     // Graal flips STOP_NEW_VIRTUALIZATIONS_LOOP_NEST per-loop in
     // stripKilledLoopLocations when loop.depth > EscapeAnalysisLoopCutoff
@@ -8214,7 +8460,7 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
     // Testing aid: optionally force MATERIALIZE_ALL for lit coverage.
     if (JeandlePEAForceMaterializeAll) {
       CurrentMode = Mode::MaterializeAll;
-      ++JeandlePEAModeEscalations;
+      ++AttemptStats.ModeEscalations;
     }
 
     // Overflow recovery is scoped to one nest: clear the cross-recursion
@@ -8264,7 +8510,7 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
     for (unsigned Iter = 0; Iter < MaxLoopFixpointIters; ++Iter) {
       if (Iter > 0)
         restoreLoopSnapshot(LoopBlocks, Pre);
-      ++JeandlePEALoopFixpointRetries;
+      ++AttemptStats.LoopFixpointRetries;
 
       processLoopBodyOnePass(L, LoopRPO, FunctionRPO);
 
@@ -8363,7 +8609,7 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
       // and the iteration cap).
       TooManyIterationsSeen = true;
       if (CurrentMode != Mode::MaterializeAll)
-        ++JeandlePEAModeEscalations;
+        ++AttemptStats.ModeEscalations;
       restoreLoopSnapshot(LoopBlocks, Pre);
       // Wipe loop-block BlockExits so the retry starts from a true pre-loop
       // view. (restoreLoopSnapshot intentionally preserves loop-block
@@ -8498,6 +8744,10 @@ jeandle::PEAResult Analyzer::run() {
   // either way (the function cannot pick a drain IP without a PH).
   materializePreheaderVirtualsForUnvisitedLoops();
   commit();
+  InvalidCFGProofKiller = validateCFGDeadnessProofs();
+  if (InvalidCFGProofKiller)
+    return jeandle::PEAResult();
+  publishAttemptOutputs();
   return std::move(Result);
 }
 
@@ -8530,6 +8780,20 @@ PartialEscapeAnalysis::run(Function &F, FunctionAnalysisManager &FAM) {
   auto &DT = FAM.getResult<DominatorTreeAnalysis>(F);
   auto &LI = FAM.getResult<LoopAnalysis>(F);
 
-  Analyzer A(F, DT, LI);
-  return A.run();
+  const bool StrictLockOrder = resolveStrictLockOrder();
+  DenseSet<Instruction *> SuppressedCFGProofs;
+  while (true) {
+    Analyzer A(F, DT, LI, StrictLockOrder, SuppressedCFGProofs);
+    jeandle::PEAResult Attempt = A.run();
+    Instruction *InvalidProof = A.getInvalidCFGProofKiller();
+    if (!InvalidProof)
+      return Attempt;
+
+    // Killer is a stable instruction in untouched input IR. Every failed
+    // attempt adds one previously unsuppressed key, so retries are bounded by
+    // the finite number of terminators in F. A duplicate indicates an
+    // invariant failure; terminate conservatively with no optimization plan.
+    if (!SuppressedCFGProofs.insert(InvalidProof).second)
+      return jeandle::PEAResult();
+  }
 }

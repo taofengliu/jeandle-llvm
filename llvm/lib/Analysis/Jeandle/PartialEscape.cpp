@@ -37,11 +37,9 @@
 using namespace llvm;
 using namespace llvm::jeandle;
 
-// Per-effect dbgs() trace. When enabled, every Effect routed through
-// PEAResult::addBlockEffect emits a one-line summary on dbgs().
-// Off by default; turn on with -jeandle-trace-pea. Defined here (rather
-// than in PartialEscapeAnalysis.cpp) so the central emission site can
-// read it without a separate accessor.
+// Per-effect dbgs() trace. Effects are published only after the analyzer has
+// selected a winning transactional attempt, so discarded attempts cannot leak
+// provisional decisions. Off by default; turn on with -jeandle-trace-pea.
 static llvm::cl::opt<bool> JeandleTracePEA(
     "jeandle-trace-pea", llvm::cl::init(false), llvm::cl::Hidden,
     llvm::cl::desc("PEA: emit a one-line dbgs() trace on every major "
@@ -702,17 +700,24 @@ ObjectID PEAResult::createVirtualObject(std::unique_ptr<VirtualObject> VO) {
 
 void PEAResult::addBlockEffect(std::unique_ptr<Effect> E) {
   assert(E->Block);
-  // Per-effect trace (gated on -jeandle-trace-pea, off by default).
-  // Centralised here so every emission site routes through a single trace
-  // call; Effect::dump prints the kind, owning ObjectID (when set), block
-  // label, and Target summary so a `2>&1 | grep PEA:` sweep is enough to
-  // follow the analyser's decisions.
-  if (JeandleTracePEA) {
+  BasicBlock *BB = E->Block;
+  BlockEffects[BB].add(std::move(E));
+}
+
+void PEAResult::publishEffectTrace() const {
+  if (!JeandleTracePEA)
+    return;
+  SmallVector<const Effect *, 16> Effects;
+  for (const auto &KV : BlockEffects)
+    for (const Effect &E : KV.second)
+      Effects.push_back(&E);
+  llvm::sort(Effects, [](const Effect *A, const Effect *B) {
+    return A->SeqNo < B->SeqNo;
+  });
+  for (const Effect *E : Effects) {
     E->dump(llvm::dbgs());
     llvm::dbgs() << "\n";
   }
-  BasicBlock *BB = E->Block;
-  BlockEffects[BB].add(std::move(E));
 }
 
 void Effect::dump(raw_ostream &OS) const {

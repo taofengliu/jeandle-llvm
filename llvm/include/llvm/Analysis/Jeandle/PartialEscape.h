@@ -1071,6 +1071,7 @@ public:
   uint32_t nextSeqNo() { return NextSeqNo++; }
 
   void addBlockEffect(std::unique_ptr<Effect> E);
+  void publishEffectTrace() const;
 
   bool hasOptimizationOpportunity() const;
 
