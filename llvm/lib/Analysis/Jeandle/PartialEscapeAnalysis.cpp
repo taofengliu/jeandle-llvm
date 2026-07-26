@@ -55,6 +55,7 @@
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
+#include "llvm/IR/InstIterator.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
@@ -583,15 +584,21 @@ static bool resolveStrictLockOrder() {
 class Analyzer {
 public:
   Analyzer(Function &F, DominatorTree &DT, LoopInfo &LI, bool StrictLockOrder,
-           const DenseSet<Instruction *> &SuppressedCFGProofs)
+           const DenseSet<Instruction *> &SuppressedCFGProofs,
+           const DenseSet<CallBase *> &SuppressedVirtualizations)
       : F(F), DT(DT), LI(LI), DL(F.getParent()->getDataLayout()),
         MonitorDepth(computeMonitorDepthInfo(F)),
         StrictLockOrder(StrictLockOrder),
-        SuppressedCFGProofs(SuppressedCFGProofs) {}
+        SuppressedCFGProofs(SuppressedCFGProofs),
+        SuppressedVirtualizations(SuppressedVirtualizations) {}
 
   jeandle::PEAResult run();
   Instruction *getInvalidCFGProofKiller() const {
     return InvalidCFGProofKiller;
+  }
+  bool hasInvalidDeoptObligation() const { return InvalidDeoptObligation; }
+  ArrayRef<CallBase *> getInvalidDeoptAllocationSites() const {
+    return InvalidDeoptAllocationSites;
   }
 
   // Cap on iterations for the loop-fixpoint.
@@ -634,9 +641,12 @@ private:
   // analysis run; see resolveStrictLockOrder() for the precedence rules.
   const bool StrictLockOrder;
   const DenseSet<Instruction *> &SuppressedCFGProofs;
+  const DenseSet<CallBase *> &SuppressedVirtualizations;
   jeandle::PEAResult Result;
   PEAAttemptStatistics AttemptStats;
   Instruction *InvalidCFGProofKiller = nullptr;
+  bool InvalidDeoptObligation = false;
+  SmallVector<CallBase *, 4> InvalidDeoptAllocationSites;
 
   // Attempt-local ledger of every non-literal CFG deadness proof actually
   // consumed by contributionFor. RecordedCFGProofs deduplicates repeated
@@ -1356,6 +1366,11 @@ private:
   // behavior; a VO referencing such an undescribable VO is itself
   // contagiously bailed (greatest-fixpoint, no dangling VORef).
   void recordDeoptBundleMappings(CallBase *CB);
+  // Materialize only virtual operands of CB's deopt bundle that were not
+  // described by recordDeoptBundleMappings. Handled intrinsics use this
+  // deopt-specific fallback so their ordinary arguments and informational
+  // operand bundles remain non-escaping.
+  void materializeUnhandledDeoptBundleOperands(CallBase *CB);
   // True iff \p U is an input of I's "deopt" operand bundle whose resolved
   // ObjectID was recorded as a scoped virtual mapping at this instruction
   // (present in DeoptBundleHandled). Used by the generic escape path to skip
@@ -1484,6 +1499,19 @@ private:
 
   void commit();
   void dropEffectsFor(jeandle::ObjectID ID);
+  const jeandle::Effect *getEarliestFinalReplacement(Instruction *Target) const;
+  const jeandle::EliminateAllocationEffect *
+  getEarliestFinalAllocationElimination(Instruction *Target) const;
+  struct FinalValue {
+    enum Kind : uint8_t {
+      ResolvedValue,
+      Deleted,
+      DependencyFreeOopHandle
+    } K = ResolvedValue;
+    llvm::Value *V = nullptr;
+  };
+  FinalValue resolveFinalValue(llvm::Value *Root) const;
+  void validateFinalDeoptObligations();
   Instruction *validateCFGDeadnessProofs() const;
   void publishAttemptOutputs();
 
@@ -4274,8 +4302,15 @@ void Analyzer::processInstruction(Instruction *I) {
     // forward the argument's virtual alias. Must run BEFORE the JavaOp fold +
     // generic-escape fall-through.
     if (auto *II = dyn_cast<IntrinsicInst>(I)) {
-      if (processIntrinsic(II))
+      if (processIntrinsic(II)) {
+        // A handled intrinsic's ordinary arguments and informational bundles
+        // are non-escaping, but a deopt bundle is executable frame state.
+        // Describe its virtual roots, then materialize only roots that could
+        // not be described, before taking the intrinsic's early return.
+        recordDeoptBundleMappings(II);
+        materializeUnhandledDeoptBundleOperands(II);
         return;
+      }
       // default: fall through to the ICmp / JavaOp / generic-escape path.
     }
     // TODO(deferred-virtualizers): deferred virtualization handlers — NOT WIRED
@@ -4396,6 +4431,14 @@ void Analyzer::processInstruction(Instruction *I) {
 // VMCallbacks gates (HasFinalizer / CanVirtualize) are Jeandle-specific
 // adaptation; the core creation+alias+eliminate sequence matches Graal.
 void Analyzer::processAllocation(CallBase *CB) {
+  // A failed final deopt obligation retries analysis from untouched IR with
+  // every offending original allocation site in this monotonic suppression
+  // set. Keeping the allocation real is the conservative fixpoint: all of its
+  // original uses and stores remain valid, and the same site cannot trigger
+  // another virtualization-dependent obligation.
+  if (SuppressedVirtualizations.count(CB))
+    return;
+
   // In StopNewInLoopNest mode (transiently set by processLoop at a
   // top-level nest whose maximum depth exceeds JeandlePEALoopCutoff),
   // refuse to register NEW virtual allocations inside the nest, but leave
@@ -6545,6 +6588,28 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
   }
 }
 
+void Analyzer::materializeUnhandledDeoptBundleOperands(CallBase *CB) {
+  auto Deopt = CB->getOperandBundle(LLVMContext::OB_deopt);
+  if (!Deopt)
+    return;
+
+  SmallVector<jeandle::ObjectID, 4> ToMaterialize;
+  DenseSet<jeandle::ObjectID> Seen;
+  for (const Use &U : Deopt->Inputs) {
+    Value *V = U.get();
+    if (!V)
+      continue;
+    auto ID = jeandle::pea::resolveVirtualRef(V, CurrentState, Aliases, DL);
+    if (!ID || DeoptBundleHandled.count(*ID))
+      continue;
+    if (Seen.insert(*ID).second)
+      ToMaterialize.push_back(*ID);
+  }
+  llvm::sort(ToMaterialize);
+  for (jeandle::ObjectID ID : ToMaterialize)
+    materializeAt(ID, CB, MatReason::Unhandled);
+}
+
 void Analyzer::collectDistinctVirtualOperands(
     Instruction *I, SmallVectorImpl<jeandle::ObjectID> &Out) {
   // Walk every operand of I, skipping described "deopt" operand-bundle inputs
@@ -7635,6 +7700,249 @@ void Analyzer::commit() {
         Kv.second == jeandle::PEAResult::EscapeKind::NeverEscapes)
       ++EliminatedAllocs;
   AttemptStats.Eliminated += EliminatedAllocs;
+}
+
+const jeandle::Effect *
+Analyzer::getEarliestFinalReplacement(Instruction *Target) const {
+  const jeandle::Effect *Earliest = nullptr;
+  for (const auto &KV : Result.BlockEffects)
+    for (const jeandle::Effect &E : KV.second) {
+      if (E.getTarget() != Target)
+        continue;
+      if (!isa<jeandle::ReplaceLoadEffect>(E) &&
+          !isa<jeandle::ReplaceCallEffect>(E))
+        continue;
+      if (!Earliest || E.SeqNo < Earliest->SeqNo)
+        Earliest = &E;
+    }
+  return Earliest;
+}
+
+const jeandle::EliminateAllocationEffect *
+Analyzer::getEarliestFinalAllocationElimination(Instruction *Target) const {
+  const jeandle::EliminateAllocationEffect *Earliest = nullptr;
+  for (const auto &KV : Result.BlockEffects)
+    for (const jeandle::Effect &E : KV.second) {
+      const auto *AE = dyn_cast<jeandle::EliminateAllocationEffect>(&E);
+      if (!AE || AE->getTarget() != Target)
+        continue;
+      if (!Earliest || AE->SeqNo < Earliest->SeqNo)
+        Earliest = AE;
+    }
+  return Earliest;
+}
+
+Analyzer::FinalValue Analyzer::resolveFinalValue(Value *Root) const {
+  Value *Current = Root;
+  SmallPtrSet<Value *, 8> Seen;
+  while (Current && Seen.insert(Current).second) {
+    auto *Target = dyn_cast<Instruction>(Current);
+    if (!Target)
+      break;
+    const jeandle::Effect *E = getEarliestFinalReplacement(Target);
+    if (!E)
+      break;
+    if (const auto *RE = dyn_cast<jeandle::ReplaceLoadEffect>(E)) {
+      Value *Replacement = RE->Replacement;
+      if (!Replacement)
+        break;
+      Current = Replacement;
+      continue;
+    }
+
+    const auto *CallRE = cast<jeandle::ReplaceCallEffect>(E);
+    if (CallRE->OopHandleId >= 0)
+      return {FinalValue::DependencyFreeOopHandle, nullptr};
+    Value *Replacement = CallRE->Replacement;
+    if (!Replacement)
+      return {FinalValue::Deleted, nullptr};
+    Current = Replacement;
+  }
+  return {FinalValue::ResolvedValue, Current};
+}
+
+void Analyzer::validateFinalDeoptObligations() {
+  InvalidDeoptObligation = false;
+  InvalidDeoptAllocationSites.clear();
+
+  DenseMap<CallBase *,
+           SmallVector<const jeandle::RewriteDeoptBundleEffect *, 2>>
+      DescriptorsAt;
+  for (const auto &KV : Result.BlockEffects)
+    for (const jeandle::Effect &E : KV.second)
+      if (const auto *RE = dyn_cast<jeandle::RewriteDeoptBundleEffect>(&E))
+        if (RE->Safepoint)
+          DescriptorsAt[RE->Safepoint].push_back(RE);
+
+  DenseMap<Value *, jeandle::ObjectID> ObjectIdentity;
+  for (const auto &VObjUP : Result.VirtualObjects) {
+    const jeandle::VirtualObject &VObj = *VObjUP;
+    Value *Identity = VObj.IsSynthetic ? static_cast<Value *>(VObj.SyntheticPhi)
+                                       : (Value *)VObj.AllocationCall;
+    if (Identity)
+      ObjectIdentity.try_emplace(Identity, VObj.getID());
+  }
+
+  SmallPtrSet<CallBase *, 8> RecordedAllocationSites;
+  std::function<void(jeandle::ObjectID)> CollectOrdinarySites =
+      [&](jeandle::ObjectID ID) {
+        if (ID == jeandle::InvalidObjectID ||
+            ID >= Result.VirtualObjects.size())
+          return;
+        const jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
+        auto CIt = Result.EscapeClassification.find(ID);
+        if (CIt == Result.EscapeClassification.end() ||
+            CIt->second != jeandle::PEAResult::EscapeKind::NeverEscapes)
+          return;
+        if (VObj.IsSynthetic) {
+          for (jeandle::ObjectID SourceID : VObj.SyntheticSourceIDs)
+            CollectOrdinarySites(SourceID);
+          return;
+        }
+        auto *Site = dyn_cast_or_null<CallBase>((Value *)VObj.AllocationCall);
+        if (Site && RecordedAllocationSites.insert(Site).second)
+          InvalidDeoptAllocationSites.push_back(Site);
+      };
+
+  auto RejectVirtualObject = [&](jeandle::ObjectID ID) {
+    InvalidDeoptObligation = true;
+    CollectOrdinarySites(ID);
+  };
+
+  auto HasDescriptorForObject = [&](CallBase *CB,
+                                    jeandle::ObjectID ID) -> bool {
+    auto It = DescriptorsAt.find(CB);
+    if (It == DescriptorsAt.end())
+      return false;
+    return llvm::any_of(It->second,
+                        [&](const jeandle::RewriteDeoptBundleEffect *RE) {
+                          return RE->ObjID == ID;
+                        });
+  };
+
+  auto HasWholeRootDescriptor = [&](CallBase *CB, Value *Root) -> bool {
+    auto It = DescriptorsAt.find(CB);
+    if (It == DescriptorsAt.end())
+      return false;
+    for (const jeandle::RewriteDeoptBundleEffect *RE : It->second) {
+      if (!RE->OrigAllocInBundle)
+        continue;
+      for (const WeakTrackingVH &RootOperand : RE->RootOperands)
+        if ((Value *)RootOperand == Root)
+          return true;
+    }
+    return false;
+  };
+
+  std::function<void(jeandle::ObjectID)> AuditObjectIdentity =
+      [&](jeandle::ObjectID ID) {
+        if (ID == jeandle::InvalidObjectID ||
+            ID >= Result.VirtualObjects.size())
+          return;
+        const jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
+        if (VObj.IsSynthetic) {
+          // A synthetic has no retained allocation of its own. Walk through
+          // the complete synthetic-source DAG until ordinary allocation
+          // leaves are reached; a prepared partial synthetic is safe because
+          // commit classified those ordinary leaves PartiallyEscapes.
+          for (jeandle::ObjectID SourceID : VObj.SyntheticSourceIDs)
+            AuditObjectIdentity(SourceID);
+          return;
+        }
+        auto CIt = Result.EscapeClassification.find(ID);
+        if (CIt != Result.EscapeClassification.end() &&
+            CIt->second == jeandle::PEAResult::EscapeKind::NeverEscapes)
+          RejectVirtualObject(ID);
+      };
+
+  std::function<void(Value *)> AuditValue = [&](Value *Root) {
+    SmallPtrSet<Value *, 32> Visited;
+    SmallVector<Value *, 16> Worklist(1, Root);
+    while (!Worklist.empty()) {
+      Value *Current = Worklist.pop_back_val();
+      if (!Current)
+        continue;
+
+      FinalValue Final = resolveFinalValue(Current);
+      if (Final.K == FinalValue::Deleted ||
+          Final.K == FinalValue::DependencyFreeOopHandle)
+        continue;
+      Current = Final.V;
+      if (!Current || !Visited.insert(Current).second)
+        continue;
+
+      if (auto It = ObjectIdentity.find(Current); It != ObjectIdentity.end()) {
+        AuditObjectIdentity(It->second);
+        continue;
+      }
+
+      // A Jeandle allocation absent from ObjectIdentity was never virtualized
+      // in this attempt, so its result is already a real oop. Do not traverse
+      // the call's arguments or its own operand bundles: those are not SSA
+      // dependencies of the surviving allocation result.
+      if (auto *CB = dyn_cast<CallBase>(Current))
+        if (jeandle::pea::isJeandleAllocation(CB))
+          continue;
+
+      if (auto *II = dyn_cast<IntrinsicInst>(Current)) {
+        Intrinsic::ID IID = II->getIntrinsicID();
+        if (IID == Intrinsic::launder_invariant_group ||
+            IID == Intrinsic::strip_invariant_group ||
+            IID == Intrinsic::ptr_annotation) {
+          Worklist.push_back(II->getArgOperand(0));
+          continue;
+        }
+      }
+
+      if (auto *U = dyn_cast<User>(Current))
+        for (Value *Operand : U->operand_values())
+          Worklist.push_back(Operand);
+    }
+  };
+
+  auto SafepointDeleted = [&](CallBase *CB) -> bool {
+    if (isa_and_nonnull<jeandle::ReplaceCallEffect>(
+            getEarliestFinalReplacement(CB)))
+      return true;
+    const auto *AE = getEarliestFinalAllocationElimination(CB);
+    if (!AE)
+      return false;
+    auto CIt = Result.EscapeClassification.find(AE->ObjID);
+    return CIt != Result.EscapeClassification.end() &&
+           CIt->second == jeandle::PEAResult::EscapeKind::NeverEscapes;
+  };
+
+  for (Instruction &I : instructions(F)) {
+    auto *CB = dyn_cast<CallBase>(&I);
+    if (!CB || !hasDeoptBundle(CB) || SafepointDeleted(CB))
+      continue;
+
+    auto Deopt = CB->getOperandBundle(LLVMContext::OB_deopt);
+    assert(Deopt && "hasDeoptBundle lied");
+    for (const Use &U : Deopt->Inputs) {
+      Value *Root = U.get();
+      if (!Root || HasWholeRootDescriptor(CB, Root))
+        continue;
+      AuditValue(Root);
+    }
+
+    auto DIt = DescriptorsAt.find(CB);
+    if (DIt == DescriptorsAt.end())
+      continue;
+    for (const jeandle::RewriteDeoptBundleEffect *RE : DIt->second)
+      for (const jeandle::MaterializeEffect::FieldEntry &FE : RE->Fields) {
+        if (FE.Value.isVirtualRef()) {
+          jeandle::ObjectID Referenced = FE.Value.getVirtualRef();
+          if (!HasDescriptorForObject(CB, Referenced))
+            RejectVirtualObject(Referenced);
+          continue;
+        }
+        if (FE.Value.isScalar())
+          AuditValue(FE.Value.getScalar());
+        else if (FE.Value.isMaterializedRef())
+          AuditValue(FE.Value.getMaterialized());
+      }
+  }
 }
 
 Instruction *Analyzer::validateCFGDeadnessProofs() const {
@@ -8744,6 +9052,9 @@ jeandle::PEAResult Analyzer::run() {
   // either way (the function cannot pick a drain IP without a PH).
   materializePreheaderVirtualsForUnvisitedLoops();
   commit();
+  validateFinalDeoptObligations();
+  if (InvalidDeoptObligation)
+    return jeandle::PEAResult();
   InvalidCFGProofKiller = validateCFGDeadnessProofs();
   if (InvalidCFGProofKiller)
     return jeandle::PEAResult();
@@ -8782,9 +9093,23 @@ PartialEscapeAnalysis::run(Function &F, FunctionAnalysisManager &FAM) {
 
   const bool StrictLockOrder = resolveStrictLockOrder();
   DenseSet<Instruction *> SuppressedCFGProofs;
+  DenseSet<CallBase *> SuppressedVirtualizations;
   while (true) {
-    Analyzer A(F, DT, LI, StrictLockOrder, SuppressedCFGProofs);
+    Analyzer A(F, DT, LI, StrictLockOrder, SuppressedCFGProofs,
+               SuppressedVirtualizations);
     jeandle::PEAResult Attempt = A.run();
+    if (A.hasInvalidDeoptObligation()) {
+      bool AddedSuppression = false;
+      for (CallBase *Site : A.getInvalidDeoptAllocationSites())
+        AddedSuppression |= SuppressedVirtualizations.insert(Site).second;
+      // Every retry must retain at least one additional stable ordinary
+      // allocation site. An obligation with no ordinary source leaf, or one
+      // that only reports already-suppressed sites, cannot make progress.
+      if (!AddedSuppression)
+        return jeandle::PEAResult();
+      continue;
+    }
+
     Instruction *InvalidProof = A.getInvalidCFGProofKiller();
     if (!InvalidProof)
       return Attempt;
