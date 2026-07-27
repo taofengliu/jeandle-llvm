@@ -8,19 +8,22 @@
 //
 // Outer fixpoint. Re-runs PartialEscapeAnalysis + PartialEscapeTransform,
 // interleaving the standard canonicalization passes (ADCE + SimplifyCFG +
-// LoopSimplify + InstCombine) between rounds, until the IR is stable. Each
-// MaterializeEffect reuses the allocation call at its original site and only
-// emits field/lock replay at the escape point; it never creates or relocates
-// an allocation. PEA can delete fully non-escaping allocations. A deopt-bundle
-// rewrite may replace an allocation call in place, without adding an
-// allocation or changing its site.
+// LoopSimplify + InstCombine) between rounds, until bounded PEA convergence.
+// Each MaterializeEffect reuses the allocation call at its original site and
+// emits field/lock replay along the paths that require a materialized value; it
+// never creates or relocates an allocation. PEA can delete fully non-escaping
+// allocations. A deopt-bundle rewrite may replace an allocation call in place,
+// without adding an allocation or changing its site.
 //
-// Convergence (see `run()`): the transform is idle AND the remaining alloc
-// count AND both analyser deltas (VirtualizationDelta, AllocationDelta) are
-// stable AND the previous round's canonicalization did not mutate IR. The
-// round cap is configured by `-jeandle-pea-iterations` (hard-capped at
-// HardIterationCap). Determinism holds because each round builds a fresh
-// PEAResult via FAM.invalidate, so no analyser state crosses rounds.
+// Convergence (see `run()`): PEA-specific convergence requires an idle
+// transform, a stable remaining-allocation count, and stable analyser deltas
+// (VirtualizationDelta, AllocationDelta). A canonicalization change normally
+// requires another round; because preservation results can conservatively
+// report changes for bit-identical IR, two consecutive PEA-stable rounds also
+// establish convergence. The round cap is configured by
+// `-jeandle-pea-iterations` (hard-capped at HardIterationCap). Each round
+// explicitly abandons PartialEscapeAnalysis before invalidation, so no
+// PEAResult crosses rounds.
 //
 //===----------------------------------------------------------------------===//
 
@@ -123,10 +126,10 @@ PreservedAnalyses PartialEscapeIterative::run(Function &F,
 
   bool AnyChanged = false;
   unsigned PrevAllocs = countJeandleAllocations(F);
-  // Previous iteration's analyser deltas. A transform that fuses multiple
-  // CommitAllocations into one keeps the alloc count stable while still
-  // doing work, so the virtualisation delta is tracked too. Sentinels
-  // mismatch any real first-iter delta so the first iteration never breaks.
+  // Previous iteration's analyser deltas. Replay planning can change while
+  // the retained original-allocation count stays stable, so the
+  // virtualisation delta is tracked too. Sentinels mismatch any real
+  // first-iter delta so the first iteration never breaks.
   int PrevVDelta = std::numeric_limits<int>::min();
   int PrevADelta = std::numeric_limits<int>::min();
   // Whether the previous iteration's canonicalization changed IR. If so,
@@ -222,15 +225,14 @@ PreservedAnalyses PartialEscapeIterative::run(Function &F,
              << " prev_canon_changed=" << PrevCanonChanged << "\n";
     });
 
-    // Convergence: transform idle, alloc count and both analyser deltas
-    // stable, and the previous round's canonicalization did not mutate IR.
     // The PEA-specific signals (transform idle, alloc count, both deltas)
-    // are sufficient to prove PEA has reached a fixpoint: they reflect a
-    // fresh analysis of the current (post-canonicalization) IR. If they are
-    // stable but canonicalization still reports "changed" (areAllPreserved
-    // is conservative), allow at most one extra round before declaring
-    // convergence — this breaks SimplifyCFG/LoopSimplify churn on loop
-    // preheaders that does not affect PEA's optimization decisions.
+    // reflect a fresh analysis of the current post-canonicalization IR. A
+    // preceding canonicalization change normally requires another round. If
+    // those PEA signals remain stable while canonicalization still reports
+    // "changed" (areAllPreserved is conservative), one additional PEA-stable
+    // round establishes convergence. This bounds SimplifyCFG/LoopSimplify
+    // preservation churn on loop preheaders that does not affect PEA's
+    // optimization decisions.
     bool PEAStable =
         TransformIdle && AllocsUnchanged && VDeltaUnchanged && ADeltaUnchanged;
     if (PEAStable) {

@@ -8,17 +8,16 @@
 ;
 ;   DEFAULT prefix  -- no `-jeandle-pea-iterations` flag, so the cl::opt
 ;                      default (now 2) applies. Same input as 280; we
-;                      expect full elimination after round 1's
-;                      materialization is canonicalized away by
-;                      InstCombine+SimplifyCFG+ADCE and round 2
-;                      re-virtualizes the freshly-emitted alloc.
+;                      expect round 1 replay plus canonicalization to make
+;                      the branch constant, then round 2 to re-analyze the
+;                      retained original allocation and fold its value.
 ;
 ;   ONE prefix      -- `-jeandle-pea-iterations=1` opt-down for callers
 ;                      that want strict single-round semantics. With the
 ;                      cap at 1 the wrapper still does one
-;                      analyze+transform pair; round 1's materialization
-;                      survives because no canonicalization runs between
-;                      rounds and no round 2 happens.
+;                      analyze+transform pair; its original allocation and
+;                      replay remain because no inter-round canonicalization
+;                      or second analysis happens.
 ;
 ; If we ever bump the default again, the DEFAULT side of this test moves
 ; with it; the ONE side stays constant.
@@ -54,9 +53,8 @@ u:
 
 ; DEFAULT-LABEL: define i32 @test_default_two_rounds()
 ; Round 2 folds the load to the constant 42 and the dead escape branch is
-; removed (no sink). With escape-point placement the surviving materialize
-; (feeding %fast) is not re-virtualized by round 2, so a dead allocation may
-; remain; full elimination is a future escape-point + outer-fixpoint refinement.
+; removed (no sink). The retained original allocation may remain after this
+; value-folding contract; allocation elimination is not this test's oracle.
 ; DEFAULT-NOT: call void @sink
 ; DEFAULT: ret i32 42
 

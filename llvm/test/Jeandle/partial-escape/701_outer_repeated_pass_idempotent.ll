@@ -4,6 +4,15 @@
 ; RUN:   -passes="partial-escape-iterative,partial-escape-iterative" \
 ; RUN:   -jeandle-pea-iterations=4 %s -o %t.twice
 ; RUN: diff %t.once %t.twice
+; RUN: grep -E ' = (call|invoke) hotspotcc ptr addrspace\(1\) @jeandle\.new_instance' %t.twice | count 1
+; RUN: grep -F '%%o = call hotspotcc ptr addrspace(1) @jeandle.new_instance' %t.twice | count 1
+; RUN: grep -F 'store atomic i32 701, ptr addrspace(1) %%pea.matslot' %t.twice | count 2
+; RUN: grep -F 'call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %%o,' %t.twice | count 1
+; RUN: grep -F 'call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1) %%o,' %t.twice | count 1
+; RUN: grep -F 'call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %%guard,' %t.twice | count 1
+; RUN: grep -F 'call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1) %%guard,' %t.twice | count 1
+; RUN: not grep -E ' = phi ' %t.twice
+; RUN: not grep -F poison %t.twice
 ; RUN: FileCheck %s --check-prefix=STABLE < %t.twice
 
 ; The virtual monitor is balanced on both source paths.  The escaping path
