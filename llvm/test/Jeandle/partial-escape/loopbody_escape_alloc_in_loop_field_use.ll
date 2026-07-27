@@ -3,11 +3,10 @@
 ; Loop-body partial escape, Case B with a loop-LOCAL allocation: the object is
 ; allocated INSIDE the loop, used virtually on the normal path (field store +
 ; load folding to the loop-variant %i), and escapes only on the `ret` branch
-; that EXITS the loop. The escape block is not a loop block (it returns), so
-; this is the partial-escape gain: the allocation is materialized only on the
-; escape path, and on normal iterations the object is scalar-replaced and
-; eliminated (no allocation executes). The old hoist placed the materialize at
-; the alloc's normal-dest, allocating every iteration even when dead.
+; that EXITS the loop. Jeandle retains the original loop-body allocation so
+; its deopt bundle stays attached to the correct BCI. The partial-escape gain
+; is that field state is replayed only on the escaping return; on continuing
+; iterations the load still folds to %i.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)
@@ -44,7 +43,8 @@ u:
 }
 
 ; CHECK-LABEL: define ptr addrspace(1) @test_loopbody_local_escape
-; The allocation is materialized only on the escape (ret) path, replaying %i.
+; The original allocation is retained and its field state is replayed for the
+; escaping return.
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(
 ; CHECK: store atomic i32 %i, ptr addrspace(1) %{{.*}} unordered, align 4
 ; CHECK: ret ptr addrspace(1) %{{.*}}

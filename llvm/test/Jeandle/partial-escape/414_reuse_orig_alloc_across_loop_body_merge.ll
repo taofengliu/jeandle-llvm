@@ -1,25 +1,23 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -verify-each %s | FileCheck %s
 ;
-; Deepest/nearest-dominating-def selection in resolveMaterializedUses.
+; Reuse of one dominating OrigAlloc across a loop-body diamond.
 ;
 ; A loop-local object %X is allocated in the loop body and escapes on BOTH arms
 ; of an in-body diamond (@sink on each). Under the reuse-OrigAlloc model the
 ; ORIGINAL allocation %X dominates both arms and the post-merge use, so it is
 ; the single sound SSA def: each arm's sink AND the in-body @use all bind to
-; OrigAlloc %X. No per-arm materialization invoke is emitted and no
-; materialized-object PHI is synthesized, so there is no multi-def ambiguity
-; for resolveMaterializedUses to resolve — @use cannot be mis-bound to a
-; non-dominating or stale def, and no poison is introduced. (The object is
-; still carried across the back-edge by the header PHI %px, which is unrelated
-; to materialization.)
+; OrigAlloc %X. No additional allocation or materialized-object PHI is
+; synthesized: @use cannot be bound to a non-dominating value, and no poison
+; is introduced. (The object is still carried across the back-edge by the
+; header PHI %px, which is unrelated to replay placement.)
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
 declare void @use(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
-define void @test_414_deepest_def(i32 %n, i1 %c)
+define void @test_reuse_orig_alloc_across_loop_body_merge(i32 %n, i1 %c)
     gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   br label %ohdr
@@ -56,7 +54,7 @@ u:
 
 ; The single OrigAlloc %X dominates both arms and the post-merge @use; every
 ; sink and the in-body @use bind to %X — no PHI, no poison.
-; CHECK-LABEL: define void @test_414_deepest_def
+; CHECK-LABEL: define void @test_reuse_orig_alloc_across_loop_body_merge
 ; CHECK: %X = invoke hotspotcc{{.*}}@jeandle.new_instance
 ; CHECK-NOT: invoke hotspotcc{{.*}}@jeandle.new_instance
 ; CHECK: call void @sink(ptr addrspace(1) %X)

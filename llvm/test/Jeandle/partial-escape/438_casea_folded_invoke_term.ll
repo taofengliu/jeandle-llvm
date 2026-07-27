@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Case-A (processBlockPhis, SkipGlobalRAUW=false, IsPerPred=false) with a
-; folded JavaOp invoke terminator, under the reuse-OrigAlloc model.
+; Case-A with a folded JavaOp invoke terminator under the reuse-OrigAlloc
+; model.
 ;
 ; %o is allocated via @jeandle.new_array. `else`'s terminator is an invoke of
 ; @jeandle.arraylength on the virtual %o, which folds (ReplaceCall erases the

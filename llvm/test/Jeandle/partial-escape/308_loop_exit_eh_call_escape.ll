@@ -1,17 +1,10 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; processLoopExit force-materialises virtuals at any loop-exit whose
-; successor is a real catch-handler EH pad (landingpad with at least one
-; catch clause). In the loop below the EXIT block %check has an invoke
-; whose unwind dest is a landingpad with an explicit clause.
-; processLoopExit runs on %check and drains every still-virtual VO at
-; the exit terminator. The alloc in the loop must survive in IR (the
-; force-mat re-emits it).
-;
-; Pure-cleanup landingpads (clauses==0) are NOT considered EH-exit by
-; the helper; that case is exercised throughout the existing test suite
-; (every alloc IS an invoke with a cleanup unwind dest) and the gate at
-; "LP->getNumClauses() > 0" keeps those paths from being demoted.
+; A loop-local object is passed to an invoke whose unwind destination is a
+; catch landingpad. Passing %obj to @may_throw is the actual escape, so PEA
+; retains OrigAlloc and both normal/unwind state use that same pointer.
+; Exception unwind is not deopt, and there is no separate processLoopExit
+; force-materialization policy.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @may_throw(ptr addrspace(1))
@@ -45,23 +38,23 @@ ret:
   ret void
 
 catchlp:
-  ; Landingpad with one explicit catch clause — qualifies as a real EH
-  ; exit, so processLoopExit force-materialises at %check.
+  ; The handler observes the same escaped OrigAlloc.
   %lp = landingpad i64
           catch ptr null
   call void @catch_handler(ptr addrspace(1) %obj)
   resume i64 %lp
 
 u:
-  ; Pure cleanup landingpad — does NOT trigger force-materialisation.
+  ; Allocation failure cleanup.
   %lpc = landingpad i64 cleanup
   resume i64 %lpc
 }
 
-; The alloc must survive in IR because the EH-exit at %check forces
-; materialisation. Either the original invoke survives or a materialised
-; copy is emitted; either way the klass id appears in the IR.
+; OrigAlloc is the sole allocation and both invoke/handler consumers use it.
 ; CHECK-LABEL: define void @test_loop_exit_eh
-; CHECK: jeandle.new_instance({{.*}}i64 8888
+; CHECK: %obj = invoke {{.*}}@jeandle.new_instance({{.*}}i64 8888
+; CHECK-NOT: @jeandle.new_instance
+; CHECK: invoke void @may_throw(ptr addrspace(1) %obj)
+; CHECK: call void @catch_handler(ptr addrspace(1) %obj)
 
 !java-method-compilation = !{}

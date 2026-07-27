@@ -21,13 +21,14 @@ u:
   resume i64 %lp
 }
 
-; Materialization invoke + replayed float store at offset 8.
+; Retained OrigAlloc + replayed float store at offset 8.
 ; CHECK-LABEL: define ptr addrspace(1) @test_float_field
-; CHECK: %[[MAT:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
-; CHECK: %[[SLOT:[A-Za-z0-9._]+]] = getelementptr inbounds i8, ptr addrspace(1) %[[MAT]], i64 8
+; CHECK: %[[ORIG:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
+; CHECK-NOT: @jeandle.new_instance
+; CHECK: %[[SLOT:[A-Za-z0-9._]+]] = getelementptr inbounds i8, ptr addrspace(1) %[[ORIG]], i64 8
 ; The replayed atomic store must carry natural 4-byte alignment for a float
 ; (a hardcoded align 1 would be an under-aligned atomic store — illegal).
 ; CHECK: store atomic float 0x40091EB860000000, ptr addrspace(1) %[[SLOT]] unordered, align 4
-; CHECK: ret ptr addrspace(1) %[[MAT]]
+; CHECK: ret ptr addrspace(1) %[[ORIG]]
 
 !java-method-compilation = !{}

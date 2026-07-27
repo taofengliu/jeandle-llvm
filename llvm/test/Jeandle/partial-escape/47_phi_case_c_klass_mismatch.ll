@@ -3,8 +3,8 @@
 ; PEA Case C klass-mismatch — diamond CFG, both arms allocate DIFFERENT
 ; Klass values. The Klass-pointer compatibility check in synthesizeCaseC
 ; fails immediately; analyzer falls through to Case A; both virtuals
-; materialize at their predecessor terminators. The PHI carries the two
-; materialized invokes.
+; materialize at their predecessor terminators by retaining their source
+; allocations. The PHI carries the two OrigAlloc values.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))

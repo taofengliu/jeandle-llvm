@@ -8,11 +8,12 @@
 ; pred exit) while the right arm does not (lock count = 0). The lock-state
 ; compatibility check in synthesizeCaseC fails, so Case C is rejected and
 ; the analyzer falls through to Case A — both virtuals materialize at their
-; respective predecessor terminators. (Strict lock order cascade applies on
-; the left, but since there's only one locked virtual, no extra cascade.)
+; respective predecessor terminators by retaining each OrigAlloc and replaying
+; its state there. (Strict lock order cascade applies on the left, but since
+; there's only one locked virtual, no extra cascade.)
 ;
-; Expected: both per-pred allocations survive in IR (materialized at preds);
-; the LLVM PHI also survives, merging the two materialized invokes.
+; Expected: both source allocations survive in IR; the LLVM PHI also survives,
+; merging the two OrigAlloc values.
 ; The right arm holds an external padding monitor, giving both incoming edges
 ; scalar depth one; the merged held owner is released after the sink.
 

@@ -6,18 +6,13 @@
 ; escapes o, else keeps it virtual) and itself has TWO successors: `merge` and
 ; `S`.
 ;
-; Historically this required per-pred materialization of o at `else`'s
-; terminator destined for `merge`, and the per-pred flip had to be cloned per
-; (PH, target-merge) so it did NOT leak to `S` -- two distinct pea.crit.split
-; blocks and two pea.mat invokes were produced off `else`, each merge carrying
-; a materialized PHI.
-;
-; Under reuse-OrigAlloc the original allocation %o dominates BOTH successors
-; of `else`, so it is the single SSA value everywhere: no per-pred
-; materialization fires, no critical edge is split, and `else`'s original
-; two-successor branch is retained verbatim. The tracked field store is
-; replayed onto %o on the escaping arm (then), and both escapes (then, S)
-; consume %o directly. No %pea.mat, no materialized-object PHI.
+; OrigAlloc %o dominates BOTH successors of `else`, so it is the single SSA
+; value everywhere. The target-local analysis states do not leak between
+; successors; because the `else` state has no field or lock replay, they need
+; no physical edge effects and no critical edge is split. The tracked field
+; store is replayed onto %o on the escaping arm (then), and both escapes
+; (then, S) consume %o directly. No additional allocation or object PHI is
+; needed.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -40,12 +35,11 @@ else:
   ; o is virtual here. TWO successors: merge and S.
   br i1 %c2, label %merge, label %S
 merge:
-  ; Mixed merge of then (materialized) and else (virtual) -> per-pred
-  ; materialize of o at else's terminator, destined for `merge`.
+  ; Mixed merge of then (materialized) and else (virtual); the target-local
+  ; merge state records OrigAlloc as the real identity.
   br label %S
 S:
-  ; Merge of else (o virtual -> own per-pred mat on else->S) and merge
-  ; (o = real materialized PHI) -> per-pred mat on else->S + CreatePHI.
+  ; Merge of else's virtual state with merge's materialized OrigAlloc state.
   call void @sink(ptr addrspace(1) %o)
   ret void
 u:

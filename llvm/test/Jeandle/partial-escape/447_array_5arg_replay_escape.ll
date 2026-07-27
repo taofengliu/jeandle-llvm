@@ -1,20 +1,17 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; 5-arg `jeandle.new_array` materialize re-emit regression test.
+; 5-arg `jeandle.new_array` replay-on-escape regression test.
 ;
 ; The TLAB fast-path change (jeandle-jdk #530) widened `jeandle.new_array` from
 ; (klass, length) to (klass, length, size_in_bytes, base_offset, length_limit).
-; PEA's applyMaterialize must re-emit the escaped array with the allocation
-; function's FULL arity, forwarding the trailing params from the original
-; invoke. With the old 2-arg re-emit the verifier rejected the post-PEA IR
-; ("incorrect number of arguments") whenever a virtualized array escaped.
+; PEA must retain the original full-arity invoke when the array escapes. The
+; transform replays tracked elements onto OrigAlloc; it never reconstructs a
+; new array invoke at the escape point.
 ;
 ; Here the array is virtualized (the element store at element 0 folds into the
 ; virtual field state), then the array pointer itself escapes through @sink.
-; PEA eliminates the original allocation invoke and emits a fresh `pea.mat`
-; materialization at the escape point, replaying the store into the
-; materialized array. The `pea.mat` invoke MUST carry all 5 operands; the
-; replayed store and the @sink call use the materialized pointer.
+; The original invoke remains the sole allocation, and both the replayed store
+; and @sink use %arr.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare void @sink(ptr addrspace(1))
@@ -38,15 +35,14 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_array_5arg_materialize_escape
-; The original allocation invoke is eliminated; a `pea.mat` materialization is
-; emitted at the escape point with the FULL 5-arg signature — klass + length
-; rebuilt from VirtualObject, then size_in_bytes / base_offset / length_limit
-; forwarded verbatim from the original invoke.
-; CHECK: %{{.*}} = invoke hotspotcc{{.*}} @jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 4, i32 64, i32 16, i32 1000000)
+; The retained source invoke keeps the FULL 5-arg signature.
+; CHECK: %arr = invoke hotspotcc{{.*}} @jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 4, i32 64, i32 16, i32 1000000)
 ; CHECK-NEXT: to label %{{.*}} unwind label %{{.*}}
-; The element store is replayed into the materialized array (pea.matslot).
-; CHECK: store atomic i32 100, ptr addrspace(1) %{{.*}} unordered, align 4
-; The @sink receives the materialized pointer (pea.mat), not the original %arr.
-; CHECK: call void @sink(ptr addrspace(1) %{{.*}})
+; No second allocation may be emitted.
+; CHECK-NOT: @jeandle.new_array
+; The element store is replayed onto %arr and @sink receives %arr.
+; CHECK: %[[SLOT:[A-Za-z0-9._]+]] = getelementptr inbounds i8, ptr addrspace(1) %arr, i64 16
+; CHECK: store atomic i32 100, ptr addrspace(1) %[[SLOT]] unordered, align 4
+; CHECK: call void @sink(ptr addrspace(1) %arr)
 
 !java-method-compilation = !{}

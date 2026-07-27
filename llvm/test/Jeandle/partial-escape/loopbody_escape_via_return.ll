@@ -2,14 +2,14 @@
 
 ; Loop-body partial escape (Case B): an object allocated OUTSIDE the loop
 ; escapes only on a path that EXITS the loop (the `ret` on the `i==7`
-; iteration). Graal keeps the object scalar-replaced on the normal path and
-; materializes it only on the escape path (materializedValuePhi is NOT needed
-; here because the escape path does not flow to the latch).
+; iteration). Jeandle retains OrigAlloc at its source site so its allocation
+; deopt bundle remains valid, but replays the field state only on the escaping
+; return path. No object PHI is needed because that path does not flow to the
+; latch.
 ;
 ; Consequence: the normal path's field load folds to the prep-stored %x
-; (object is virtual there), and the allocation appears only on the `ret`
-; path. With the old hoist-to-alloc-normal-dest fallback the object was
-; fully materialized before the loop and the load was a real load.
+; because the object remains virtual in that analysis state. The same
+; dominating OrigAlloc is used by the return.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)
@@ -47,7 +47,8 @@ u:
 
 ; The normal path keeps the object virtual: the field load folds to %x.
 ; CHECK-LABEL: define ptr addrspace(1) @test_loopbody_escape_return
-; The allocation is materialized on the escape (ret) path, replaying %x.
+; The original allocation is retained and its field state is replayed for the
+; escaping return.
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(
 ; CHECK: store atomic i32 %x, ptr addrspace(1) %{{.*}} unordered, align 4
 ; CHECK: ret ptr addrspace(1) %{{.*}}

@@ -4,14 +4,11 @@
 ; successor of an invoke that materialized one of its operands. A
 ; separate pre-invoke snapshot is used for the unwind successor, but
 ; the normal successor must continue to inherit the post-invoke state
-; (i.e. it sees VO_A as Materialized, with the materialized invoke as
-; its backing pointer).
+; (i.e. it sees VO_A as Materialized, backed by OrigAlloc).
 ;
 ; A subsequent use of VO_A on the normal path must thread through the
-; materialized invoke. The test below uses @sink2 (a second opaque
-; consumer on the normal path) to anchor the materialized value; the
-; CHECK requires it to take a real pointer rather than the original
-; (eliminated) %a.
+; retained allocation. The test below uses @sink2 (a second opaque
+; consumer on the normal path) to anchor that pointer.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -29,8 +26,7 @@ n:
        to label %nfinal unwind label %handler
 nfinal:
   ; Normal successor: another consumer of VO_A. Must see the materialized
-  ; pointer (the freshly-emitted new_instance invoke), not the original
-  ; (which gets eliminated).
+  ; pointer, which is the retained OrigAlloc.
   call void @sink2(ptr addrspace(1) %a)
   ret void
 handler:
@@ -41,12 +37,11 @@ u_a:
   resume i64 %lpa
 }
 
-; The original allocation invoke is eliminated; a single new_instance
-; invoke survives as the materialization point before @sink. Both @sink
-; and @sink2 must thread through the SAME materialized pointer.
+; The original allocation is the sole new_instance. Both consumers use it.
 ; CHECK-LABEL: define void @test_293
-; CHECK: %[[MAT:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
-; CHECK: invoke void @sink(ptr addrspace(1) %[[MAT]])
-; CHECK: call void @sink2(ptr addrspace(1) %[[MAT]])
+; CHECK: %[[ORIG:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
+; CHECK-NOT: @jeandle.new_instance
+; CHECK: invoke void @sink(ptr addrspace(1) %[[ORIG]])
+; CHECK: call void @sink2(ptr addrspace(1) %[[ORIG]])
 
 !java-method-compilation = !{}

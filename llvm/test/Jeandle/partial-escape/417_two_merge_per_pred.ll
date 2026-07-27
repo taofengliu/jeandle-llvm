@@ -5,15 +5,11 @@
 ; (`else`) has TWO successor merges (merge1, merge2), BOTH mixed (split arm
 ; materialized via sink, else arm virtual).
 ;
-; Historically this required TWO distinct critical-edge splits off `else`
-; (one per target merge), each with its own per-pred NewInv, because a
-; PHRename/BlockRename keyed by PH alone would let the second split overwrite
-; the first and mis-route one merge's PHI incoming to a non-predecessor.
-;
-; Under reuse-OrigAlloc the original allocation %o dominates both merges, so
-; no per-pred materialization fires and no critical edge is split: `else`
-; retains its original two-successor branch, and both merge sinks consume %o
-; directly. No %pea.mat, no materialized-object PHI, no pea.crit.split.
+; OrigAlloc %o dominates both merges. Because this object has no field or lock
+; state to replay, the per-merge state transitions require no physical
+; side-effect and no critical edge is split: `else` retains its original
+; two-successor branch, and both merge sinks consume %o directly. No
+; additional allocation or materialized-object PHI is needed.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -36,11 +32,11 @@ else:
   ; o is virtual. TWO successors: merge1 and merge2, both mixed merges.
   br i1 %c2, label %merge1, label %merge2
 merge1:
-  ; preds: split (materialized), else (virtual) -> per-pred mat at else for merge1.
+  ; preds: split (materialized), else (virtual) -> merge state uses OrigAlloc.
   call void @sink(ptr addrspace(1) %o)
   ret void
 merge2:
-  ; preds: split (materialized), else (virtual) -> per-pred mat at else for merge2.
+  ; preds: split (materialized), else (virtual) -> merge state uses OrigAlloc.
   call void @sink(ptr addrspace(1) %o)
   ret void
 u:
@@ -57,7 +53,7 @@ u:
 ; `else` retains its original two-successor branch to merge1/merge2.
 ; CHECK: else:
 ; CHECK-NEXT: br i1 %c2, label %merge1, label %merge2
-; Both merges escape OrigAlloc %o directly (no PHI selecting per-pred NewInvs).
+; Both merges escape OrigAlloc %o directly; no object PHI is needed.
 ; CHECK: merge1:
 ; CHECK: call void @sink(ptr addrspace(1) %o)
 ; CHECK: ret void

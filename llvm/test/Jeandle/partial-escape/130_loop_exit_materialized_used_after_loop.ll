@@ -2,11 +2,9 @@
 
 ; Alloc BEFORE the loop, materialized INSIDE the loop body (via @sink that
 ; flows to the latch), then the same pointer is used AFTER the loop. Loop-body
-; partial escape materializes the object exactly once at the preheader end
-; (Graal materializedValuePhi at the loop header, which is trivial here and
-; folds), and both the in-loop escape and the post-loop use resolve to that
-; single materialized pointer. (Previously the hoist + post-body merge
-; accidentally produced TWO allocations here.)
+; partial escape retains the source OrigAlloc, replays its field before the
+; escape, and both the in-loop escape and post-loop use read that single
+; dominating pointer.
 ;
 ; Verifies the post-loop use sees the single materialized pointer.
 
@@ -40,14 +38,12 @@ u:
   resume i64 %lp
 }
 
-; The alloc is materialized exactly once (at the alloc's SafeIP, before the
-; loop); both the in-loop @sink and the post-loop @ret_use receive the
-; same materialized pointer.
+; The source allocation is the only invoke; both consumers receive it.
 ; CHECK-LABEL: define void @test_a6_mat_in_loop_use_after
-; CHECK: %[[MAT:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK: %[[ORIG:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK-NOT: @jeandle.new_instance
 ; CHECK: store atomic i32 %x, ptr addrspace(1) %{{.*}}
-; CHECK: call void @sink(ptr addrspace(1) %[[MAT]])
-; CHECK: call void @ret_use(ptr addrspace(1) %[[MAT]])
-; CHECK-NOT: jeandle.new_instance
+; CHECK: call void @sink(ptr addrspace(1) %[[ORIG]])
+; CHECK: call void @ret_use(ptr addrspace(1) %[[ORIG]])
 
 !java-method-compilation = !{}

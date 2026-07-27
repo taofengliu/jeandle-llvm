@@ -1,17 +1,22 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s --check-prefix=DEFAULT
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-pea-loop-cutoff=2 %s | FileCheck %s --check-prefix=OVERRIDE
+; RUN: opt -disable-output -passes="require<partial-escape-analysis>" \
+; RUN:     -jeandle-dump-pea-stats %s 2>&1 | FileCheck %s --check-prefix=DEFAULT-STATS
+; RUN: opt -disable-output -passes="require<partial-escape-analysis>" \
+; RUN:     -jeandle-pea-loop-cutoff=2 -jeandle-dump-pea-stats %s 2>&1 \
+; RUN:     | FileCheck %s --check-prefix=OVERRIDE-STATS
 
 ; -jeandle-pea-loop-cutoff exposes the depth threshold. Default is
 ; 20, so a 3-deep nest does NOT trip Mode::StopNewInLoopNest and the
 ; loop-local alloc at depth 3 follows normal Regular-mode handling
-; (escapes via @sink so materializes; OrigAlloc invoke RAUW'd to a new
-; invoke at the materialize site — i64 4444 still appears in IR but only
-; on the materialised invoke).
+; (escapes via @sink, so OrigAlloc is retained and classified
+; PartiallyEscapes).
 ;
 ; With -jeandle-pea-loop-cutoff=2, the same nest crosses the threshold,
 ; StopNew kicks in, processAllocation refuses the depth-3 alloc, and the
-; ORIGINAL invoke (with its original SSA name) survives unchanged. Use
-; the @sink to anchor a CHECK that distinguishes the two paths.
+; original invoke survives without ever becoming a VO. The final IR shape is
+; intentionally the same in both modes, so the stats oracle distinguishes the
+; analysis decisions.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -72,10 +77,12 @@ u:
 ; DEFAULT-LABEL: define void @test_cutoff
 ; DEFAULT: invoke {{.*}}@jeandle.new_instance({{.*}}i64 4444
 ; DEFAULT: call void @sink
+; DEFAULT-STATS: ;; PEA stats @test_cutoff: NeverEscapes=0 PartiallyEscapes=1 AlwaysEscapes=0
 
 ; Override cutoff to 2: max-depth 3 > 2, StopNew, alloc refused.
 ; OVERRIDE-LABEL: define void @test_cutoff
 ; OVERRIDE: invoke {{.*}}@jeandle.new_instance({{.*}}i64 4444
 ; OVERRIDE: call void @sink
+; OVERRIDE-STATS: ;; PEA stats @test_cutoff: NeverEscapes=0 PartiallyEscapes=0 AlwaysEscapes=0
 
 !java-method-compilation = !{}

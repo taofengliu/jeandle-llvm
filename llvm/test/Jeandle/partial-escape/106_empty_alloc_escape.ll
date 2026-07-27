@@ -1,9 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Edge case: virtual with zero stores between alloc and escape.
-; Materialization with zero FieldEntries: the allocator zero-fills, so no
-; replay stores are needed. Just the materialization invoke and the use of
-; its result.
+; Materialization with zero FieldEntries changes only analysis state: the
+; original allocation is retained and no replay IR is required.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -22,11 +21,11 @@ u:
   resume i64 %lp
 }
 
-; A new alloc invoke appears for materialization (no replay stores needed,
-; since there are no recorded fields - the allocator zero-fills).
+; OrigAlloc is the only invoke and @sink consumes it directly.
 ; CHECK-LABEL: define void @test_empty_alloc_escape
-; CHECK: %[[MAT:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
+; CHECK: %[[ORIG:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
+; CHECK-NOT: @jeandle.new_instance
 ; CHECK-NOT: store atomic
-; CHECK: call void @sink(ptr addrspace(1) %[[MAT]])
+; CHECK: call void @sink(ptr addrspace(1) %[[ORIG]])
 
 !java-method-compilation = !{}

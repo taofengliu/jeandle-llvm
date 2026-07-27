@@ -25,14 +25,14 @@ u:
   resume i64 %lp
 }
 
-; The seq_cst store is gone. A new materialization invoke for klass 12345
-; appears, then the replayed unordered store, then the sink consuming the
-; materialized pointer.
+; The seq_cst store is gone. The source allocation remains, followed by the
+; replayed unordered store and the sink consuming OrigAlloc.
 ; CHECK-LABEL: define void @test_atomic_seqcst
 ; CHECK-NOT: store atomic i32 99,{{.*}}seq_cst
-; CHECK: %[[MAT:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
+; CHECK: %[[ORIG:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
 ; CHECK-NEXT: to label %{{.*}} unwind label %{{.*}}
+; CHECK-NOT: @jeandle.new_instance
 ; CHECK: store atomic i32 99,{{.*}}unordered
-; CHECK: call void @sink(ptr addrspace(1) %[[MAT]])
+; CHECK: call void @sink(ptr addrspace(1) %[[ORIG]])
 
 !java-method-compilation = !{}

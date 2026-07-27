@@ -1,10 +1,9 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; An indirectbr-created back-edge that LoopInfo does NOT recognise as a
-; loop. The block %head has a pred from %indirect that is later in RPO
-; than %head (the indirectbr to %head); LoopInfo does not see it as a
-; loop. The defensive sweep in Analyzer::run bails every VO virtual at
-; entry to %head, so the alloc + stores survive in IR.
+; Coverage for an indirectbr back-edge. This CFG is reducible: %head dominates
+; the latch, so LoopInfo can represent it as a natural loop. The test locks
+; down the conservative output for this unusual terminator, but deliberately
+; makes no claim that Analyzer::run's missed-LoopInfo safety sweep fired.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare i32 @__gxx_personality_v0(...)
@@ -23,9 +22,7 @@ head:
   br label %indirect
 
 indirect:
-  ; Back-edge to %head via indirectbr — LoopInfo does not model this as
-  ; a loop, so the analyzer's RPO walk reaches %head with one unvisited
-  ; pred (%indirect, later in RPO).
+  ; Back-edge to %head via indirectbr.
   indirectbr ptr %target, [label %head, label %exit]
 
 exit:

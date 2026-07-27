@@ -2,14 +2,11 @@
 
 ; Loop-body partial escape, Case A: object allocated BEFORE the loop escapes
 ; inside the loop body via a call that FLOWS TO THE LATCH (the escape block is
-; a loop block, so EscapeLoop != AllocLoop and the old code hoisted). Graal
-; materializes once at the preheader end and builds a materializedValuePhi at
-; the header; since phi(M_pre, phi) == M_pre the phi is trivial.
+; a loop block). Jeandle retains OrigAlloc and replays its field before the
+; escape; the same dominating pointer reaches the post-loop consumer.
 ;
-; This test asserts the SOUNDNESS property that exactly ONE allocation
-; survives: the old hoist + post-body merge both emitted a materialize in the
-; preheader, producing TWO allocations (one dead). Loop-body partial escape
-; must produce a single materialization.
+; This test asserts that exactly one allocation survives and both consumers
+; use it.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -42,12 +39,11 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_loopbody_escape_to_latch
-; Exactly ONE allocation: match the first, then forbid any second one before
-; the function ends.
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(
+; Exactly ONE allocation: the source %o.
+; CHECK: %o = invoke hotspotcc{{.*}}@jeandle.new_instance(
 ; CHECK-NOT: @jeandle.new_instance
-; Both the in-loop escape and the post-loop use receive the single mat pointer.
-; CHECK: call void @sink(ptr addrspace(1)
-; CHECK: call void @ret_use(ptr addrspace(1)
+; Both the in-loop escape and the post-loop use receive OrigAlloc.
+; CHECK: call void @sink(ptr addrspace(1) %o)
+; CHECK: call void @ret_use(ptr addrspace(1) %o)
 
 !java-method-compilation = !{}

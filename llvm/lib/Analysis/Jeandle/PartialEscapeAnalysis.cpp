@@ -22,9 +22,11 @@
 //
 // Per-block exit state (virtual set, field values, lock counts) is snapshotted
 // into BlockExits; at each block header we inherit a single pred's snapshot or
-// run mergeStates() over all preds. An object stays virtual iff every pred is
-// Virtual and they agree on field values and lock counts; any disagreement
-// marks the object ineligible and commit() drops its effects.
+// run mergeStates() over all preds. Compatible virtual states remain virtual;
+// differing scalar fields are merged with PHIs. Mixed virtual/materialized
+// states, incompatible fields, or incompatible lock states materialize the
+// virtual predecessor contributions. Ineligibility is reserved for shapes
+// that the analysis cannot represent or replay safely.
 //
 // At multi-pred merges, explicit LLVM PHIs of heap pointers are classified:
 // Case A (a non-virtual incoming or a Case-C bail) materializes each virtual
@@ -78,9 +80,9 @@ using namespace llvm;
 
 // Per-statistic counters surfaced via LLVM's standard `-stats` flag
 // (Statistic.h). Emission sites bump attempt-local counters, which are
-// published only after the final effect plan validates. A small drift vs. the
-// committed effect set is still possible when late effect filtering strips a
-// Materialize already counted; these remain diagnostics, not an audit.
+// published only after the analysis attempt validates. Loop rollback and
+// late effect filtering can discard an effect that was already counted, so
+// these counters diagnose analysis activity rather than audit the final plan.
 STATISTIC(JeandlePEAVirtualized, "Number of virtual objects PEA created");
 STATISTIC(JeandlePEAEliminated,
           "Number of allocations eliminated (erased) by PEA");
@@ -830,10 +832,11 @@ private:
 
   // Function-wide dedup of (Pred, TargetMerge, ObjectID) materializations.
   // Multiple merge-time Materialize-at-pred emissions for the same (Pred, M,
-  // ID) would otherwise produce duplicate invokes; this nested map ensures we
-  // emit exactly one Materialize effect per (Pred, M, ID) across the entire
-  // run. Per-pred mats for distinct target merges M1, M2 at the same PH are NOT
-  // deduped (they are distinct edge materializations). A true block-end drain
+  // ID) would otherwise produce duplicate replay effects; this nested map
+  // ensures we emit exactly one Materialize effect per (Pred, M, ID) across
+  // the entire run. Per-pred mats for distinct target merges M1, M2 at the same
+  // PH are NOT deduped (they are distinct edge materializations). A true
+  // block-end drain
   // passes M=null, so its (PH, null, ID) entry dedups at that program point.
   // Nested as
   // PH -> M -> ID set so `MaterializedAtPred[PH][M]` is a `DenseSet<ID>&`
@@ -911,9 +914,9 @@ private:
   // loops (an unreachable top-level loop the RPO walk skipped, or a
   // sub-loop whose containing top-level loop's processLoop bailed before
   // recursing into it). processLoop handles every loop it visits —
-  // whether the body fixpoint converged or fell into the MATERIALIZE_ALL
-  // fallback — by draining preheader virtuals itself, so the only loops
-  // that need this safety-net drain are those processLoop never ran on.
+  // converged loops need no drain, while overflow/non-convergence recovery
+  // drains in place — so the only loops that need this safety-net drain are
+  // those processLoop never ran on.
   DenseSet<Loop *> VisitedLoops;
 
   // Per-in-loop-block field-PHI cache. Keyed on (BB, ID, Offset) where BB is
@@ -1514,9 +1517,8 @@ private:
       jeandle::ObjectID FlippedID, Value *NewPtr,
       DenseMap<jeandle::ObjectID, DenseMap<int64_t, jeandle::FieldValue>> &FS);
 
-  // Bump the appropriate per-reason Statistic. Always bumps the
-  // total JeandlePEAMaterialized; the per-reason counter is bumped only for
-  // the four reasons (Unhandled / Merge / LoopExit / PHI).
+  // Bump the total materialization count and the counter for the supplied
+  // reason. Cascade and Nested are also included in the Unhandled rollup.
   void bumpMaterializeStat(MatReason R);
 
   void commit();
@@ -3327,8 +3329,7 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
       Value *V = Phi.getIncomingValue(I);
       Value *OrigAlloc = Result.VirtualObjects[OID]->AllocationCall;
       if (V == OrigAlloc)
-        continue; // object-carry: resolution sub-pass rewrites this OrigAlloc
-                  // use.
+        continue; // object-carry already names the retained allocation.
       int64_t Off = 0;
       bool NonConst = false;
       Value *Base =
@@ -4515,12 +4516,12 @@ void Analyzer::processAllocation(CallBase *CB) {
   // In MATERIALIZE_ALL mode the analyzer registers the VO normally
   // (so intra-block processLoad/processStore folds against the new
   // FieldStates), then defers a Materialize effect to end-of-processBlock so
-  // the alloc is re-emitted at the block's terminator IP — by which time all
-  // stores have updated FieldStates so the materialised invoke captures the
-  // final field values. In MATERIALIZE_ALL, a virtualizable node is virtualised
-  // AND immediately ensure-materialized before the next fixed node. The
-  // end-of-block emission is the practical compromise: intra-block folds
-  // work, end-of-block emission is dominance-safe.
+  // replay occurs at the block's terminator IP — by which time all stores have
+  // updated FieldStates. OrigAlloc remains at its source site. In
+  // MATERIALIZE_ALL, a virtualizable node is virtualised AND
+  // ensure-materialized before the next fixed node. Deferring the effect to
+  // block end preserves intra-block folds and makes every replay value
+  // available at its insertion point.
   const bool VirtualiseThenMaterialise = (CurrentMode == Mode::MaterializeAll);
 
   // Stable VO-per-allocation-site cache. Re-processing the same alloc
@@ -4566,16 +4567,14 @@ void Analyzer::processAllocation(CallBase *CB) {
   }
 
   // Loop-body allocations are permitted as virtualization candidates. The
-  // dominance check in materializeAt (DT.dominates(VI, SafeIP) per
-  // FieldStates entry) is what protects the analyzer from forming an unsound
-  // replay: any field whose stored value is defined later in the loop body
-  // cannot dominate the SafeIP just after the alloc, so the object becomes
-  // ineligible and survives in IR untouched.
-  // materializePreheaderVirtualsForUnvisitedLoops independently
-  // force-materializes any virtual that is still virtual at a loop preheader's
-  // exit (modulo loops drained by the loop fixpoint's pessimistic fallback), so
-  // objects allocated BEFORE the loop and surviving into the loop are also
-  // handled.
+  // availability gate in ensureMaterialized checks every replay value at the
+  // actual escape/edge replay point. A field value defined after OrigAlloc is
+  // therefore valid when it dominates that point; otherwise the object becomes
+  // ineligible and the original IR survives.
+  // materializePreheaderVirtualsForUnvisitedLoops independently drains a
+  // preheader only when processLoop never visited that loop. Normal loops carry
+  // pre-loop objects through the B/B' fixpoint; overflow/non-convergence
+  // recovery drains them before the MaterializeAll retry.
 
   uintptr_t Klass = jeandle::pea::extractAllocationKlass(CB);
   if (Klass == 0)
@@ -4770,12 +4769,13 @@ std::optional<int64_t> Analyzer::resolveAccess(Value *Ptr,
     // past-the-end offset as a phantom field that is never replayed (the emit
     // loop walks only 0..ArrayLength-1), silently dropping the store.
     //
-    // The upper bound is only enforceable (and only needed) when the element
-    // scale is known (ArrayIndexScale > 0, i.e. ArrayElementType was supplied
-    // via the VM callback log): that is the only case where the emit loop
-    // iterates elements and could drop a past-the-end slot. With an unknown
-    // scale the array is modeled as per-byte-offset field slots that are all
-    // replayed individually, so a tail offset is faithfully replayed, not lost.
+    // The upper bound is enforceable only when the element scale is known
+    // (ArrayIndexScale > 0, i.e. ArrayElementType was supplied via the VM
+    // callback log). With an unknown scale, no layout-derived upper bound can
+    // be proved here; constant offsets after the header remain raw field slots.
+    // Those slots are replayed individually if the allocation survives. A
+    // NeverEscapes allocation needs no replay because both it and its
+    // unobservable stores are eliminated.
     int64_t BaseOff = static_cast<int64_t>(VObj.ArrayBaseOffset);
     if (*Offset < BaseOff)
       return std::nullopt;
@@ -4799,17 +4799,12 @@ bool Analyzer::processStore(StoreInst *SI) {
   // emitReplaceCall is RAUW'd and ERASED by its ReplaceLoad/ReplaceCall effect
   // in Pass 1, which runs BEFORE the Materialize / RewriteDeoptBundle effects
   // that read the FieldStates snapshot — recording the folded instruction
-  // itself would leave a dangling pointer in the snapshot. The alias chain
-  // A value folded by processLoad / foldICmpEquality / emitReplaceCall is
-  // RAUW'd and ERASED by its ReplaceLoad/ReplaceCall effect in Pass 1, which
-  // runs BEFORE the Materialize / RewriteDeoptBundle effects that read the
-  // FieldStates snapshot — recording the folded instruction itself would
-  // leave a dangling pointer in the snapshot. The alias chain terminates at a
-  // value that is never erased (a constant, an argument, an OrigAlloc, or a
-  // real SSA def that dominates this store): the fold that produced the alias
-  // always precedes the store in RPO (the load dominates its uses), so the
-  // alias is always registered by the time we see the store. A value carrying
-  // a VIRTUAL alias never carries a scalar alias, so this never changes the
+  // itself would leave a dangling pointer in the snapshot. The chain
+  // terminates at a value that is never erased (a constant, an argument, an
+  // OrigAlloc, or a real SSA def that dominates this store): the fold that
+  // produced the alias always precedes the store in RPO, so the alias is
+  // registered by the time we see the store. A value carrying a VIRTUAL alias
+  // never carries a scalar alias, so this does not change the
   // resolveVirtualRef outcome below.
   while (Value *A = Aliases.getScalarAlias(Val))
     Val = A;
@@ -6726,10 +6721,9 @@ void Analyzer::materializeAllVirtualOperands(Instruction *I) {
   // Trigger materialization for every distinct virtual ObjectID that I uses.
   // After materializeAt, the per-object state in CurrentState flips to
   // Materialized so subsequent resolveVirtualRef queries return nullopt.
-  // Operand rewriting is done by the point-sensitive resolution sub-pass: the
-  // materialized value at this point is OrigAlloc (reused directly by
-  // applyMaterialize). Uses simply keep reading OrigAlloc; there is no
-  // resolution sub-pass that updates operands to a per-point NewInv.
+  // Ordinary uses already name OrigAlloc, which remains at its original site;
+  // a prepared synthetic object is represented by its SyntheticPhi. No
+  // per-point allocation or operand-resolution pass is needed.
   SmallVector<jeandle::ObjectID, 4> ToMaterialize;
   collectDistinctVirtualOperands(I, ToMaterialize);
   for (jeandle::ObjectID ID : ToMaterialize)
@@ -6764,9 +6758,10 @@ void Analyzer::materializeVirtualCallArgs(CallBase *CB) {
 // Materialize placement is escape-point / predecessor-end (Graal
 // materializeBefore=node): materializeAt places at the escape-point
 // instruction; materializeAtPredFromExitInfo places at the predecessor's
-// terminator (Graal predecessor.getEndNode()). OrigAlloc uses are resolved
-// per-point by the transform's resolution sub-pass, so a non-dominating
-// materialize is SSA-sound.
+// terminator (Graal predecessor.getEndNode()). These positions govern field
+// and lock replay, not allocation creation: the receiver is the dominating
+// OrigAlloc or SyntheticPhi. Edge-local replay is moved onto the corresponding
+// split edge by the transform when the predecessor has other successors.
 
 // Returns true iff CB has at least one "deopt" operand bundle.
 static bool hasDeoptBundle(CallBase *CB) {
@@ -7308,15 +7303,12 @@ void Analyzer::materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
     // Mode::StopNewInLoopNest +
     // MATERIALIZE_ALL escalation remain the safety net for pathological nests.
     //
-    // OrigAlloc uses that the escape-point materialization does not
-    // dominate — notably uses at a multi-pred merge where the object is
-    // still virtual on another arm — are sound because OrigAlloc (the
-    // original allocation) dominates every escape point by PEA's
-    // invariant (see applyMaterialize, which asserts the materialized value
-    // equals VObj.AllocationCall; see also the "Materialization model"
-    // paragraph in the PartialEscapeTransform.cpp file header). The
-    // OrigAlloc is reused directly post-merge, so escape-point replay is
-    // SSA-sound for every escape.
+    // Uses outside the escape-point replay block — notably at a multi-pred
+    // merge where the object is still virtual on another arm — remain
+    // SSA-sound because OrigAlloc dominates every such use by PEA's invariant
+    // (see applyMaterialize, which asserts the receiver equals
+    // VObj.AllocationCall; see also the "Materialization model" paragraph in
+    // the PartialEscapeTransform.cpp file header).
     return InsertBefore;
   };
   auto FlipState = [&](jeandle::ObjectID Oid) {
@@ -7597,9 +7589,9 @@ void Analyzer::commit() {
   // For each surviving (eligible) VO, classify based on whether ANY
   // Materialize effect survived in the committed plan:
   //   * no Materialize  -> NeverEscapes      (alloc fully eliminated)
-  //   * any Materialize -> PartiallyEscapes  (alloc eliminated on the
-  //                                           virtual path, re-emitted on
-  //                                           the escape path)
+  //   * any Materialize -> PartiallyEscapes  (original allocation retained;
+  //                                           tracked fields and locks replayed
+  //                                           at each required escape)
   // Maps to NEVER vs PARTIAL vs ALWAYS escape classification.
   // -------------------------------------------------------------------------
   DenseSet<jeandle::ObjectID> HasSurvivingMaterialize;
@@ -8115,18 +8107,11 @@ static void collectLoopsPreorder(Loop *L, SmallVectorImpl<Loop *> &Out) {
     collectLoopsPreorder(Sub, Out);
 }
 
-// Loop soundness: after the RPO walk has populated BlockExits but before
-// commit(), force-materialize every virtual that is still virtual at any
-// loop preheader's terminator. This makes loops trivially sound — no
-// virtual survives the loop boundary — at the cost of giving up
-// virtualization across loops. Combined with the processAllocation refusal of
-// loop-body allocs, the analyzer never tracks an object across a back-edge.
-//
-// Important sequencing: this MUST run after the per-block analysis (we need
-// BlockExits[preheader] to know what's still virtual on the way into the loop)
-// and BEFORE commit() (so the Materialize effects we add are subject to the
-// same eligibility filter that drops effects for objects we've decided to
-// abandon).
+// Overflow recovery drains the outer virtual state at the loop preheader before
+// retrying the nest in MaterializeAll mode. Normally, processLoop computes the
+// Graal-style B/B' fixpoint and virtual objects may remain virtual across
+// backedges; the separate unvisited-loop safety net drains only loops that the
+// RPO recursion never processed.
 
 void Analyzer::processStateBeforeLoopOnOverflow(Loop *L) {
   // Every VO still virtual at the loop's forward end (preheader exit) is
@@ -8162,11 +8147,10 @@ void Analyzer::materializePreheaderVirtualsForUnvisitedLoops() {
   for (Loop *L : AllLoops) {
     BasicBlock *PH = L->getLoopPreheader();
     if (!PH) {
-      // Loops without a unique preheader are drained in-place by
-      // processLoop (it materialises every still-virtual VO at every
-      // forward header predecessor). This branch is a defense-in-depth
-      // no-op: the safety net cannot pick a single PH to drain at when
-      // none exists, so the only sound action here is to skip.
+      // processLoop handles loops without a unique preheader by marking every
+      // VO live at a forward header predecessor ineligible, preserving the
+      // original IR. This safety net cannot select a unique drain point, so it
+      // has nothing further to do here.
       continue;
     }
     assert(
@@ -8175,7 +8159,7 @@ void Analyzer::materializePreheaderVirtualsForUnvisitedLoops() {
     // Strict gate on VisitedLoops. Every loop processLoop touched —
     // whether the body fixpoint converged, fell into the pessimistic
     // MATERIALIZE_ALL fallback, or hit the overflow-recovery retry path
-    // — already had its preheader virtuals handled inside processLoop.
+    // — was already handled by processLoop. Converged loops need no drain.
     // The only loops that need this safety-net drain are those
     // processLoop never visited (an unreachable top-level loop the RPO
     // walk skipped, or a sub-loop whose outer recursion returned early
@@ -8243,8 +8227,9 @@ bool Analyzer::isReplayEdgeSupported(BasicBlock *PH,
 //    effect in the dedicated block. OrigAlloc is reused as the value and
 //    already dominates the edge.
 //  - Block-end drain (EdgeLocal=false): replay intentionally applies to every
-//    successor and the shared ExitInfo is flipped. Loop-preheader drains use
-//    this form to prevent virtual state crossing an unsupported loop boundary.
+//    successor and the shared ExitInfo is flipped. Overflow recovery and the
+//    truly-unvisited-loop safety net use this form to start subsequent
+//    processing with no virtual object live at the loop entry.
 void Analyzer::materializeAtPredFromExitInfo(jeandle::ObjectID ID,
                                              BasicBlock *PH,
                                              BlockExitData &ExitInfo,
@@ -8364,15 +8349,14 @@ void Analyzer::materializeAtPredFromExitInfo(jeandle::ObjectID ID,
 // ===========================================================================
 //
 // Structure mirrors Graal: an OUTER retry loop wraps an INNER fixpoint (up to
-// MaxLoopFixpointIters = 10 body passes). Each inner pass starts from a clean
-// rollback to the pre-loop snapshot (LoopSnapshot). The fixpoint variable is
-// the per-block exit state of every loop block: mergeStates(Header) on pass i+1
-// sees the preheader BlockExitInfo plus the pass-i backedge BlockExitInfo, so
-// decisions stabilise once the per-block exits do (Jeandle's BlockExits-based
-// convergence stands in for Graal's equivalentTo on cloned state). Field PHIs
-// at the loop header MUST be stable across passes (same Value*) for the
-// convergence comparison — that is the purpose of LoopFieldPhiCache /
-// OwnedLoopFieldPhis.
+// MaxLoopFixpointIters = 10 body passes). The fixpoint state B starts as the
+// preheader state A. After each body pass, mergeStates(Header) computes
+// B' = merge(A, fresh latch states), and convergence compares B' with B.
+// BlockExits for loop blocks are retained across iteration rollback so the
+// next in-pass header merge can see the previous latch contribution; they are
+// not themselves the convergence variable. Field PHIs inside the loop MUST be
+// stable across passes (same Value*) for B/B' structural equivalence — that is
+// the purpose of LoopFieldPhiCache / OwnedLoopFieldPhis.
 //
 // On non-convergence OR overflow (OverflowFlag, latched in ensureMaterialized
 // under Mode::StopNewInLoopNest), escalate to Mode::MaterializeAll ONCE and
@@ -8588,10 +8572,9 @@ void Analyzer::restoreLoopSnapshot(
   // learn the loop-internal contribution (the back-edge pred is later in RPO
   // than the header, so wiping it would leave mergeStates seeing only the
   // preheader). snapshotExitState() at the end of each processBlock
-  // overwrites the stale entry with the iteration's fresh result, and the
-  // convergence check compares iter (N+1)'s CurExits against iter N's
-  // LastExits, so a never-changing BlockExits still converges after one extra
-  // iteration.
+  // overwrites the stale entry with the iteration's fresh result. Convergence
+  // compares the post-body NewMergedState (B') with LastMergedState (B); the
+  // preserved BlockExits only supply the next in-pass latch contribution.
   //
   // BlockEffects and MaterializedAtPred MUST be rolled back (they accumulate
   // emitted-effect side-data; leaving them would duplicate effects across

@@ -4,8 +4,9 @@
 ; allocated BEFORE the loop is captured (escapes) on a CONDITIONAL path INSIDE
 ; the body that then CONTINUES to the latch (so the escape block is a loop
 ; block -> EscapeLoop != AllocLoop). The object is not used after the loop.
-; Loop-body partial escape materializes the object exactly once before the loop
-; (Graal materializedValuePhi, trivial here) and the capture uses it.
+; Jeandle retains the one source OrigAlloc before the loop and places any
+; required replay at the preheader, so the capture uses that same value on
+; every iteration.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @capture(ptr addrspace(1))

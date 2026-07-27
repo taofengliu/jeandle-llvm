@@ -10,7 +10,8 @@
 ; Fields-union step catches the conflict: unioning right's i32@12 into a VO that
 ; already holds i64@8 makes getOrCreateFieldIndex return -1 (overlap). The merge
 ; must bail, falling through to Case A — both objects materialize at their
-; predecessor terminators and the PHI carries the two materialized invokes.
+; predecessor terminators by retaining their OrigAllocs and replaying the
+; tracked fields there. The PHI carries the two source pointers.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))

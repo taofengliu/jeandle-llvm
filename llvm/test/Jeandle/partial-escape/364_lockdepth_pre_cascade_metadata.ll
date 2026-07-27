@@ -9,10 +9,9 @@
 ; B's enter on the virtual lock stack corrupted because A's real monitorenter
 ; wouldn't be present in IR.
 ;
-; A materialises at B's enter; both A's enter and the un-elide
-; ReplaceInput emit a real call site for A. B stays virtual until the
-; actual sink (which only references A in this test); B has nothing
-; observable to materialise for, and its enter folds away.
+; A materialises at B's enter and its captured lock is re-emitted on OrigAlloc.
+; B stays virtual until the actual sink (which only references A in this
+; test); B has nothing observable to materialise for, and its enter folds away.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr) nounwind
@@ -51,14 +50,14 @@ u:
 }
 
 ; A is materialised (either at pre-cascade time or at the sink); A's enter
-; survives on the materialised pointer; A's exit also survives. We do not
+; and exit use its retained OrigAlloc. We do not
 ; over-constrain B's status — the conservative behaviour is for B to also
 ; materialise via the cascade-on-A path, but the post-conditions we PIN
 ; are A-only.
 ; CHECK-LABEL: define void @test_lockdepth_pre_cascade_metadata
-; CHECK: %[[MATA:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 31415 to ptr), i32 16)
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MATA]],
-; CHECK: call void @sink(ptr addrspace(1) %[[MATA]])
-; CHECK: call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1) %[[MATA]],
+; CHECK: %[[ORIGA:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 31415 to ptr), i32 16)
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1) %[[ORIGA]],
+; CHECK: call void @sink(ptr addrspace(1) %[[ORIGA]])
+; CHECK: call hotspotcc void @jeandle.monitorexit_with_lightweight_lock(ptr addrspace(1) %[[ORIGA]],
 
 !java-method-compilation = !{}

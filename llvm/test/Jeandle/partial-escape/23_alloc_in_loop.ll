@@ -2,10 +2,9 @@
 
 ; PEA: the allocation lives inside a loop body and escapes via @sink on
 ; every iteration. processAllocation virtualizes loop-body allocs; the @sink
-; call forces materialization at the alloc's SafeIP (still inside the loop).
-; The IR therefore still contains a
-; jeandle.new_instance invoke per iteration — just rewritten through the
-; analyzer's materialization machinery instead of left untouched.
+; call changes its abstract state to materialized. The original
+; jeandle.new_instance remains at its source site and executes per iteration;
+; no replacement allocation is emitted at the escape.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -33,8 +32,10 @@ u:
   resume i64 %lp
 }
 
-; Loop-body alloc is preserved as an invoke.
+; Loop-body OrigAlloc is preserved as the only invoke and feeds @sink.
 ; CHECK-LABEL: define void @test_loop_alloc
-; CHECK: invoke {{.*}}@jeandle.new_instance
+; CHECK: %o = invoke {{.*}}@jeandle.new_instance
+; CHECK-NOT: @jeandle.new_instance
+; CHECK: call void @sink(ptr addrspace(1) %o)
 
 !java-method-compilation = !{}

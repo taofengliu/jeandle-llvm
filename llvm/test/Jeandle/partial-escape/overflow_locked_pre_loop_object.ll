@@ -3,6 +3,9 @@
 ; RUN:     -jeandle-pea-loop-cutoff=0 %s | FileCheck %s --check-prefix=IR
 ; RUN: opt -disable-output -passes="require<partial-escape-analysis>" \
 ; RUN:     -jeandle-pea-loop-cutoff=0 -stats %s 2>&1 | FileCheck %s --check-prefix=STATS
+; RUN: opt -disable-output -jeandle-trace-pea \
+; RUN:     -passes="require<partial-escape-analysis>,partial-escape-transform" \
+; RUN:     -jeandle-pea-loop-cutoff=0 %s 2>&1 | FileCheck %s --check-prefix=TRACE
 
 ; E1 — STOP_NEW overflow escalation carrying a live lock.
 ;
@@ -63,5 +66,8 @@ u:
 
 ; The STOP_NEW overflow escalated the loop to MATERIALIZE_ALL:
 ; STATS: partial-escape-analysis - Regular -> MaterializeAll mode flips (escalations)
+; The final recovered plan replays fields and the captured lock at the
+; preheader rather than creating another allocation in the loop.
+; TRACE: PEA: Materialize function=@test_overflow_locked [VO=0] block=%e.cont target=
 
 !java-method-compilation = !{}

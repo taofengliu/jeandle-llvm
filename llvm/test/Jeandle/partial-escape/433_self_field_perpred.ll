@@ -7,7 +7,7 @@
 ; both arms and the merge, so o is kept alive as the one SSA value: the
 ; self-referential field replays onto OrigAlloc (storing %o into its own
 ; field), both sink calls receive OrigAlloc directly, and NO materialized-
-; object PHI is needed at the merge (no per-pred NewInv, no pea.mat).
+; object PHI or additional allocation is needed at the merge.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))

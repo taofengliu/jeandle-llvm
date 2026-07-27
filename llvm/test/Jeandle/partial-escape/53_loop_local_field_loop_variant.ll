@@ -2,12 +2,10 @@
 
 ; PEA: a loop body allocates an object, stores into one field a value
 ; computed from the loop counter (i.e. defined AFTER the alloc, inside the
-; alloc's normal-dest block), then escapes via @sink. materializeAt's
-; per-field dominance check rejects the materialization because the stored
-; value does not dominate the alloc's SafeIP. The analyzer marks the object
-; ineligible; the allocation invoke survives untouched. Conservative but
-; sound — a future loop-fixpoint extension can recover this case by
-; hoisting the stored value or moving the SafeIP forward.
+; alloc's normal-dest block), then escapes via @sink. Under reuse-OrigAlloc the
+; computed value only needs to dominate its replay point, not the allocation
+; site. The source invoke remains and the loop-variant value is replayed before
+; the sink.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -40,11 +38,11 @@ u:
   resume i64 %lp
 }
 
-; Dominance check fails => alloc is preserved as the original invoke. The
-; @sink call still receives the original alloc.
+; OrigAlloc is the sole allocation; the loop-variant store and sink use it.
 ; CHECK-LABEL: define void @test_loop_loop_variant_escape
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
-; CHECK: store atomic i32
-; CHECK: call void @sink
+; CHECK: %o = invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK-NOT: @jeandle.new_instance
+; CHECK: store atomic i32 %comp
+; CHECK: call void @sink(ptr addrspace(1) %o)
 
 !java-method-compilation = !{}

@@ -4,8 +4,9 @@
 ; same virtual predecessor. `else` branches to `merge` and `S`, and o is
 ; virtual on both edges, so under reuse-OrigAlloc the single OrigAlloc is kept
 ; alive and the self-referential field replays ONCE PER escaping edge (two
-; replayed stores onto OrigAlloc). No per-pred NewInv, no pea.mat, and no
-; materialized-object PHI at either merge — OrigAlloc is the single SSA value.
+; replayed stores onto OrigAlloc). No additional allocation or
+; materialized-object PHI is needed at either merge — OrigAlloc is the single
+; SSA value.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))

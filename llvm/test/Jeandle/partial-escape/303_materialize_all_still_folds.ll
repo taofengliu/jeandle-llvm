@@ -9,8 +9,8 @@
 ; the alloc is registered (intra-block FieldStates are populated), the
 ; load against the same slot folds against FieldStates to the constant
 ; 7, and @sink_i32 is called with that constant. The end-of-block
-; deferred Materialize re-emits the alloc at the terminator (the
-; original alloc is RAUW'd to the new invoke).
+; deferred Materialize retains OrigAlloc and replays the final field state;
+; it does not emit a new allocation.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink_i32(i32)
@@ -47,6 +47,9 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_mat_all_folds
+; OrigAlloc remains the sole allocation.
+; CHECK: %obj = invoke {{.*}}@jeandle.new_instance
+; CHECK-NOT: @jeandle.new_instance
 ; The intra-block load folded to the constant 7 against FieldStates.
 ; CHECK-NOT: load atomic i32
 ; CHECK: call void @sink_i32(i32 7)

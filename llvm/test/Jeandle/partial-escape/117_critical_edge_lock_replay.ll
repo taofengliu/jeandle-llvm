@@ -3,29 +3,15 @@
 ; RUN:   -passes="require<partial-escape-analysis>,partial-escape-transform" %s 2>&1 \
 ; RUN:   | FileCheck %s --check-prefix=TRACE
 
-; Split critical edges before per-pred materialisation.
+; Lock replay on a critical predecessor.
 ;
-; The pre-Pass-1 critical-edge split in PartialEscapeTransform inspects
-; every IsPerPred Materialize effect and, when the recorded PH has
-; multiple successors and the merge successor has multiple predecessors,
-; splits the PH→merge critical edge so the materialisation invoke (and
-; its OOM-throwing unwind) only lives on the merge-bound path.
+; The virtual-object lock state differs across the two incoming paths. PEA
+; retains the original allocation and re-emits the required monitorenter on
+; that same %o receiver. Replay placement remains edge-sensitive: a
+; predecessor with another successor must not leak merge-only lock effects
+; onto the cold path. The verifier and trace checks cover the normalized
+; replay plan; no fresh allocation is created at the merge.
 ;
-; Under the current SkipGlobalRAUW=true policy in mergeStates, the only
-; analyzer path that emits IsPerPred Materialize effects is the
-; lock-mismatch cascade (PartialEscapeAnalysis.cpp:1386-1396). That path
-; also emits ReplaceInput effects for the un-elided monitorenter calls
-; that sit in PH; moving the Materialize to a new edge-block PH' would
-; break SSA dominance for the un-elided receiver. The transform's
-; pre-pass therefore SKIPS the split when PH carries any ReplaceInput
-; effect.
-;
-; This test exercises the lock-mismatch + critical-edge path and asserts
-; the IR remains well-formed (verifyFunction passes) and the
-; lock-cascade machinery still materialises both arms per the existing
-; 250_lock_mismatch_one_arm_locked.ll contract. The full
-; OOM-only-on-merge guarantee will be restored when a richer un-elide
-; model or the LockState port becomes available.
 ; The else arm holds an external padding monitor so both incoming CFG depths
 ; are one. The virtual-object lock state still differs across the merge, and
 ; both dynamic paths release exactly the monitor they acquired.
@@ -70,13 +56,13 @@ u:
   resume i64 %lp
 }
 
-; The lock-mismatch cascade must still materialise %o per-pred; the
-; verifyFunction gate ensures the resulting IR is well-formed even when
-; the pre-pass declines to split the critical edge.
+; The original allocation is the sole receiver allocation. The lock mismatch
+; must re-emit a real enter for %o without creating another new_instance.
 ; CHECK-LABEL: define void @critical_edge_lock_mismatch
-; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK: %o = invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK-NOT: @jeandle.new_instance
 ; CHECK-NOT: tail call hotspotcc void @jeandle.monitorenter_with_thin_lock
-; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock
+; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %o,
 ; TRACE: PEA: LockReplay function=@critical_edge_lock_mismatch
 
 !java-method-compilation = !{}

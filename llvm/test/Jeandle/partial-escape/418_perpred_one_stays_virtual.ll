@@ -5,15 +5,11 @@
 ; reuse-OrigAlloc model. PH (`else`) has TWO successors: `merge` (mixed) and
 ; `D` (single-pred, o stays virtual, never escapes).
 ;
-; Historically the per-pred flip had to NOT leak to `D`: `D` saw o as virtual
-; on the else->D edge (clone not shared), so no per-pred mat fired there and
-; no OOM-unwind lived on that edge; only else->merge was split with a pea.mat.
-;
-; Under reuse-OrigAlloc the original allocation %o dominates every successor,
-; so it is the single value on ALL edges: no per-pred mat fires anywhere, no
-; edge is split. `D` still has no invoke (it never escapes), and its `ret` is
-; unchanged. The then-arm escape replays the tracked field store onto %o and
-; sinks %o.
+; OrigAlloc %o dominates every successor and is the real identity on escaping
+; paths. The target-local materialized state for `merge` does not leak to `D`;
+; because the virtual `else` state has no field or lock replay, no physical
+; edge effect or split is needed. `D` remains a non-escaping path, and the
+; then-arm escape replays the tracked field store onto %o before sinking it.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -36,8 +32,8 @@ else:
   ; o is virtual. TWO successors: merge and D.
   br i1 %c2, label %merge, label %D
 merge:
-  ; Mixed merge of then (materialized) and else (virtual) -> per-pred mat at
-  ; else for merge.
+  ; Mixed merge of then (materialized) and else (virtual); merge records
+  ; OrigAlloc as the real identity for the virtual incoming.
   br label %exit
 D:
   ; Single-pred (else). o stays virtual here, never escapes. No materialize.

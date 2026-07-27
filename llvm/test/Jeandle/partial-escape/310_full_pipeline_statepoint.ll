@@ -8,22 +8,20 @@
 ; that perform loop-explosion / partial-evaluation merges, which Jeandle
 ; does not.
 ;
-; This test exercises the FULL Jeandle pipeline relevant to materialized
-; allocations:
+; This test exercises the FULL Jeandle pipeline relevant to retained
+; PartiallyEscapes allocations:
 ;   PEA analyze -> PEA transform -> InsertGCBarriers -> RewriteStatepointsForGC
 ;
-; across three shapes that stress materialization-point placement:
-;   1. @t_mat_plain  - single materialize at an escape call site
+; across three shapes that stress replay and GC statepoint handling:
+;   1. @t_mat_plain  - single escape call site
 ;   2. @t_mat_mixed  - mixed-state merge (virtual on one pred, escaped on
-;                      the other), materialization synthesized before the
-;                      escape call
-;   3. @t_mat_phi    - per-pred materialization on both incoming edges of
-;                      a PHI that flows into an escape call
+;                      the other)
+;   3. @t_mat_phi    - two retained allocations feeding a PHI that escapes
 ;
 ; For each case we assert that:
-;   - The PEA-materialized invoke is wrapped by `gc.statepoint`
-;   - The materialized pointer is recovered via `gc.result`
-;   - Subsequent escape calls list the materialized/relocated pointer in
+;   - Each retained allocation invoke is wrapped by `gc.statepoint`
+;   - Its pointer is recovered via `gc.result`
+;   - Subsequent escape calls list the retained/relocated pointer in
 ;     their `gc-live` operand bundle (stack-map entry preserved)
 ;   - The synthesized landingpad has type `token` (RewriteStatepointsForGC's
 ;     rewrite of the i64 landingpad — proves the exception edge survived)
@@ -73,14 +71,13 @@ u:
 }
 
 ; CHECK-LABEL: define void @t_mat_plain
-; The PEA-materialized invoke is wrapped by gc.statepoint and routes to
-; the materialization-continuation block on the normal edge.
+; The retained source allocation is wrapped by gc.statepoint.
 ; CHECK: invoke hotspotcc token (i64, i32, ptr, i32, i32, ...) @llvm.experimental.gc.statepoint.p0
 ; CHECK-SAME: ptr addrspace(1) (ptr, i32)) @jeandle.new_instance
 ; CHECK: gc.result
 ; CHECK: call token (i64, i32, ptr, i32, i32, ...) @llvm.experimental.gc.statepoint.p0
 ; CHECK-SAME: void (ptr addrspace(1))) @sink
-; The materialized pointer is live across the @sink statepoint -> appears
+; The retained pointer is live across the @sink statepoint -> appears
 ; in the gc-live bundle and a gc.relocate is produced for it.
 ; CHECK-SAME: "gc-live"
 ; CHECK: gc.relocate
@@ -123,9 +120,8 @@ u:
 ; CHECK: landingpad token
 
 ;; ---------------------------------------------------------------------
-;; Case 3: per-pred materialization across a PHI that escapes post-merge.
-;; Both branches allocate; the PHI merges two virtual incomings; the
-;; escape call after the merge forces materialize on each pred.
+;; Case 3: two source allocations feed a PHI that escapes post-merge.
+;; Their Klass values differ, so Case C is rejected and both OrigAllocs remain.
 ;; ---------------------------------------------------------------------
 define void @t_mat_phi(i1 %c) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:

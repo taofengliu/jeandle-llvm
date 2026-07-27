@@ -4,7 +4,7 @@
 ; alias. Casting to addrspace(0) (or any other AS) crosses the Java-heap
 ; boundary and forces materialization. Test: alloc, cast to AS(0), pass to a
 ; non-AS sink. The allocation must survive the analysis pass as a
-; materialized invoke.
+; retained OrigAlloc.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink_as0(ptr)
@@ -25,8 +25,9 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_addrspacecast_escape
-; CHECK: jeandle.new_instance
-; CHECK: addrspacecast ptr addrspace(1)
-; CHECK: call void @sink_as0
+; CHECK: %o = invoke {{.*}}@jeandle.new_instance
+; CHECK-NOT: @jeandle.new_instance
+; CHECK: %as0 = addrspacecast ptr addrspace(1) %o to ptr
+; CHECK: call void @sink_as0(ptr %as0)
 
 !java-method-compilation = !{}

@@ -5,15 +5,11 @@
 ; PH (`else`) has THREE successors via a switch: merge1, merge2 (both mixed ->
 ; per-pred mat at else) and D (o virtual, no escape, single-pred).
 ;
-; Historically the two critical edges (else->merge1, else->merge2) had to be
-; split with their own per-pred NewInv, while the else->D edge (not critical)
-; stayed unchanged and carried no pea.mat.
-;
-; Under reuse-OrigAlloc the original allocation %o dominates all three
-; successors, so no per-pred mat fires and no edge is split: `else` retains
-; its original three-way switch verbatim. Both merge escapes consume %o
-; directly, and `D` still has no invoke (o never escapes there). No %pea.mat,
-; no pea.crit.split.
+; OrigAlloc %o dominates all three successors. With no field or lock state to
+; replay, the two per-merge state transitions need no physical effects and no
+; edge is split: `else` retains its original three-way switch verbatim. Both
+; merge escapes consume %o directly, while `D` has no additional allocation
+; or replay because the object does not escape there.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -37,11 +33,11 @@ else:
   switch i32 %c2, label %D [ i32 0, label %merge1
                               i32 1, label %merge2 ]
 merge1:
-  ; preds: split (materialized), else (virtual) -> per-pred at else for merge1.
+  ; preds: split (materialized), else (virtual) -> merge state uses OrigAlloc.
   call void @sink(ptr addrspace(1) %o)
   ret void
 merge2:
-  ; preds: split (materialized), else (virtual) -> per-pred at else for merge2.
+  ; preds: split (materialized), else (virtual) -> merge state uses OrigAlloc.
   call void @sink(ptr addrspace(1) %o)
   ret void
 D:

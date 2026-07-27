@@ -3,13 +3,10 @@
 ; Loop with TWO exit blocks. The alloc happens before the loop (entry →
 ; prep, where prep is the unique loop-preheader so the loop fixpoint
 ; runs). Inside the loop body, the alloc escapes via @sink on every
-; iteration → materializeAt hoists a new invoke to the alloc's SafeIP
-; (prep's first non-PHI), and applyMaterialize RAUWs OrigAlloc → NewInv
-; function-wide. Both exit blocks (one reached via the !c branch from the
-; header, one via a break inside the body) read %o; after RAUW they both
-; see the same materialized pointer with no per-exit-block PHI synthesis
-; needed — this is the "materialized at loop exit" case that reduces to
-; function-wide RAUW in our LLVM model.
+; iteration, so PEA retains OrigAlloc %o. Both exit blocks (one reached via
+; the !c branch from the header, one via a break inside the body) read the
+; same dominating source pointer; no per-exit allocation or
+; materialized-object PHI is needed.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -46,13 +43,12 @@ u:
   resume i64 %lp
 }
 
-; Exactly one new materialization invoke. Both exit-block uses receive
-; the same materialized pointer via function-wide RAUW.
+; Exactly one allocation: the original %o. Every consumer receives it.
 ; CHECK-LABEL: define void @test_a6_multiple_exits
-; CHECK: %[[MAT:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance
-; CHECK-DAG: call void @sink(ptr addrspace(1) %[[MAT]])
-; CHECK-DAG: call void @ret_use_a(ptr addrspace(1) %[[MAT]])
-; CHECK-DAG: call void @ret_use_b(ptr addrspace(1) %[[MAT]])
-; CHECK-NOT: jeandle.new_instance
+; CHECK: %o = invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK-NOT: @jeandle.new_instance
+; CHECK-DAG: call void @sink(ptr addrspace(1) %o)
+; CHECK-DAG: call void @ret_use_a(ptr addrspace(1) %o)
+; CHECK-DAG: call void @ret_use_b(ptr addrspace(1) %o)
 
 !java-method-compilation = !{}

@@ -13,9 +13,9 @@
 ; materializeAt RECURSIVELY materializes inner0 (MatReason::Nested) before
 ; replaying the tracked arr[0]=inner0 store onto arr's OrigAlloc
 ; (pea.matslot), so the replayed store and the symbolic store both write
-; live pointers. The commit-time VirtualRefEdges cascade remains as a
-; backstop for objects made ineligible by NON-store paths while holding
-; VirtualRef fields — see 674_commit_cascade_lock_imbalance.ll.
+; live pointers. Conservative fallback dependencies are rebuilt at commit
+; from surviving/observed EliminateStore effects plus
+; VirtualRefStoreTargets, so only live VirtualRef definitions participate.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)

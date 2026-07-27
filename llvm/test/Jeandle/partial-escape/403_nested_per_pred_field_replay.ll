@@ -8,18 +8,12 @@
 ; (right) -- a lock mismatch -- AND outer.field (offset 8) holds a SECOND
 ; virtual object `inner` (22222).
 ;
-; Historically the lock mismatch drove per-pred materialization of outer at
-; each pred, recursively per-pred-materializing inner at the same pred, with
-; each pred's field store replaying that pred's OWN inner-NewInv into its
-; outer-NewInv, reconciled by materializedValuePhis.
-;
-; Under reuse-OrigAlloc the ORIGINAL allocation invokes (%outer, %inner) are
-; both KEPT and dominate every escape. The lock mismatch no longer allocates
-; fresh invokes: the right-arm monitorenter is re-emitted onto %outer in
-; `right`, and the outer.f=inner field store is replayed onto %outer (with
+; The original allocation invokes (%outer, %inner) are both retained and
+; dominate every escape. The right-arm monitorenter is re-emitted onto %outer
+; in `right`, and the outer.f=inner field store is replayed onto %outer (with
 ; %inner as the value) at each materialization point (left and right). No
-; %pea.mat, no materialized-object PHI, no critical-edge split. The escape
-; consumes %outer directly.
+; additional allocation, materialized-object PHI, or critical-edge split is
+; needed. The escape consumes %outer directly.
 ; The left arm holds an external padding monitor and the merged owner is
 ; released after the sink, keeping both CFG paths balanced at scalar depth one.
 

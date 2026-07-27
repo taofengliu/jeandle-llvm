@@ -3,6 +3,9 @@
 ; RUN:     -jeandle-pea-loop-cutoff=1 %s | FileCheck %s --check-prefix=IR
 ; RUN: opt -disable-output -passes="require<partial-escape-analysis>" \
 ; RUN:     -jeandle-pea-loop-cutoff=1 -stats %s 2>&1 | FileCheck %s --check-prefix=STATS
+; RUN: opt -disable-output -jeandle-trace-pea \
+; RUN:     -passes="require<partial-escape-analysis>,partial-escape-transform" \
+; RUN:     -jeandle-pea-loop-cutoff=1 %s 2>&1 | FileCheck %s --check-prefix=TRACE
 
 ; A2 — STOP_NEW overflow escalation inside a NESTED loop structure.
 ;
@@ -70,5 +73,7 @@ u:
 
 ; The nest escalated to MATERIALIZE_ALL via the STOP_NEW overflow:
 ; STATS: partial-escape-analysis - Regular -> MaterializeAll mode flips (escalations)
+; The final recovered plan replays at the outer-loop preheader.
+; TRACE: PEA: Materialize function=@test_overflow_nested_outer_body [VO=0] block=%e.cont target=
 
 !java-method-compilation = !{}

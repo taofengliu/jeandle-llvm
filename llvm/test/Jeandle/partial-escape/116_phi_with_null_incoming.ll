@@ -4,8 +4,8 @@
 ; on one arm and a null pointer on the other. The merge-time AliasMap
 ; consultation marks the virtual-incoming side eligible for per-pred
 ; materialization; the null side is treated as a non-virtual pointer.
-; The resulting Materialize lands on the virtual-side pred's terminator
-; and the PHI survives in IR with %[[MAT]] / null incomings.
+; Materialization retains OrigAlloc on the virtual arm and the PHI survives
+; with %o / null incomings.
 ;
 ; This is purely a regression guard — today's processBlockPhis Case-A
 ; fallback at PartialEscapeAnalysis.cpp already handles the pattern; we
@@ -34,12 +34,11 @@ u:
   resume i64 %lp
 }
 
-; The virtual on the alloc arm is materialized at the alloc pred (so the
-; PHI's first incoming becomes the materialized invoke); the null arm is
-; unchanged. The PHI survives.
+; OrigAlloc is the only allocation; the null arm is unchanged.
 ; CHECK-LABEL: define void @test_phi_virt_null
-; CHECK: invoke{{.*}}@jeandle.new_instance
-; CHECK: phi ptr addrspace(1)
-; CHECK: call void @sink
+; CHECK: %o = invoke{{.*}}@jeandle.new_instance
+; CHECK-NOT: @jeandle.new_instance
+; CHECK: %x = phi ptr addrspace(1) [ %o, %alloc ], [ null, %nullarm ]
+; CHECK: call void @sink(ptr addrspace(1) %x)
 
 !java-method-compilation = !{}

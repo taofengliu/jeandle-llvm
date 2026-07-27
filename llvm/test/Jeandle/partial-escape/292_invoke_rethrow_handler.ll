@@ -6,11 +6,9 @@
 ; analyzer in a confused state (e.g. by treating the pre-invoke snapshot
 ; as authoritative for a sink-only handler).
 ;
-; In particular, the materialization Effect emitted by the invoke is
-; inserted BEFORE the invoke, so the materialized invoke is also a
-; terminator of the entry block; the handler block must still be
-; well-formed after the transform (landingpad + resume present, no
-; dangling SSA references).
+; The escape retains OrigAlloc; replay effects, if any, are inserted before
+; the consumer invoke. The handler block must remain well-formed (landingpad +
+; resume present, no dangling SSA references).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -36,11 +34,12 @@ u_a:
   resume i64 %lpa
 }
 
-; VO_A materializes for the @sink call. The materialization invoke must
-; reuse VO_A's klass. The handler must still terminate with `resume`.
+; VO_A's source allocation is retained as the only allocation and the handler
+; still terminates with `resume`.
 ; CHECK-LABEL: define void @test_292
-; CHECK: invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
-; CHECK: invoke void @sink
+; CHECK: %a = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
+; CHECK-NOT: @jeandle.new_instance
+; CHECK: invoke void @sink(ptr addrspace(1) %a)
 ; CHECK: resume i64
 
 !java-method-compilation = !{}

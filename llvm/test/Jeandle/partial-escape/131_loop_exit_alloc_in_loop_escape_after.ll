@@ -2,14 +2,13 @@
 
 ; Alloc INSIDE the loop body, escape AFTER the loop exit. The body alloc
 ; is tracked through the back-edge, and the post-loop @sink call
-; materializes the object at the alloc's SafeIP (still inside the body).
-; Function-wide RAUW on the original alloc means the post-loop use sees
-; the materialized pointer.
+; changes the object to materialized state. OrigAlloc stays at its source
+; position and is the pointer observed after the loop.
 ;
 ; Pre-LCSSA, the original IR uses %o directly in the exit block: the
 ; body block dominates the exit (single-pred exit from body). After
-; RAUW, the exit's use snaps onto the materialized invoke that also
-; lives in the body block — dominance is preserved by construction.
+; materialization, the exit use remains %o; dominance is preserved by the
+; original SSA shape.
 ;
 ; This exercises the "alloc-in-loop + escape-after-loop" path.
 
@@ -37,8 +36,7 @@ cont:
   %i1 = add i32 %i, 1
   br label %loop
 exit_use:
-  ; Post-loop use of the body-local alloc. After materialization + RAUW,
-  ; %o refers to the materialized invoke produced inside the body block.
+  ; Post-loop use of the retained body-local OrigAlloc.
   call void @sink(ptr addrspace(1) %o)
   ret void
 exit_null:
@@ -48,13 +46,12 @@ u:
   resume i64 %lp
 }
 
-; The body materializes the alloc at its SafeIP; the field store is
-; replayed; the post-loop @sink call receives the materialized pointer
-; via the function-wide RAUW. Exactly one new_instance invoke survives,
-; and there is no separate preheader force-materialize.
+; The field store is replayed onto OrigAlloc and @sink receives %o. Exactly one
+; new_instance invoke survives, with no separate preheader allocation.
 ; CHECK-LABEL: define void @test_a6_alloc_in_loop_use_after
-; CHECK: %[[MAT:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK: %[[ORIG:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance
+; CHECK-NOT: @jeandle.new_instance
 ; CHECK: store atomic i32 %x, ptr addrspace(1) %{{.*}}
-; CHECK: call void @sink(ptr addrspace(1) %[[MAT]])
+; CHECK: call void @sink(ptr addrspace(1) %[[ORIG]])
 
 !java-method-compilation = !{}

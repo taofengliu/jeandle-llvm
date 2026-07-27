@@ -5,16 +5,15 @@
 
 ; Lock-cascade merge under the reuse-OrigAlloc model. Two preds join at
 ; %merge with lock counts 0 (left) and 1 (right) on the same virtual object
-; -- a lock disagreement that historically fired per-pred materialization at
-; every pred (each emitting its own fresh alloc invoke and selecting between
-; them with a materializedValuePhi).
+; -- a lock disagreement that requires the merge to reconcile per-pred object
+; state.
 ; The left arm holds an external padding monitor, so both CFG edges have depth
 ; one even though their virtual-object states disagree.
 ;
 ; Under reuse-OrigAlloc the original allocation invoke (%o) is the SINGLE
 ; retained value: it dominates both preds and the merge. The right-arm lock
-; (LC=1) is already on %o in the IR, so no per-pred materialize fires, no
-; fresh alloc invoke is emitted, and no materialized-object PHI is needed.
+; (LC=1) is already on %o in the IR, so no additional allocation or
+; materialized-object PHI is needed.
 ; The return consumes OrigAlloc directly. (Field-value PHIs would still be
 ; built here for genuine per-offset field disagreements, but this scenario
 ; has none.)
@@ -58,8 +57,8 @@ u:
 ; Exactly one allocation invoke (the original, retained) for the whole fn.
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
 ; CHECK-NOT: invoke hotspotcc{{.*}}@jeandle.new_instance
-; The single right-arm lock is already on OrigAlloc %o -- no per-pred mat,
-; no fresh invoke, no un-elided enter snap to a NewInv.
+; The single right-arm lock is re-emitted on OrigAlloc %o; no additional
+; allocation is introduced.
 ; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %o, ptr %lock)
 ; CHECK-NOT: tail call hotspotcc void @jeandle.monitorenter_with_thin_lock
 ; No materialized-object PHI and no critical-edge split: the return consumes

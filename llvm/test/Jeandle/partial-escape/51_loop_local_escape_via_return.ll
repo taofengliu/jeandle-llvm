@@ -2,11 +2,11 @@
 
 ; Loop-body partial escape (Case B): a loop-body allocation is stored into,
 ; then conditionally returned on one branch (= escape via a path that EXITS
-; the loop) or continues on the other. The escape block is not a loop block
-; (it returns), so the object stays scalar-replaced on the continue path and
-; is materialized ONLY on the return path; the continue path observes no
-; allocation at all. (Previously the materialize was hoisted to the alloc's
-; normal-dest, allocating every iteration even when dead.)
+; the loop) or continues on the other. Jeandle cannot sink the allocation to
+; the return because a newly placed allocation could not reconstruct the
+; correct deopt bundle. The original loop-body allocation therefore remains,
+; while field replay is needed only on the return path; the continue path
+; needs no replay.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare i32 @__gxx_personality_v0(...)
@@ -39,8 +39,8 @@ u:
   resume i64 %lp
 }
 
-; A new_instance invoke is materialized; the loop-invariant store is
-; replayed; the return uses the materialized pointer.
+; The original new_instance invoke is retained, the field store is replayed
+; for the escaping return, and the return uses OrigAlloc directly.
 ; CHECK-LABEL: define ptr addrspace(1) @test_loop_escape_return
 ; CHECK: %[[MAT:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance
 ; CHECK: store atomic i32 %x, ptr addrspace(1) %{{.*}}

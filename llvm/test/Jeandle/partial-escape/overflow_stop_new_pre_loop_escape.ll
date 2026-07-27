@@ -3,6 +3,9 @@
 ; RUN:     -jeandle-pea-loop-cutoff=0 %s | FileCheck %s --check-prefix=IR
 ; RUN: opt -disable-output -passes="require<partial-escape-analysis>" \
 ; RUN:     -jeandle-pea-loop-cutoff=0 -stats %s 2>&1 | FileCheck %s --check-prefix=STATS
+; RUN: opt -disable-output -jeandle-trace-pea \
+; RUN:     -passes="require<partial-escape-analysis>,partial-escape-transform" \
+; RUN:     -jeandle-pea-loop-cutoff=0 %s 2>&1 | FileCheck %s --check-prefix=TRACE
 
 ; A1 — STOP_NEW overflow escalation (the core refactor test).
 ;
@@ -16,11 +19,9 @@
 ; preheader (processStateBeforeLoopOnOverflow), and redoes the body in
 ; MATERIALIZE_ALL (EffectsClosure.java:533-551).
 ;
-; The IR is identical to a direct (Regular-mode) materialization — the value of
-; this test is the STATS check: the escalation counter must advance, proving the
-; STOP_NEW overflow path fired (it never did before the refactor, which had the
-; check gated on MaterializeAll instead). The IR check confirms the escalation
-; still produces a sound, single materialization.
+; The escalation statistic proves that STOP_NEW overflow recovery ran. The
+; final effect trace pins replay to the loop preheader, while the IR check
+; confirms that replay retains the one original allocation.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -61,5 +62,9 @@ u:
 
 ; The STOP_NEW overflow fired and escalated the loop to MATERIALIZE_ALL:
 ; STATS: partial-escape-analysis - Regular -> MaterializeAll mode flips (escalations)
+; Standard materialization counters include effects later discarded by loop
+; rollback, so the final trace—not a per-reason counter—is the placement
+; oracle for the recovered plan.
+; TRACE: PEA: Materialize function=@test_overflow_pre_loop_escape [VO=0] block=%e.cont target=
 
 !java-method-compilation = !{}

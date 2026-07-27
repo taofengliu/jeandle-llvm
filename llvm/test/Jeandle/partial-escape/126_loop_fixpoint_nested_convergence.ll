@@ -1,16 +1,15 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Nested loops where the inner-body alloc escapes via a sink. The inner
-; loop's fixpoint converges with the obj marked escaped (every iteration
-; the materializeAt at the @sink emits a Materialize effect at the
-; alloc's SafeIP). The outer-loop fixpoint sees the inner-loop body
-; produce a stable BlockExits and converges. The alloc survives in IR.
+; Nested loops where the inner-body allocation escapes via a sink. With the
+; default cutoff (20), this two-deep nest stays in Regular mode: it exercises
+; recursive B/B' convergence, not STOP_NEW overflow. The allocation is
+; retained as OrigAlloc and the sink consumes it directly.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
-define void @test_nested_overflow(i32 %n, i32 %m) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
+define void @test_nested_loop_convergence(i32 %n, i32 %m) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
   br label %outer
 outer:
@@ -41,8 +40,9 @@ u:
   resume i64 %lp
 }
 
-; CHECK-LABEL: define void @test_nested_overflow
-; CHECK: invoke {{.*}}@jeandle.new_instance
-; CHECK: call void @sink
+; CHECK-LABEL: define void @test_nested_loop_convergence
+; CHECK: %ob = invoke {{.*}}@jeandle.new_instance
+; CHECK-NOT: @jeandle.new_instance
+; CHECK: call void @sink(ptr addrspace(1) %ob)
 
 !java-method-compilation = !{}

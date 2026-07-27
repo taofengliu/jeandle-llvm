@@ -1,8 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Non-regression for #2.1: when the original alloc's unwind dest has NO phi
-; nodes (the common OOM-cleanup shape: landingpad + resume), reuse is safe and
-; still preferred — no pea.unwind block is synthesized.
+; The retained allocation keeps its original PHI-less OOM cleanup edge. PEA
+; must not synthesize a pea.unwind block merely because the object escapes.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -23,7 +22,7 @@ uw:
 
 ; CHECK-LABEL: define void @test_unwind_dest_no_phi
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
-; The materialization invoke reuses the PHI-less %uw; no synthesized block.
+; The source allocation still unwinds directly to %uw; no synthesized block.
 ; CHECK-NOT: pea.unwind
 ; CHECK: call void @sink(ptr addrspace(1)
 

@@ -265,8 +265,10 @@ enum class JeandleInlineReason : int {
 ///                         elide the check (klass is NOT value-based). For
 ///                         null/unresolved klass inputs the implementation
 ///                         must return false (PEA already gates the query
-///                         on VObj.Klass != 0, so any false is treated
-///                         conservatively).
+///                         on VObj.Klass != 0 and callback availability).
+///                         Therefore false for a queried exact Klass means it
+///                         is provably not value-based and the check is folded
+///                         away; the null case is only defensive API behavior.
 ///   IsBoxed              — Returns the JBasicType integer of the boxed
 ///                         primitive if the klass is one of the eight
 ///                         autobox wrapper classes (java.lang.Boolean,

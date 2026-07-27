@@ -13,10 +13,10 @@
 ; MaterializedAtPred, no further Effects are emitted, and the loop converges.
 ;
 ; Expected optimization: both outers are fully scalar-replaced (no
-; jeandle.new_instance for klass 67890). The single inner is materialized at
-; the end of the left arm. Each outer carries its own ptr addrspace(1) field
-; PHI at the merge selecting between the inner-materialized pointer and the
-; per-VO right-arm pointer.
+; jeandle.new_instance for klass 67890). The single inner's original
+; allocation is retained on the left arm. Each outer carries its own ptr
+; addrspace(1) field PHI at the merge selecting between the inner OrigAlloc
+; and the per-VO right-arm pointer.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -68,7 +68,7 @@ u:
 ; CHECK-LABEL: define void @test_a5_two_outer_shared_inner
 ; Outers fully scalar-replaced (klass 67890 nowhere in the body).
 ; CHECK-NOT: i64 67890
-; Inner is materialized exactly once on the left arm.
+; Inner has exactly one retained original allocation on the left arm.
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 12345 to ptr)
 ; Two distinct ptr addrspace(1) field PHIs at the merge.
 ; CHECK: = phi ptr addrspace(1)

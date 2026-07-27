@@ -3,8 +3,8 @@
 ; Real loop fixpoint: an alloc lives in entry and is used inside a loop
 ; only via a field load (no escape, no field mutation). The loop
 ; fixpoint tracks the object through the back-edge — every iteration
-; sees the same all-default field state, the convergence check passes
-; on iteration 2, and the alloc is FULLY ELIMINATED (no preheader
+; sees the same all-default field state, the first post-body B' equals
+; the entry state B, and the alloc is FULLY ELIMINATED (no preheader
 ; materialization). The load default-folds to zero. The analyser
 ; recognises that the loop body never escapes the object and skips the
 ; preheader force-materialise drain. The load folds to zero on every

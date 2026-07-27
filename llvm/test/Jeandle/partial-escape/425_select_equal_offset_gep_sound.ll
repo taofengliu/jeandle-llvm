@@ -2,12 +2,11 @@
 
 ; Select of equal-offset derived GEPs into a virtual object. %g1 and %g2 both
 ; offset %o by 16; %sel = select %c, %g1, %g2; the load is through %sel, whose
-; runtime address is %o+16 (field @16 = 42). The GEP arms are computed before
-; any materialize point, so PEA keeps %o real (markIneligible) rather than
-; materializing at the select, which would place pea.mat after the arms and
-; leave them resolving to poison. The object survives as a real allocation,
-; the select/load survive reading %o+16, and the load is NOT folded to the
-; field@0 value 7.
+; runtime address is %o+16 (field @16 = 42). A select does not preserve the
+; byte offset in the alias map, so PEA replays tracked state onto OrigAlloc at
+; the select and leaves the select/load real instead of mis-modelling it as
+; offset 0. OrigAlloc dominates both precomputed GEP arms, so they remain
+; valid; the load is not folded to the field@0 value 7.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)

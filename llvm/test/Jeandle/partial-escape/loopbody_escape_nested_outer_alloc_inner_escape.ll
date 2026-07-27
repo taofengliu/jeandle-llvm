@@ -2,12 +2,11 @@
 
 ; Loop-body partial escape, NESTED loops: object allocated BEFORE the outer
 ; loop escapes inside the INNER loop body (the @sink call flows to the inner
-; latch, so EscapeLoop = inner loop != AllocLoop = none). Graal builds a
-; materializedValuePhi at each enclosing loop header; the result must be a
-; SINGLE materialization before the OUTER loop (not one per outer iteration,
-; which would re-allocate the same object). The inner-preheader materialize
-; (which sits in the outer-loop body) is cleared by the outer fixpoint, and the
-; outer materializedValuePhi propagates materialization into the inner loop.
+; latch, so EscapeLoop = inner loop != AllocLoop = none). Jeandle retains the
+; single source OrigAlloc before the outer loop. The inner-preheader replay
+; produced by an intermediate nested-loop pass is cleared by the outer
+; fixpoint; the surviving replay is at the outer preheader and the same
+; OrigAlloc flows into the inner loop.
 ;
 ; This is the canonical "outer allocation partially escapes in inner loop"
 ; scenario. Soundness: exactly one allocation.
@@ -54,9 +53,8 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_nested_outer_alloc_inner_escape
-; Exactly ONE allocation, placed before the outer loop. A second allocation
-; (e.g. a per-outer-iteration materialize at the inner preheader) would be a
-; re-allocation soundness bug.
+; Exactly ONE source allocation remains before the outer loop. Replay must not
+; introduce a second allocation inside either loop.
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(
 ; CHECK-NOT: jeandle.new_instance
 ; Both the inner-loop escape and the post-loop use receive the single pointer.

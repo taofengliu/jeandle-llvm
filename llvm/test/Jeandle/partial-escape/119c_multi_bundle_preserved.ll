@@ -5,9 +5,7 @@
 ; fresh materialization invoke is emitted), so every operand bundle it carries
 ; survives untouched — there is no bundle-copy step that could drop or reorder
 ; bundles. Here the allocation carries both a "deopt" and a "cfguardtarget"
-; bundle; BOTH must remain on the retained invoke. This guards against any
-; future code path that re-emits the allocation and mishandles multi-bundle
-; copies (e.g. a loop that breaks after the first bundle).
+; bundle; BOTH must remain on the retained invoke.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))

@@ -1,9 +1,9 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; A callbr-created back-edge that LoopInfo does NOT model. The alloc +
-; store at entry survive in IR because the analyzer's defensive sweep
-; marks every still-virtual VO at %head ineligible on detecting the
-; unvisited back-edge.
+; Coverage for a callbr back-edge. This reducible CFG has a dominating header
+; and can be represented as a natural loop; it does not prove that the
+; missed-LoopInfo defensive sweep ran. The oracle records the current
+; conservative output while exercising the callbr terminator shape.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @asm_callbr()

@@ -18,8 +18,7 @@
 ;               At the merge the object is mixed (virtual on else, materialized
 ;               on if) but the alloc dominates the merge, so the VO is
 ;               classified PartiallyEscapes (Materialize effect survives,
-;               EliminateAllocation also survives because the original alloc
-;               is rewritten to a branch by Pass 2).
+;               and the original allocation is retained as OrigAlloc).
 ;
 ;  * @t_always: one VO with a store at a runtime (non-constant) byte offset.
 ;               processStore's resolveFieldOffset returns nullopt, so the

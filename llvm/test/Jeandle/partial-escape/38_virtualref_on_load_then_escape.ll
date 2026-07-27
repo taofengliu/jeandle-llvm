@@ -3,12 +3,12 @@
 ; VirtualRef-on-load + nested-virtual materialization: the load result
 ; from a VirtualRef field is passed to an opaque sink. The alias install
 ; makes the load result resolve to the inner ObjectID, so the sink call
-; escapes the *inner* virtual (not the outer). The inner must
-; materialize; the outer
+; escapes the *inner* virtual (not the outer). The inner's OrigAlloc must be
+; retained; the outer
 ; stays virtual end-to-end (no live use of the outer pointer except its
-; field, which is folded). After PEA we expect exactly one materialization
-; invoke (for the inner array's klass 12345) and the sink to receive the
-; new materialized pointer. The outer allocation disappears.
+; field, which is folded). After PEA we expect exactly the original inner
+; array invoke (klass 12345) and the sink to receive that OrigAlloc. The outer
+; allocation disappears.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
@@ -41,10 +41,10 @@ u2:
 ; CHECK-LABEL: define void @test_virtualref_on_load_then_escape
 ; The outer (klass 67890) is fully eliminated.
 ; CHECK-NOT: i64 67890
-; A materialization for the inner (klass 12345) is emitted.
+; The original allocation for the inner (klass 12345) is retained.
 ; CHECK: %[[MAT:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 4, i32 32, i32 16, i32 1048576)
 ; CHECK-NEXT: to label %{{.*}} unwind label %{{.*}}
-; The sink receives the newly materialized pointer, not the original load result.
+; The sink receives the inner OrigAlloc directly, not the eliminated load.
 ; CHECK: call void @sink(ptr addrspace(1) %[[MAT]])
 
 !java-method-compilation = !{}
