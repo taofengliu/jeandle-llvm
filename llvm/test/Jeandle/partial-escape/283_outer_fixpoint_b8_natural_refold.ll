@@ -1,23 +1,14 @@
 ; RUN: opt -S -passes="partial-escape-iterative" -jeandle-pea-iterations=2 %s | FileCheck %s
 
-; Natural-path re-foldable materialize. Round 1 of PEA materializes %o
-; at the escape arm via applyMaterialize, which emits a fresh
-; `jeandle.new_instance` invoke ("pea.mat") followed by separate `store`
-; instructions for each tracked field. After canonicalization between rounds
-; (InstCombine folds the load+icmp, SimplifyCFG drops the now-dead escape
-; arm, ADCE/the dead-code sweep cleans up), the analyzer's RPO walk in
-; round 2 sees the freshly materialized invoke as a brand-new allocation
-; site — processAllocation recognises it, the residual field stores are picked
-; up naturally as virtual-field writes, and the alloc is re-virtualized
-; and eliminated.
-;
-; This is the "without metadata" path: no AllocatedObjectNode-style
-; back-pointer is needed because the IR shape the materializer emits is
-; already in the form PEA can re-process.
+; Natural-path re-foldable materialization. Round 1 keeps %o at its original
+; allocation site and replays both tracked fields before the escape consumer.
+; Canonicalization between rounds folds the load+icmp and drops the dead
+; escape arm. Round 2 then analyzes the surviving OrigAlloc and replay-derived
+; state without introducing or relocating an allocation.
 ;
 ; What differs from 280: we write TWO fields, then read them back on the
-; fast path. The two stores survive round 1 (since the alloc was
-; materialized) and both are re-folded into the virtual state in round 2.
+; fast path. The retained source allocation carries replay for both stores,
+; which round 2 re-folds into virtual state.
 
 @G_zero = private unnamed_addr constant i32 0
 
@@ -54,10 +45,9 @@ u:
 }
 
 ; CHECK-LABEL: define i64 @test_b8_natural_refold()
-; Round 2 folds the loads to the constants and the dead escape branch is
-; removed (no sink). With escape-point placement a dead materialize may survive
-; (feeding the fast path, not re-virtualized by round 2); full elimination is a
-; future escape-point + outer-fixpoint refinement.
+; Round 2 folds the loads to the constants and removes the dead escape branch.
+; The source allocation is retained only if the final explicit path still
+; needs its physical identity.
 ; CHECK-NOT: call void @sink
 ; CHECK: ret i64 42
 

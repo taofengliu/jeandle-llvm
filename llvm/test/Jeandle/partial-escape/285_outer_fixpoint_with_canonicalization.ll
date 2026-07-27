@@ -4,13 +4,13 @@
 ; that:
 ;   - Round 1 PEA's analyzer CANNOT see the escape arm as dead (the guard
 ;     condition depends on two operations InstCombine can fold but PEA's
-;     symbolic interpreter does not). PEA materializes %o at the escape.
+;     symbolic interpreter does not). PEA keeps %o at its source allocation
+;     and replays its tracked field before the escape.
 ;   - Between rounds InstCombine performs a non-trivial fold:
 ;       %m = mul i32 %x, 0       ; -> 0
 ;       %s = sub i32 %m, %m      ; -> 0
 ;       %c = icmp ne i32 %s, 0   ; -> false
-;     SimplifyCFG then drops the dead branch; ADCE/the cleanup loop
-;     prunes the orphaned mat invoke.
+;     SimplifyCFG then drops the dead branch; ADCE removes orphaned replay.
 ;   - Round 2 PEA virtualizes %o and removes everything.
 ;
 ; The point: this round-between-passes (InstCombine/SimplifyCFG/ADCE) is
@@ -49,10 +49,8 @@ u:
 }
 
 ; CHECK-LABEL: define i32 @test_with_canonicalization(i32 %x)
-; Round 2 folds the load to 99 and the dead escape branch is removed (no sink).
-; With escape-point placement a dead materialize may survive (feeding the fast
-; path, not re-virtualized by round 2); full elimination is a future
-; escape-point + outer-fixpoint refinement.
+; Round 2 folds the load to 99 and removes the dead escape branch. No
+; allocation is introduced at the escape point.
 ; CHECK-NOT: call void @sink
 ; CHECK: ret i32 99
 

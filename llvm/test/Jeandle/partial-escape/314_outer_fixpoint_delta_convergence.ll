@@ -4,8 +4,8 @@
 ; convergence check. A break condition of just (TransformIdle &&
 ; AllocsUnchanged) could miss progress when an iteration shuffled
 ; virtualisation effects without changing the surviving allocation count
-; (e.g. a CommitAllocation that fuses multiple per-pred materialisations
-; into one).
+; (e.g. multiple predecessor replay plans converging on one retained
+; OrigAlloc identity).
 ;
 ; This test exercises a chain of three nested allocs whose virtualisation
 ; opportunities only fully resolve after multiple rounds of analyse +

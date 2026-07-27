@@ -1,18 +1,19 @@
 ; RUN: opt -S -passes="partial-escape-iterative" -jeandle-pea-iterations=4 %s | FileCheck %s
 
-; postTriggered signal in the outer fixpoint break condition.
+; Canonicalization progress in the outer fixpoint break condition.
 ;
-; Round 0's PEA materialises %o on the always-false escape arm. Round 0's
+; Round 0's PEA retains %o's OrigAlloc and plans replay on the escape arm.
+; Round 0's
 ; canonicalisation (ADCE → SCFG → LoopSimplify → InstCombine) prunes the
 ; dead branch and consolidates the survivor blocks — this is the
-; "postTriggered" event: canonicalisation moved IR around, and the
-; subsequent iteration's analyser may discover new opportunities even if
-; round 1's transform pass came up idle on its first scan.
+; inter-round canonicalization event: canonicalisation moved IR around, and
+; the subsequent fresh analysis may discover new opportunities even if the
+; next transform is idle.
 ;
-; The break condition `TransformIdle && AllocsUnchanged && !PrevCanonChanged`
-; requires that canonicalisation also be idle, so iter 1 keeps iterating
-; until iter 2's analysis sees a fully canonicalised function with no
-; remaining work — at which point the function reduces to ret i32 11.
+; Convergence requires stable allocation and analyser deltas plus an idle
+; transform. A previous canonicalization mutation forces another analysis;
+; persistent conservative canonicalization reports are bounded by the two
+; consecutive PEA-stable-round rule.
 
 @G_zero = private unnamed_addr constant i32 0
 

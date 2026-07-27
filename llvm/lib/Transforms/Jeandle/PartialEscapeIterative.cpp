@@ -180,8 +180,12 @@ PreservedAnalyses PartialEscapeIterative::run(Function &F,
       CurVDelta = Cached->VirtualizationDelta;
       CurADelta = Cached->AllocationDelta;
     }
-    FAM.invalidate(F, TransformPA);
     const bool TransformIdle = TransformPA.areAllPreserved();
+    // Each outer round requires a fresh PEAResult, including after an
+    // idempotent transform. Other function analyses remain governed by the
+    // transform's preservation result and the canonicalization passes below.
+    TransformPA.abandon<PartialEscapeAnalysis>();
+    FAM.invalidate(F, TransformPA);
     AnyChanged |= !TransformIdle;
     ExecutedRounds = Iter + 1;
 
@@ -260,6 +264,7 @@ PreservedAnalyses PartialEscapeIterative::run(Function &F,
       // Re-count in case ADCE pruned an alloc whose only uses became dead.
       PrevAllocs = countJeandleAllocations(F);
     }
+    AnyChanged |= CanonChanged;
     // Carry this round's canonicalization result into the next iteration's
     // convergence check.
     PrevCanonChanged = CanonChanged;
