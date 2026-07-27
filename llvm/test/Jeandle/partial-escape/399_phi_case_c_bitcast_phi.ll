@@ -1,4 +1,5 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -disable-output -passes="require<partial-escape-analysis>" %s
 
 ; PEA Case C — a same-bit-width reinterpret (bitcast) of a merged field PHI.
 ; Both arms allocate the same Klass and store a full-width i32 at offset 8

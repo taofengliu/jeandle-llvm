@@ -6,7 +6,9 @@
 ; RUN:   -passes="require<partial-escape-analysis>" -jeandle-trace-pea \
 ; RUN:   -jeandle-dump-pea-stats \
 ; RUN:   -jeandle-vm-callback-log=%S/Inputs/231_value_based_check_value_based.cblog \
-; RUN:   %s 2>&1 | FileCheck %s --check-prefix=ATTEMPT
+; RUN:   %s 2>&1 | FileCheck %s --check-prefix=ATTEMPT \
+; RUN:     --implicit-check-not='PEA stats @final_deopt_dependency: NeverEscapes=1 PartiallyEscapes=0 AlwaysEscapes=1' \
+; RUN:     --implicit-check-not='PEA stats @final_deopt_ssa_shapes: NeverEscapes=1 PartiallyEscapes=0 AlwaysEscapes=1'
 
 ; The equality initially folds to false and hides both allocation operands
 ; behind a scalar alias.  The later value-based check makes %a ineligible, so

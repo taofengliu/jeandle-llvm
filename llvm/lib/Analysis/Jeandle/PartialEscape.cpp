@@ -12,6 +12,7 @@
 #include "llvm/Analysis/Jeandle/PartialEscape.h"
 
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/Analysis/Jeandle/PartialEscapeUtils.h"
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/IR/Argument.h"
@@ -632,57 +633,45 @@ void PEAResult::computeEscapePointLocks() {
   }
 }
 
+static void destroyUnparentedOwnedInstructions(
+    ArrayRef<WeakTrackingVH> Phis, ArrayRef<WeakTrackingVH> Insts,
+    ArrayRef<WeakTrackingVH> LoopFieldPhis = {}) {
+  SmallPtrSet<Instruction *, 16> Seen;
+  SmallVector<Instruction *, 16> ToDelete;
+  auto Collect = [&](ArrayRef<WeakTrackingVH> Values) {
+    for (const WeakTrackingVH &VH : Values)
+      if (auto *I = dyn_cast_or_null<Instruction>((Value *)VH))
+        if (!I->getParent() && Seen.insert(I).second)
+          ToDelete.push_back(I);
+  };
+
+  Collect(LoopFieldPhis);
+  Collect(Phis);
+  Collect(Insts);
+
+  // Analyzer-owned instructions may reference one another, for example a
+  // load-replacement bitcast can use an unparented field PHI. Break all such
+  // links before deleting any value, then destroy users before definitions.
+  for (Instruction *I : ToDelete)
+    I->dropAllReferences();
+  for (Instruction *I : llvm::reverse(ToDelete))
+    I->deleteValue();
+}
+
 PEAResult::~PEAResult() {
-  // Any unparented PHI created by the analyzer (e.g., the analyzer ran
-  // but the transform never consumed the result) must be freed. Once a PHI
-  // has been inserted into a BasicBlock, that block's ilist owns it and we
-  // must NOT delete here. WeakTrackingVH auto-nulls when the underlying
-  // Value is deleted by an unrelated path (e.g. dead-code sweep), so the
-  // null-check below also guards against stale references.
-  for (WeakTrackingVH &VH : OwnedPhis) {
-    if (Value *V = VH) {
-      if (auto *Phi = dyn_cast<PHINode>(V))
-        if (!Phi->getParent())
-          delete Phi;
-    }
-  }
-  // Same lifecycle for ReplaceLoad coercion instructions.
-  for (WeakTrackingVH &VH : OwnedInsts) {
-    if (Value *V = VH) {
-      if (auto *I = dyn_cast<Instruction>(V))
-        if (!I->getParent())
-          I->deleteValue();
-    }
-  }
-  // Loop-header field PHIs preserved across fixpoint iterations.
-  for (WeakTrackingVH &VH : OwnedLoopFieldPhis) {
-    if (Value *V = VH) {
-      if (auto *Phi = dyn_cast<PHINode>(V))
-        if (!Phi->getParent())
-          delete Phi;
-    }
-  }
+  // Once an analyzer-owned instruction has been inserted into a BasicBlock,
+  // that block's ilist owns it. WeakTrackingVH also auto-nulls when an
+  // unrelated cleanup path has already deleted the value.
+  destroyUnparentedOwnedInstructions(OwnedPhis, OwnedInsts, OwnedLoopFieldPhis);
 }
 
 void PEAResult::truncateOwnedTo(size_t PhisMark, size_t InstsMark) {
-  while (OwnedPhis.size() > PhisMark) {
-    WeakTrackingVH &VH = OwnedPhis.back();
-    if (Value *V = VH) {
-      if (auto *P = dyn_cast<PHINode>(V))
-        if (!P->getParent())
-          delete P;
-    }
-    OwnedPhis.pop_back();
-  }
-  while (OwnedInsts.size() > InstsMark) {
-    WeakTrackingVH &VH = OwnedInsts.back();
-    if (Value *V = VH) {
-      if (auto *I = dyn_cast<Instruction>(V))
-        if (!I->getParent())
-          I->deleteValue();
-    }
-    OwnedInsts.pop_back();
-  }
+  assert(PhisMark <= OwnedPhis.size() && InstsMark <= OwnedInsts.size());
+  destroyUnparentedOwnedInstructions(
+      ArrayRef(OwnedPhis).drop_front(PhisMark),
+      ArrayRef(OwnedInsts).drop_front(InstsMark));
+  OwnedPhis.resize(PhisMark);
+  OwnedInsts.resize(InstsMark);
 }
 
 ObjectID PEAResult::createVirtualObject(std::unique_ptr<VirtualObject> VO) {

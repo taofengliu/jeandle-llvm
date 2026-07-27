@@ -546,14 +546,35 @@ struct BlockExitInfo : BlockExitData {
 // data are meaningful only while the object is virtual, so the transition
 // drops them together. Call sites decide whether Data is a shared block exit,
 // an invoke-unwind snapshot, or a target-local incoming-edge view.
-static void markObjectMaterializedInExitData(BlockExitData &Data,
-                                             jeandle::ObjectID ID) {
+static void rewriteVirtualRefsToMaterialized(
+    jeandle::ObjectID ID, Value *MaterializedValue,
+    DenseMap<jeandle::ObjectID, DenseMap<int64_t, jeandle::FieldValue>>
+        &FieldStates) {
+  assert(MaterializedValue && "materialized reference requires a real value");
+  for (auto &Other : FieldStates) {
+    if (Other.first == ID)
+      continue;
+    for (auto &Field : Other.second)
+      if (Field.second.isVirtualRef() && Field.second.getVirtualRef() == ID)
+        Field.second = jeandle::FieldValue::materializedRef(MaterializedValue);
+  }
+}
+
+static void markObjectMaterializedDispositionInExitData(BlockExitData &Data,
+                                                        jeandle::ObjectID ID) {
   Data.Virtuals.erase(ID);
   Data.Materialized.insert(ID);
   Data.FieldStates.erase(ID);
   Data.FieldDefinitions.erase(ID);
   Data.LockCounts.erase(ID);
   Data.LiveLockEnters.erase(ID);
+}
+
+static void markObjectMaterializedInExitData(BlockExitData &Data,
+                                             jeandle::ObjectID ID,
+                                             Value *MaterializedValue) {
+  markObjectMaterializedDispositionInExitData(Data, ID);
+  rewriteVirtualRefsToMaterialized(ID, MaterializedValue, Data.FieldStates);
 }
 
 // Resolve the effective "strict lock order" value for one analyzer run.
@@ -1236,6 +1257,7 @@ private:
     size_t OwnedPhisSize = 0;
     size_t OwnedInstsSize = 0;
     size_t CFGDeadnessProofCount = 0;
+    bool NeedsCFGCleanup = false;
 
     // For each block in L, the prior BlockEffects[BB] (if any) and
     // MaterializedAtPred[BB] (if any), captured *before* the loop iteration
@@ -1811,7 +1833,8 @@ void Analyzer::processBlock(BasicBlock *BB) {
             continue;
           if ((Value *)ME->InsertBefore != (Value *)TermII)
             continue;
-          markObjectMaterializedInExitData(*PreInvokeSnapshot, ME->ObjID);
+          markObjectMaterializedInExitData(*PreInvokeSnapshot, ME->ObjID,
+                                           realIdentityOf(ME->ObjID));
         }
     }
 
@@ -1938,7 +1961,7 @@ EdgeContribution Analyzer::contributionFor(BasicBlock *Pred, BasicBlock *Succ) {
       if (SIt != PIt->second.end())
         for (jeandle::ObjectID ID : SIt->second)
           if (Eligible.lookup(ID))
-            markObjectMaterializedInExitData(*Storage, ID);
+            markObjectMaterializedInExitData(*Storage, ID, realIdentityOf(ID));
     }
   }
   return EdgeContribution::live(Storage.get());
@@ -6758,16 +6781,7 @@ static bool hasDeoptBundle(CallBase *CB) {
 void Analyzer::updateOtherStatesForMaterialized(
     jeandle::ObjectID FlippedID, Value *NewPtr,
     DenseMap<jeandle::ObjectID, DenseMap<int64_t, jeandle::FieldValue>> &FS) {
-  for (auto &OtherKv : FS) {
-    if (OtherKv.first == FlippedID)
-      continue;
-    for (auto &Entry : OtherKv.second) {
-      if (Entry.second.isVirtualRef() &&
-          Entry.second.getVirtualRef() == FlippedID) {
-        Entry.second = jeandle::FieldValue::materializedRef(NewPtr);
-      }
-    }
-  }
+  rewriteVirtualRefsToMaterialized(FlippedID, NewPtr, FS);
 }
 
 void Analyzer::bumpMaterializeStat(MatReason R) {
@@ -7004,11 +7018,9 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
   observeFieldDefinitions(ID, C.FieldDefinitions);
   if (!Eligible.lookup(ID))
     return; // already gave up on this object; nothing to materialize.
-  // No dead-block guard here: pre-PEA LLVM cleanup (SimplifyCFG + ADCE,
-  // see Pipeline.cpp) removes unreachable blocks via
-  // removeUnreachableBlock, so every block that reaches PEA is reachable.
-  // If dead-block marking is ever needed in PEA itself, reintroduce a
-  // PEABlockState flag and wire killIfBranch.
+  // processBlock publishes a dead exit and returns before walking instructions
+  // when no incoming contribution is live. Materialization therefore only
+  // runs with a live block state or an edge-local copy of one.
 
   jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
 
@@ -7784,25 +7796,30 @@ void Analyzer::validateFinalDeoptObligations() {
   }
 
   SmallPtrSet<CallBase *, 8> RecordedAllocationSites;
-  std::function<void(jeandle::ObjectID)> CollectOrdinarySites =
-      [&](jeandle::ObjectID ID) {
-        if (ID == jeandle::InvalidObjectID ||
-            ID >= Result.VirtualObjects.size())
-          return;
-        const jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
-        auto CIt = Result.EscapeClassification.find(ID);
-        if (CIt == Result.EscapeClassification.end() ||
-            CIt->second != jeandle::PEAResult::EscapeKind::NeverEscapes)
-          return;
-        if (VObj.IsSynthetic) {
-          for (jeandle::ObjectID SourceID : VObj.SyntheticSourceIDs)
-            CollectOrdinarySites(SourceID);
-          return;
-        }
-        auto *Site = dyn_cast_or_null<CallBase>((Value *)VObj.AllocationCall);
-        if (Site && RecordedAllocationSites.insert(Site).second)
-          InvalidDeoptAllocationSites.push_back(Site);
-      };
+  auto CollectOrdinarySites = [&](jeandle::ObjectID RootID) {
+    DenseSet<jeandle::ObjectID> Visited;
+    SmallVector<jeandle::ObjectID, 8> Worklist(1, RootID);
+    while (!Worklist.empty()) {
+      jeandle::ObjectID ID = Worklist.pop_back_val();
+      if (!Visited.insert(ID).second)
+        continue;
+      if (ID == jeandle::InvalidObjectID || ID >= Result.VirtualObjects.size())
+        continue;
+      const jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
+      auto CIt = Result.EscapeClassification.find(ID);
+      if (CIt == Result.EscapeClassification.end() ||
+          CIt->second != jeandle::PEAResult::EscapeKind::NeverEscapes)
+        continue;
+      if (VObj.IsSynthetic) {
+        Worklist.append(VObj.SyntheticSourceIDs.begin(),
+                        VObj.SyntheticSourceIDs.end());
+        continue;
+      }
+      auto *Site = dyn_cast_or_null<CallBase>((Value *)VObj.AllocationCall);
+      if (Site && RecordedAllocationSites.insert(Site).second)
+        InvalidDeoptAllocationSites.push_back(Site);
+    }
+  };
 
   auto RejectVirtualObject = [&](jeandle::ObjectID ID) {
     InvalidDeoptObligation = true;
@@ -7834,26 +7851,31 @@ void Analyzer::validateFinalDeoptObligations() {
     return false;
   };
 
-  std::function<void(jeandle::ObjectID)> AuditObjectIdentity =
-      [&](jeandle::ObjectID ID) {
-        if (ID == jeandle::InvalidObjectID ||
-            ID >= Result.VirtualObjects.size())
-          return;
-        const jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
-        if (VObj.IsSynthetic) {
-          // A synthetic has no retained allocation of its own. Walk through
-          // the complete synthetic-source DAG until ordinary allocation
-          // leaves are reached; a prepared partial synthetic is safe because
-          // commit classified those ordinary leaves PartiallyEscapes.
-          for (jeandle::ObjectID SourceID : VObj.SyntheticSourceIDs)
-            AuditObjectIdentity(SourceID);
-          return;
-        }
-        auto CIt = Result.EscapeClassification.find(ID);
-        if (CIt != Result.EscapeClassification.end() &&
-            CIt->second == jeandle::PEAResult::EscapeKind::NeverEscapes)
-          RejectVirtualObject(ID);
-      };
+  auto AuditObjectIdentity = [&](jeandle::ObjectID RootID) {
+    DenseSet<jeandle::ObjectID> Visited;
+    SmallVector<jeandle::ObjectID, 8> Worklist(1, RootID);
+    while (!Worklist.empty()) {
+      jeandle::ObjectID ID = Worklist.pop_back_val();
+      if (!Visited.insert(ID).second)
+        continue;
+      if (ID == jeandle::InvalidObjectID || ID >= Result.VirtualObjects.size())
+        continue;
+      const jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
+      if (VObj.IsSynthetic) {
+        // A synthetic has no retained allocation of its own. Walk through
+        // the complete synthetic-source graph until ordinary allocation
+        // leaves are reached. Loop-carried Case-C merges can make this graph
+        // cyclic, so each identity is visited at most once.
+        Worklist.append(VObj.SyntheticSourceIDs.begin(),
+                        VObj.SyntheticSourceIDs.end());
+        continue;
+      }
+      auto CIt = Result.EscapeClassification.find(ID);
+      if (CIt != Result.EscapeClassification.end() &&
+          CIt->second == jeandle::PEAResult::EscapeKind::NeverEscapes)
+        RejectVirtualObject(ID);
+    }
+  };
 
   std::function<void(Value *)> AuditValue = [&](Value *Root) {
     SmallPtrSet<Value *, 32> Visited;
@@ -7894,6 +7916,14 @@ void Analyzer::validateFinalDeoptObligations() {
         }
       }
 
+      // A surviving call result is already an SSA value at this safepoint.
+      // Its arguments and operand bundles describe how the earlier call ran;
+      // they are not dependencies that will be rebuilt from the result.
+      // Transparent identity intrinsics are handled above because their
+      // result deliberately preserves the input object's identity.
+      if (isa<CallBase>(Current))
+        continue;
+
       if (auto *U = dyn_cast<User>(Current))
         for (Value *Operand : U->operand_values())
           Worklist.push_back(Operand);
@@ -7915,6 +7945,13 @@ void Analyzer::validateFinalDeoptObligations() {
   for (Instruction &I : instructions(F)) {
     auto *CB = dyn_cast<CallBase>(&I);
     if (!CB || !hasDeoptBundle(CB) || SafepointDeleted(CB))
+      continue;
+    auto ExitIt = BlockExits.find(CB->getParent());
+    // A safepoint in a proven-dead block is removed by the same committed CFG
+    // plan and has no final frame-state obligation. The deadness proof is
+    // validated immediately after this audit; an invalid proof discards the
+    // whole attempt before any effect is published.
+    if (ExitIt != BlockExits.end() && ExitIt->second.IsDead)
       continue;
 
     auto Deopt = CB->getOperandBundle(LLVMContext::OB_deopt);
@@ -8257,7 +8294,7 @@ void Analyzer::materializeAtPredFromExitInfo(jeandle::ObjectID ID,
     // contributionFor. A block-end drain applies to every successor and flips
     // the shared predecessor snapshot supplied directly by its caller.
     if (EdgeLocal) {
-      markObjectMaterializedInExitData(ExitInfo, Oid);
+      markObjectMaterializedDispositionInExitData(ExitInfo, Oid);
       return;
     }
     ExitInfo.Virtuals.erase(Oid);
@@ -8317,7 +8354,8 @@ void Analyzer::materializeAtPredFromExitInfo(jeandle::ObjectID ID,
   if (!EdgeLocal && isa<InvokeInst>(PH->getTerminator())) {
     auto BEIt = BlockExits.find(PH);
     if (BEIt != BlockExits.end() && BEIt->second.UnwindData)
-      markObjectMaterializedInExitData(*BEIt->second.UnwindData, ID);
+      markObjectMaterializedInExitData(*BEIt->second.UnwindData, ID,
+                                       realIdentityOf(ID));
   }
 }
 
@@ -8441,6 +8479,7 @@ void Analyzer::takeLoopSnapshot(
   S.OwnedPhisSize = Result.OwnedPhis.size();
   S.OwnedInstsSize = Result.OwnedInsts.size();
   S.CFGDeadnessProofCount = CFGDeadnessProofs.size();
+  S.NeedsCFGCleanup = Result.NeedsCFGCleanup;
   S.SavedBlockEffects.clear();
   S.SavedMaterializedAtPred.clear();
   S.HadBlockEffects.clear();
@@ -8537,6 +8576,7 @@ void Analyzer::restoreLoopSnapshot(
   Result.truncateOwnedTo(S.OwnedPhisSize, S.OwnedInstsSize);
   Result.NextSeqNo = S.NextSeqNo;
   CFGDeadnessProofs.resize(S.CFGDeadnessProofCount);
+  Result.NeedsCFGCleanup = S.NeedsCFGCleanup;
   RecordedCFGProofs.clear();
   for (const CFGDeadnessProof &Proof : CFGDeadnessProofs)
     RecordedCFGProofs.insert(Proof.Killer);
