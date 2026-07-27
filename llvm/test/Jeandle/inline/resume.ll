@@ -1,4 +1,4 @@
-; RUN: opt -S -passes=jeandle-inline-driver -jeandle-vm-callback-log=%S/Inputs/resume.cblog %s 2>&1 | FileCheck %s
+; RUN: opt -S -passes=jeandle-inline-driver -jeandle-vm-callback-log=%S/Inputs/resume.cblog %s 2>&1 | FileCheck --implicit-check-not=' resume ' %s
 
 ; Callee IR can unwind with either a normal landingpad value or a dummy zero
 ; resume value. Both forms should be redirected to the caller landingpad when
