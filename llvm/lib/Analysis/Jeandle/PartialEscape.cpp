@@ -34,6 +34,7 @@
 #include "llvm/Support/raw_ostream.h"
 
 #include <algorithm>
+#include <limits>
 
 using namespace llvm;
 using namespace llvm::jeandle;
@@ -52,9 +53,17 @@ static llvm::cl::opt<bool> JeandleTracePEA(
 // VirtualObject
 // ===========================================================================
 
+std::optional<bool> VirtualObject::FieldDesc::overlaps(int64_t Off,
+                                                       uint8_t Size) const {
+  return jeandle::pea::checkedRangesOverlap(Offset, ByteSize, Off, Size);
+}
+
 int VirtualObject::getOrCreateFieldIndex(int64_t Offset, Type *Ty,
                                          const DataLayout &DL) {
   assert(Ty && "field type must be non-null");
+  if (!jeandle::pea::isLegalMaterializationAtomicType(Ty, DL))
+    return -1;
+
   uint8_t ByteSize = 0;
   bool IsReference = false;
   if (Ty->isPointerTy()) {
@@ -72,20 +81,33 @@ int VirtualObject::getOrCreateFieldIndex(int64_t Offset, Type *Ty,
     // per-access defense for hand-written / mixed IR.
     if (Ty->getPointerAddressSpace() != jeandle::AddrSpace::JavaHeapAddrSpace)
       return -1;
-    ByteSize = static_cast<uint8_t>(
-        DL.getPointerSize(jeandle::AddrSpace::JavaHeapAddrSpace));
+    uint64_t PointerByteSize =
+        DL.getPointerSize(jeandle::AddrSpace::JavaHeapAddrSpace);
+    if (PointerByteSize == 0 ||
+        PointerByteSize > std::numeric_limits<uint8_t>::max())
+      return -1;
+    ByteSize = static_cast<uint8_t>(PointerByteSize);
     IsReference = true;
   } else {
-    TypeSize Bits = Ty->getPrimitiveSizeInBits();
+    TypeSize Bits = DL.getTypeSizeInBits(Ty);
     if (Bits.isScalable())
       return -1; // runtime-dependent field width — conservative escape
     uint64_t FixedBits = Bits.getFixedValue();
     if (FixedBits == 0)
       return -1; // unknown-size type (e.g. aggregate) — conservative escape
-    if (FixedBits > 255 * 8)
-      return -1; // oversized field (does not fit FieldDesc::ByteSize) — bail
+    // FieldDesc intentionally uses a compact byte-size representation. Wider
+    // verifier-legal atomic types conservatively stay real.
+    if (FixedBits > std::numeric_limits<uint8_t>::max() * 8ULL)
+      return -1;
     ByteSize = static_cast<uint8_t>((FixedBits + 7) / 8);
   }
+
+  // Every tracked field is a representable half-open byte range. This check
+  // is required even for the first field, where there is no neighbor overlap
+  // query to validate the endpoint.
+  if (!jeandle::pea::isUsableFieldOffset(Offset) ||
+      !jeandle::pea::checkedOffsetAdd(Offset, ByteSize))
+    return -1;
 
   auto It = std::lower_bound(
       Fields.begin(), Fields.end(), Offset,
@@ -102,12 +124,16 @@ int VirtualObject::getOrCreateFieldIndex(int64_t Offset, Type *Ty,
   // Overlap check against the candidate neighbor on the left.
   if (It != Fields.begin()) {
     auto Prev = std::prev(It);
-    if (Prev->overlaps(Offset, ByteSize))
+    std::optional<bool> Overlap = Prev->overlaps(Offset, ByteSize);
+    if (!Overlap || *Overlap)
       return -1;
   }
   // Overlap check against the candidate neighbor on the right.
-  if (It != Fields.end() && It->overlaps(Offset, ByteSize))
-    return -1;
+  if (It != Fields.end()) {
+    std::optional<bool> Overlap = It->overlaps(Offset, ByteSize);
+    if (!Overlap || *Overlap)
+      return -1;
+  }
 
   FieldDesc New{Offset, Ty, ByteSize, IsReference};
   auto NewIt = Fields.insert(It, New);
@@ -176,7 +202,9 @@ static Value *matchAddBasePlusScaledIndex(Value *ByteOff,
   } else {
     return nullptr;
   }
-  if (!BaseCI || BaseCI->getSExtValue() != ExpectedBaseOffset)
+  std::optional<int64_t> Base =
+      BaseCI ? BaseCI->getValue().trySExtValue() : std::nullopt;
+  if (!Base || *Base != ExpectedBaseOffset)
     return nullptr;
 
   // Now ScaledIdx must equal idx * Scale (or idx if Scale == 1).
@@ -187,17 +215,22 @@ static Value *matchAddBasePlusScaledIndex(Value *ByteOff,
   if (isPowerOf2_64(Scale)) {
     unsigned LogScale = Log2_64(Scale);
     ConstantInt *ShAmt = nullptr;
+    std::optional<uint64_t> Shift;
     if (match(ScaledIdx, m_Shl(m_Value(Idx), m_ConstantInt(ShAmt))) && ShAmt &&
-        ShAmt->getZExtValue() == LogScale)
+        (Shift = ShAmt->getValue().tryZExtValue()) && *Shift == LogScale)
       return peelIndexWrappers(Idx);
   }
   ConstantInt *MulCI = nullptr;
-  if (match(ScaledIdx, m_Mul(m_Value(Idx), m_ConstantInt(MulCI))) && MulCI &&
-      (uint64_t)MulCI->getSExtValue() == Scale)
-    return peelIndexWrappers(Idx);
-  if (match(ScaledIdx, m_Mul(m_ConstantInt(MulCI), m_Value(Idx))) && MulCI &&
-      (uint64_t)MulCI->getSExtValue() == Scale)
-    return peelIndexWrappers(Idx);
+  if (match(ScaledIdx, m_Mul(m_Value(Idx), m_ConstantInt(MulCI))) && MulCI) {
+    std::optional<int64_t> Mul = MulCI->getValue().trySExtValue();
+    if (Mul && *Mul >= 0 && static_cast<uint64_t>(*Mul) == Scale)
+      return peelIndexWrappers(Idx);
+  }
+  if (match(ScaledIdx, m_Mul(m_ConstantInt(MulCI), m_Value(Idx))) && MulCI) {
+    std::optional<int64_t> Mul = MulCI->getValue().trySExtValue();
+    if (Mul && *Mul >= 0 && static_cast<uint64_t>(*Mul) == Scale)
+      return peelIndexWrappers(Idx);
+  }
   return nullptr;
 }
 
@@ -211,7 +244,7 @@ VirtualObject::matchArrayElementGEP(GetElementPtrInst *GEP,
 
   auto *GEPOp = cast<GEPOperator>(GEP);
   const unsigned AS = GEPOp->getPointerAddressSpace();
-  const unsigned PtrBits = DL.getPointerSizeInBits(AS);
+  const unsigned IndexBits = DL.getIndexSizeInBits(AS);
 
   // Pattern A: typed GEP with sourceElementType == ArrayElementType. The
   // typed GEP's pointer operand must reach the alloc base with a constant
@@ -252,11 +285,16 @@ VirtualObject::matchArrayElementGEP(GetElementPtrInst *GEP,
     if (auto *CI = dyn_cast<ConstantInt>(ByteOff)) {
       // Constant byte offset. Recover the element index if (off - base) is
       // a multiple of Scale and lies in [0, ArrayLength).
-      int64_t Off = CI->getValue().sextOrTrunc(PtrBits).getSExtValue();
-      int64_t Adj = Off - static_cast<int64_t>(ArrayBaseOffset);
-      if (Adj < 0 || (Adj % static_cast<int64_t>(ArrayIndexScale)) != 0)
+      std::optional<int64_t> Off =
+          CI->getValue().sextOrTrunc(IndexBits).trySExtValue();
+      std::optional<int64_t> Adj =
+          Off ? jeandle::pea::checkedOffsetSub(
+                    *Off, static_cast<int64_t>(ArrayBaseOffset))
+              : std::nullopt;
+      if (!Adj || *Adj < 0 ||
+          (*Adj % static_cast<int64_t>(ArrayIndexScale)) != 0)
         return std::nullopt;
-      int64_t Cidx = Adj / static_cast<int64_t>(ArrayIndexScale);
+      int64_t Cidx = *Adj / static_cast<int64_t>(ArrayIndexScale);
       if (Cidx < 0 || static_cast<uint64_t>(Cidx) >= ArrayLength)
         return std::nullopt;
       Constant *CIdx = ConstantInt::get(CI->getType(), Cidx, /*isSigned=*/true);
@@ -561,6 +599,12 @@ void PEAResult::computeEscapePointLocks() {
     for (jeandle::MaterializeEffect *ME : EffectsAtSite)
       LockReplayBatches.back().EmitterSeqNo =
           std::max(LockReplayBatches.back().EmitterSeqNo, ME->SeqNo);
+    assert(llvm::count_if(EffectsAtSite,
+                          [&](MaterializeEffect *ME) {
+                            return ME->SeqNo ==
+                                   LockReplayBatches.back().EmitterSeqNo;
+                          }) == 1 &&
+           "one physical lock replay batch must have exactly one tail emitter");
   }
 
   for (unsigned BatchID = 0; BatchID < LockReplayBatches.size(); ++BatchID) {
@@ -623,8 +667,8 @@ void PEAResult::computeEscapePointLocks() {
         else
           llvm::dbgs() << "<unknown>";
         llvm::dbgs() << " logical_escape=" << GetLogicalEscapeID(LogicalEscape)
-                     << " batch=" << BatchID
-                     << " source=" << Batch.SourceID << " receiver_vo="
+                     << " batch=" << BatchID << " source=" << Batch.SourceID
+                     << " receiver_vo="
                      << static_cast<unsigned>(ML.SourceEffect->ObjID)
                      << " depth=" << ML.BytecodeDepth << " ordinal=" << Ordinal
                      << "\n";
@@ -709,6 +753,26 @@ void PEAResult::publishEffectTrace() const {
   }
 }
 
+bool PEAResult::hasUniqueEffectSequenceNumbers() const {
+  DenseSet<uint32_t> Seen;
+  for (const auto &KV : BlockEffects)
+    for (const Effect &E : KV.second)
+      if (!Seen.insert(E.SeqNo).second || E.SeqNo >= NextSeqNo)
+        return false;
+  return true;
+}
+
+bool PEAResult::hasLegalMaterializationAtomicTypes(const DataLayout &DL) const {
+  for (const auto &KV : BlockEffects)
+    for (const Effect &E : KV.second)
+      if (const auto *ME = dyn_cast<MaterializeEffect>(&E))
+        for (const MaterializeEffect::FieldEntry &FE : ME->FieldEntries)
+          if (!pea::isLegalMaterializationAtomicType(FE.Value.getDeclaredType(),
+                                                     DL))
+            return false;
+  return true;
+}
+
 void Effect::dump(raw_ostream &OS) const {
   OS << "PEA: ";
   switch (getKind()) {
@@ -745,7 +809,9 @@ void Effect::dump(raw_ostream &OS) const {
   if (const auto *PE = dyn_cast<CreatePHIEffect>(this))
     OS << " offset=" << PE->FieldOffset;
   if (Instruction *T = getTarget())
-    OS << " target=" << *T;
+    OS << " target= seq=" << SeqNo << " " << *T;
+  else
+    OS << " seq=" << SeqNo;
 }
 
 void MaterializeEffect::setInsertBefore(Instruction *I) { InsertBefore = I; }

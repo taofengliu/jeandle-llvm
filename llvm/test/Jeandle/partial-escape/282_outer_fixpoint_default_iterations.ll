@@ -15,9 +15,10 @@
 ;   ONE prefix      -- `-jeandle-pea-iterations=1` opt-down for callers
 ;                      that want strict single-round semantics. With the
 ;                      cap at 1 the wrapper still does one
-;                      analyze+transform pair; its original allocation and
-;                      replay remain because no inter-round canonicalization
-;                      or second analysis happens.
+;                      analyze+transform+canonicalize round. Its original
+;                      allocation remains, while current-round
+;                      canonicalization removes the dead sink and leaves the
+;                      constant branch for a later SimplifyCFG round.
 ;
 ; If we ever bump the default again, the DEFAULT side of this test moves
 ; with it; the ONE side stays constant.
@@ -60,6 +61,8 @@ u:
 
 ; ONE-LABEL: define i32 @test_default_two_rounds()
 ; ONE: jeandle.new_instance
-; ONE: call void @sink
+; ONE: br i1 false
+; ONE-NOT: call void @sink
+; ONE: ret i32
 
 !java-method-compilation = !{}

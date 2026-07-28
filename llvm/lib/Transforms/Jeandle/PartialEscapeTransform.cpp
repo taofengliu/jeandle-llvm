@@ -62,6 +62,7 @@
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Jeandle/Attributes.h"
 #include "llvm/IR/Jeandle/Metadata.h"
 #include "llvm/IR/Metadata.h"
@@ -714,6 +715,9 @@ static bool applyMaterialize(Function &F, const jeandle::PEAResult &Result,
   // VirtualRef→MaterializedRef during prerequisite materialization), which also
   // dominates here.
   for (const auto &FE : E.FieldEntries) {
+    assert(jeandle::pea::isLegalMaterializationAtomicType(
+               FE.Value.getDeclaredType(), DL) &&
+           "materialize replay field must be a legal atomic store type");
     Value *V = nullptr;
     if (FE.Value.isScalar()) {
       V = FE.Value.getScalar();
@@ -1300,6 +1304,67 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
   auto &Result = FAM.getResult<PartialEscapeAnalysis>(F);
   if (!Result.hasOptimizationOpportunity())
     return PreservedAnalyses::all();
+  // A malformed cached/custom analysis result must not mutate CFG or IR
+  // before discovering that one replay store would be verifier-illegal.
+  if (!Result.hasLegalMaterializationAtomicTypes(M->getDataLayout()))
+    return PreservedAnalyses::all();
+  assert(Result.hasUniqueEffectSequenceNumbers() &&
+         "PEA effect sequence numbers must be globally unique");
+#ifndef NDEBUG
+  DenseSet<Instruction *> RemovedTargets;
+  for (const auto &KV : Result.BlockEffects)
+    for (const jeandle::Effect &E : KV.second)
+      if (isa<jeandle::ReplaceLoadEffect>(E) ||
+          isa<jeandle::ReplaceCallEffect>(E) ||
+          isa<jeandle::EliminateStoreEffect>(E))
+        if (Instruction *Target = E.getTarget())
+          RemovedTargets.insert(Target);
+  for (const auto &KV : Result.EscapeClassification) {
+    if (KV.second != jeandle::PEAResult::EscapeKind::NeverEscapes)
+      continue;
+    const jeandle::VirtualObject &VObj = *Result.VirtualObjects[KV.first];
+    if (VObj.IsSynthetic)
+      continue;
+    Value *Allocation = VObj.AllocationCall;
+    assert(Allocation && "NeverEscapes object must retain its allocation");
+    bool HasSurvivingUse =
+        jeandle::pea::hasUnremovedSemanticUses(Allocation, [&](const Use &U) {
+          auto *UserI = dyn_cast<Instruction>(U.getUser());
+          if (UserI && Result.FinalDeadBlocks.count(UserI->getParent()))
+            return true;
+          if (UserI && RemovedTargets.count(UserI))
+            return true;
+          auto *CB = dyn_cast_or_null<CallBase>(UserI);
+          if (!CB)
+            return false;
+          if (!CB->isBundleOperand(U.getOperandNo()))
+            return jeandle::pea::isPEAHandledNonEscapingIntrinsic(
+                dyn_cast<IntrinsicInst>(CB));
+          OperandBundleUse Bundle =
+              CB->getOperandBundleForOperand(U.getOperandNo());
+          if (!Bundle.isDeoptOperandBundle())
+            return jeandle::pea::isPEAHandledNonEscapingIntrinsic(
+                dyn_cast<IntrinsicInst>(CB));
+          for (const auto &EffectsKV : Result.BlockEffects)
+            for (const jeandle::Effect &E : EffectsKV.second) {
+              const auto *RE = dyn_cast<jeandle::RewriteDeoptBundleEffect>(&E);
+              if (!RE || RE->Safepoint != CB)
+                continue;
+              if (E.ObjID == KV.first && RE->OrigAllocInBundle &&
+                  U.get() == Allocation)
+                return true;
+              if (llvm::any_of(RE->RootOperands,
+                               [&](const WeakTrackingVH &Root) {
+                                 return (Value *)Root == U.get();
+                               }))
+                return true;
+            }
+          return false;
+        });
+    assert(!HasSurvivingUse &&
+           "NeverEscapes allocation has a surviving semantic use");
+  }
+#endif
 
   bool Changed = false;
 

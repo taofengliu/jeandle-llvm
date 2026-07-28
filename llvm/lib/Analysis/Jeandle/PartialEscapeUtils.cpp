@@ -14,9 +14,11 @@
 #include "llvm/Analysis/Jeandle/PartialEscapeUtils.h"
 
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/DataLayout.h"
 #include "llvm/IR/DerivedTypes.h"
@@ -29,6 +31,10 @@
 #include "llvm/IR/Jeandle/VMCallback.h"
 #include "llvm/IR/Operator.h"
 #include "llvm/IR/Type.h"
+#include "llvm/Support/CheckedArithmetic.h"
+#include "llvm/Support/MathExtras.h"
+
+#include <limits>
 
 using namespace llvm;
 
@@ -114,6 +120,36 @@ bool isJeandleRegisterFinalizerIfNeeded(const CallBase *CB) {
   return isJeandleCallNamed(CB, "jeandle.register_finalizer_if_needed");
 }
 
+bool isPEAHandledNonEscapingIntrinsic(const IntrinsicInst *II) {
+  if (!II)
+    return false;
+  switch (II->getIntrinsicID()) {
+  case Intrinsic::assume:
+  case Intrinsic::lifetime_start:
+  case Intrinsic::lifetime_end:
+  case Intrinsic::invariant_start:
+  case Intrinsic::invariant_end:
+  case Intrinsic::experimental_noalias_scope_decl:
+  case Intrinsic::dbg_declare:
+  case Intrinsic::dbg_value:
+  case Intrinsic::dbg_label:
+  case Intrinsic::donothing:
+  case Intrinsic::sideeffect:
+  case Intrinsic::var_annotation:
+  case Intrinsic::is_constant:
+  case Intrinsic::expect:
+  case Intrinsic::expect_with_probability:
+  case Intrinsic::allow_runtime_check:
+  case Intrinsic::allow_ubsan_check:
+  case Intrinsic::launder_invariant_group:
+  case Intrinsic::strip_invariant_group:
+  case Intrinsic::ptr_annotation:
+    return true;
+  default:
+    return false;
+  }
+}
+
 // ===========================================================================
 // Type / klass helpers
 // ===========================================================================
@@ -154,6 +190,57 @@ Type *llvmElementTypeFor(JBasicType Kind, LLVMContext &Ctx) {
     return nullptr;
   }
   return nullptr;
+}
+
+bool isLegalMaterializationAtomicType(Type *Ty, const DataLayout &DL) {
+  if (!Ty || !Ty->isSized())
+    return false;
+
+  Type *ScalarTy = Ty->getScalarType();
+  if (!ScalarTy->isIntOrPtrTy() && !ScalarTy->isFloatingPointTy())
+    return false;
+
+  TypeSize Bits = DL.getTypeSizeInBits(Ty);
+  if (Bits.isScalable())
+    return false;
+  uint64_t FixedBits = Bits.getFixedValue();
+  return FixedBits >= 8 && isPowerOf2_64(FixedBits);
+}
+
+std::optional<int64_t> checkedOffsetAdd(int64_t LHS, int64_t RHS) {
+  return checkedAdd(LHS, RHS);
+}
+
+std::optional<int64_t> checkedOffsetSub(int64_t LHS, int64_t RHS) {
+  return checkedSub(LHS, RHS);
+}
+
+std::optional<int64_t> checkedArrayElementOffset(int64_t Base, int64_t Index,
+                                                 uint64_t Scale) {
+  if (Scale > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+    return std::nullopt;
+  return checkedMulAdd(Index, static_cast<int64_t>(Scale), Base);
+}
+
+bool isUsableFieldOffset(int64_t Offset) {
+  return Offset != DenseMapInfo<int64_t>::getEmptyKey() &&
+         Offset != DenseMapInfo<int64_t>::getTombstoneKey();
+}
+
+std::optional<bool> checkedRangesOverlap(int64_t AStart, uint64_t ASize,
+                                         int64_t BStart, uint64_t BSize) {
+  if (ASize == 0 || BSize == 0)
+    return false;
+  if (ASize > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()) ||
+      BSize > static_cast<uint64_t>(std::numeric_limits<int64_t>::max()))
+    return std::nullopt;
+  std::optional<int64_t> AEnd =
+      checkedOffsetAdd(AStart, static_cast<int64_t>(ASize));
+  std::optional<int64_t> BEnd =
+      checkedOffsetAdd(BStart, static_cast<int64_t>(BSize));
+  if (!AEnd || !BEnd)
+    return std::nullopt;
+  return AStart < *BEnd && BStart < *AEnd;
 }
 
 // ===========================================================================
@@ -222,28 +309,36 @@ static Value *getIntToPtrRoundTripInner(Value *V, const DataLayout &DL) {
 }
 
 Value *stripPointerCastsAndOffsets(Value *Ptr, const DataLayout &DL,
-                                   int64_t *OutOffset, bool *NonConstant) {
+                                   int64_t *OutOffset, bool *Unresolved) {
   if (OutOffset)
     *OutOffset = 0;
-  if (NonConstant)
-    *NonConstant = false;
+  if (Unresolved)
+    *Unresolved = false;
   if (!Ptr)
     return nullptr;
 
+  int64_t Offset = 0;
   Value *V = Ptr;
   // Bound the walk defensively; Jeandle IR typically has < 5 layers.
   for (unsigned Depth = 0; Depth < 32; ++Depth) {
     if (auto *GEP = dyn_cast<GEPOperator>(V)) {
       const unsigned AS = GEP->getPointerAddressSpace();
-      const unsigned PtrBits = DL.getPointerSizeInBits(AS);
-      APInt Acc(PtrBits, 0, /*isSigned=*/true);
+      const unsigned IndexBits = DL.getIndexSizeInBits(AS);
+      APInt Acc(IndexBits, 0, /*isSigned=*/true);
       if (!GEP->accumulateConstantOffset(DL, Acc)) {
-        if (NonConstant)
-          *NonConstant = true;
+        if (Unresolved)
+          *Unresolved = true;
         return V;
       }
-      if (OutOffset)
-        *OutOffset += Acc.getSExtValue();
+      std::optional<int64_t> GEPDelta = Acc.trySExtValue();
+      std::optional<int64_t> NewOffset =
+          GEPDelta ? checkedOffsetAdd(Offset, *GEPDelta) : std::nullopt;
+      if (!NewOffset) {
+        if (Unresolved)
+          *Unresolved = true;
+        return V;
+      }
+      Offset = *NewOffset;
       V = GEP->getPointerOperand();
       continue;
     }
@@ -258,11 +353,17 @@ Value *stripPointerCastsAndOffsets(Value *Ptr, const DataLayout &DL,
       // Only chase through casts that stay in JavaHeapAddrSpace.
       auto *DstPT = dyn_cast<PointerType>(ASC->getType());
       auto *SrcPT = dyn_cast<PointerType>(ASC->getOperand(0)->getType());
-      if (!DstPT || !SrcPT)
+      if (!DstPT || !SrcPT) {
+        if (OutOffset)
+          *OutOffset = Offset;
         return V;
+      }
       if (DstPT->getAddressSpace() != jeandle::AddrSpace::JavaHeapAddrSpace ||
-          SrcPT->getAddressSpace() != jeandle::AddrSpace::JavaHeapAddrSpace)
+          SrcPT->getAddressSpace() != jeandle::AddrSpace::JavaHeapAddrSpace) {
+        if (OutOffset)
+          *OutOffset = Offset;
         return V;
+      }
       V = ASC->getOperand(0);
       continue;
     }
@@ -297,6 +398,8 @@ Value *stripPointerCastsAndOffsets(Value *Ptr, const DataLayout &DL,
     }
     break;
   }
+  if (OutOffset)
+    *OutOffset = Offset;
   return V;
 }
 
@@ -310,26 +413,27 @@ Value *stripPointerCastsAndOffsets(Value *Ptr, const DataLayout &DL,
 // expansion through repeated PHI/Select operands.
 static constexpr unsigned ResolveVirtualRefMaxDepth = 8;
 
-static std::optional<ObjectID>
-resolveVirtualRefImpl(Value *V, const PEABlockState &State,
-                      const AliasMap &Aliases, const DataLayout &DL,
-                      DenseSet<Value *> &Visited, unsigned Depth);
+static VirtualIdentityResult
+resolveVirtualIdentityImpl(Value *V, const PEABlockState &State,
+                           const AliasMap &Aliases, const DataLayout &DL,
+                           VirtualIdentityMode Mode, DenseSet<Value *> &Visited,
+                           unsigned Depth);
 
-static std::optional<ObjectID>
-checkAliasMap(Value *V, const PEABlockState &State, const AliasMap &Aliases) {
+static VirtualIdentityResult checkAliasMap(Value *V, const PEABlockState &State,
+                                           const AliasMap &Aliases) {
   // Virtual alias: a Value* registered as standing for some ObjectID.
   if (auto ID = Aliases.getVirtualAlias(V)) {
     if (const ObjectState *OS = State.getObjectStateOptional(*ID)) {
       if (OS->isVirtual())
-        return *ID;
+        return VirtualIdentityResult::defined(*ID);
     }
     // Materialized or missing: V no longer denotes a virtual object.
-    return std::nullopt;
+    return VirtualIdentityResult::unknown();
   }
   // Scalar replacement aliases never resolve to a virtual object.
   if (Aliases.getScalarAlias(V) != nullptr)
-    return std::nullopt;
-  return std::nullopt;
+    return VirtualIdentityResult::unknown();
+  return VirtualIdentityResult::unknown();
 }
 
 // RAII helper: insert `V` into `Visited` on entry and erase on scope exit so
@@ -352,62 +456,81 @@ struct StackGuard {
 };
 } // namespace
 
-static std::optional<ObjectID>
-resolveVirtualRefImpl(Value *V, const PEABlockState &State,
-                      const AliasMap &Aliases, const DataLayout &DL,
-                      DenseSet<Value *> &Visited, unsigned Depth) {
+static VirtualIdentityResult
+resolveVirtualIdentityImpl(Value *V, const PEABlockState &State,
+                           const AliasMap &Aliases, const DataLayout &DL,
+                           VirtualIdentityMode Mode, DenseSet<Value *> &Visited,
+                           unsigned Depth) {
   if (!V)
-    return std::nullopt;
+    return VirtualIdentityResult::unknown();
   if (Depth > ResolveVirtualRefMaxDepth)
-    return std::nullopt;
+    return VirtualIdentityResult::unknown();
   // Cycle detection: if V is already on the resolution stack we're in a
   // self-reference (e.g. phi referencing itself) — bail.
   if (Visited.count(V))
-    return std::nullopt;
+    return VirtualIdentityResult::unknown();
   StackGuard Guard(Visited, V);
 
   // (1) Alias map lookup takes precedence over structural peeling so that
   // alias-registered Values (loads, PHIs, ...) resolve correctly even though
   // they have no structural relationship with their allocation site.
   if (Aliases.getVirtualAlias(V).has_value() ||
-      Aliases.getScalarAlias(V) != nullptr)
+      Aliases.getScalarAlias(V) != nullptr) {
+    if (Mode == VirtualIdentityMode::WholeObject) {
+      std::optional<int64_t> Offset = resolveFieldOffset(V, DL);
+      if (!Offset || *Offset != 0)
+        return VirtualIdentityResult::unknown();
+    }
     return checkAliasMap(V, State, Aliases);
+  }
 
   // (2) Constants and special values.
   if (auto *C = dyn_cast<Constant>(V)) {
-    if (C->isNullValue() || isa<UndefValue>(C) || isa<PoisonValue>(C) ||
-        isa<GlobalValue>(C) || isa<ConstantInt>(C) || isa<ConstantFP>(C) ||
+    if (isa<PoisonValue>(C))
+      return VirtualIdentityResult::poisonWildcard();
+    if (C->isNullValue() || isa<UndefValue>(C) || isa<GlobalValue>(C) ||
+        isa<ConstantInt>(C) || isa<ConstantFP>(C) ||
         isa<ConstantPointerNull>(C))
-      return std::nullopt;
+      return VirtualIdentityResult::unknown();
     // ConstantExpr GEP/cast falls through to the structural cases below.
   }
 
   // (3) GEP — chase the base pointer (offset is resolveFieldOffset's job).
-  if (auto *GEP = dyn_cast<GEPOperator>(V))
-    return resolveVirtualRefImpl(GEP->getPointerOperand(), State, Aliases, DL,
-                                 Visited, Depth + 1);
+  if (auto *GEP = dyn_cast<GEPOperator>(V)) {
+    if (Mode == VirtualIdentityMode::WholeObject) {
+      std::optional<int64_t> Offset = resolveFieldOffset(V, DL);
+      if (!Offset || *Offset != 0)
+        return VirtualIdentityResult::unknown();
+    }
+    return resolveVirtualIdentityImpl(GEP->getPointerOperand(), State, Aliases,
+                                      DL, Mode, Visited, Depth + 1);
+  }
 
   // (4) AddrSpaceCast — only chase within JavaHeapAddrSpace.
   if (auto *ASC = dyn_cast<AddrSpaceCastOperator>(V)) {
     if (auto *DstPT = dyn_cast<PointerType>(ASC->getType()))
       if (DstPT->getAddressSpace() != jeandle::AddrSpace::JavaHeapAddrSpace)
-        return std::nullopt;
+        return VirtualIdentityResult::unknown();
     if (auto *SrcPT = dyn_cast<PointerType>(ASC->getOperand(0)->getType()))
       if (SrcPT->getAddressSpace() != jeandle::AddrSpace::JavaHeapAddrSpace)
-        return std::nullopt;
-    return resolveVirtualRefImpl(ASC->getOperand(0), State, Aliases, DL,
-                                 Visited, Depth + 1);
+        return VirtualIdentityResult::unknown();
+    return resolveVirtualIdentityImpl(ASC->getOperand(0), State, Aliases, DL,
+                                      Mode, Visited, Depth + 1);
   }
 
   // (5) BitCast.
   if (auto *BC = dyn_cast<BitCastOperator>(V))
-    return resolveVirtualRefImpl(BC->getOperand(0), State, Aliases, DL, Visited,
-                                 Depth + 1);
+    return resolveVirtualIdentityImpl(BC->getOperand(0), State, Aliases, DL,
+                                      Mode, Visited, Depth + 1);
 
-  // (6) Freeze.
-  if (auto *FI = dyn_cast<FreezeInst>(V))
-    return resolveVirtualRefImpl(FI->getOperand(0), State, Aliases, DL, Visited,
-                                 Depth + 1);
+  // (6) Freeze preserves only an already-defined identity. Freezing poison,
+  // undef, or an unresolved merge creates an arbitrary stable value, not a
+  // virtual-object identity.
+  if (auto *FI = dyn_cast<FreezeInst>(V)) {
+    VirtualIdentityResult Inner = resolveVirtualIdentityImpl(
+        FI->getOperand(0), State, Aliases, DL, Mode, Visited, Depth + 1);
+    return Inner.isDefined() ? Inner : VirtualIdentityResult::unknown();
+  }
 
   // (7) IntToPtr(PtrToInt(x)) round-trip with matching widths is a legal
   // laundering pattern (see getIntToPtrRoundTripInner); tagged-pointer
@@ -417,9 +540,9 @@ resolveVirtualRefImpl(Value *V, const PEABlockState &State,
   // with the identity-resolution path above.
   if (isIntToPtrOp(V)) {
     if (Value *Inner = getIntToPtrRoundTripInner(V, DL))
-      return resolveVirtualRefImpl(Inner, State, Aliases, DL, Visited,
-                                   Depth + 1);
-    return std::nullopt;
+      return resolveVirtualIdentityImpl(Inner, State, Aliases, DL, Mode,
+                                        Visited, Depth + 1);
+    return VirtualIdentityResult::unknown();
   }
 
   // (8) PHINode / (9) SelectInst — recursion through Case-B-style merges that
@@ -432,61 +555,175 @@ resolveVirtualRefImpl(Value *V, const PEABlockState &State,
   // value with an earlier sibling can still descend through it.
   if (auto *Phi = dyn_cast<PHINode>(V)) {
     std::optional<ObjectID> Common;
-    bool First = true;
     for (Value *In : Phi->incoming_values()) {
-      // Treat a poison incoming as no-contribution. The pred path that
-      // supplies poison is by definition unreachable at runtime (or produces
-      // UB if reached); the incoming carries no information about virtual
-      // identity. Skip it entirely so a single live virtual incoming makes
-      // the whole PHI denote that virtual.
-      if (isa<PoisonValue>(In))
+      VirtualIdentityResult Sub = resolveVirtualIdentityImpl(
+          In, State, Aliases, DL, Mode, Visited, Depth + 1);
+      if (Sub.isPoisonWildcard())
         continue;
-      auto Sub =
-          resolveVirtualRefImpl(In, State, Aliases, DL, Visited, Depth + 1);
-      if (!Sub)
-        return std::nullopt;
-      if (First) {
-        Common = Sub;
-        First = false;
-      } else if (*Sub != *Common) {
-        return std::nullopt;
-      }
+      if (!Sub.isDefined())
+        return VirtualIdentityResult::unknown();
+      if (!Common)
+        Common = Sub.getObjectID();
+      else if (Sub.getObjectID() != *Common)
+        return VirtualIdentityResult::unknown();
     }
-    return Common;
+    if (Common)
+      return VirtualIdentityResult::defined(*Common);
+    // A merge made entirely from poison has no defined identity to refine.
+    return VirtualIdentityResult::unknown();
   }
 
   if (auto *Sel = dyn_cast<SelectInst>(V)) {
-    Value *TV = Sel->getTrueValue();
-    Value *FV = Sel->getFalseValue();
-    // A poison arm carries no virtual identity information; if the OTHER arm
-    // resolves to a virtual, that virtual is the only possible runtime value
-    // of the Select (the poison-arm path would be UB if executed).
-    bool TPoison = isa<PoisonValue>(TV);
-    bool FPoison = isa<PoisonValue>(FV);
-    if (TPoison && FPoison)
-      return std::nullopt;
-    if (TPoison)
-      return resolveVirtualRefImpl(FV, State, Aliases, DL, Visited, Depth + 1);
-    if (FPoison)
-      return resolveVirtualRefImpl(TV, State, Aliases, DL, Visited, Depth + 1);
-    auto T = resolveVirtualRefImpl(TV, State, Aliases, DL, Visited, Depth + 1);
-    if (!T)
-      return std::nullopt;
-    auto F = resolveVirtualRefImpl(FV, State, Aliases, DL, Visited, Depth + 1);
-    if (!F || *T != *F)
-      return std::nullopt;
-    return T;
+    VirtualIdentityResult T = resolveVirtualIdentityImpl(
+        Sel->getTrueValue(), State, Aliases, DL, Mode, Visited, Depth + 1);
+    VirtualIdentityResult F = resolveVirtualIdentityImpl(
+        Sel->getFalseValue(), State, Aliases, DL, Mode, Visited, Depth + 1);
+    if (T.isPoisonWildcard() && F.isDefined())
+      return F;
+    if (F.isPoisonWildcard() && T.isDefined())
+      return T;
+    if (T.isDefined() && F.isDefined() && T.getObjectID() == F.getObjectID())
+      return T;
+    // In particular, all-poison selects are Unknown, as are any merges
+    // involving undef/external values or differing defined identities.
+    return VirtualIdentityResult::unknown();
   }
 
   // (10) Call, Argument, ... — opaque to alias analysis. Fall through.
-  return std::nullopt;
+  return VirtualIdentityResult::unknown();
+}
+
+VirtualIdentityResult resolveVirtualIdentity(Value *V,
+                                             const PEABlockState &State,
+                                             const AliasMap &Aliases,
+                                             const DataLayout &DL,
+                                             VirtualIdentityMode Mode) {
+  DenseSet<Value *> Visited;
+  return resolveVirtualIdentityImpl(V, State, Aliases, DL, Mode, Visited,
+                                    /*Depth=*/0);
 }
 
 std::optional<ObjectID> resolveVirtualRef(Value *V, const PEABlockState &State,
                                           const AliasMap &Aliases,
                                           const DataLayout &DL) {
+  VirtualIdentityResult R = resolveVirtualIdentity(
+      V, State, Aliases, DL, VirtualIdentityMode::BaseObject);
+  if (!R.isDefined())
+    return std::nullopt;
+  return R.getObjectID();
+}
+
+static bool isProvablyDistinctFromVirtualImpl(Value *V, ObjectID TargetID,
+                                              const PEABlockState &State,
+                                              const AliasMap &Aliases,
+                                              const DataLayout &DL,
+                                              DenseSet<Value *> &Visited,
+                                              unsigned Depth) {
+  if (!V || Depth > ResolveVirtualRefMaxDepth || Visited.count(V))
+    return false;
+  StackGuard Guard(Visited, V);
+
+  if (isa<PoisonValue>(V) || isa<UndefValue>(V))
+    return false;
+
+  VirtualIdentityResult Whole = resolveVirtualIdentity(
+      V, State, Aliases, DL, VirtualIdentityMode::WholeObject);
+  if (Whole.isDefined())
+    return Whole.getObjectID() != TargetID;
+
+  // A materialized/stale alias no longer resolves through State, but the
+  // AliasMap still records its allocation identity. Only its whole-object
+  // address can participate in the allocation-site distinctness proof.
+  if (auto AliasID = Aliases.getVirtualAlias(V)) {
+    std::optional<int64_t> Offset = resolveFieldOffset(V, DL);
+    return Offset && *Offset == 0 && *AliasID != TargetID;
+  }
+  if (Value *Scalar = Aliases.getScalarAlias(V))
+    return isProvablyDistinctFromVirtualImpl(Scalar, TargetID, State, Aliases,
+                                             DL, Visited, Depth + 1);
+
+  if (auto *PN = dyn_cast<PHINode>(V)) {
+    if (PN->getNumIncomingValues() == 0)
+      return false;
+    return llvm::all_of(PN->incoming_values(), [&](Value *Incoming) {
+      return isProvablyDistinctFromVirtualImpl(Incoming, TargetID, State,
+                                               Aliases, DL, Visited, Depth + 1);
+    });
+  }
+  if (auto *Sel = dyn_cast<SelectInst>(V))
+    return isProvablyDistinctFromVirtualImpl(Sel->getTrueValue(), TargetID,
+                                             State, Aliases, DL, Visited,
+                                             Depth + 1) &&
+           isProvablyDistinctFromVirtualImpl(Sel->getFalseValue(), TargetID,
+                                             State, Aliases, DL, Visited,
+                                             Depth + 1);
+
+  // Freeze makes an undef/poison choice observable. Recurse only when LLVM
+  // can prove its operand already has a defined value.
+  if (auto *FI = dyn_cast<FreezeInst>(V))
+    return isGuaranteedNotToBeUndefOrPoison(FI->getOperand(0)) &&
+           isProvablyDistinctFromVirtualImpl(FI->getOperand(0), TargetID, State,
+                                             Aliases, DL, Visited, Depth + 1);
+
+  if (auto *GEP = dyn_cast<GEPOperator>(V)) {
+    std::optional<int64_t> Offset = resolveFieldOffset(V, DL);
+    return Offset && *Offset == 0 &&
+           isProvablyDistinctFromVirtualImpl(GEP->getPointerOperand(), TargetID,
+                                             State, Aliases, DL, Visited,
+                                             Depth + 1);
+  }
+  if (auto *BC = dyn_cast<BitCastOperator>(V))
+    return isProvablyDistinctFromVirtualImpl(BC->getOperand(0), TargetID, State,
+                                             Aliases, DL, Visited, Depth + 1);
+  if (auto *ASC = dyn_cast<AddrSpaceCastOperator>(V)) {
+    auto *SrcPT = dyn_cast<PointerType>(ASC->getOperand(0)->getType());
+    auto *DstPT = dyn_cast<PointerType>(ASC->getType());
+    if (!SrcPT || !DstPT ||
+        SrcPT->getAddressSpace() != jeandle::AddrSpace::JavaHeapAddrSpace ||
+        DstPT->getAddressSpace() != jeandle::AddrSpace::JavaHeapAddrSpace)
+      return false;
+    return isProvablyDistinctFromVirtualImpl(
+        ASC->getOperand(0), TargetID, State, Aliases, DL, Visited, Depth + 1);
+  }
+  if (isIntToPtrOp(V)) {
+    Value *Inner = getIntToPtrRoundTripInner(V, DL);
+    return Inner &&
+           isProvablyDistinctFromVirtualImpl(Inner, TargetID, State, Aliases,
+                                             DL, Visited, Depth + 1);
+  }
+
+  if (auto *II = dyn_cast<IntrinsicInst>(V)) {
+    switch (II->getIntrinsicID()) {
+    case Intrinsic::launder_invariant_group:
+    case Intrinsic::strip_invariant_group:
+    case Intrinsic::ptr_annotation:
+      return isProvablyDistinctFromVirtualImpl(II->getArgOperand(0), TargetID,
+                                               State, Aliases, DL, Visited,
+                                               Depth + 1);
+    default:
+      return false;
+    }
+  }
+
+  if (isa<ConstantPointerNull>(V) || isa<GlobalValue>(V))
+    return true;
+  if (isa<Constant>(V))
+    return false;
+
+  // A still-virtual allocation has not been published. A direct external SSA
+  // reference cannot denote it. Unknown pointer-producing structure is not
+  // accepted: it may merely be another carrier for TargetID.
+  return isa<Argument>(V) || isa<LoadInst>(V) || isa<CallBase>(V);
+}
+
+bool isProvablyDistinctFromVirtual(Value *V, ObjectID TargetID,
+                                   const PEABlockState &State,
+                                   const AliasMap &Aliases,
+                                   const DataLayout &DL) {
+  assert(TargetID != InvalidObjectID);
   DenseSet<Value *> Visited;
-  return resolveVirtualRefImpl(V, State, Aliases, DL, Visited, /*Depth=*/0);
+  return isProvablyDistinctFromVirtualImpl(V, TargetID, State, Aliases, DL,
+                                           Visited, /*Depth=*/0);
 }
 
 // ===========================================================================
@@ -506,36 +743,40 @@ std::optional<int64_t> resolveFieldOffset(Value *Ptr, const DataLayout &DL) {
   int64_t Off = 0;
   bool NonConst = false;
   stripPointerCastsAndOffsets(Ptr, DL, &Off, &NonConst);
-  if (NonConst)
+  if (NonConst || !isUsableFieldOffset(Off))
     return std::nullopt;
   return Off;
 }
 
-bool isWholeObjectReference(Value *V, const DataLayout &DL) {
-  unsigned Depth = 0;
-  SmallVector<Value *, 8> Worklist(1, V);
-  SmallPtrSet<Value *, 8> Visited;
+bool hasUnremovedSemanticUses(Value *Root,
+                              function_ref<bool(const Use &)> IsRemoved) {
+  SmallPtrSet<Value *, 16> Visited;
+  SmallVector<Value *, 16> Worklist(1, Root);
   while (!Worklist.empty()) {
-    Value *Cur = Worklist.pop_back_val();
-    if (!Cur || !Visited.insert(Cur).second)
+    Value *Current = Worklist.pop_back_val();
+    if (!Current || !Visited.insert(Current).second)
       continue;
-    if (++Depth > 8)
-      return false; // pathological merge chain — conservative.
-    if (auto *Sel = dyn_cast<SelectInst>(Cur)) {
-      Worklist.push_back(Sel->getTrueValue());
-      Worklist.push_back(Sel->getFalseValue());
-      continue;
+    for (const Use &U : Current->uses()) {
+      auto *I = dyn_cast<Instruction>(U.getUser());
+      bool IsCarrier = I && (isa<GetElementPtrInst>(I) || isa<BitCastInst>(I) ||
+                             isa<AddrSpaceCastInst>(I) || isa<FreezeInst>(I) ||
+                             isa<PHINode>(I) || isa<SelectInst>(I));
+      if (auto *II = dyn_cast_or_null<IntrinsicInst>(I)) {
+        Intrinsic::ID ID = II->getIntrinsicID();
+        IsCarrier = U.getOperandNo() == 0 &&
+                    (ID == Intrinsic::launder_invariant_group ||
+                     ID == Intrinsic::strip_invariant_group ||
+                     ID == Intrinsic::ptr_annotation);
+      }
+      if (IsCarrier) {
+        Worklist.push_back(I);
+        continue;
+      }
+      if (!IsRemoved(U))
+        return true;
     }
-    if (auto *PN = dyn_cast<PHINode>(Cur)) {
-      for (Value *Inc : PN->incoming_values())
-        Worklist.push_back(Inc);
-      continue;
-    }
-    auto Off = resolveFieldOffset(Cur, DL);
-    if (!Off || *Off != 0)
-      return false;
   }
-  return true;
+  return false;
 }
 
 // ===========================================================================

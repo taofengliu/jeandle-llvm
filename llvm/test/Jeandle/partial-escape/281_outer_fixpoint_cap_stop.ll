@@ -5,9 +5,8 @@
 ; %sink has no attributes the standard pipeline can exploit. We run the
 ; wrapper with the full iteration cap (4) and verify that:
 ;   1. the pass terminates cleanly (no infinite loop, no crash),
-;   2. convergence detection short-circuits the cap (the first round detects
-;      no allocation was eliminated and bails — the cap is the safety net,
-;      not the steady-state behaviour),
+;   2. convergence detection short-circuits the cap once a complete current
+;      transform+canonicalization round leaves IR unchanged,
 ;   3. the allocation and the sink call are preserved (no spurious deletion).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)

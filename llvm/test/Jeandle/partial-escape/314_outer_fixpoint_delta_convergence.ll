@@ -1,17 +1,14 @@
 ; RUN: opt -S -passes="partial-escape-iterative" -jeandle-pea-iterations=4 %s | FileCheck %s
 
-; Plumb VirtualizationDelta + AllocationDelta into the outer fixpoint's
-; convergence check. A break condition of just (TransformIdle &&
-; AllocsUnchanged) could miss progress when an iteration shuffled
-; virtualisation effects without changing the surviving allocation count
-; (e.g. multiple predecessor replay plans converging on one retained
-; OrigAlloc identity).
+; Outer convergence follows actual work rather than allocation-count
+; heuristics. A round that changes either the PEA transform or the complete
+; canonicalized Function IR must be followed by another PEA round when the cap
+; permits.
 ;
 ; This test exercises a chain of three nested allocs whose virtualisation
 ; opportunities only fully resolve after multiple rounds of analyse +
-; canonicalise. The outer loop requires both delta values to be stable
-; across consecutive iterations before breaking, so the third round
-; actually runs and completes the virtualisation.
+; canonicalise. The outer loop therefore reaches the later round that
+; completes the virtualisation.
 
 @G_zero = private unnamed_addr constant i32 0
 

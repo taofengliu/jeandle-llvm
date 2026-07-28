@@ -143,9 +143,8 @@ public:
     uint8_t ByteSize;
     bool IsReference;
 
-    bool overlaps(int64_t Off, uint8_t Size) const {
-      return Off < Offset + ByteSize && Offset < Off + Size;
-    }
+    // Empty means an endpoint overflowed and overlap is unknown.
+    std::optional<bool> overlaps(int64_t Off, uint8_t Size) const;
   };
 
 private:
@@ -666,6 +665,8 @@ public:
 // PartialEscapeBlockState.materializeBefore.
 class MaterializeEffect : public Effect {
 public:
+  static constexpr uint32_t InvalidPlanID = ~uint32_t{0};
+
   // Per-offset snapshot of a virtual object's field values at a
   // materialization point.
   struct FieldEntry {
@@ -704,6 +705,11 @@ public:
   // moves every replay operation to that edge before building batches. Null
   // for live-path materializations and true block-end drains.
   BasicBlock *ReplayTarget = nullptr;
+  // Recursive field prerequisites and strict-lock cascade members share one
+  // plan ID. Final eligibility treats every surviving plan as an atomic
+  // component: if any member is ineligible, every member's effects are
+  // discarded before transform application.
+  uint32_t PlanID = InvalidPlanID;
   // Incoming-edge replay uses the effect's real receiver. Field and lock replay
   // retain edge provenance, and per-pred receiver identity survives via
   // MaterializedReceiverOf[SourceEffect].
@@ -1014,6 +1020,10 @@ public:
   // The transform must run its terminator and unreachable-block cleanup even
   // when applying the surviving effects does not otherwise mutate the IR.
   bool NeedsCFGCleanup = false;
+  // Blocks excluded by the final, validated CFG-deadness plan. Uses in these
+  // blocks are removed by the transform's unreachable-block cleanup and are
+  // not surviving semantic uses of a NeverEscapes allocation.
+  DenseSet<BasicBlock *> FinalDeadBlocks;
 
   // PHI nodes created (unparented) by the analyzer for CreatePHI effects.
   // Stored as WeakTrackingVH so we can safely check for nullness in the
@@ -1072,6 +1082,8 @@ public:
 
   void addBlockEffect(std::unique_ptr<Effect> E);
   void publishEffectTrace() const;
+  bool hasUniqueEffectSequenceNumbers() const;
+  bool hasLegalMaterializationAtomicTypes(const DataLayout &DL) const;
 
   bool hasOptimizationOpportunity() const;
 

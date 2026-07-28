@@ -10,8 +10,8 @@
 //===----------------------------------------------------------------------===//
 //
 // Outer fixpoint. Runs PartialEscapeAnalysis + PartialEscapeTransform in a
-// bounded loop, interleaving canonicalization passes (ADCE + SimplifyCFG +
-// LoopSimplify + InstCombine) between rounds so new scalar-replacement
+// bounded loop, running canonicalization passes (ADCE + SimplifyCFG +
+// LoopSimplify + InstCombine) in each round so new scalar-replacement
 // opportunities are exposed for the next round.
 //
 //===----------------------------------------------------------------------===//
@@ -23,8 +23,7 @@
 
 namespace llvm {
 
-class PartialEscapeIterative
-    : public PassInfoMixin<PartialEscapeIterative> {
+class PartialEscapeIterative : public PassInfoMixin<PartialEscapeIterative> {
 public:
   PartialEscapeIterative() = default;
   PreservedAnalyses run(Function &F, FunctionAnalysisManager &FAM);

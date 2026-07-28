@@ -44,6 +44,7 @@ set(ANALYSIS_TEST_SOURCES
   MemoryProfileInfoTest.cpp
   MemorySSATest.cpp
   MLModelRunnerTest.cpp
+  PartialEscapeUtilsTest.cpp
   PhiValuesTest.cpp
   PluginInlineAdvisorAnalysisTest.cpp
   PluginInlineOrderAnalysisTest.cpp

@@ -1,11 +1,18 @@
-; RUN: opt -S -passes="partial-escape-iterative" -jeandle-pea-iterations=8 -jeandle-dump-pea-ir=stable_convergence %s 2>&1 | FileCheck %s
+; RUN: opt -S -passes="partial-escape-iterative" -jeandle-pea-iterations=8 \
+; RUN:   -jeandle-dump-pea-ir=stable_convergence %s 2>&1 \
+; RUN:   | grep '^;; PEA-SUMMARY' | FileCheck %s --check-prefix=ONCE
+; RUN: opt -S \
+; RUN:   -passes="partial-escape-iterative,partial-escape-iterative" \
+; RUN:   -jeandle-pea-iterations=8 -jeandle-dump-pea-ir=stable_convergence \
+; RUN:   %s 2>&1 | grep '^;; PEA-SUMMARY' \
+; RUN:   | FileCheck %s --check-prefix=TWICE
 
 ; Regression test for the outer fixpoint convergence logic. A function whose
-; PEA-specific signals (transform idle, alloc count, virtualization delta,
-; allocation delta) are stable from round 1 onward — but whose canonicalization
-; (SimplifyCFG/LoopSimplify) reports "changed" every round due to conservative
-; areAllPreserved — must still converge. The PEAStableRounds mechanism
-; declares convergence after 2 consecutive PEA-stable rounds.
+; canonicalization passes conservatively invalidate analyses while
+; SimplifyCFG and LoopSimplify leave the whole sequence's printed IR unchanged
+; must not report an IR mutation. The first wrapper invocation performs one
+; real cleanup round and one unchanged round. Its already-canonical result
+; reaches a fixpoint in the first round of the second invocation.
 
 declare hotspotcc void @jeandle.safepoint_poll()
 declare i32 @__gxx_personality_v0(...)
@@ -39,7 +46,8 @@ loop:
   br i1 %exitcond.not, label %exit.loopexit, label %loop
 }
 
-; The outer fixpoint must converge (stop=fixpoint), not hit the iteration cap.
-; CHECK: PEA-SUMMARY function stable_convergence rounds={{[1-4]}} stop=fixpoint
+; ONCE: PEA-SUMMARY function stable_convergence rounds=2 stop=fixpoint
+; TWICE: PEA-SUMMARY function stable_convergence rounds=2 stop=fixpoint
+; TWICE-NEXT: PEA-SUMMARY function stable_convergence rounds=1 stop=fixpoint
 
 !java-method-compilation = !{}

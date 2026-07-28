@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="partial-escape-iterative" -jeandle-pea-iterations=2 \
 ; RUN:   -jeandle-dump-pea-ir-function=test_two_round_elim %s 2>&1 \
-; RUN:   | grep '^;; PEA-DUMP' | FileCheck %s --check-prefix=CAP2
+; RUN:   | grep '^;; PEA-' | FileCheck %s --check-prefix=CAP2
 ; RUN: opt -S -passes="partial-escape-iterative" -jeandle-pea-iterations=2 %s \
 ; RUN:   | FileCheck %s --check-prefix=FINAL
 
@@ -50,7 +50,8 @@ u:
 ; CAP2-NEXT: ;; PEA-DUMP after iter=0 function test_two_round_elim transform_idle=1
 ; CAP2-NEXT: ;; PEA-DUMP before iter=1 function test_two_round_elim
 ; CAP2-NEXT: ;; PEA-DUMP after iter=1 function test_two_round_elim transform_idle=0
-; CAP2-NOT: ;; PEA-DUMP
+; CAP2-NEXT: ;; PEA-SUMMARY function test_two_round_elim rounds=2 stop=iteration-cap
+; CAP2-NOT: ;; PEA-
 
 ; FINAL-LABEL: define i32 @test_two_round_elim()
 ; FINAL-NOT: jeandle.new_instance

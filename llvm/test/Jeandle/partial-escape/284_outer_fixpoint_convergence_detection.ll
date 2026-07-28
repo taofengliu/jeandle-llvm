@@ -66,9 +66,9 @@
 
 ; Outer-fixpoint convergence detection. The first transform is idle, but its
 ; following canonicalization deletes the constant-false escape branch. The
-; second transform eliminates the now non-escaping allocation. Two idle
-; rounds then establish that the transform result, allocation count, analysis
-; deltas, and preceding canonicalization are all stable.
+; second transform eliminates the now non-escaping allocation. The next idle
+; transform and its unchanged current canonicalization establish the real IR
+; fixpoint.
 ;
 ; Caps 4 and 16 therefore stop at exactly the same stable point and produce
 ; byte-identical IR. Running the pipeline twice resets the iteration counter,
@@ -374,9 +374,7 @@ u:
 ; HIGH-NEXT: ;; PEA-DUMP after iter=1 function test_convergence_detection transform_idle=0
 ; HIGH-NEXT: ;; PEA-DUMP before iter=2 function test_convergence_detection
 ; HIGH-NEXT: ;; PEA-DUMP after iter=2 function test_convergence_detection transform_idle=1
-; HIGH-NEXT: ;; PEA-DUMP before iter=3 function test_convergence_detection
-; HIGH-NEXT: ;; PEA-DUMP after iter=3 function test_convergence_detection transform_idle=1
-; HIGH-NEXT: ;; PEA-SUMMARY function test_convergence_detection rounds=4 stop=fixpoint
+; HIGH-NEXT: ;; PEA-SUMMARY function test_convergence_detection rounds=3 stop=fixpoint
 ; HIGH-NOT: ;; PEA-
 
 ; REPEAT: ;; PEA-DUMP before iter=0 function test_convergence_detection
@@ -385,12 +383,8 @@ u:
 ; REPEAT-NEXT: ;; PEA-DUMP after iter=1 function test_convergence_detection transform_idle=0
 ; REPEAT-NEXT: ;; PEA-DUMP before iter=2 function test_convergence_detection
 ; REPEAT-NEXT: ;; PEA-DUMP after iter=2 function test_convergence_detection transform_idle=1
-; REPEAT-NEXT: ;; PEA-DUMP before iter=3 function test_convergence_detection
-; REPEAT-NEXT: ;; PEA-DUMP after iter=3 function test_convergence_detection transform_idle=1
 ; REPEAT-NEXT: ;; PEA-DUMP before iter=0 function test_convergence_detection
 ; REPEAT-NEXT: ;; PEA-DUMP after iter=0 function test_convergence_detection transform_idle=1
-; REPEAT-NEXT: ;; PEA-DUMP before iter=1 function test_convergence_detection
-; REPEAT-NEXT: ;; PEA-DUMP after iter=1 function test_convergence_detection transform_idle=1
 ; REPEAT-NOT: ;; PEA-DUMP
 
 ; A stable partial escape keeps its original allocation and one replay at each
@@ -401,20 +395,14 @@ u:
 ; PARTIAL-NEXT: ;; PEA-DUMP after iter=0 function test_partial_replay_converges transform_idle=0
 ; PARTIAL-NEXT: ;; PEA-DUMP before iter=1 function test_partial_replay_converges
 ; PARTIAL-NEXT: ;; PEA-DUMP after iter=1 function test_partial_replay_converges transform_idle=1
-; PARTIAL-NEXT: ;; PEA-DUMP before iter=2 function test_partial_replay_converges
-; PARTIAL-NEXT: ;; PEA-DUMP after iter=2 function test_partial_replay_converges transform_idle=1
 ; PARTIAL-NOT: ;; PEA-DUMP
 
 ; PARTIAL-REPEAT: ;; PEA-DUMP before iter=0 function test_partial_replay_converges
 ; PARTIAL-REPEAT-NEXT: ;; PEA-DUMP after iter=0 function test_partial_replay_converges transform_idle=0
 ; PARTIAL-REPEAT-NEXT: ;; PEA-DUMP before iter=1 function test_partial_replay_converges
 ; PARTIAL-REPEAT-NEXT: ;; PEA-DUMP after iter=1 function test_partial_replay_converges transform_idle=1
-; PARTIAL-REPEAT-NEXT: ;; PEA-DUMP before iter=2 function test_partial_replay_converges
-; PARTIAL-REPEAT-NEXT: ;; PEA-DUMP after iter=2 function test_partial_replay_converges transform_idle=1
 ; PARTIAL-REPEAT-NEXT: ;; PEA-DUMP before iter=0 function test_partial_replay_converges
 ; PARTIAL-REPEAT-NEXT: ;; PEA-DUMP after iter=0 function test_partial_replay_converges transform_idle=1
-; PARTIAL-REPEAT-NEXT: ;; PEA-DUMP before iter=1 function test_partial_replay_converges
-; PARTIAL-REPEAT-NEXT: ;; PEA-DUMP after iter=1 function test_partial_replay_converges transform_idle=1
 ; PARTIAL-REPEAT-NOT: ;; PEA-DUMP
 
 ; The replayed monitorenter is stable for the same reason as field stores. It
@@ -424,8 +412,6 @@ u:
 ; LOCK-NEXT: ;; PEA-DUMP after iter=0 function test_lock_replay_converges transform_idle=0
 ; LOCK-NEXT: ;; PEA-DUMP before iter=1 function test_lock_replay_converges
 ; LOCK-NEXT: ;; PEA-DUMP after iter=1 function test_lock_replay_converges transform_idle=1
-; LOCK-NEXT: ;; PEA-DUMP before iter=2 function test_lock_replay_converges
-; LOCK-NEXT: ;; PEA-DUMP after iter=2 function test_lock_replay_converges transform_idle=1
 ; LOCK-NOT: ;; PEA-DUMP
 
 ; The input's complete a@0,b@1,a@2 suffix already has the exact replay shape,
@@ -434,28 +420,20 @@ u:
 ; MERGED-LOCK-NEXT: ;; PEA-DUMP after iter=0 function test_merged_lock_replay_converges transform_idle=1
 ; MERGED-LOCK-NEXT: ;; PEA-DUMP before iter=1 function test_merged_lock_replay_converges
 ; MERGED-LOCK-NEXT: ;; PEA-DUMP after iter=1 function test_merged_lock_replay_converges transform_idle=1
-; MERGED-LOCK-NEXT: ;; PEA-DUMP before iter=2 function test_merged_lock_replay_converges
-; MERGED-LOCK-NEXT: ;; PEA-DUMP after iter=2 function test_merged_lock_replay_converges transform_idle=1
 ; MERGED-LOCK-NOT: ;; PEA-DUMP
 
 ; PER-PRED-CASCADE: ;; PEA-DUMP before iter=0 function test_per_pred_cascade_replay_converges
 ; PER-PRED-CASCADE-NEXT: ;; PEA-DUMP after iter=0 function test_per_pred_cascade_replay_converges transform_idle=0
 ; PER-PRED-CASCADE-NEXT: ;; PEA-DUMP before iter=1 function test_per_pred_cascade_replay_converges
 ; PER-PRED-CASCADE-NEXT: ;; PEA-DUMP after iter=1 function test_per_pred_cascade_replay_converges transform_idle=1
-; PER-PRED-CASCADE-NEXT: ;; PEA-DUMP before iter=2 function test_per_pred_cascade_replay_converges
-; PER-PRED-CASCADE-NEXT: ;; PEA-DUMP after iter=2 function test_per_pred_cascade_replay_converges transform_idle=1
 ; PER-PRED-CASCADE-NOT: ;; PEA-DUMP
 
 ; MERGED-LOCK-REPEAT: ;; PEA-DUMP before iter=0 function test_merged_lock_replay_converges
 ; MERGED-LOCK-REPEAT-NEXT: ;; PEA-DUMP after iter=0 function test_merged_lock_replay_converges transform_idle=1
 ; MERGED-LOCK-REPEAT-NEXT: ;; PEA-DUMP before iter=1 function test_merged_lock_replay_converges
 ; MERGED-LOCK-REPEAT-NEXT: ;; PEA-DUMP after iter=1 function test_merged_lock_replay_converges transform_idle=1
-; MERGED-LOCK-REPEAT-NEXT: ;; PEA-DUMP before iter=2 function test_merged_lock_replay_converges
-; MERGED-LOCK-REPEAT-NEXT: ;; PEA-DUMP after iter=2 function test_merged_lock_replay_converges transform_idle=1
 ; MERGED-LOCK-REPEAT-NEXT: ;; PEA-DUMP before iter=0 function test_merged_lock_replay_converges
 ; MERGED-LOCK-REPEAT-NEXT: ;; PEA-DUMP after iter=0 function test_merged_lock_replay_converges transform_idle=1
-; MERGED-LOCK-REPEAT-NEXT: ;; PEA-DUMP before iter=1 function test_merged_lock_replay_converges
-; MERGED-LOCK-REPEAT-NEXT: ;; PEA-DUMP after iter=1 function test_merged_lock_replay_converges transform_idle=1
 ; MERGED-LOCK-REPEAT-NOT: ;; PEA-DUMP
 
 ; The volatile access is preserved while its preceding ordinary replay reaches
@@ -464,24 +442,16 @@ u:
 ; VOLATILE-REPEAT-NEXT: ;; PEA-DUMP after iter=0 function test_volatile_replay_mismatch transform_idle=0
 ; VOLATILE-REPEAT-NEXT: ;; PEA-DUMP before iter=1 function test_volatile_replay_mismatch
 ; VOLATILE-REPEAT-NEXT: ;; PEA-DUMP after iter=1 function test_volatile_replay_mismatch transform_idle=1
-; VOLATILE-REPEAT-NEXT: ;; PEA-DUMP before iter=2 function test_volatile_replay_mismatch
-; VOLATILE-REPEAT-NEXT: ;; PEA-DUMP after iter=2 function test_volatile_replay_mismatch transform_idle=1
 ; VOLATILE-REPEAT-NEXT: ;; PEA-DUMP before iter=0 function test_volatile_replay_mismatch
 ; VOLATILE-REPEAT-NEXT: ;; PEA-DUMP after iter=0 function test_volatile_replay_mismatch transform_idle=1
-; VOLATILE-REPEAT-NEXT: ;; PEA-DUMP before iter=1 function test_volatile_replay_mismatch
-; VOLATILE-REPEAT-NEXT: ;; PEA-DUMP after iter=1 function test_volatile_replay_mismatch transform_idle=1
 ; VOLATILE-REPEAT-NOT: ;; PEA-DUMP
 
 ; SYNCSCOPE-REPEAT: ;; PEA-DUMP before iter=0 function test_syncscope_replay_mismatch
 ; SYNCSCOPE-REPEAT-NEXT: ;; PEA-DUMP after iter=0 function test_syncscope_replay_mismatch transform_idle=0
 ; SYNCSCOPE-REPEAT-NEXT: ;; PEA-DUMP before iter=1 function test_syncscope_replay_mismatch
 ; SYNCSCOPE-REPEAT-NEXT: ;; PEA-DUMP after iter=1 function test_syncscope_replay_mismatch transform_idle=1
-; SYNCSCOPE-REPEAT-NEXT: ;; PEA-DUMP before iter=2 function test_syncscope_replay_mismatch
-; SYNCSCOPE-REPEAT-NEXT: ;; PEA-DUMP after iter=2 function test_syncscope_replay_mismatch transform_idle=1
 ; SYNCSCOPE-REPEAT-NEXT: ;; PEA-DUMP before iter=0 function test_syncscope_replay_mismatch
 ; SYNCSCOPE-REPEAT-NEXT: ;; PEA-DUMP after iter=0 function test_syncscope_replay_mismatch transform_idle=1
-; SYNCSCOPE-REPEAT-NEXT: ;; PEA-DUMP before iter=1 function test_syncscope_replay_mismatch
-; SYNCSCOPE-REPEAT-NEXT: ;; PEA-DUMP after iter=1 function test_syncscope_replay_mismatch transform_idle=1
 ; SYNCSCOPE-REPEAT-NOT: ;; PEA-DUMP
 
 ; FINAL-LABEL: define i32 @test_convergence_detection()

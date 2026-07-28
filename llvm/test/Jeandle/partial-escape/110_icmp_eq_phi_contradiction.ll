@@ -1,10 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Contradiction rule: a Case-B PHI carries the virtual ObjectID forward
-; through both arms, then `icmp eq %phi, %arg` where %arg is a non-null,
-; non-virtual pointer must fold to false (distinct identity).
-; A virtual is a fresh, just-allocated object — it cannot alias any
-; pre-existing reference. eq -> false.
+; through both arms. Although the argument has no virtual identity, a
+; still-virtual fresh allocation cannot alias a pre-existing external value.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)
@@ -37,9 +35,7 @@ u:
   resume i64 %lp
 }
 
-; The virtual is fresh — it cannot alias the function-arg pointer %arg.
-; The icmp must fold to false, the same arm is dead, and the alloc is
-; eliminated (no consumer survives).
+; The target-relative distinctness proof folds the compare to false.
 ; CHECK-LABEL: define void @test_icmp_eq_phi_contradiction
 ; CHECK-NOT: @jeandle.new_instance
 ; CHECK-NOT: pea.mat

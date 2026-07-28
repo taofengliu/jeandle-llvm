@@ -60,8 +60,10 @@ unwind:
 ; CHECK-NOT: poison
 
 ; No classification, trace, or statistic from the failed attempt may be
-; published.  In the winner only %a is analyzed, and its value-based veto
-; classifies it AlwaysEscapes; %b is retained by site suppression.
+; published. In the winner only %a is analyzed. Although %b is retained by
+; site suppression and has no tracked ObjectID, it remains a distinct fresh
+; allocation site, so the target-relative distinctness proof keeps the
+; contradiction fold.
 ; ATTEMPT-NOT: PEA: EliminateAllocation function=@final_deopt_dependency [VO=1]
 ; ATTEMPT: ;; PEA stats @final_deopt_dependency: NeverEscapes=0 PartiallyEscapes=0 AlwaysEscapes=1
 

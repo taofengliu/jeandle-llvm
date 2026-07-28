@@ -16,6 +16,7 @@
 #include "llvm/IR/Jeandle/Metadata.h"
 #include "llvm/IR/Jeandle/VMCallback.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
 namespace llvm {
@@ -250,6 +251,8 @@ void appendVirtualObjectDescriptor(SmallVectorImpl<Value *> &Args,
   // array the caller has already expanded ALL elements (touched + default) into
   // Fields, so field_count == ArrayLength.
   for (const VODescriptorField &F : Fields) {
+    assert(isInt<32>(F.Offset) &&
+           "PEA deopt field offset must fit DeoptValueEncoding::Index");
     if (F.IsVORef) {
       uint64_t FieldEnc =
           jeandle::DeoptValueEncoding(

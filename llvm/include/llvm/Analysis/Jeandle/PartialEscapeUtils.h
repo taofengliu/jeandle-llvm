@@ -16,6 +16,7 @@
 #ifndef LLVM_ANALYSIS_JEANDLE_PARTIALESCAPEUTILS_H
 #define LLVM_ANALYSIS_JEANDLE_PARTIALESCAPEUTILS_H
 
+#include "llvm/ADT/STLFunctionalExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Analysis/Jeandle/PartialEscape.h"
 #include "llvm/IR/Jeandle/VMConstants.h"
@@ -29,6 +30,7 @@ class DataLayout;
 class Function;
 class GetElementPtrInst;
 class Instruction;
+class IntrinsicInst;
 class LLVMContext;
 class Type;
 } // namespace llvm
@@ -55,6 +57,11 @@ bool isJeandleMonitorEnter(const CallBase *CB);
 bool isJeandleMonitorExit(const CallBase *CB);
 bool isJeandleRegisterFinalizerIfNeeded(const CallBase *CB);
 
+// Whether processIntrinsic treats II's ordinary operands and non-deopt operand
+// bundles as non-escaping. Deopt bundles remain executable frame state and
+// require a surviving RewriteDeoptBundleEffect.
+bool isPEAHandledNonEscapingIntrinsic(const IntrinsicInst *II);
+
 // Extract the Java element basic type from an array klass pointer.
 // TODO: returns std::nullopt when VMCallbacks are unavailable; pending
 // full VMCallbacks integration.
@@ -64,6 +71,30 @@ std::optional<JBasicType> elementTypeForArrayKlass(uintptr_t ArrayKlass);
 // Object→ptr addrspace(1)).  Returns nullptr if Kind == Count.
 Type *llvmElementTypeFor(JBasicType Kind, LLVMContext &Ctx);
 
+// Whether Ty may be emitted by materialization as an LLVM atomic store.
+// Mirrors Verifier::visitStoreInst/checkAtomicMemAccessSize: a sized,
+// fixed-width integer, pointer, floating-point, or vector thereof whose total
+// width is at least one byte and a power of two.
+bool isLegalMaterializationAtomicType(Type *Ty, const DataLayout &DL);
+
+// Checked arithmetic for the signed byte-offset model shared by pointer
+// resolution, field ranges, array addressing, and deopt descriptors. An empty
+// result means the value cannot be represented by int64_t and callers must
+// treat the access as unknown.
+std::optional<int64_t> checkedOffsetAdd(int64_t LHS, int64_t RHS);
+std::optional<int64_t> checkedOffsetSub(int64_t LHS, int64_t RHS);
+std::optional<int64_t> checkedArrayElementOffset(int64_t Base, int64_t Index,
+                                                 uint64_t Scale);
+
+// Field state uses DenseMap<int64_t, ...>; its empty and tombstone keys cannot
+// represent real offsets. Such offsets are unknown to PEA.
+bool isUsableFieldOffset(int64_t Offset);
+
+// Return whether the half-open ranges overlap. An empty result means at least
+// one endpoint is not representable; it is not proof of non-overlap.
+std::optional<bool> checkedRangesOverlap(int64_t AStart, uint64_t ASize,
+                                         int64_t BStart, uint64_t BSize);
+
 // Strip pointer-identity-preserving operations (bitcast, addrspacecast within
 // addrspace(1), freeze, launder/strip.invariant.group, ptr.annotation, and a
 // pre-existing same-width inttoptr(ptrtoint(x)) round-trip) and
@@ -71,35 +102,92 @@ Type *llvmElementTypeFor(JBasicType Kind, LLVMContext &Ctx);
 // Instruction dispatch still treats PtrToIntInst as an identity observation;
 // structural round-trip support does not keep a virtual live across it. Returns
 // the root pointer. Sets
-// *NonConstant = true if a non-constant GEP index was encountered (then the
-// accumulated offset is invalid). Shared structural helper used by
-// resolveVirtualRef and resolveFieldOffset.
+// *Unresolved = true if a non-constant GEP index, a non-representable APInt, or
+// an overflowing accumulated offset was encountered (then the accumulated
+// offset is invalid). Shared structural helper used by resolveVirtualRef and
+// resolveFieldOffset.
 Value *stripPointerCastsAndOffsets(Value *Ptr, const DataLayout &DL,
-                                   int64_t *OutOffset, bool *NonConstant);
+                                   int64_t *OutOffset, bool *Unresolved);
 
-// Resolve V to the ObjectID of the virtual object it names in the current
-// State. Returns std::nullopt if V does not resolve to a virtual object.
-// Cycle-safe via a small visited set. Canonical implementation; the
-// PEABlockState::resolveVirtualRef overload delegates here.
+// Result of resolving the virtual-object identity carried by an LLVM value.
+// Poison is a refinement wildcard while resolving a PHI/select, but is never
+// itself a defined identity. Undef and all other unresolved values are
+// Unknown.
+class VirtualIdentityResult {
+public:
+  enum class Kind : uint8_t { DefinedIdentity, PoisonWildcard, Unknown };
+
+  static VirtualIdentityResult defined(ObjectID ID) {
+    assert(ID != InvalidObjectID);
+    return VirtualIdentityResult(Kind::DefinedIdentity, ID);
+  }
+  static VirtualIdentityResult poisonWildcard() {
+    return VirtualIdentityResult(Kind::PoisonWildcard, InvalidObjectID);
+  }
+  static VirtualIdentityResult unknown() {
+    return VirtualIdentityResult(Kind::Unknown, InvalidObjectID);
+  }
+
+  Kind getKind() const { return K; }
+  bool isDefined() const { return K == Kind::DefinedIdentity; }
+  bool isPoisonWildcard() const { return K == Kind::PoisonWildcard; }
+  ObjectID getObjectID() const {
+    assert(isDefined());
+    return ID;
+  }
+
+private:
+  VirtualIdentityResult(Kind K, ObjectID ID) : K(K), ID(ID) {}
+
+  Kind K;
+  ObjectID ID;
+};
+
+enum class VirtualIdentityMode : uint8_t {
+  // Resolve the underlying virtual object. Constant-offset derived pointers
+  // keep the base identity.
+  BaseObject,
+  // Resolve only values that denote the complete object at byte offset zero
+  // on every defined path.
+  WholeObject
+};
+
+// Resolve V using the shared DefinedIdentity/PoisonWildcard/Unknown model.
+// Cycle-safe via a small visited set. WholeObject mode rejects non-zero and
+// symbolic offsets recursively through PHI/select.
+VirtualIdentityResult resolveVirtualIdentity(
+    Value *V, const PEABlockState &State, const AliasMap &Aliases,
+    const DataLayout &DL,
+    VirtualIdentityMode Mode = VirtualIdentityMode::BaseObject);
+
+// Compatibility wrapper for callers interested only in a defined base-object
+// identity.
 std::optional<ObjectID> resolveVirtualRef(Value *V, const PEABlockState &State,
                                           const AliasMap &Aliases,
                                           const DataLayout &DL);
+
+// Whether V is provably unable to denote TargetID's virtual allocation.
+// This is deliberately target-relative: an identity-Unknown PHI/select may
+// still be distinct when every alternative is external, but not when any
+// alternative can carry TargetID, poison, undef, a derived address, or an
+// unrecognised pointer-producing structure.
+bool isProvablyDistinctFromVirtual(Value *V, ObjectID TargetID,
+                                   const PEABlockState &State,
+                                   const AliasMap &Aliases,
+                                   const DataLayout &DL);
 
 // Resolve V to the byte offset from its (presumed virtual) base pointer.
 // Returns std::nullopt if V is not a constant-offset access (e.g., GEP with
 // non-constant index, inttoptr, or unrecognised pattern).
 std::optional<int64_t> resolveFieldOffset(Value *Ptr, const DataLayout &DL);
 
-// Whether V denotes the object it resolves to WHOLE — at byte offset 0 on
-// every execution path. resolveVirtualRef returns object identity and
-// discards byte offsets, and resolveFieldOffset has no Select/PHI case (it
-// returns 0 for them), so a consumer that records a whole-object reference
-// (a VirtualRef field entry, a whole-object alias-forward) must check this:
-// a Select/PHI whose arms may carry different non-zero offsets resolves to
-// the object by identity without being address-equal to it. Recurses
-// through Select arms and PHI incomings (cycle-safe via depth cap); leaves
-// go through resolveFieldOffset.
-bool isWholeObjectReference(Value *V, const DataLayout &DL);
+// Walk Root's users through pointer-value carriers that do not themselves
+// observe the pointer (GEP/casts/freeze/PHI/select and transparent pointer
+// intrinsics). Return true when a semantic use is not accepted by IsRemoved.
+// Analysis uses this for final NeverEscapes eligibility; the transform repeats
+// it as a debug invariant against the committed effect plan.
+bool hasUnremovedSemanticUses(Value *Root,
+                              function_ref<bool(const Use &)> IsRemoved);
 
 // Find the start index (into the "deopt" bundle's Inputs) of the CURRENT
 // (innermost) deopt scope's duplicated-BCI pair. A Jeandle deopt bundle is

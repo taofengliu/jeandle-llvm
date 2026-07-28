@@ -64,10 +64,12 @@ u:
 ; IR: call void @sink
 ; IR: call {{.*}}@jeandle.monitorexit_with_thin_lock
 
-; The STOP_NEW overflow escalated the loop to MATERIALIZE_ALL:
-; STATS: partial-escape-analysis - Regular -> MaterializeAll mode flips (escalations)
 ; The final recovered plan replays fields and the captured lock at the
 ; preheader rather than creating another allocation in the loop.
+; STATS: partial-escape-analysis - Materializations at loop preheader (force-drain)
+; STATS-NOT: partial-escape-analysis - Materializations triggered by state merge
+; The STOP_NEW overflow escalated the loop to MATERIALIZE_ALL:
+; STATS: partial-escape-analysis - Regular -> MaterializeAll mode flips (escalations)
 ; TRACE: PEA: Materialize function=@test_overflow_locked [VO=0] block=%e.cont target=
 
 !java-method-compilation = !{}

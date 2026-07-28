@@ -6,14 +6,12 @@
 ; Round 0's
 ; canonicalisation (ADCE → SCFG → LoopSimplify → InstCombine) prunes the
 ; dead branch and consolidates the survivor blocks — this is the
-; inter-round canonicalization event: canonicalisation moved IR around, and
+; current-round canonicalization event: canonicalisation moved IR around, and
 ; the subsequent fresh analysis may discover new opportunities even if the
 ; next transform is idle.
 ;
-; Convergence requires stable allocation and analyser deltas plus an idle
-; transform. A previous canonicalization mutation forces another analysis;
-; persistent conservative canonicalization reports are bounded by the two
-; consecutive PEA-stable-round rule.
+; Convergence requires both an idle transform and unchanged exact printed IR
+; from the same round's complete canonicalization sequence.
 
 @G_zero = private unnamed_addr constant i32 0
 

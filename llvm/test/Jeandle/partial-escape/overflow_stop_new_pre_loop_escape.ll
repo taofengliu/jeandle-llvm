@@ -60,11 +60,12 @@ u:
 ; IR: invoke {{.*}}@jeandle.new_instance({{.*}}i64 7777
 ; IR: call void @sink
 
+; The recovered plan is created by the explicit preheader force-drain, not by
+; the later header merge repairing a still-virtual preheader contribution.
+; STATS: partial-escape-analysis - Materializations at loop preheader (force-drain)
+; STATS-NOT: partial-escape-analysis - Materializations triggered by state merge
 ; The STOP_NEW overflow fired and escalated the loop to MATERIALIZE_ALL:
 ; STATS: partial-escape-analysis - Regular -> MaterializeAll mode flips (escalations)
-; Standard materialization counters include effects later discarded by loop
-; rollback, so the final trace—not a per-reason counter—is the placement
-; oracle for the recovered plan.
 ; TRACE: PEA: Materialize function=@test_overflow_pre_loop_escape [VO=0] block=%e.cont target=
 
 !java-method-compilation = !{}

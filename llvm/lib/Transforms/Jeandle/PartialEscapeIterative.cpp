@@ -7,20 +7,18 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // Outer fixpoint. Re-runs PartialEscapeAnalysis + PartialEscapeTransform,
-// interleaving the standard canonicalization passes (ADCE + SimplifyCFG +
-// LoopSimplify + InstCombine) between rounds, until bounded PEA convergence.
+// running the standard canonicalization passes (ADCE + SimplifyCFG +
+// LoopSimplify + InstCombine) in every round, until the transform and
+// canonicalized IR both reach a bounded fixpoint.
 // Each MaterializeEffect reuses the allocation call at its original site and
 // emits field/lock replay along the paths that require a materialized value; it
 // never creates or relocates an allocation. PEA can delete fully non-escaping
 // allocations. A deopt-bundle rewrite may replace an allocation call in place,
 // without adding an allocation or changing its site.
 //
-// Convergence (see `run()`): PEA-specific convergence requires an idle
-// transform, a stable remaining-allocation count, and stable analyser deltas
-// (VirtualizationDelta, AllocationDelta). A canonicalization change normally
-// requires another round; because preservation results can conservatively
-// report changes for bit-identical IR, two consecutive PEA-stable rounds also
-// establish convergence. The round cap is configured by
+// Convergence (see `run()`): a round is a fixpoint only when the PEA transform
+// is idle and the complete current canonicalization sequence leaves the exact
+// printed Function IR unchanged. The round cap is configured by
 // `-jeandle-pea-iterations` (hard-capped at HardIterationCap). Each round
 // explicitly abandons PartialEscapeAnalysis before invalidation, so no
 // PEAResult crosses rounds.
@@ -29,12 +27,8 @@
 
 #include "llvm/Transforms/Jeandle/PartialEscapeIterative.h"
 
-#include "llvm/Analysis/Jeandle/PartialEscape.h"
 #include "llvm/Analysis/Jeandle/PartialEscapeAnalysis.h"
-#include "llvm/Analysis/Jeandle/PartialEscapeUtils.h"
 #include "llvm/IR/Function.h"
-#include "llvm/IR/InstrTypes.h"
-#include "llvm/IR/Instructions.h"
 #include "llvm/IR/Jeandle/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/PassManager.h"
@@ -48,7 +42,7 @@
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
 #include "llvm/Transforms/Utils/LoopSimplify.h"
 
-#include <limits>
+#include <string>
 
 #define DEBUG_TYPE "jeandle-pea-iterative"
 
@@ -65,14 +59,14 @@ static cl::opt<unsigned> JeandlePEAIterations(
              "in the outer fixpoint. Default 2. Set to 1 for single-round "
              "semantics or higher to observe an idle convergence probe."));
 
-// PEA-only IR dump hook. When non-empty and matching F.getName(), dumps F
-// to errs() before and after each PartialEscapeTransform round, followed by
-// a summary. Filter with `2>&1 | grep PEA-` to isolate PEA diagnostics.
+// PEA-only IR dump hook. When non-empty and matching F.getName(), dumps F to
+// errs() before and after each complete outer round, followed by a summary.
+// Filter with `2>&1 | grep PEA-` to isolate PEA diagnostics.
 static cl::opt<std::string> JeandleDumpPEAIR(
     "jeandle-dump-pea-ir", cl::init(""), cl::Hidden,
-    cl::desc("PEA: dump function IR to errs() before AND after every "
-             "PartialEscapeTransform round whose function name contains "
-             "the given substring. Empty (the default) disables the dump."));
+    cl::desc("PEA: dump function IR to errs() before AND after every outer "
+             "round whose function name contains the given substring. Empty "
+             "(the default) disables the dump."));
 
 static cl::list<std::string> JeandleDumpPEAIRFunctions(
     "jeandle-dump-pea-ir-function", cl::Hidden,
@@ -95,19 +89,11 @@ static constexpr unsigned HardIterationCap = 16;
 
 bool llvm::jeandle::isPEAEnabled() { return JeandlePEAIterations != 0; }
 
-// Count `jeandle.new_instance` / `jeandle.new_array` CallBases in F — the
-// "allocations remaining" signal for convergence detection.
-static unsigned countJeandleAllocations(Function &F) {
-  unsigned Count = 0;
-  for (BasicBlock &BB : F) {
-    for (Instruction &I : BB) {
-      if (auto *CB = dyn_cast<CallBase>(&I)) {
-        if (jeandle::pea::isJeandleAllocation(CB))
-          ++Count;
-      }
-    }
-  }
-  return Count;
+static std::string printFunctionIR(const Function &F) {
+  std::string IR;
+  raw_string_ostream OS(IR);
+  F.print(OS);
+  return IR;
 }
 
 PreservedAnalyses PartialEscapeIterative::run(Function &F,
@@ -125,25 +111,6 @@ PreservedAnalyses PartialEscapeIterative::run(Function &F,
   const unsigned IterCap = std::min(Requested, HardIterationCap);
 
   bool AnyChanged = false;
-  unsigned PrevAllocs = countJeandleAllocations(F);
-  // Previous iteration's analyser deltas. Replay planning can change while
-  // the retained original-allocation count stays stable, so the
-  // virtualisation delta is tracked too. Sentinels mismatch any real
-  // first-iter delta so the first iteration never breaks.
-  int PrevVDelta = std::numeric_limits<int>::min();
-  int PrevADelta = std::numeric_limits<int>::min();
-  // Whether the previous iteration's canonicalization changed IR. If so,
-  // the analyser must run again before convergence can be declared.
-  // NOTE: this uses each canon pass's PreservedAnalyses (areAllPreserved),
-  // which is conservative — a pass that preserves only CFG still reports
-  // "changed" here even when the IR is bit-identical. To avoid diverging
-  // forever on canonicalization churn that does not affect PEA's decisions
-  // (e.g. SimplifyCFG/LoopSimplify reshaping loop preheaders), PEA-stable
-  // rounds are counted: once the PEA-specific signals (transform idle,
-  // alloc count, both deltas) have been stable for two consecutive rounds,
-  // convergence is declared regardless of PrevCanonChanged.
-  bool PrevCanonChanged = false;
-  unsigned PEAStableRounds = 0;
 
   // Run a sub-pass directly and invalidate FAM with its PreservedAnalyses,
   // mirroring what FunctionPassManager does between adjacent passes so the
@@ -151,7 +118,6 @@ PreservedAnalyses PartialEscapeIterative::run(Function &F,
   auto runAndInvalidate = [&](auto &&Pass) {
     PreservedAnalyses Sub = Pass.run(F, FAM);
     FAM.invalidate(F, Sub);
-    return Sub;
   };
 
   // Dump-IR gating (legacy substring and exact allowlist matches are fixed
@@ -174,15 +140,9 @@ PreservedAnalyses PartialEscapeIterative::run(Function &F,
     // The transform triggers PartialEscapeAnalysis via FAM.getResult, which
     // constructs a fresh PEAResult for this round.
     PartialEscapeTransform Transform;
-    // Run by hand (not via runAndInvalidate) so we can read the analyser's
-    // deltas from the cached PEAResult before FAM.invalidate drops it.
+    // Run by hand so this round's transform result can explicitly abandon its
+    // cached PEAResult before the canonicalization sequence.
     PreservedAnalyses TransformPA = Transform.run(F, FAM);
-    int CurVDelta = 0;
-    int CurADelta = 0;
-    if (auto *Cached = FAM.getCachedResult<PartialEscapeAnalysis>(F)) {
-      CurVDelta = Cached->VirtualizationDelta;
-      CurADelta = Cached->AllocationDelta;
-    }
     const bool TransformIdle = TransformPA.areAllPreserved();
     // Each outer round requires a fresh PEAResult, including after an
     // idempotent transform. Other function analyses remain governed by the
@@ -192,84 +152,49 @@ PreservedAnalyses PartialEscapeIterative::run(Function &F,
     AnyChanged |= !TransformIdle;
     ExecutedRounds = Iter + 1;
 
+    // Canonicalization is part of every executed round, including the last
+    // round allowed by the cap. Order: ADCE → SimplifyCFG → LoopSimplify →
+    // InstCombine. Compare the complete sequence's deterministic printed IR;
+    // individual passes may conservatively invalidate analyses, and adjacent
+    // passes may make offsetting structural changes.
+    const std::string BeforeCanonicalization = printFunctionIR(F);
+    ADCEPass Dc;
+    SimplifyCFGPass Sc;
+    LoopSimplifyPass Ls;
+    InstCombinePass Ic;
+    runAndInvalidate(Dc);
+    runAndInvalidate(Sc);
+    runAndInvalidate(Ls);
+    runAndInvalidate(Ic);
+    const bool CanonChanged = BeforeCanonicalization != printFunctionIR(F);
+    AnyChanged |= CanonChanged;
+
     if (DumpThisFunc) {
       errs() << ";; PEA-DUMP after iter=" << Iter << " function " << F.getName()
              << " transform_idle=" << TransformIdle << "\n"
              << F << "\n";
     }
 
-    // In debug builds, validate IR at each iteration boundary so a
-    // malformation is reported before later canonicalization rewrites mangle
-    // the stack trace.
+    // Validate the complete round boundary so the after dump and the next
+    // round always observe the same well-formed IR.
 #ifndef NDEBUG
-    if (!TransformIdle && verifyFunction(F, &errs())) {
+    if ((!TransformIdle || CanonChanged) && verifyFunction(F, &errs())) {
       errs() << "PEA: produced malformed IR for " << F.getName()
              << " at iter=" << Iter << "\n";
       llvm_unreachable("PartialEscapeIterative produced malformed IR");
     }
 #endif
 
-    // Fresh count to detect allocation elimination this round; eraseAllocation
-    // removes the alloc CallBase, so the drop is observed directly.
-    const unsigned NowAllocs = countJeandleAllocations(F);
-    const bool AllocsUnchanged = (NowAllocs == PrevAllocs);
-    PrevAllocs = NowAllocs;
-
-    const bool VDeltaUnchanged = (CurVDelta == PrevVDelta);
-    const bool ADeltaUnchanged = (CurADelta == PrevADelta);
-
     LLVM_DEBUG({
       dbgs() << "PartialEscapeIterative[" << F.getName() << "] iter=" << Iter
-             << " transform_idle=" << TransformIdle << " allocs=" << NowAllocs
-             << " v_delta=" << CurVDelta << " a_delta=" << CurADelta
-             << " prev_canon_changed=" << PrevCanonChanged << "\n";
+             << " transform_idle=" << TransformIdle
+             << " canon_changed=" << CanonChanged << "\n";
     });
 
-    // The PEA-specific signals (transform idle, alloc count, both deltas)
-    // reflect a fresh analysis of the current post-canonicalization IR. A
-    // preceding canonicalization change normally requires another round. If
-    // those PEA signals remain stable while canonicalization still reports
-    // "changed" (areAllPreserved is conservative), one additional PEA-stable
-    // round establishes convergence. This bounds SimplifyCFG/LoopSimplify
-    // preservation churn on loop preheaders that does not affect PEA's
-    // optimization decisions.
-    bool PEAStable =
-        TransformIdle && AllocsUnchanged && VDeltaUnchanged && ADeltaUnchanged;
-    if (PEAStable) {
-      ++PEAStableRounds;
-      if (!PrevCanonChanged || PEAStableRounds >= 2) {
-        ReachedFixpoint = true;
-        break;
-      }
-    } else {
-      PEAStableRounds = 0;
+    if (TransformIdle && !CanonChanged) {
+      ReachedFixpoint = true;
+      break;
     }
-
-    PrevVDelta = CurVDelta;
-    PrevADelta = CurADelta;
-
-    // Canonicalize between rounds, skipping the last iter (no further
-    // analysis). Order: ADCE → SimplifyCFG → LoopSimplify → InstCombine.
-    // ADCE-first prevents InstCombine from folding against stale-but-dead
-    // IR; LoopSimplify restores preheaders SimplifyCFG may have removed so
-    // the next round still sees a single-edge loop preheader.
-    bool CanonChanged = false;
-    if (Iter + 1 < IterCap) {
-      ADCEPass Dc;
-      SimplifyCFGPass Sc;
-      LoopSimplifyPass Ls;
-      InstCombinePass Ic;
-      CanonChanged |= !runAndInvalidate(Dc).areAllPreserved();
-      CanonChanged |= !runAndInvalidate(Sc).areAllPreserved();
-      CanonChanged |= !runAndInvalidate(Ls).areAllPreserved();
-      CanonChanged |= !runAndInvalidate(Ic).areAllPreserved();
-      // Re-count in case ADCE pruned an alloc whose only uses became dead.
-      PrevAllocs = countJeandleAllocations(F);
-    }
-    AnyChanged |= CanonChanged;
-    // Carry this round's canonicalization result into the next iteration's
-    // convergence check.
-    PrevCanonChanged = CanonChanged;
   }
 
   if (DumpThisFunc)
