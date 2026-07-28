@@ -647,8 +647,8 @@ public:
         UnsafeCyclicBlocks(findUnsafeReachableCyclicBlocks(F, LI)) {}
 
   jeandle::PEAResult run();
-  Instruction *getInvalidCFGProofKiller() const {
-    return InvalidCFGProofKiller;
+  ArrayRef<Instruction *> getInvalidCFGProofKillers() const {
+    return InvalidCFGProofKillers;
   }
   bool hasInvalidDeoptObligation() const { return InvalidDeoptObligation; }
   ArrayRef<CallBase *> getInvalidDeoptAllocationSites() const {
@@ -702,7 +702,7 @@ private:
   DenseSet<BasicBlock *> UnsafeCyclicBlocks;
   jeandle::PEAResult Result;
   PEAAttemptStatistics AttemptStats;
-  Instruction *InvalidCFGProofKiller = nullptr;
+  SmallVector<Instruction *, 8> InvalidCFGProofKillers;
   bool InvalidDeoptObligation = false;
   SmallVector<CallBase *, 4> InvalidDeoptAllocationSites;
   SmallVector<CallBase *, 4> UnsafeFinalUseAllocationSites;
@@ -1568,9 +1568,6 @@ private:
   void commit();
   bool effectSurvivesIneligibleOwner(const jeandle::Effect &E) const;
   void dropEffectsFor(jeandle::ObjectID ID);
-  const jeandle::Effect *getEarliestFinalReplacement(Instruction *Target) const;
-  const jeandle::EliminateAllocationEffect *
-  getEarliestFinalAllocationElimination(Instruction *Target) const;
   struct FinalValue {
     enum Kind : uint8_t {
       ResolvedValue,
@@ -1579,9 +1576,8 @@ private:
     } K = ResolvedValue;
     llvm::Value *V = nullptr;
   };
-  FinalValue resolveFinalValue(llvm::Value *Root) const;
   void validateFinalDeoptObligations();
-  Instruction *validateCFGDeadnessProofs() const;
+  SmallVector<Instruction *, 8> validateCFGDeadnessProofs() const;
   void publishAttemptOutputs();
 
   // Mark a VO ineligible, taking the TRANSITIVE closure over synthetic Case-C
@@ -8031,68 +8027,71 @@ void Analyzer::commit() {
   AttemptStats.Eliminated += EliminatedAllocs;
 }
 
-const jeandle::Effect *
-Analyzer::getEarliestFinalReplacement(Instruction *Target) const {
-  const jeandle::Effect *Earliest = nullptr;
-  for (const auto &KV : Result.BlockEffects)
-    for (const jeandle::Effect &E : KV.second) {
-      if (E.getTarget() != Target)
-        continue;
-      if (!isa<jeandle::ReplaceLoadEffect>(E) &&
-          !isa<jeandle::ReplaceCallEffect>(E))
-        continue;
-      if (!Earliest || E.SeqNo < Earliest->SeqNo)
-        Earliest = &E;
-    }
-  return Earliest;
-}
-
-const jeandle::EliminateAllocationEffect *
-Analyzer::getEarliestFinalAllocationElimination(Instruction *Target) const {
-  const jeandle::EliminateAllocationEffect *Earliest = nullptr;
-  for (const auto &KV : Result.BlockEffects)
-    for (const jeandle::Effect &E : KV.second) {
-      const auto *AE = dyn_cast<jeandle::EliminateAllocationEffect>(&E);
-      if (!AE || AE->getTarget() != Target)
-        continue;
-      if (!Earliest || AE->SeqNo < Earliest->SeqNo)
-        Earliest = AE;
-    }
-  return Earliest;
-}
-
-Analyzer::FinalValue Analyzer::resolveFinalValue(Value *Root) const {
-  Value *Current = Root;
-  SmallPtrSet<Value *, 8> Seen;
-  while (Current && Seen.insert(Current).second) {
-    auto *Target = dyn_cast<Instruction>(Current);
-    if (!Target)
-      break;
-    const jeandle::Effect *E = getEarliestFinalReplacement(Target);
-    if (!E)
-      break;
-    if (const auto *RE = dyn_cast<jeandle::ReplaceLoadEffect>(E)) {
-      Value *Replacement = RE->Replacement;
-      if (!Replacement)
-        break;
-      Current = Replacement;
-      continue;
-    }
-
-    const auto *CallRE = cast<jeandle::ReplaceCallEffect>(E);
-    if (CallRE->OopHandleId >= 0)
-      return {FinalValue::DependencyFreeOopHandle, nullptr};
-    Value *Replacement = CallRE->Replacement;
-    if (!Replacement)
-      return {FinalValue::Deleted, nullptr};
-    Current = Replacement;
-  }
-  return {FinalValue::ResolvedValue, Current};
-}
-
 void Analyzer::validateFinalDeoptObligations() {
   InvalidDeoptObligation = false;
   InvalidDeoptAllocationSites.clear();
+
+  // Precompute, in a single pass over the committed effects, the earliest
+  // (lowest SeqNo) ReplaceLoad/ReplaceCall effect and the earliest
+  // EliminateAllocationEffect targeting each instruction. The audits below
+  // resolve every deopt operand through these replacement chains and query the
+  // earliest effect per node; a deopt operand whose resolution transitively
+  // reaches a NeverEscapes allocation identity must keep that allocation real.
+  // Rescanning all of BlockEffects on every resolution step made that audit
+  // O(deopt_operands * graph_size * effect_count) — catastrophic on large
+  // methods (hundreds of safepoints), which never finished compiling. The maps
+  // turn each lookup into O(1) while preserving the exact earliest-SeqNo
+  // selection of the former scans.
+  DenseMap<Instruction *, const jeandle::Effect *> EarliestReplFor;
+  DenseMap<Instruction *, const jeandle::EliminateAllocationEffect *>
+      EarliestAllocElimFor;
+  for (const auto &KV : Result.BlockEffects)
+    for (const jeandle::Effect &E : KV.second) {
+      Instruction *T = E.getTarget();
+      if (!T)
+        continue;
+      if (isa<jeandle::ReplaceLoadEffect>(E) ||
+          isa<jeandle::ReplaceCallEffect>(E)) {
+        auto [It, Inserted] = EarliestReplFor.try_emplace(T, &E);
+        if (!Inserted && E.SeqNo < It->second->SeqNo)
+          It->second = &E;
+      }
+      if (const auto *AE = dyn_cast<jeandle::EliminateAllocationEffect>(&E)) {
+        auto [It, Inserted] = EarliestAllocElimFor.try_emplace(T, AE);
+        if (!Inserted && AE->SeqNo < It->second->SeqNo)
+            It->second = AE;
+      }
+    }
+
+  // Resolve a value through the committed replacement chain (ReplaceLoad /
+  // ReplaceCall effects) to its final surviving SSA value, or to Deleted /
+  // DependencyFreeOopHandle when the chain ends in an eliminated value.
+  auto ResolveFinalValue = [&](Value *Root) -> FinalValue {
+    Value *Current = Root;
+    SmallPtrSet<Value *, 8> Seen;
+    while (Current && Seen.insert(Current).second) {
+      auto *Target = dyn_cast<Instruction>(Current);
+      if (!Target)
+        break;
+      auto It = EarliestReplFor.find(Target);
+      if (It == EarliestReplFor.end())
+        break;
+      const jeandle::Effect *E = It->second;
+      if (const auto *RE = dyn_cast<jeandle::ReplaceLoadEffect>(E)) {
+        if (!RE->Replacement)
+          break;
+        Current = RE->Replacement;
+        continue;
+      }
+      const auto *CallRE = cast<jeandle::ReplaceCallEffect>(E);
+      if (CallRE->OopHandleId >= 0)
+        return {FinalValue::DependencyFreeOopHandle, nullptr};
+      if (!CallRE->Replacement)
+        return {FinalValue::Deleted, nullptr};
+      Current = CallRE->Replacement;
+    }
+    return {FinalValue::ResolvedValue, Current};
+  };
 
   DenseMap<CallBase *,
            SmallVector<const jeandle::RewriteDeoptBundleEffect *, 2>>
@@ -8202,7 +8201,7 @@ void Analyzer::validateFinalDeoptObligations() {
       if (!Current)
         continue;
 
-      FinalValue Final = resolveFinalValue(Current);
+      FinalValue Final = ResolveFinalValue(Current);
       if (Final.K == FinalValue::Deleted ||
           Final.K == FinalValue::DependencyFreeOopHandle)
         continue;
@@ -8248,10 +8247,9 @@ void Analyzer::validateFinalDeoptObligations() {
   };
 
   auto SafepointDeleted = [&](CallBase *CB) -> bool {
-    if (isa_and_nonnull<jeandle::ReplaceCallEffect>(
-            getEarliestFinalReplacement(CB)))
+    if (isa_and_nonnull<jeandle::ReplaceCallEffect>(EarliestReplFor.lookup(CB)))
       return true;
-    const auto *AE = getEarliestFinalAllocationElimination(CB);
+    const auto *AE = EarliestAllocElimFor.lookup(CB);
     if (!AE)
       return false;
     auto CIt = Result.EscapeClassification.find(AE->ObjID);
@@ -8299,98 +8297,106 @@ void Analyzer::validateFinalDeoptObligations() {
   }
 }
 
-Instruction *Analyzer::validateCFGDeadnessProofs() const {
-  auto EarliestReplacementEffect =
-      [&](Instruction *Target) -> const jeandle::Effect * {
-    const jeandle::Effect *Earliest = nullptr;
-    for (const auto &KV : Result.BlockEffects)
-      for (const jeandle::Effect &E : KV.second) {
-        if (E.getTarget() != Target)
-          continue;
-        if (!isa<jeandle::ReplaceLoadEffect>(E) &&
-            !isa<jeandle::ReplaceCallEffect>(E))
-          continue;
-        if (!Earliest || E.SeqNo < Earliest->SeqNo)
-          Earliest = &E;
+SmallVector<Instruction *, 8>
+Analyzer::validateCFGDeadnessProofs() const {
+  // Precompute the earliest (lowest SeqNo) ReplaceLoad/ReplaceCall effect and
+  // the earliest EliminateAllocationEffect per target instruction in a single
+  // pass. Each proof is validated with O(1) lookups instead of rescanning all
+  // BlockEffects per proof, and every invalid killer is collected so the outer
+  // retry can suppress them all at once (rather than one terminator per retry,
+  // which re-analyzed large methods O(#recorded-proofs) times).
+  DenseMap<Instruction *, const jeandle::Effect *> EarliestReplFor;
+  DenseMap<Instruction *, const jeandle::EliminateAllocationEffect *>
+      EarliestAllocElimFor;
+  for (const auto &KV : Result.BlockEffects)
+    for (const jeandle::Effect &E : KV.second) {
+      Instruction *T = E.getTarget();
+      if (!T)
+        continue;
+      if (isa<jeandle::ReplaceLoadEffect>(E) ||
+          isa<jeandle::ReplaceCallEffect>(E)) {
+        auto [It, Inserted] = EarliestReplFor.try_emplace(T, &E);
+        if (!Inserted && E.SeqNo < It->second->SeqNo)
+          It->second = &E;
       }
-    return Earliest;
-  };
-
-  auto ResolveFinalReplacement = [&](Value *Root) -> Value * {
-    Value *Current = Root;
-    SmallPtrSet<Value *, 4> Seen;
-    while (Current && Seen.insert(Current).second) {
-      auto *Target = dyn_cast<Instruction>(Current);
-      if (!Target)
-        break;
-      const jeandle::Effect *E = EarliestReplacementEffect(Target);
-      if (!E)
-        break;
-      Value *Replacement = nullptr;
-      if (const auto *RE = dyn_cast<jeandle::ReplaceLoadEffect>(E))
-        Replacement = RE->Replacement;
-      else {
-        const auto *CallRE = cast<jeandle::ReplaceCallEffect>(E);
-        Replacement = CallRE->Replacement;
+      if (const auto *AE = dyn_cast<jeandle::EliminateAllocationEffect>(&E)) {
+        auto [It, Inserted] = EarliestAllocElimFor.try_emplace(T, AE);
+        if (!Inserted && AE->SeqNo < It->second->SeqNo)
+          It->second = AE;
       }
-      if (!Replacement)
-        break;
-      Current = Replacement;
     }
-    return Current;
-  };
 
-  auto EarliestAllocationElimination =
-      [&](Instruction *Target) -> const jeandle::EliminateAllocationEffect * {
-    const jeandle::EliminateAllocationEffect *Earliest = nullptr;
-    for (const auto &KV : Result.BlockEffects)
-      for (const jeandle::Effect &E : KV.second) {
-        const auto *AE = dyn_cast<jeandle::EliminateAllocationEffect>(&E);
-        if (!AE || AE->getTarget() != Target)
-          continue;
-        if (!Earliest || AE->SeqNo < Earliest->SeqNo)
-          Earliest = AE;
-      }
-    return Earliest;
+  SmallVector<Instruction *, 8> InvalidKillers;
+  auto RecordIfInvalid = [&](Instruction *Killer) {
+    if (Killer)
+      InvalidKillers.push_back(Killer);
   };
 
   for (const CFGDeadnessProof &Proof : CFGDeadnessProofs) {
     switch (Proof.Kind) {
     case CFGDeadnessProofKind::FoldedTerminatorCondition: {
-      Value *Resolved = ResolveFinalReplacement(Proof.Condition);
-      auto *CI = dyn_cast_or_null<ConstantInt>(Resolved);
-      if (!CI)
-        return Proof.Killer;
+      Value *Current = Proof.Condition;
+      SmallPtrSet<Value *, 4> Seen;
+      while (Current && Seen.insert(Current).second) {
+        auto *Target = dyn_cast<Instruction>(Current);
+        if (!Target)
+          break;
+        auto It = EarliestReplFor.find(Target);
+        if (It == EarliestReplFor.end())
+          break;
+        const jeandle::Effect *E = It->second;
+        Value *Replacement = nullptr;
+        if (const auto *RE = dyn_cast<jeandle::ReplaceLoadEffect>(E))
+          Replacement = RE->Replacement;
+        else
+          Replacement = cast<jeandle::ReplaceCallEffect>(E)->Replacement;
+        if (!Replacement)
+          break;
+        Current = Replacement;
+      }
+      auto *CI = dyn_cast_or_null<ConstantInt>(Current);
+      if (!CI) {
+        InvalidKillers.push_back(Proof.Killer);
+        break;
+      }
       BasicBlock *Chosen = nullptr;
       if (auto *BI = dyn_cast<BranchInst>(Proof.Killer))
         Chosen = BI->getSuccessor(CI->isZero() ? 1 : 0);
       else if (auto *SI = dyn_cast<SwitchInst>(Proof.Killer))
         Chosen = SI->findCaseValue(CI)->getCaseSuccessor();
-      else
-        return Proof.Killer;
+      else {
+        InvalidKillers.push_back(Proof.Killer);
+        break;
+      }
       if (Chosen != Proof.ChosenSuccessor)
-        return Proof.Killer;
+        InvalidKillers.push_back(Proof.Killer);
       break;
     }
     case CFGDeadnessProofKind::FoldedInvoke: {
-      const jeandle::Effect *E = EarliestReplacementEffect(Proof.Killer);
-      if (!E || !isa<jeandle::ReplaceCallEffect>(E))
-        return Proof.Killer;
+      auto It = EarliestReplFor.find(Proof.Killer);
+      RecordIfInvalid(It == EarliestReplFor.end() ||
+                              !isa<jeandle::ReplaceCallEffect>(It->second)
+                          ? Proof.Killer
+                          : nullptr);
       break;
     }
     case CFGDeadnessProofKind::EliminatedAllocationInvoke: {
-      const auto *AE = EarliestAllocationElimination(Proof.Killer);
-      if (!AE)
-        return Proof.Killer;
-      auto CIt = Result.EscapeClassification.find(AE->ObjID);
-      if (CIt == Result.EscapeClassification.end() ||
-          CIt->second != jeandle::PEAResult::EscapeKind::NeverEscapes)
-        return Proof.Killer;
+      auto It = EarliestAllocElimFor.find(Proof.Killer);
+      if (It == EarliestAllocElimFor.end()) {
+        InvalidKillers.push_back(Proof.Killer);
+        break;
+      }
+      auto CIt = Result.EscapeClassification.find(It->second->ObjID);
+      RecordIfInvalid(CIt == Result.EscapeClassification.end() ||
+                              CIt->second !=
+                                  jeandle::PEAResult::EscapeKind::NeverEscapes
+                          ? Proof.Killer
+                          : nullptr);
       break;
     }
     }
   }
-  return nullptr;
+  return InvalidKillers;
 }
 
 void Analyzer::publishAttemptOutputs() {
@@ -9414,8 +9420,8 @@ jeandle::PEAResult Analyzer::run() {
   validateFinalDeoptObligations();
   if (InvalidDeoptObligation)
     return jeandle::PEAResult();
-  InvalidCFGProofKiller = validateCFGDeadnessProofs();
-  if (InvalidCFGProofKiller)
+  InvalidCFGProofKillers = validateCFGDeadnessProofs();
+  if (!InvalidCFGProofKillers.empty())
     return jeandle::PEAResult();
   if (!Result.hasLegalMaterializationAtomicTypes(DL))
     return jeandle::PEAResult();
@@ -9482,15 +9488,21 @@ PartialEscapeAnalysis::run(Function &F, FunctionAnalysisManager &FAM) {
       continue;
     }
 
-    Instruction *InvalidProof = A.getInvalidCFGProofKiller();
-    if (!InvalidProof)
+    ArrayRef<Instruction *> InvalidProofs = A.getInvalidCFGProofKillers();
+    if (InvalidProofs.empty())
       return Attempt;
 
-    // Killer is a stable instruction in untouched input IR. Every failed
-    // attempt adds one previously unsuppressed key, so retries are bounded by
-    // the finite number of terminators in F. A duplicate indicates an
-    // invariant failure; terminate conservatively with no optimization plan.
-    if (!SuppressedCFGProofs.insert(InvalidProof).second)
+    // Each killer is a stable instruction in untouched input IR. Record every
+    // invalid proof discovered this attempt at once, so the fixpoint converges
+    // in a small number of retries instead of one terminator per retry (which
+    // made large methods re-analyze O(#recorded-proofs) times). The loop still
+    // terminates: each retry must suppress at least one previously-unsuppressed
+    // terminator, and the set of terminators is finite. A retry that suppresses
+    // nothing new indicates an invariant failure; terminate conservatively.
+    bool AddedSuppression = false;
+    for (Instruction *Killer : InvalidProofs)
+      AddedSuppression |= SuppressedCFGProofs.insert(Killer).second;
+    if (!AddedSuppression)
       return jeandle::PEAResult();
   }
 }
