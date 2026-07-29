@@ -55,21 +55,22 @@ u:
 ; CHECK: call void @sink(i32 %val)
 ; CHECK-SAME: [ "deopt"(
 ; CHECK-SAME: i32 99, i32 99,
-; vo-ids: arr=0 (root), point=1 (transitive). The transitive point descriptor
-; (higher SeqNo) is inserted at the VO-section front, BEFORE the arr descriptor.
-; point descriptor header (vo_id=1, ScalarValueType, T_OBJECT):
-;   (1<<32)|(4<<16)|12 = 4295229452
-; CHECK-SAME: i64 4295229452, i64 54005, i32 1,
-; point field 0 (offset 8, LocalType/T_INT): (8<<32)|10 = 34359738378 -> %val
-; CHECK-SAME: i64 34359738378, i32 %val,
-; arr descriptor header (vo_id=0, ScalarValueType, T_ARRAY=13): 262157
+; Root-first dense numbering assigns arr wire id 0 and the transitively
+; discovered point wire id 1. The arr descriptor is emitted first.
+; arr descriptor header (wire id 0, ScalarValueType, T_ARRAY=13): 262157
 ; CHECK-SAME: i64 262157, i64 54004, i32 2,
-; arr elem 0 @ offset 16 (VORef to point id 1): (16<<32)|(8<<16)|12 = 68720001036
+; arr elem 0 @ offset 16 (VORef to point wire id 1):
+;   (16<<32)|(8<<16)|12 = 68720001036
 ; CHECK-SAME: i64 68720001036, i32 1,
 ; arr elem 1 @ offset 24 (untouched default null), LocalType/T_OBJECT:
 ;   (24<<32)|12 = 103079215116
 ; CHECK-SAME: i64 103079215116, ptr addrspace(1) null,
-; the OrigAlloc locals slot -> VORefLocalType (vo_id=0): 524300
+; point descriptor header (wire id 1, ScalarValueType, T_OBJECT):
+;   (1<<32)|(4<<16)|12 = 4295229452
+; CHECK-SAME: i64 4295229452, i64 54005, i32 1,
+; point field 0 (offset 8, LocalType/T_INT): (8<<32)|10 = 34359738378 -> %val
+; CHECK-SAME: i64 34359738378, i32 %val,
+; the OrigAlloc locals slot -> VORefLocalType (wire id 0): 524300
 ; CHECK-SAME: i64 524300, i32 0) ]
 ; CHECK-NOT: addrspace(1) %arr
 ; CHECK-NOT: addrspace(1) %point

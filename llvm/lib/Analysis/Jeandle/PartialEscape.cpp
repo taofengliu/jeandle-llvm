@@ -10,6 +10,7 @@
 // declared in llvm/include/llvm/Analysis/Jeandle/PartialEscape.h.
 
 #include "llvm/Analysis/Jeandle/PartialEscape.h"
+#include "llvm/Analysis/Jeandle/DeoptPoolBundleLowering.h"
 
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -483,10 +484,12 @@ ObjectState &PEABlockState::getObjectStateForModification(ObjectID ID) {
 // AliasMap
 // ===========================================================================
 
-void AliasMap::addVirtualAlias(Value *V, ObjectID ID) {
+void AliasMap::addVirtualAlias(Value *V, ObjectID ID, bool IsWholeObject) {
   assert(V && ID != InvalidObjectID);
   assert(!VirtualAliases.count(V) && "value already aliased");
   VirtualAliases[V] = ID;
+  if (IsWholeObject)
+    WholeObjectVirtualAliases.insert(V);
   for (User *U : V->users()) {
     if (auto *I = dyn_cast<Instruction>(U))
       HasVirtualInputs.insert(I);
@@ -500,6 +503,7 @@ void AliasMap::addScalarAlias(Value *V, Value *Replacement) {
 
 void AliasMap::resetAlias(Value *V) {
   VirtualAliases.erase(V);
+  WholeObjectVirtualAliases.erase(V);
   ScalarAliases.erase(V);
 }
 
@@ -517,6 +521,7 @@ Value *AliasMap::getScalarAlias(Value *V) const {
 
 void AliasMap::clear() {
   VirtualAliases.clear();
+  WholeObjectVirtualAliases.clear();
   ScalarAliases.clear();
   HasVirtualInputs.clear();
 }
@@ -660,6 +665,8 @@ void PEAResult::computeEscapePointLocks() {
     Function *F = Batch.EmitSite ? Batch.EmitSite->getFunction() : nullptr;
     for (unsigned Ordinal = 0; Ordinal < Batch.Locks.size(); ++Ordinal) {
       const MergedLock &ML = Batch.Locks[Ordinal];
+      if (!ML.SourceEffect || !ML.SourceEffect->hasMutationOwner())
+        continue;
       for (const Value *LogicalEscape : ML.LogicalEscapes) {
         llvm::dbgs() << "PEA: LockReplay function=";
         if (F)
@@ -669,7 +676,8 @@ void PEAResult::computeEscapePointLocks() {
         llvm::dbgs() << " logical_escape=" << GetLogicalEscapeID(LogicalEscape)
                      << " batch=" << BatchID << " source=" << Batch.SourceID
                      << " receiver_vo="
-                     << static_cast<unsigned>(ML.SourceEffect->ObjID)
+                     << static_cast<unsigned>(
+                            ML.SourceEffect->getMutationOwner())
                      << " depth=" << ML.BytecodeDepth << " ordinal=" << Ordinal
                      << "\n";
       }
@@ -732,6 +740,8 @@ ObjectID PEAResult::createVirtualObject(std::unique_ptr<VirtualObject> VO) {
 }
 
 void PEAResult::addBlockEffect(std::unique_ptr<Effect> E) {
+  assert(E && E->hasValidMutationOwner() &&
+         "only an atomic deopt-pool effect may be ownerless");
   assert(E->Block);
   BasicBlock *BB = E->Block;
   BlockEffects[BB].add(std::move(E));
@@ -794,20 +804,24 @@ void Effect::dump(raw_ostream &OS) const {
   case Kind::CreatePHI:
     OS << "CreatePHI";
     break;
-  case Kind::RewriteDeoptBundle:
-    OS << "RewriteDeoptBundle";
+  case Kind::RewriteDeoptPool:
+    OS << "RewriteDeoptPool";
     break;
   }
   if (Function *F = Block ? Block->getParent() : nullptr) {
     OS << " function=";
     F->printAsOperand(OS, false);
   }
-  if (ObjID != InvalidObjectID)
-    OS << " [VO=" << static_cast<unsigned>(ObjID) << "]";
+  if (hasMutationOwner())
+    OS << " [VO=" << static_cast<unsigned>(getMutationOwner()) << "]";
   if (Block && Block->hasName())
     OS << " block=%" << Block->getName();
   if (const auto *PE = dyn_cast<CreatePHIEffect>(this))
     OS << " offset=" << PE->FieldOffset;
+  if (const auto *PE = dyn_cast<RewriteDeoptPoolEffect>(this))
+    OS << " nodes=" << PE->getPlan().graph().nodes().size()
+       << " current=" << PE->getPlan().graph().currentMembers().size()
+       << " tokens=" << PE->getPlan().tokens().size();
   if (Instruction *T = getTarget())
     OS << " target= seq=" << SeqNo << " " << *T;
   else
@@ -815,6 +829,52 @@ void Effect::dump(raw_ostream &OS) const {
 }
 
 void MaterializeEffect::setInsertBefore(Instruction *I) { InsertBefore = I; }
+
+RewriteDeoptPoolEffect::RewriteDeoptPoolEffect(
+    CallBase *Safepoint,
+    std::shared_ptr<const pea::FinalDeoptPoolBundlePlan> Plan)
+    : SafepointKey(Safepoint), SafepointVH(Safepoint), Plan(std::move(Plan)) {
+  assert(Safepoint && "deopt-pool rewrite requires a safepoint");
+  assert(this->Plan && "deopt-pool rewrite requires an immutable plan");
+}
+
+Instruction *RewriteDeoptPoolEffect::getTarget() const {
+  Value *Tracked = SafepointVH;
+  return Tracked == SafepointKey ? SafepointKey : nullptr;
+}
+
+bool RewriteDeoptPoolEffect::coversExactOccurrence(unsigned SemanticCell,
+                                                   ObjectID ID) const {
+  return Plan->coversExactOccurrence(SemanticCell, ID);
+}
+
+bool RewriteDeoptPoolEffect::acceptsCurrentMember(ObjectID ID) const {
+  return llvm::is_contained(Plan->graph().currentMembers(), ID);
+}
+
+bool PEAResult::currentIdentityRepresentsSource(ObjectID CurrentID,
+                                                ObjectID SourceID) const {
+  if (CurrentID == InvalidObjectID || SourceID == InvalidObjectID ||
+      CurrentID >= VirtualObjects.size() || SourceID >= VirtualObjects.size())
+    return false;
+
+  DenseSet<ObjectID> Visited;
+  SmallVector<ObjectID, 8> Worklist(1, CurrentID);
+  while (!Worklist.empty()) {
+    ObjectID ID = Worklist.pop_back_val();
+    if (ID == InvalidObjectID || ID >= VirtualObjects.size() ||
+        !Visited.insert(ID).second)
+      continue;
+    if (ID == SourceID)
+      return true;
+    const VirtualObject &VObj = *VirtualObjects[ID];
+    if (!VObj.IsSynthetic)
+      continue;
+    Worklist.append(VObj.SyntheticSourceIDs.begin(),
+                    VObj.SyntheticSourceIDs.end());
+  }
+  return false;
+}
 
 bool PEAResult::hasOptimizationOpportunity() const {
   // VirtualizationDelta and AllocationDelta are mutated in lockstep (each

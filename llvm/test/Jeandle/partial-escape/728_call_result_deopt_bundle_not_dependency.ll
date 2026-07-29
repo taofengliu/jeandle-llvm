@@ -25,7 +25,7 @@ body:
   %result = call i32 @produce()
       [ "deopt"(i32 99, i32 99, i64 12, ptr addrspace(1) %o) ]
   call void @safepoint()
-      [ "deopt"(i32 99, i32 99, i64 12, i32 %result,
+      [ "deopt"(i32 99, i32 99, i64 10, i32 %result,
                   i64 4294967308, ptr addrspace(1) %o) ]
   ret void
 

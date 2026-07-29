@@ -53,6 +53,9 @@ class Effect;
 class EffectList;
 class PEABlockState;
 struct TransformContext;
+namespace pea {
+class FinalDeoptPoolBundlePlan;
+}
 
 // ===========================================================================
 // 1.1  ObjectID and VirtualObject
@@ -172,10 +175,9 @@ public:
   // Behaviorally equivalent: OrigAlloc's role is a pure identity token / the
   // single sound SSA materialized value, never a fresh allocation in the final
   // IR.
-  // WeakTrackingVH: RewriteDeoptBundleEffect::apply may clone the allocation
-  // invoke (when its deopt bundle gets a VO descriptor) and RAUW the
-  // original — the handle follows to the clone so transform-time uses
-  // (OrigAlloc slot scans, the applyMaterialize identity assert) stay valid.
+  // WeakTrackingVH: an atomic deopt-pool rewrite may clone the allocation
+  // invoke and RAUW the original. The handle follows to the clone so
+  // transform-time uses remain valid.
   WeakTrackingVH AllocationCall;
 
   uintptr_t Klass = 0;
@@ -254,8 +256,8 @@ private:
   Tag T = Unknown;
   // Valid when T is Scalar or MaterializedRef. WeakTrackingVH (NOT a raw
   // Value*): the snapshotted value may be RAUW'd during the transform — a
-  // folded load RAUW'd to its replacement, or a safepoint call cloned by
-  // RewriteDeoptBundleEffect::apply — and a raw Value* would then dangle.
+  // folded load RAUW'd to its replacement, or a safepoint call cloned by an
+  // atomic deopt-pool rewrite — and a raw Value* would then dangle.
   // The handle follows the RAUW so the snapshot never dangles. A value
   // DELETED without replacement nulls the handle; the transform asserts
   // values are non-null and parented (or Constant/Argument) at use. Valid
@@ -431,15 +433,19 @@ private:
 
 class AliasMap {
   DenseMap<Value *, ObjectID> VirtualAliases;
+  DenseSet<Value *> WholeObjectVirtualAliases;
   DenseMap<Value *, Value *> ScalarAliases;
   DenseSet<Instruction *> HasVirtualInputs;
 
 public:
-  void addVirtualAlias(Value *V, ObjectID ID);
+  void addVirtualAlias(Value *V, ObjectID ID, bool IsWholeObject);
   void addScalarAlias(Value *V, Value *Replacement);
   void resetAlias(Value *V);
 
   std::optional<ObjectID> getVirtualAlias(Value *V) const;
+  bool isWholeObjectVirtualAlias(Value *V) const {
+    return WholeObjectVirtualAliases.count(V);
+  }
   Value *getScalarAlias(Value *V) const;
 
   bool hasVirtualInputs(Instruction *I) const {
@@ -472,7 +478,7 @@ public:
 //     applied in two passes — non-cfgKill first, cfgKill second — driven
 //     entirely by `isCfgKill()`.
 //
-// Jeandle mirrors this shape with two IR-form-induced adaptations:
+// Jeandle mirrors this shape with three IR-form-induced adaptations:
 //   1. LLVM's Analysis/Transform split forbids mutating IR during analysis,
 //      so Jeandle's effects are serializable DATA RECORDS (named subclasses
 //      with fields), not anonymous closures capturing graph nodes. They are
@@ -482,12 +488,19 @@ public:
 //      `apply(graph, obsoleteNodes)` — `TransformContext` bundles the
 //      Function and the shared per-apply maps (defined in
 //      PartialEscapeTransform.cpp).
+//   3. A safepoint's complete deoptimization object pool is one atomic phase
+//      between ordinary SSA rewrites and cfg-kill effects. LLVM operand
+//      bundles have no independently mutable FrameState/ObjectState graph, so
+//      exposing per-object bundle edits would create observable intermediate
+//      states that do not exist in Graal.
 // ===========================================================================
 
 // Jeandle adaptation of Graal's `EffectList.Effect`. Abstract base for every
 // recorded IR mutation.
 class Effect {
 public:
+  enum class Phase : uint8_t { Ordinary, DeoptPool, CfgKill };
+
   enum class Kind : uint8_t {
     ReplaceLoad,
     ReplaceCall,
@@ -495,15 +508,9 @@ public:
     EliminateAllocation,
     Materialize,
     CreatePHI,
-    // Rewrite a "deopt" operand bundle on a safepoint (call/invoke) so a PEA
-    // virtual object that is still virtual at the safepoint is described by a
-    // virtual-object (VO) descriptor instead of a (soon-to-be-poisoned)
-    // OrigAlloc reference. Non-cfgKill (Pass 1): it MUST run before Pass 2's
-    // EliminateAllocation RAUWs OrigAlloc to poison, otherwise the bundle
-    // operand would be poisoned. Graal analog: addVirtualMapping /
-    // processNodeWithState (the FrameState/deopt state is recorded as a
-    // virtual mapping rather than an escape).
-    RewriteDeoptBundle,
+    // Atomically replace one safepoint's complete deoptimization object pool.
+    // Unlike ordinary effects it has no single virtual-object mutation owner.
+    RewriteDeoptPool,
   };
 
   // --- common fields (read by commit/dropEffectsFor/the transform) ---
@@ -525,20 +532,34 @@ public:
   // merge/loop emission; SeqNo + the deferred-CreatePHI trick covers ordering
   // meanwhile.
   uint32_t SeqNo = 0;
-  ObjectID ObjID = InvalidObjectID;
+
+private:
+  // The one virtual object whose ordinary IR mutation this effect performs.
+  // A deopt-pool rewrite spans zero or more objects and has no mutation owner.
+  ObjectID MutationOwner = InvalidObjectID;
+
+public:
+  bool hasMutationOwner() const { return MutationOwner != InvalidObjectID; }
+  ObjectID getMutationOwner() const { return MutationOwner; }
+  void setMutationOwner(ObjectID ID) {
+    assert(ID != InvalidObjectID);
+    MutationOwner = ID;
+  }
 
   virtual ~Effect() = default;
 
-  // Graal isCfgKill(): drives the two-pass apply (non-cfgKill first across all
-  // blocks, cfgKill second). True ONLY for EliminateAllocation (maps to Graal's
-  // deleteNode(WithExceptionNode) / killIfBranch / replaceWithSink). NOTE this
-  // is NOT the same as
-  // "structurally rewrites the CFG": Materialize (splitBasicBlock) and
-  // CreatePHI (PHI insertion) DO rewrite control flow but run in the first
-  // pass — they are not cfg-kill in Graal's apply-ordering sense.
-  virtual bool isCfgKill() const { return false; }
+  // Graal's non-cfgKill/cfgKill ordering with an LLVM-specific atomic
+  // deopt-pool phase inserted between them. This phase is not the same as
+  // "structurally rewrites the CFG": Materialize and CreatePHI run in the
+  // ordinary phase.
+  virtual Phase getPhase() const { return Phase::Ordinary; }
 
   virtual Kind getKind() const = 0;
+
+  bool hasValidMutationOwner() const {
+    return getKind() == Kind::RewriteDeoptPool ? !hasMutationOwner()
+                                               : hasMutationOwner();
+  }
 
   // The IR instruction this effect rewrites/erases, or null for effects that
   // have no single target (CreatePHI). Read generically by the analyzer-side
@@ -550,8 +571,8 @@ public:
   virtual void apply(TransformContext &Ctx) = 0;
 
   // Graal format()/toString(). Drives the -jeandle-trace-pea per-effect line.
-  // Non-pure: the kind name / ObjID / Block / Target are all reachable via the
-  // base API, so one shared definition suffices. Defined in PartialEscape.cpp.
+  // Non-pure: the kind name, mutation owner, block, and target are all
+  // reachable via the base API, so one shared definition suffices.
   virtual void dump(raw_ostream &OS) const;
 
   // Deep copy for the loop-fixpoint snapshot (takeLoopSnapshot/
@@ -566,9 +587,8 @@ public:
 // synthesized coercion / default). Non-cfgKill. Graal analog: replaceAtUsages.
 class ReplaceLoadEffect : public Effect {
 public:
-  // WeakTrackingVH: follows RAUW (e.g. a sibling RewriteDeoptBundleEffect
-  // cloning the safepoint that produced Target/Replacement); null on
-  // deletion-without-replacement (apply must no-op then).
+  // WeakTrackingVH follows RAUW, including a safepoint clone performed by the
+  // atomic deopt-pool phase; null on deletion without replacement.
   WeakTrackingVH Target;
   WeakTrackingVH Replacement;
 
@@ -631,20 +651,19 @@ public:
 };
 
 // Rewrite the original allocation invoke into an unconditional branch (dropping
-// the unwind edge) or erase a call alloc. cfgKill: applied in Pass 2.
+// the unwind edge) or erase a call alloc. Applied in the cfg-kill phase.
 // Graal analog: deleteNode (WithExceptionNode) / killIfBranch.
 class EliminateAllocationEffect : public Effect {
 public:
-  // WeakTrackingVH: the allocation may have been cloned by a
-  // RewriteDeoptBundleEffect on its deopt bundle (Pass 1); the handle follows
-  // so Pass 2 erases the CLONE, not freed memory.
+  // WeakTrackingVH: the allocation may be cloned by the deopt-pool phase; the
+  // handle follows so the cfg-kill phase erases the clone.
   WeakTrackingVH Target;
 
   Kind getKind() const override { return Kind::EliminateAllocation; }
   static bool classof(const Effect *E) {
     return E->getKind() == Kind::EliminateAllocation;
   }
-  bool isCfgKill() const override { return true; }
+  Phase getPhase() const override { return Phase::CfgKill; }
   Instruction *getTarget() const override {
     return dyn_cast_or_null<Instruction>((Value *)Target);
   }
@@ -660,7 +679,7 @@ public:
 // prepared synthetic Case-C VO, it is SyntheticPhi. Neither form emits a fresh
 // allocation invoke. The receiver is recorded in
 // `MaterializedReceiverOf[&E]`.
-// Non-cfgKill (Pass 1).
+// Ordinary phase.
 // Graal analog: the one `Effect("materializeBefore")` appended by
 // PartialEscapeBlockState.materializeBefore.
 class MaterializeEffect : public Effect {
@@ -678,15 +697,14 @@ public:
   // handle. applyMaterialize ASSERTS this is non-null — the eager-update hook
   // relocateDependentMaterializes re-aims every dependent Materialize's
   // InsertBefore to the dying instruction's in-block successor BEFORE the
-  // instruction is erased (Pass 1 runs effects in RPO, so an erase in an
-  // earlier block re-aims dependents before they reach apply — see the
+  // instruction is erased (the ordinary phase runs effects in RPO, so an erase
+  // in an earlier block re-aims dependents before they reach apply — see the
   // InsertBeforeDependents pre-scan built in the TransformContext). The
   // handle is NOT recomputed at apply time; WeakTrackingVH is only there to
   // fail loudly rather than dangling.
   WeakTrackingVH InsertBefore;
   // Replay receiver: OrigAlloc for an ordinary VO, SyntheticPhi for a
-  // synthetic Case-C VO. WeakTrackingVH follows the clone a
-  // RewriteDeoptBundleEffect can make of an ordinary allocation invoke.
+  // synthetic Case-C VO. WeakTrackingVH follows any safepoint clone.
   WeakTrackingVH Target;
   SmallVector<FieldEntry, 8> FieldEntries;
   // Surviving (unbalanced) monitorenters to re-emit at the materialize point
@@ -736,7 +754,7 @@ public:
 };
 
 // Insert an analyzer-built unparented PHINode at a merge block and wire its
-// incomings. Non-cfgKill (Pass 1). Graal analog: addFloatingNode + setPhiInput
+// incomings. Ordinary phase. Graal analog: addFloatingNode + setPhiInput
 // (initializePhiInput).
 //
 // CreatePHIEffects are field-value PHIs that merge a per-offset field value
@@ -747,7 +765,7 @@ public:
   Type *PHIType = nullptr;
   int64_t FieldOffset = 0;
   // WeakTrackingVH: an incoming value may be a call result whose call is
-  // cloned by RewriteDeoptBundleEffect — the handle follows the RAUW.
+  // cloned by the deopt-pool phase; the handle follows the RAUW.
   SmallVector<WeakTrackingVH, 4> PHIIncomingValues;
   SmallVector<BasicBlock *, 4> PHIIncomingBlocks;
   PHINode *PhiInst = nullptr;
@@ -762,100 +780,43 @@ public:
   }
 };
 
-// Rewrite the "deopt" operand bundle of a safepoint (CallBase) so that a
-// virtual object referenced in the bundle (and still virtual at the safepoint)
-// is described by a VO descriptor (ScalarValueType header + klass + per-offset
-// field values) and the bundle slot that held OrigAlloc becomes a VORefType
-// reference. Non-cfgKill (Pass 1). ALL descriptors of a deopt point are
-// placed in the ROOT (outermost) scope's VO section — the deopt-point-level
-// object pool (C2's dump_object_pool-before-scope-values analog) — and a
-// bundle slot in ANY scope (locals/stack of an outer or inner scope, or an
-// outer-scope monitor owner) is rewritten to a VORef by vo-id; the HotSpot
-// parser resolves VORefs through a record-level vo_map populated from the
-// root scope's VO section, which always precedes any reference. A field
-// whose value is ANOTHER in-scope VO is emitted as a VORef FIELD (vo-id) so
-// the descriptor graph can be cyclic / transitive (mirrors C2/Graal nested
-// ObjectValue + id back-ref). Scope of
-// the current implementation: instance objects AND arrays (whose element kind
-// the VMCallback could classify — ArrayElementType != nullptr &&
-// ArrayIndexScale != 0), including synthetic (Case-C merge) objects, referenced
-// by object identity (the OrigAlloc for an ordinary VO, SyntheticPhi for a
-// synthetic; not a derived bundle operand), with fields/elements that are plain
-// scalars, VORefs to other describable VOs, or describable wide-oop
-// (addrspace-1) reference values to non-VO
-// (argument/null/materialized-external) oops. A touched long/double field is
-// described with ONE wire entry carrying the full i64/f64 value; the HotSpot
-// parser's fill_one_scope_value T_LONG/ T_DOUBLE branch expands it to the two
-// field_values slots. A VO HOLDING A LOCK at the safepoint IS described: its
-// PEA-eliminated lock is reconstructed at deopt by rewriting the bundle's
-// monitor entry to eliminated=true with a VORef owner (the transform handles
-// monitor-object OrigAlloc slots in step 3).
-//
-// Intentionally deferred — the analyzer bails these (and contagiously bails
-// any VO referencing a bailed VO, so no dangling VORef is ever emitted):
-//   - a DERIVED bundle operand (V != AllocationCall, not a virtual alias;
-//     see the Banned set built in recordDeoptBundleMappings);
-//   - an array whose element kind the VMCallback could not classify
-//     (ArrayElementType == nullptr || ArrayIndexScale == 0);
-//   - a narrow-oop (addrspace-3) reference field (CompressedOops,
-//     TODO(compressed-oop));
-//   - a non-null constant oop field (would trip HotSpot
-//     fill_one_scope_value);
-//
-// Graal analog: addVirtualMapping (PartialEscapeClosure.java) records a
-// FrameState's reference to a still-virtual object as a virtual mapping
-// (re-emitted as an ObjectValue at deopt) rather than an escape. Jeandle
-// cannot mutate the bundle during analysis, so it records this effect and
-// the transform rewrites the bundle in Pass 1.
-class RewriteDeoptBundleEffect : public Effect {
+// One immutable, complete deopt object-pool plan for a safepoint. The plan
+// owns every output token and every exact current-object source occurrence;
+// transform application therefore performs one checked rebuild rather than
+// composing per-object edits.
+class RewriteDeoptPoolEffect : public Effect {
 public:
-  // The safepoint whose "deopt" bundle references the VO's OrigAlloc. Used
-  // ONLY as an identity (DenseMap key + pointer equality) — never
-  // dereferenced post-erasure. SafepointVH is the WeakTrackingVH follower of
-  // the same value: apply resolves the live call via (a) the
-  // SafepointReplacements chain keyed on this raw pointer, or (b) SafepointVH
-  // when it still equals this raw pointer (a follow to a DIFFERENT value —
-  // e.g. a folded JavaOp's replacement — means the call and its bundle died,
-  // so the rewrite must no-op; see PartialEscapeTransform.cpp).
-  CallBase *Safepoint = nullptr;
-  WeakTrackingVH SafepointVH;
-  // Every "deopt" bundle operand of the safepoint that denotes THIS VO by
-  // object identity (the OrigAlloc itself for an ordinary VO, SyntheticPhi for
-  // a synthetic, or an alias-map virtual-alias such as a Case-B PHI / freeze /
-  // offset-0 select / offset-0 GEP / load-through result). The transform
-  // rewrites slots matching the VO's root identity (OrigAlloc or SyntheticPhi)
-  // OR any of these operands (a load-through alias is RAUW'd to OrigAlloc by
-  // its ReplaceLoad before this effect applies, so the root-identity match
-  // covers it; the other shapes are never RAUW'd and are covered by
-  // RootOperands). WeakTrackingVH: follows any RAUW of the operand.
-  SmallVector<WeakTrackingVH, 2> RootOperands;
-  // Per-offset snapshot of the object's field values at the safepoint (read
-  // from the analyzer's FieldStates keyed by (ObjectID, byte-offset)). Each
-  // entry's FieldValue is either Scalar (a plain scalar field) or VirtualRef
-  // (a field that references another in-scope VO, emitted as a VORef field).
-  // The analyzer only records this effect when it can prove that invariant at
-  // the safepoint. Each Scalar FieldValue's backing def must dominate the
-  // safepoint (any Value* reachable from surviving state must outlive the
-  // transform) — the analyzer only snapshots dominating scalar stores.
-  SmallVector<MaterializeEffect::FieldEntry, 8> Fields;
-  // True iff this VO's OrigAlloc is a direct "deopt" bundle operand at this
-  // safepoint (a ROOT, referenced from a locals/stack slot). The transform
-  // then REQUIRES OrigAlloc to still be in the bundle (bails if it was
-  // scrubbed, to avoid an orphan descriptor with no slot). False for a
-  // TRANSITIVE member — a VO referenced only via another VO's VORef field,
-  // whose OrigAlloc is never a bundle operand. The transform still emits its
-  // descriptor (referenced by id from the enclosing VO's VORef field) but
-  // skips the slot rewrite.
-  bool OrigAllocInBundle = true;
+  RewriteDeoptPoolEffect(
+      CallBase *Safepoint,
+      std::shared_ptr<const pea::FinalDeoptPoolBundlePlan> Plan);
 
-  Kind getKind() const override { return Kind::RewriteDeoptBundle; }
+  Kind getKind() const override { return Kind::RewriteDeoptPool; }
   static bool classof(const Effect *E) {
-    return E->getKind() == Kind::RewriteDeoptBundle;
+    return E->getKind() == Kind::RewriteDeoptPool;
   }
+  Phase getPhase() const override { return Phase::DeoptPool; }
+  Instruction *getTarget() const override;
+
+  CallBase *getSafepointKey() const { return SafepointKey; }
+  bool hasPlan() const { return static_cast<bool>(Plan); }
+  const pea::FinalDeoptPoolBundlePlan &getPlan() const {
+    assert(Plan && "deopt-pool effect has no plan");
+    return *Plan;
+  }
+  bool coversExactOccurrence(unsigned SemanticCell, ObjectID ID) const;
+  bool acceptsCurrentMember(ObjectID ID) const;
+
   void apply(TransformContext &Ctx) override;
   std::unique_ptr<Effect> clone() const override {
-    return std::make_unique<RewriteDeoptBundleEffect>(*this);
+    return std::make_unique<RewriteDeoptPoolEffect>(*this);
   }
+
+private:
+  // Stable analysis-time identity. It is compared and used as a map key only,
+  // never dereferenced after SafepointVH stops denoting the same value.
+  CallBase *const SafepointKey;
+  WeakTrackingVH SafepointVH;
+  const std::shared_ptr<const pea::FinalDeoptPoolBundlePlan> Plan;
 };
 
 // Jeandle adaptation of Graal's `EffectList` / `GraphEffectList`. Append-only
@@ -910,10 +871,10 @@ public:
     return C;
   }
 
-  // Apply every effect where `isCfgKill()==CfgKills`, in SeqNo order (Jeandle's
-  // substitute for Graal list-order — see Effect::SeqNo). Defined in
+  // Apply every effect in Phase, in SeqNo order (Jeandle's substitute for
+  // Graal list-order — see Effect::SeqNo). Defined in
   // PartialEscapeTransform.cpp.
-  void apply(TransformContext &Ctx, bool CfgKills);
+  void apply(TransformContext &Ctx, Effect::Phase Phase);
 
   // Range-for yielding Effect& / const Effect& (the analyzer-side scans iterate
   // by reference; ownership stays with the list).
@@ -996,12 +957,14 @@ public:
   // ordering is therefore not combined across mutually exclusive paths.
   //
   // OrigInsertBefore (captured by the TransformContext after edge normalization
-  // and before Pass 1) records InsertBefore before any eager-update re-aim by
+  // and before the ordinary phase) records InsertBefore before any
+  // eager-update re-aim by
   // relocateDependentMaterializes; the lock key is exactly this captured
   // normalized pointer (looked up via OrigInsertBefore.lookup(&E) — a re-aimed
   // E.InsertBefore could otherwise miss the final physical batch).
   //
-  // Populated by computeEscapePointLocks(), called once before Pass 1 from
+  // Populated by computeEscapePointLocks(), called once before the ordinary
+  // phase from
   // the TransformContext setup in run().
   SmallVector<LockReplayBatch, 4> LockReplayBatches;
   DenseMap<Instruction *, unsigned> LockReplayBatchForSite;
@@ -1086,6 +1049,14 @@ public:
   bool hasLegalMaterializationAtomicTypes(const DataLayout &DL) const;
 
   bool hasOptimizationOpportunity() const;
+
+  // Whether CurrentID's runtime identity can denote SourceID. Ordinary
+  // identities represent only themselves. A synthetic Case-C identity
+  // represents the transitive closure of its SyntheticSourceIDs. Invalid and
+  // out-of-range IDs are rejected, and cycles in nested/loop-carried
+  // synthetic graphs are bounded.
+  bool currentIdentityRepresentsSource(ObjectID CurrentID,
+                                       ObjectID SourceID) const;
 
   // Truncate OwnedPhis/OwnedInsts to the given marks, deleting each trailing
   // entry that is still unparented (the transform only inserts these into a

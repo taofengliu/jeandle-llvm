@@ -14,11 +14,11 @@
 // reuses the original allocation at its original site, then replays tracked
 // field stores and surviving monitorenters before the escape. NeverEscape
 // source allocations can instead be deleted. Effects are Graal-style
-// polymorphic records (jeandle::Effect subclasses). isCfgKill() orders the
-// transform's two apply passes and is true ONLY for EliminateAllocation;
-// "control-flow-rewriting" (Materialize's splitBasicBlock, CreatePHI's PHI
-// insertion) is a separate notion and runs in Pass 1, matching Graal's
-// EffectList.isCfgKill().
+// polymorphic records (jeandle::Effect subclasses). The transform applies
+// ordinary effects first, each complete deopt-pool transaction second, and
+// allocation cfg-kill effects last. "Control-flow-rewriting"
+// (Materialize's splitBasicBlock and CreatePHI's PHI insertion) remains an
+// ordinary effect, matching Graal's non-cfgKill phase.
 //
 // Per-block exit state (virtual set, field values, lock counts) is snapshotted
 // into BlockExits; at each block header we inherit a single pred's snapshot or
@@ -50,6 +50,8 @@
 #include "llvm/ADT/Statistic.h"
 #include "llvm/Analysis/CFG.h"
 #include "llvm/Analysis/ConstantFolding.h"
+#include "llvm/Analysis/Jeandle/DeoptPoolBundleLowering.h"
+#include "llvm/Analysis/Jeandle/DeoptPoolPlanner.h"
 #include "llvm/Analysis/Jeandle/PartialEscape.h"
 #include "llvm/Analysis/Jeandle/PartialEscapeUtils.h"
 #include "llvm/Analysis/LoopInfo.h"
@@ -706,6 +708,7 @@ private:
   bool InvalidDeoptObligation = false;
   SmallVector<CallBase *, 4> InvalidDeoptAllocationSites;
   SmallVector<CallBase *, 4> UnsafeFinalUseAllocationSites;
+  DenseSet<CallBase *> LateInvalidDeoptPools;
 
   // Attempt-local ledger of every non-literal CFG deadness proof actually
   // consumed by contributionFor. RecordedCFGProofs deduplicates repeated
@@ -785,16 +788,14 @@ private:
   // materialize preserves every fold recorded so far.
   DenseMap<jeandle::ObjectID, bool> Eligible;
 
-  // ObjectIDs whose OrigAlloc appears in the CURRENTLY-processed
-  // instruction's "deopt" bundle AND was recorded as a scoped virtual
-  // mapping by recordDeoptBundleMappings (a RewriteDeoptBundleEffect was
-  // emitted for it). The generic escape path skips these deopt-bundle
-  // operands so describing an object in a deopt bundle does not, by itself,
-  // force a materialization (Graal addVirtualMapping semantics). Per-
-  // instruction: cleared and repopulated by recordDeoptBundleMappings at the
-  // top of the call dispatch, consumed by materializeAllVirtualOperands in
-  // the same dispatch.
-  DenseSet<jeandle::ObjectID> DeoptBundleHandled;
+  // Exact CallBase operand numbers owned by the current safepoint's complete
+  // deopt-pool plan. Object identity is deliberately not the key: one SSA
+  // value may occur in several semantically different cells, and only cells
+  // explicitly rewritten or removed by the immutable plan are non-escaping.
+  // This state is ephemeral for one processInstruction dispatch and is not
+  // part of loop snapshots; the durable plan lives in the block EffectList.
+  CallBase *HandledDeoptCall = nullptr;
+  SmallDenseSet<unsigned, 16> HandledDeoptOperandNos;
 
   // Per-object monitor lock counter. Incremented on a folded monitorenter,
   // decremented on a folded monitorexit. Any object with LockCount != 0 at
@@ -1408,32 +1409,16 @@ private:
   std::optional<bool> evalSubtypeRelation(uintptr_t SubKlass,
                                           uintptr_t SuperKlass);
   void emitReplaceCall(CallBase *CB, Value *Replacement, jeandle::ObjectID ID);
-  // PEA deopt support. Scan CB's "deopt" operand bundle for references to
-  // still-virtual objects and, for each that meets the scoped criteria
-  // (single never-escaping instance OR array of known element kind, virtual
-  // at the safepoint, identity-not-derived), record a
-  // RewriteDeoptBundleEffect snapshotting per-offset/per-element FieldValues
-  // (long/double as a single wire entry; materialized wide-oop reference
-  // values as live-oop Scalar cells; array elements as one wire entry each
-  // in 0..ArrayLength-1 order, including untouched defaults) and add the
-  // ObjectID to DeoptBundleHandled. A VO holding a lock at the safepoint is
-  // still described; its PEA-eliminated lock is reconstructed at deopt via
-  // the bundle's monitor entry (eliminated=true with a VORef owner). Graal
-  // analog: addVirtualMapping — a deopt-state reference to a virtual object is
-  // recorded as a virtual mapping (re-emitted as an ObjectValue at deopt),
-  // NOT an escape. The generic escape path (materializeAllVirtualOperands)
-  // consults DeoptBundleHandled to skip the handled deopt-bundle operands so
-  // the bundle alone does not force a materialization. Roots are collected
-  // across ALL scopes of the bundle (outer-scope locals/stack slots and
-  // monitor owners included); all descriptors are emitted into the root
-  // scope's VO section, the record-level (whole-deopt-point) object pool —
-  // C2's dump_object_pool-before-scope-values analog (see the MULTI-SCOPE
-  // comment in the implementation). Out-of-scope shapes (derived bundle
-  // operand, array of unknown element kind, narrow-oop (addrspace-3)
-  // reference field, non-null constant oop field) are conservatively left
-  // unrecorded so they fall through to the existing escape/materialization
-  // behavior; a VO referencing such an undescribable VO is itself
-  // contagiously bailed (greatest-fixpoint, no dangling VORef).
+  // PEA deopt support. Parse the complete safepoint bundle, combine durable
+  // legacy descriptors with current virtual-object state, and publish one
+  // immutable whole-pool rewrite. The pure planner owns reachability, pruning,
+  // and dense wire-ID assignment. Reachable current nodes that cannot be
+  // described are materialized and the complete pool is planned again, so a
+  // parent may remain virtual with a real-oop scalar field. Only exact source
+  // cells rewritten to VORefs or removed by legacy pruning enter the handled
+  // operand set; all other scalar uses retain ordinary escape semantics.
+  // Graal analog: addVirtualMapping records a virtual mapping in frame state
+  // rather than treating the frame-state reference itself as an escape.
   void recordDeoptBundleMappings(CallBase *CB);
   // Materialize only virtual operands of CB's deopt bundle that were not
   // described by recordDeoptBundleMappings. Handled intrinsics use this
@@ -1442,8 +1427,8 @@ private:
   void materializeUnhandledDeoptBundleOperands(CallBase *CB);
   // True iff \p U is an input of I's "deopt" operand bundle whose resolved
   // ObjectID was recorded as a scoped virtual mapping at this instruction
-  // (present in DeoptBundleHandled). Used by the generic escape path to skip
-  // deopt-state operands.
+  // covered by the current whole-pool plan. Used by the generic escape path to
+  // skip deopt-state operands.
   bool isHandledDeoptBundleOperand(const Use &U, Instruction *I);
   // Single source of truth for "which distinct virtual ObjectIDs does I use as
   // operands (skipping described deopt-bundle operands)?" The generic escape
@@ -1872,12 +1857,13 @@ void Analyzer::processBlock(BasicBlock *BB) {
       if (EIt != Result.BlockEffects.end())
         for (const auto &E : EIt->second) {
           const auto *ME = dyn_cast<jeandle::MaterializeEffect>(&E);
-          if (!ME)
+          if (!ME || !ME->hasMutationOwner())
             continue;
           if ((Value *)ME->InsertBefore != (Value *)TermII)
             continue;
-          markObjectMaterializedInExitData(*PreInvokeSnapshot, ME->ObjID,
-                                           realIdentityOf(ME->ObjID));
+          markObjectMaterializedInExitData(
+              *PreInvokeSnapshot, ME->getMutationOwner(),
+              realIdentityOf(ME->getMutationOwner()));
         }
     }
 
@@ -2965,7 +2951,7 @@ bool Analyzer::MergeProcessor::mergeFieldStates(jeandle::ObjectID ID) {
     PE->Block = BB;
     // SeqNo assigned at drain time; see PendingMergePhis comment.
     PE->SeqNo = 0;
-    PE->ObjID = ID;
+    PE->setMutationOwner(ID);
     PE->PhiInst = Phi;
     PE->PHIType = PhiType;
     PE->FieldOffset = Off;
@@ -3264,7 +3250,7 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
       if (OS && OS->isVirtual()) {
         // Register the PHI as an alias for the same ObjectID so downstream
         // load/store handlers in this block resolve through it.
-        Aliases.addVirtualAlias(&Phi, *First);
+        Aliases.addVirtualAlias(&Phi, *First, /*IsWholeObject=*/true);
         // Also record the PHI on the per-VO Case-B alias list so commit() can
         // erase it if the VO is NeverEscapes. The incomings are all the VO's
         // OrigAlloc, which EliminateAllocation RAUWs to poison; the PHI is then
@@ -3394,8 +3380,8 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
         // embedded in the derivation): cannot soundly re-derive a constant
         // byte offset at the latch. Sound fallback — keep the object real.
         // commit()->dropEffectsFor(ID) purges the materialize above (and this
-        // would-be effect by ObjID), so the original allocation survives and no
-        // poison leaks.
+        // would-be effect by mutation owner), so the original allocation
+        // survives and no poison leaks.
         markIneligible(OID);
         continue;
       }
@@ -3426,7 +3412,7 @@ bool Analyzer::hasObservableIdentityUse(
   DenseSet<Instruction *> InternalTargets;
   for (auto &KV : Result.BlockEffects)
     for (const auto &E : KV.second)
-      if (E.ObjID == ID)
+      if (E.hasMutationOwner() && E.getMutationOwner() == ID)
         if (Instruction *Target = E.getTarget())
           // A folded identity compare records the icmp as an effect target,
           // but the compare still observes this VO's identity: the fold is
@@ -4195,7 +4181,7 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
     PE->Block = BB;
     // SeqNo assigned at drain time; see PendingMergePhis comment.
     PE->SeqNo = 0;
-    PE->ObjID = NewID;
+    PE->setMutationOwner(NewID);
     PE->PhiInst = NewPhi;
     PE->PHIType = P.PhiType;
     PE->FieldOffset = P.Off;
@@ -4240,7 +4226,7 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
     if (!RefStack.empty())
       LiveLockEnters[NewID] = RefStack;
   }
-  Aliases.addVirtualAlias(Phi, NewID);
+  Aliases.addVirtualAlias(Phi, NewID, /*IsWholeObject=*/true);
   LLVM_DEBUG(dbgs() << "PEA-CASEC-SUCCESS: synthesized VO=" << NewID
                     << " for phi '" << Phi->getName() << "' at merge "
                     << BB->getName() << "\n");
@@ -4253,6 +4239,9 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
 }
 
 void Analyzer::processInstruction(Instruction *I) {
+  HandledDeoptCall = nullptr;
+  HandledDeoptOperandNos.clear();
+
   // Graal correspondence: PartialEscapeClosure.processNode /
   // processNodeInternal (Graal PartialEscapeClosure). Graal dispatches
   // in three stages; this function mirrors them, adapted to LLVM's opcode-
@@ -4301,7 +4290,7 @@ void Analyzer::processInstruction(Instruction *I) {
       // helpers are no-ops when the bundle has no virtual references, and
       // every processAllocation early-return path (cache hit, finalizer,
       // length cap, ...) still lands here. The transform side is clone-safe:
-      // a RewriteDeoptBundleEffect on the allocation invoke clones it, and
+      // a whole-pool rewrite on the allocation invoke clones it, and
       // every handle to the original (VirtualObject::AllocationCall, effect
       // Targets) follows the RAUW via WeakTrackingVH.
       recordDeoptBundleMappings(CB);
@@ -4458,7 +4447,6 @@ void Analyzer::processInstruction(Instruction *I) {
     // handled (whether by folding to a constant or by being a known-safe
     // non-escaping shape that needs no transform).
     if (auto *CB = dyn_cast<CallBase>(I)) {
-      DeoptBundleHandled.clear(); // defensive: kill any stale per-call state
       if (processJavaOp(CB)) {
         // The call was folded / is a known-safe shape. It may still SURVIVE
         // with a deopt bundle (the fold effect can be dropped at commit when
@@ -4498,7 +4486,11 @@ void Analyzer::processInstruction(Instruction *I) {
     return;
   }
 
-  // Scalar-replaced inputs: nothing to do.
+  // A safepoint may contain only a durable pool left by an earlier PEA round.
+  // It still needs a whole-pool cleanup/idempotence plan even when this round
+  // sees no virtual LLVM operand.
+  if (auto *CB = dyn_cast<CallBase>(I))
+    recordDeoptBundleMappings(CB);
 }
 
 // Allocation virtualization. Graal correspondence:
@@ -4601,7 +4593,7 @@ void Analyzer::processAllocation(CallBase *CB) {
     // the cache restore has wiped the entry (the common case under
     // restoreLoopSnapshot, which restores Aliases to its pre-loop state).
     if (!Aliases.getVirtualAlias(CB))
-      Aliases.addVirtualAlias(CB, ID);
+      Aliases.addVirtualAlias(CB, ID, /*IsWholeObject=*/true);
     if (!CurrentState.hasObjectState(ID))
       CurrentState.addObject(ID, jeandle::ObjectState());
     // Re-emit the EliminateAllocation effect. The pre-iter snapshot has
@@ -4611,7 +4603,7 @@ void Analyzer::processAllocation(CallBase *CB) {
     E->Block = CB->getParent();
     E->Target = CB;
     E->SeqNo = Result.nextSeqNo();
-    E->ObjID = ID;
+    E->setMutationOwner(ID);
     Result.addBlockEffect(std::move(E));
     // Also re-enqueue the per-block materialise on the cache-hit
     // path. For an InvokeInst alloc, the alloc IS the terminator of its
@@ -4747,7 +4739,7 @@ void Analyzer::processAllocation(CallBase *CB) {
   //     the on-VO ObjectState carries no field state) — see the class comment.
   jeandle::ObjectID ID = Result.createVirtualObject(std::move(VO));
   AllocSiteToVO[CB] = ID; // Jeandle: stable id per site (loop fixpoint).
-  Aliases.addVirtualAlias(CB, ID); // Graal addVirtualAlias
+  Aliases.addVirtualAlias(CB, ID, /*IsWholeObject=*/true);
   // Register a Virtual ObjectState — a presence marker carrying only Kind ==
   // Virtual (Graal addObject). resolveVirtualRef only needs the slot present;
   // the per-field FieldValue tracking lives in FieldStates (see class comment).
@@ -4755,14 +4747,14 @@ void Analyzer::processAllocation(CallBase *CB) {
   Eligible[ID] = true;
 
   // replaceWithVirtual analog (Graal effects.deleteNode). Recorded here as
-  // an EliminateAllocation effect; the transform's Pass 2 erases the alloc
-  // for NeverEscapes VOs and suppresses it for PartiallyEscapes VOs (keeps
-  // OrigAlloc alive as the materialized value).
+  // an EliminateAllocation effect; the transform's cfg-kill phase erases the
+  // alloc for NeverEscapes VOs and suppresses it for PartiallyEscapes VOs
+  // (keeps OrigAlloc alive as the materialized value).
   auto E = std::make_unique<jeandle::EliminateAllocationEffect>();
   E->Block = CB->getParent();
   E->Target = CB;
   E->SeqNo = Result.nextSeqNo();
-  E->ObjID = ID;
+  E->setMutationOwner(ID);
   Result.addBlockEffect(std::move(E));
 
   ++Result.VirtualizationDelta; // Graal effects.addVirtualizationDelta(1)
@@ -4868,7 +4860,7 @@ bool Analyzer::processStore(StoreInst *SI) {
   // Normalize the stored value through the scalar-alias chain before any
   // resolution / recording. A value folded by processLoad / foldICmpEquality /
   // emitReplaceCall is RAUW'd and ERASED by its ReplaceLoad/ReplaceCall effect
-  // in Pass 1, which runs BEFORE the Materialize / RewriteDeoptBundle effects
+  // in phase 1, which runs BEFORE the Materialize / RewriteDeoptPool effects
   // that read the FieldStates snapshot — recording the folded instruction
   // itself would leave a dangling pointer in the snapshot. The chain
   // terminates at a value that is never erased (a constant, an argument, an
@@ -5004,7 +4996,7 @@ bool Analyzer::processStore(StoreInst *SI) {
     E->Block = SI->getParent();
     E->Target = SI;
     E->SeqNo = Result.nextSeqNo();
-    E->ObjID = *BaseID;
+    E->setMutationOwner(*BaseID);
     Result.addBlockEffect(std::move(E));
     return true;
   }
@@ -5025,7 +5017,7 @@ bool Analyzer::processStore(StoreInst *SI) {
   E->Block = SI->getParent();
   E->Target = SI;
   E->SeqNo = Result.nextSeqNo();
-  E->ObjID = *BaseID;
+  E->setMutationOwner(*BaseID);
   Result.addBlockEffect(std::move(E));
   return true;
 }
@@ -5086,7 +5078,7 @@ void Analyzer::processLoad(LoadInst *LI) {
         E->Replacement =
             ConstantInt::get(LI->getType(), (uint64_t)VObj.ArrayLength);
         E->SeqNo = Result.nextSeqNo();
-        E->ObjID = *BaseID;
+        E->setMutationOwner(*BaseID);
         Result.addBlockEffect(std::move(E));
         return;
       }
@@ -5205,7 +5197,7 @@ void Analyzer::processLoad(LoadInst *LI) {
     E->Target = LI;
     E->Replacement = Def;
     E->SeqNo = Result.nextSeqNo();
-    E->ObjID = *BaseID;
+    E->setMutationOwner(*BaseID);
     Result.addBlockEffect(std::move(E));
     Aliases.addScalarAlias(LI, Def);
     return;
@@ -5237,7 +5229,7 @@ void Analyzer::processLoad(LoadInst *LI) {
     E->Target = LI;
     E->Replacement = Coerced;
     E->SeqNo = Result.nextSeqNo();
-    E->ObjID = *BaseID;
+    E->setMutationOwner(*BaseID);
     Result.addBlockEffect(std::move(E));
     Aliases.addScalarAlias(LI, Coerced);
     return;
@@ -5320,7 +5312,7 @@ void Analyzer::processLoad(LoadInst *LI) {
     E->Target = LI;
     E->Replacement = Coerced;
     E->SeqNo = Result.nextSeqNo();
-    E->ObjID = *BaseID;
+    E->setMutationOwner(*BaseID);
     Result.addBlockEffect(std::move(E));
 
     // Install the virtual alias only when the inner is still virtual at
@@ -5330,7 +5322,7 @@ void Analyzer::processLoad(LoadInst *LI) {
     if (InnerOS->isMaterialized())
       Aliases.addScalarAlias(LI, Coerced);
     else
-      Aliases.addVirtualAlias(LI, InnerID);
+      Aliases.addVirtualAlias(LI, InnerID, /*IsWholeObject=*/true);
     return;
   }
 
@@ -5359,7 +5351,7 @@ void Analyzer::processLoad(LoadInst *LI) {
     E->Target = LI;
     E->Replacement = Coerced;
     E->SeqNo = Result.nextSeqNo();
-    E->ObjID = *BaseID;
+    E->setMutationOwner(*BaseID);
     Result.addBlockEffect(std::move(E));
     Aliases.addScalarAlias(LI, Coerced);
     return;
@@ -5388,7 +5380,7 @@ void Analyzer::emitReplaceCall(CallBase *CB, Value *Replacement,
   E->Target = CB;
   E->Replacement = Replacement;
   E->SeqNo = Result.nextSeqNo();
-  E->ObjID = ID;
+  E->setMutationOwner(ID);
   Result.addBlockEffect(std::move(E));
   // Scalar-alias non-void call values so downstream resolveVirtualRef queries
   // (e.g. another JavaOp later in the same block whose operand is the call
@@ -5485,7 +5477,7 @@ bool Analyzer::foldGetClass(CallBase *CB) {
   E->Replacement = nullptr; // built in apply() from OopHandleId.
   E->OopHandleId = MirrorOopId;
   E->SeqNo = Result.nextSeqNo();
-  E->ObjID = *BaseID;
+  E->setMutationOwner(*BaseID);
   Result.addBlockEffect(std::move(E));
   return true;
 }
@@ -5988,8 +5980,13 @@ bool Analyzer::processIntrinsic(IntrinsicInst *II) {
   case Intrinsic::ptr_annotation: {
     Value *Arg = II->getArgOperand(0);
     if (auto BaseID =
-            jeandle::pea::resolveVirtualRef(Arg, CurrentState, Aliases, DL))
-      Aliases.addVirtualAlias(II, *BaseID);
+            jeandle::pea::resolveVirtualRef(Arg, CurrentState, Aliases, DL)) {
+      auto WholeIdentity = jeandle::pea::resolveVirtualIdentity(
+          Arg, CurrentState, Aliases, DL,
+          jeandle::pea::VirtualIdentityMode::WholeObject);
+      Aliases.addVirtualAlias(II, *BaseID,
+                              /*IsWholeObject=*/WholeIdentity.isDefined());
+    }
     // Whether or not the arg resolved, the call has no PEA escape effect.
     return true;
   }
@@ -6102,7 +6099,7 @@ bool Analyzer::foldICmpEquality(ICmpInst *ICmp) {
   E->Target = ICmp;
   E->Replacement = C;
   E->SeqNo = Result.nextSeqNo();
-  E->ObjID = BaseID;
+  E->setMutationOwner(BaseID);
   Result.addBlockEffect(std::move(E));
   Aliases.addScalarAlias(ICmp, C);
   return true;
@@ -6152,36 +6149,40 @@ void Analyzer::propagatePointerAlias(Instruction *I) {
         Sel, CurrentState, Aliases, DL,
         jeandle::pea::VirtualIdentityMode::WholeObject);
     if (Identity.isDefined()) {
-      Aliases.addVirtualAlias(I, Identity.getObjectID());
+      Aliases.addVirtualAlias(I, Identity.getObjectID(),
+                              /*IsWholeObject=*/true);
       return;
     }
     materializeAllVirtualOperands(I);
     return;
   }
 
-  auto BaseID = jeandle::pea::resolveVirtualRef(I, CurrentState, Aliases, DL);
+  auto WholeIdentity = jeandle::pea::resolveVirtualIdentity(
+      I, CurrentState, Aliases, DL,
+      jeandle::pea::VirtualIdentityMode::WholeObject);
+  auto BaseID =
+      WholeIdentity.isDefined()
+          ? std::optional<jeandle::ObjectID>(WholeIdentity.getObjectID())
+          : jeandle::pea::resolveVirtualRef(I, CurrentState, Aliases, DL);
   if (!BaseID) {
     // Couldn't resolve — the underlying chain may have already escaped.
     materializeAllVirtualOperands(I);
     return;
   }
-  Aliases.addVirtualAlias(I, *BaseID);
+  Aliases.addVirtualAlias(I, *BaseID,
+                          /*IsWholeObject=*/WholeIdentity.isDefined());
 }
 
 bool Analyzer::isHandledDeoptBundleOperand(const Use &U, Instruction *I) {
   auto *CB = dyn_cast<CallBase>(I);
-  if (!CB)
+  if (!CB || CB != HandledDeoptCall)
     return false;
   unsigned OpIdx = U.getOperandNo();
   if (!CB->isBundleOperand(OpIdx))
     return false;
   if (!CB->getOperandBundleForOperand(OpIdx).isDeoptOperandBundle())
     return false;
-  auto Identity = jeandle::pea::resolveVirtualIdentity(
-      U.get(), CurrentState, Aliases, DL,
-      jeandle::pea::VirtualIdentityMode::WholeObject);
-  return Identity.isDefined() &&
-         DeoptBundleHandled.count(Identity.getObjectID());
+  return HandledDeoptOperandNos.contains(OpIdx);
 }
 
 // Defined below (near the materialize-placement helpers); forward-declared
@@ -6189,582 +6190,391 @@ bool Analyzer::isHandledDeoptBundleOperand(const Use &U, Instruction *I) {
 static bool hasDeoptBundle(CallBase *CB);
 
 void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
-  DeoptBundleHandled.clear();
+  using namespace jeandle::pea;
+
+  HandledDeoptCall = nullptr;
+  HandledDeoptOperandNos.clear();
   if (!hasDeoptBundle(CB))
     return;
-
   auto Deopt = CB->getOperandBundle(LLVMContext::OB_deopt);
-  assert(Deopt && "hasDeoptBundle lied");
+  if (!Deopt)
+    return;
 
-  // A VO described in a deopt bundle may have a FIELD whose value is itself
-  // another in-scope VO (virtual at this safepoint). Such a field is emitted as
-  // a VORef (reference by vo-id) to the other VO's descriptor, not as a scalar
-  // or constant oop — mirrors C2/Graal's nested ObjectValue + id back-ref. This
-  // requires:
-  //   1. a transitive closure so every referenced VO is described once;
-  //   2. a coherent fallback closure so a descriptor never references an
-  //      undescribable VO and a generically materialized VO never has a
-  //      descendant described separately at the same safepoint.
-  // A VO that HOLDS A LOCK at this safepoint is describable too — its
-  // (PEA-eliminated) lock is reconstructed at deopt via a monitor entry with
-  // eliminated=true whose owner is a VORef to this VO (mirrors C2/Graal
-  // MonitorValue{eliminated} + collectLockedVirtualObjects). So locks are not a
-  // bail here; the transform rewrites the monitor's OrigAlloc owner in place.
-  // The sound single-VO bails (derived bundle operand, array of unknown
-  // element kind, non-describable reference value — narrow-oop addrspace-3
-  // or non-null constant oop; a describable wide-oop materialized ref IS
-  // described) are clean falls-through; long/double fields are described (one
-  // wire entry, expanded to two slots on the parse side); arrays of known
-  // element kind are described with a T_ARRAY header and all elements emitted;
-  // roots are collected across ALL scopes of the bundle — outer-scope
-  // references are described like inner ones (see the MULTI-SCOPE comment at
-  // Step 1 below).
+  DeoptBundleParseResult ParsedResult = parseDeoptBundle(*CB);
+  if (!ParsedResult.Bundle)
+    return;
+  ParsedDeoptBundle Parsed = std::move(*ParsedResult.Bundle);
 
-  // Per-cell plan: a touched field/element is either a plain scalar, a VORef to
-  // another in-scope VO (by id), or Bad (this VO cannot be described). For an
-  // ARRAY, untouched elements are synthesized as the Java default (0 / null) so
-  // field_count == ArrayLength (see structurallyEligible).
-  struct Cell {
-    int64_t Offset;
-    enum K : uint8_t { Scalar, VORef, Bad } Kind;
-    Value *ScalarV = nullptr;                             // valid when Scalar
-    jeandle::ObjectID VORefID = jeandle::InvalidObjectID; // valid when VORef
+  auto SourceValue = [&](DeoptPoolSemanticCellID Cell) -> Value * {
+    if (Cell >= Parsed.OriginalInputs.size())
+      return nullptr;
+    return Parsed.OriginalInputs[Cell];
   };
-  struct Plan {
-    SmallVector<Cell, 8> Cells;
+  auto IsVirtualHere = [&](jeandle::ObjectID ID) {
+    const jeandle::ObjectState *State = CurrentState.getObjectStateOptional(ID);
+    return State && State->isVirtual();
   };
-  DenseMap<jeandle::ObjectID, Plan> Plans;
-  SmallVector<jeandle::ObjectID, 4> Order; // insertion order for stable emit
-
-  auto isDescriptorOffsetEncodable = [](int64_t Offset) {
-    return Offset >= std::numeric_limits<int32_t>::min() &&
-           Offset <= std::numeric_limits<int32_t>::max();
+  auto IsCurrentVirtual = [&](jeandle::ObjectID ID) {
+    return ID < Result.VirtualObjects.size() && Eligible.lookup(ID) &&
+           IsVirtualHere(ID);
   };
-
-  // Basic structural eligibility (eligible, klass [and a known array element
-  // kind for arrays]). Locks are not a bail: a VO holding a lock at this
-  // safepoint is still described, and its PEA-eliminated lock is reconstructed
-  // at deopt as a monitor entry
-  // (eliminated=true, owner=VORef). isVirtualHere (checked in the worklist) is
-  // the virtual-at-safepoint gate; commit()'s end-of-analysis LockCounts!=0
-  // gate separately drops genuinely unbalanced-lock VOs.
-  auto structurallyEligible = [&](jeandle::ObjectID ID) -> bool {
-    if (!Eligible.lookup(ID))
+  auto ResolveCurrentVirtual =
+      [&](Value *V) -> std::optional<jeandle::ObjectID> {
+    if (!V || !jeandle::isWideOopType(V->getType()))
+      return std::nullopt;
+    VirtualIdentityResult Identity = resolveVirtualIdentity(
+        V, CurrentState, Aliases, DL, VirtualIdentityMode::WholeObject);
+    if (!Identity.isDefined() || !IsCurrentVirtual(Identity.getObjectID()))
+      return std::nullopt;
+    return Identity.getObjectID();
+  };
+  auto IsDescribableOop = [](Value *V) {
+    if (!V || !jeandle::isWideOopType(V->getType()))
       return false;
-    if (ID >= Result.VirtualObjects.size())
-      return false;
-    jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
-    if (VObj.AllocationCall == nullptr)
-      return false;
-    // Synthetic (Case-C merge) VOs are describable like ordinary VOs — Graal
-    // treats a synthetic VO identically to a normal VO in deopt. A synthetic's
-    // AllocationCall is BORROWED from a source (see synthesizeCaseC) and is NOT
-    // its identity; the transform matches a synthetic by its SyntheticPhi
-    // (RewriteDeoptBundleEffect's RootIdentity), so the borrowed allocation is
-    // never rewritten as the synthetic's bundle slot.
-    if (VObj.Klass == 0)
-      return false; // no klass identity — cannot describe.
-    if (VObj.isArray()) {
-      // Array VO descriptors use a T_ARRAY header and emit one typed wire pair
-      // per element 0..ArrayLength-1 (field_count == ArrayLength, including
-      // untouched defaults — HotSpot derives the array length from
-      // field_values.size(), so emitting only touched elements would
-      // miscompile the length). Building this requires a known element type
-      // (to synthesize per-element defaults and the element's computational
-      // basicType), so an array whose element kind the VMCallback could not
-      // identify (ArrayElementType == nullptr / ArrayIndexScale == 0) bails
-      // and is left materialized.
-      if (!VObj.ArrayElementType || VObj.ArrayIndexScale == 0)
-        return false;
-      // DeoptValueEncoding stores byte offsets in its signed 32-bit Index
-      // field. Prove the complete monotonically increasing element range
-      // before walking or emitting it.
-      if (VObj.ArrayLength != 0) {
-        std::optional<int64_t> LastOffset =
-            jeandle::pea::checkedArrayElementOffset(
-                VObj.ArrayBaseOffset,
-                static_cast<int64_t>(VObj.ArrayLength) - 1,
-                VObj.ArrayIndexScale);
-        if (!LastOffset || !isDescriptorOffsetEncodable(VObj.ArrayBaseOffset) ||
-            !isDescriptorOffsetEncodable(*LastOffset))
-          return false;
-      }
-    }
-    return true;
-  };
-
-  // Whether ID is still VIRTUAL at this safepoint (per-block ObjectState
-  // present & virtual). resolveVirtualRef on a bundle operand returns the ID
-  // iff this holds; for transitive members we re-check it here.
-  auto isVirtualHere = [&](jeandle::ObjectID ID) -> bool {
-    auto *OS = CurrentState.getObjectStateOptional(ID);
-    return OS && OS->isVirtual();
-  };
-
-  // Compute the per-field Cell plan for one eligible VO. A Cell is:
-  //   - VORef(InnerID) if the field value is VirtualRef(InnerID) OR a scalar
-  //     whose backing Value* resolves to a virtual InnerID (the inner VO is
-  //     referenced by identity);
-  //   - Scalar(V) if the field is a plain primitive scalar (incl. a touched
-  //     long/double field), OR a reference field holding a REAL (non-
-  //     virtual) wide oop (addrspace 1) that is not a non-null constant —
-  //     emitted as a live-oop field value that RS4GC keeps GC-live/relocatable
-  //     and HotSpot's fill_one_scope_value T_OBJECT non-constant branch reads
-  //     back as LocationValue(Location::oop);
-  //   - Bad otherwise: a MaterializedRef/Unknown whose value fails the
-  //     describable-oop test, a narrow-oop (addrspace 3) reference field
-  //     (CompressedOops deferred), a non-null constant oop (would trip
-  //     fill_one_scope_value's ShouldNotReachHere on a stackmap constant; null
-  //     is fine), or a scalar whose LLVM type has no HotSpot computational
-  //     BasicType. A VO with any Bad cell is wholly undescribable.
-  auto describeMaterializedOop = [&](Value *V) -> bool {
-    auto *PT = dyn_cast<PointerType>(V->getType());
-    if (!PT || PT->getAddressSpace() != jeandle::AddrSpace::JavaHeapAddrSpace)
-      return false; // narrow-oop (addrspace 3) deferred, or not a managed oop.
     Value *Stripped = V->stripPointerCasts();
-    if (isa<Constant>(Stripped) && !isa<ConstantPointerNull>(Stripped))
-      return false; // non-null constant oop -> would trip fill_one_scope_value.
-    return true;
+    return !isa<Constant>(Stripped) || isa<ConstantPointerNull>(Stripped);
+  };
+  auto IsEncodableOffset = [](int64_t Offset) {
+    return Offset >= 0 &&
+           static_cast<uint64_t>(Offset) <=
+               static_cast<uint64_t>(std::numeric_limits<int32_t>::max());
   };
 
-  // Classify a TOUCHED FieldValue into a Cell. Shared by the instance
-  // touched-field walk and the array touched-element walk so the two agree on
-  // scalar / VORef / Bad routing (a VORef to an undescribed VO, or a
-  // non-describable oop, makes the whole VO Bad).
-  auto classifyFieldValue = [&](int64_t Offset,
-                                const jeandle::FieldValue &FV) -> Cell {
-    Cell C;
-    C.Offset = Offset;
-    if (!isDescriptorOffsetEncodable(Offset)) {
-      C.Kind = Cell::Bad;
-      return C;
-    }
-    if (FV.isVirtualRef()) {
-      C.Kind = Cell::VORef;
-      C.VORefID = FV.getVirtualRef();
-    } else if (FV.isScalar()) {
-      Value *SV = FV.getScalar();
-      auto InnerIdentity = jeandle::pea::resolveVirtualIdentity(
-          SV, CurrentState, Aliases, DL,
-          jeandle::pea::VirtualIdentityMode::WholeObject);
-      if (InnerIdentity.isDefined()) {
-        // A scalar field whose value resolves to a virtual VO -> VORef by
-        // identity (emitted as vo-id, no Value* in the bundle).
-        // For an object array this is how an element holding another in-scope
-        // virtual VO becomes a VORef FIELD (transitive closure through an
-        // array element).
-        C.Kind = Cell::VORef;
-        C.VORefID = InnerIdentity.getObjectID();
-      } else if (FV.getDeclaredType() && FV.getDeclaredType()->isPointerTy() &&
-                 describeMaterializedOop(SV)) {
-        // Reference field holding a non-VO wide oop (argument/null/
-        // materialized external oop): describe it as a Scalar field whose
-        // value is the live oop (RS4GC keeps it relocatable).
-        C.Kind = Cell::Scalar;
-        C.ScalarV = SV;
-      } else if (FV.getDeclaredType() && FV.getDeclaredType()->isPointerTy()) {
-        // Narrow-oop (addrspace 3) reference field, or a non-null constant
-        // oop: not describable. TODO(compressed-oop): narrow-oop reference
-        // fields are explicitly deferred (do NOT add handling).
-        C.Kind = Cell::Bad;
-      } else if (!FV.getDeclaredType() ||
-                 jeandle::LLVM2JavaComputational(FV.getDeclaredType()) ==
-                     jeandle::T_ILLEGAL) {
-        // LLVM permits additional atomic replay types (for example fixed
-        // vectors, i128, and half), but the deopt wire format can describe
-        // only values with a HotSpot computational BasicType. Materialize the
-        // whole coherent VO closure before this safepoint instead.
-        C.Kind = Cell::Bad;
-      } else {
-        // Plain primitive scalar (int/float/long/double; also byte/char/short
-        // elements, whose LLVM type widens to T_INT on the emit side). A
-        // touched long/double is described with one typed wire pair carrying
-        // the full i64/f64 value; the HotSpot parser's fill_one_scope_value
-        // T_LONG/T_DOUBLE branch expands it to the two ScopeValue slots
-        // reassign_fields_by_klass consumes.
-        C.Kind = Cell::Scalar;
-        C.ScalarV = SV;
-      }
-    } else if (FV.isMaterializedRef()) {
-      // Field holds a reference to a materialized VO (value = its OrigAlloc
-      // or a merge-PHI over OrigAllocs). Flatten to a Scalar field whose
-      // value is that live oop; bail if it is not a describable wide oop.
-      Value *MV = FV.getMaterialized();
-      if (describeMaterializedOop(MV)) {
-        C.Kind = Cell::Scalar;
-        C.ScalarV = MV;
-      } else {
-        C.Kind = Cell::Bad;
-      }
-    } else {
-      // Unknown: ref-to-unknown -> bail.
-      C.Kind = Cell::Bad;
-    }
-    return C;
-  };
+  // A fallback materialization monotonically changes current object state.
+  // Rebuild the entire semantic graph after every such change; no partial
+  // planner result is durable.
+  for (unsigned Attempt = 0; Attempt <= Result.VirtualObjects.size();
+       ++Attempt) {
+    DeoptPoolPlannerInput Input;
+    SmallVector<DeoptPoolScalarTokenBinding, 32> ScalarBindings;
+    SmallVector<DeoptPoolCurrentCellBinding, 8> CurrentCells;
+    DenseMap<jeandle::ObjectID, unsigned> CurrentNodeIndices;
+    SmallVector<jeandle::ObjectID, 8> CurrentExpansionQueue;
+    uint64_t NextScalarToken = 1;
 
-  auto planFields = [&](jeandle::ObjectID ID, Plan &P) {
-    jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
-    auto ItFS = FieldStates.find(ID);
+    auto BindScalar = [&](Value *V) {
+      uint64_t Token = NextScalarToken++;
+      ScalarBindings.push_back({Token, V});
+      return Token;
+    };
 
-    if (VObj.isArray()) {
-      // Arrays emit ALL elements 0..ArrayLength-1 in offset order
-      // (field_count == ArrayLength). A touched element uses its recorded
-      // FieldValue (routed through the shared classifier, so a VORef element
-      // reaches the transitive closure exactly like a VORef instance field);
-      // an untouched element is synthesized as the Java default. HotSpot's
-      // realloc_objects derives the array length from field_values.size()
-      // (typeArray: len = field_size()/type2size; objArray: len =
-      // field_size()), so omitting untouched elements would miscompile the
-      // length. The element offset is ArrayBaseOffset + idx*ArrayIndexScale
-      // (uniform stride; offset order == index order). NOTE: we deliberately
-      // do NOT take the JVMCI JavaKind.Illegal packed-write micro-optimization
-      // for byte/boolean arrays — each element is one normal T_INT slot.
-      const DenseMap<int64_t, jeandle::FieldValue> *Touched =
-          (ItFS != FieldStates.end()) ? &ItFS->second : nullptr;
-      if (Touched) {
-        const int64_t Base = static_cast<int64_t>(VObj.ArrayBaseOffset);
-        const int64_t Scale = static_cast<int64_t>(VObj.ArrayIndexScale);
-        for (const auto &OffKV : *Touched) {
-          std::optional<int64_t> Delta =
-              jeandle::pea::checkedOffsetSub(OffKV.first, Base);
-          Type *TouchedType = OffKV.second.getDeclaredType();
-          bool Canonical =
-              Delta && *Delta >= 0 && Scale > 0 && *Delta % Scale == 0 &&
-              static_cast<uint64_t>(*Delta / Scale) < VObj.ArrayLength &&
-              isDescriptorOffsetEncodable(OffKV.first);
-          // boolean[] has an i1 logical element type, but its VM storage
-          // scale is one byte and the front end accesses that storage as i8.
-          // Both forms map to the same T_INT deopt computational type.  Keep
-          // every other kind exact so a same-width reinterpretation cannot
-          // enter the descriptor.
-          bool ExactElementType =
-              TouchedType &&
-              (TouchedType == VObj.ArrayElementType ||
-               (VObj.ArrayElementType->isIntegerTy(1) &&
-                TouchedType->isIntegerTy(8) && VObj.ArrayIndexScale == 1));
-          bool ExactStoreSize = false;
-          bool FullByteRange = false;
-          if (TouchedType) {
-            TypeSize StoreSize = DL.getTypeStoreSize(TouchedType);
-            if (!StoreSize.isScalable()) {
-              uint64_t FixedStoreSize = StoreSize.getFixedValue();
-              ExactStoreSize = FixedStoreSize == static_cast<uint64_t>(Scale);
-              if (Delta && *Delta >= 0 && Scale > 0) {
-                std::optional<uint64_t> ArrayBytes = llvm::checkedMulUnsigned(
-                    static_cast<uint64_t>(VObj.ArrayLength),
-                    static_cast<uint64_t>(VObj.ArrayIndexScale));
-                uint64_t Start = static_cast<uint64_t>(*Delta);
-                std::optional<uint64_t> End =
-                    llvm::checkedAddUnsigned(Start, FixedStoreSize);
-                FullByteRange = ArrayBytes && End && *End <= *ArrayBytes;
-              }
-            }
-          }
-          if (!Canonical || !ExactElementType || !ExactStoreSize ||
-              !FullByteRange) {
-            // A descriptor cannot omit, truncate, reinterpret, or overlap a
-            // touched byte cell. Feed the failure through the ordinary Cell
-            // fixpoint so any outer VORef plan also becomes Bad.
-            Cell C;
-            C.Offset = OffKV.first;
-            C.Kind = Cell::Bad;
-            P.Cells.push_back(C);
-            return;
-          }
-        }
+    auto RegisterCurrentNode = [&](jeandle::ObjectID ID) {
+      if (CurrentNodeIndices.count(ID))
+        return;
+      unsigned NodeIndex = Input.CurrentNodes.size();
+      CurrentNodeIndices.try_emplace(ID, NodeIndex);
+      Input.CurrentNodes.emplace_back();
+      CurrentExpansionQueue.push_back(ID);
+    };
+
+    auto ExpandCurrentNode = [&](jeandle::ObjectID ID) {
+      unsigned NodeIndex = CurrentNodeIndices.lookup(ID);
+      CurrentDeoptPoolNode Node;
+      Node.ID = ID;
+      if (ID >= Result.VirtualObjects.size()) {
+        Node.Describable = false;
+        Input.CurrentNodes[NodeIndex] = std::move(Node);
+        return;
       }
-      Constant *Default = Constant::getNullValue(VObj.ArrayElementType);
-      for (uint32_t Idx = 0; Idx < VObj.ArrayLength; ++Idx) {
-        std::optional<int64_t> Off = jeandle::pea::checkedArrayElementOffset(
-            VObj.ArrayBaseOffset, Idx, VObj.ArrayIndexScale);
-        if (!Off || !isDescriptorOffsetEncodable(*Off)) {
-          Cell C;
-          C.Offset = 0;
-          C.Kind = Cell::Bad;
-          P.Cells.push_back(C);
+
+      jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
+      Node.Klass = VObj.Klass;
+      Node.IsArray = VObj.isArray();
+      bool HasIdentity = VObj.IsSynthetic ? VObj.SyntheticPhi != nullptr
+                                          : VObj.AllocationCall != nullptr;
+      Node.Describable = IsCurrentVirtual(ID) && VObj.Klass != 0 && HasIdentity;
+
+      auto AddScalarField = [&](int64_t Offset,
+                                jeandle::HotspotBasicType BasicType, Value *V) {
+        if (!IsEncodableOffset(Offset) || !V || !isValueAvailableAt(V, CB)) {
+          Node.Describable = false;
           return;
         }
+        Node.Fields.push_back(DeoptPoolFieldInput::scalar(
+            InvalidDeoptPoolSemanticCellID, Offset, BasicType, BindScalar(V)));
+      };
+
+      auto AddRealOopField = [&](int64_t Offset, Value *V) {
+        if (!IsDescribableOop(V)) {
+          Node.Describable = false;
+          return;
+        }
+        AddScalarField(Offset, jeandle::T_OBJECT, V);
+      };
+
+      auto AddCurrentRefField = [&](int64_t Offset, jeandle::ObjectID Target) {
+        if (!IsEncodableOffset(Offset) ||
+            Target >= Result.VirtualObjects.size()) {
+          Node.Describable = false;
+          return;
+        }
+        if (!IsCurrentVirtual(Target)) {
+          AddRealOopField(Offset, realIdentityOf(Target));
+          return;
+        }
+        RegisterCurrentNode(Target);
+        Node.Fields.push_back(DeoptPoolFieldInput::reference(
+            InvalidDeoptPoolSemanticCellID, Offset,
+            DeoptPoolNodeRef::current(Target)));
+      };
+
+      auto AddFieldValue = [&](int64_t Offset, const jeandle::FieldValue &FV) {
+        if (!IsEncodableOffset(Offset)) {
+          Node.Describable = false;
+          return;
+        }
+        if (FV.isVirtualRef()) {
+          AddCurrentRefField(Offset, FV.getVirtualRef());
+          return;
+        }
+        if (FV.isMaterializedRef()) {
+          AddRealOopField(Offset, FV.getMaterialized());
+          return;
+        }
+        if (!FV.isScalar() || !FV.getDeclaredType()) {
+          Node.Describable = false;
+          return;
+        }
+
+        Value *Scalar = FV.getScalar();
+        jeandle::HotspotBasicType BasicType =
+            jeandle::LLVM2JavaComputational(FV.getDeclaredType());
+        if (BasicType == jeandle::T_OBJECT) {
+          if (std::optional<jeandle::ObjectID> Target =
+                  ResolveCurrentVirtual(Scalar)) {
+            AddCurrentRefField(Offset, *Target);
+            return;
+          }
+          AddRealOopField(Offset, Scalar);
+          return;
+        }
+        if (BasicType == jeandle::T_ILLEGAL ||
+            BasicType == jeandle::T_NARROWOOP) {
+          Node.Describable = false;
+          return;
+        }
+        AddScalarField(Offset, BasicType, Scalar);
+      };
+
+      auto FSIt = FieldStates.find(ID);
+      if (VObj.isArray()) {
+        if (!VObj.ArrayElementType || VObj.ArrayIndexScale == 0) {
+          Node.Describable = false;
+          Input.CurrentNodes[NodeIndex] = std::move(Node);
+          return;
+        }
+
+        const DenseMap<int64_t, jeandle::FieldValue> *Touched =
+            FSIt == FieldStates.end() ? nullptr : &FSIt->second;
         if (Touched) {
-          auto It = Touched->find(*Off);
-          if (It != Touched->end()) {
-            P.Cells.push_back(classifyFieldValue(*Off, It->second));
-            continue;
+          int64_t Base = static_cast<int64_t>(VObj.ArrayBaseOffset);
+          int64_t Scale = static_cast<int64_t>(VObj.ArrayIndexScale);
+          for (const auto &Entry : *Touched) {
+            std::optional<int64_t> Delta = checkedOffsetSub(Entry.first, Base);
+            Type *TouchedType = Entry.second.getDeclaredType();
+            bool Canonical =
+                Delta && *Delta >= 0 && Scale > 0 && *Delta % Scale == 0 &&
+                static_cast<uint64_t>(*Delta / Scale) < VObj.ArrayLength &&
+                IsEncodableOffset(Entry.first);
+            bool ExactElementType =
+                TouchedType &&
+                (TouchedType == VObj.ArrayElementType ||
+                 (VObj.ArrayElementType->isIntegerTy(1) &&
+                  TouchedType->isIntegerTy(8) && VObj.ArrayIndexScale == 1));
+            bool ExactStoreSize = false;
+            bool FullByteRange = false;
+            if (TouchedType) {
+              TypeSize StoreSize = DL.getTypeStoreSize(TouchedType);
+              if (!StoreSize.isScalable()) {
+                uint64_t FixedStoreSize = StoreSize.getFixedValue();
+                ExactStoreSize = FixedStoreSize == static_cast<uint64_t>(Scale);
+                if (Delta && *Delta >= 0 && Scale > 0) {
+                  std::optional<uint64_t> ArrayBytes = llvm::checkedMulUnsigned(
+                      static_cast<uint64_t>(VObj.ArrayLength),
+                      static_cast<uint64_t>(VObj.ArrayIndexScale));
+                  uint64_t Start = static_cast<uint64_t>(*Delta);
+                  std::optional<uint64_t> End =
+                      llvm::checkedAddUnsigned(Start, FixedStoreSize);
+                  FullByteRange = ArrayBytes && End && *End <= *ArrayBytes;
+                }
+              }
+            }
+            if (!Canonical || !ExactElementType || !ExactStoreSize ||
+                !FullByteRange) {
+              Node.Describable = false;
+              Input.CurrentNodes[NodeIndex] = std::move(Node);
+              return;
+            }
           }
         }
-        // Untouched element: synthesize the Java default (0 for primitive
-        // arrays, null for object arrays). The emit side derives the
-        // computational basicType from the constant's type.
-        Cell C;
-        C.Offset = *Off;
-        C.Kind = Cell::Scalar;
-        C.ScalarV = Default;
-        P.Cells.push_back(C);
+
+        Constant *Default = Constant::getNullValue(VObj.ArrayElementType);
+        for (uint32_t Index = 0; Index < VObj.ArrayLength; ++Index) {
+          std::optional<int64_t> Offset = checkedArrayElementOffset(
+              VObj.ArrayBaseOffset, Index, VObj.ArrayIndexScale);
+          if (!Offset || !IsEncodableOffset(*Offset)) {
+            Node.Describable = false;
+            break;
+          }
+          if (Touched) {
+            auto It = Touched->find(*Offset);
+            if (It != Touched->end()) {
+              AddFieldValue(*Offset, It->second);
+              continue;
+            }
+          }
+          jeandle::HotspotBasicType BasicType =
+              jeandle::LLVM2JavaComputational(VObj.ArrayElementType);
+          if (BasicType == jeandle::T_ILLEGAL ||
+              BasicType == jeandle::T_NARROWOOP) {
+            Node.Describable = false;
+            break;
+          }
+          AddScalarField(*Offset, BasicType, Default);
+        }
+      } else if (FSIt != FieldStates.end()) {
+        SmallVector<int64_t, 8> Offsets;
+        Offsets.reserve(FSIt->second.size());
+        for (const auto &Entry : FSIt->second)
+          Offsets.push_back(Entry.first);
+        llvm::sort(Offsets);
+        for (int64_t Offset : Offsets)
+          AddFieldValue(Offset, FSIt->second.lookup(Offset));
       }
+
+      Input.CurrentNodes[NodeIndex] = std::move(Node);
+    };
+
+    auto AddCurrentOverlay = [&](DeoptPoolSemanticCellID Cell, Value *V) {
+      std::optional<jeandle::ObjectID> ID = ResolveCurrentVirtual(V);
+      if (!ID)
+        return;
+      RegisterCurrentNode(*ID);
+      Input.Overlays.push_back({Cell, *ID});
+      CurrentCells.push_back({Cell, *ID});
+    };
+
+    // Legacy descriptors form the durable half of the graph. Only a scalar
+    // T_OBJECT field may be reclassified as a current reference; primitive
+    // fields remain scalar even when their SSA dependency graph mentions an
+    // allocation.
+    for (const ParsedDeoptDescriptor &Descriptor : Parsed.Descriptors) {
+      LegacyDeoptPoolNode Node;
+      Node.WireID = static_cast<uint32_t>(Descriptor.WireID);
+      Node.Klass = Descriptor.Klass;
+      Node.IsArray = Descriptor.IsArray;
+      for (const ParsedDeoptField &Field : Descriptor.Fields) {
+        DeoptPoolSemanticCellID Cell = Field.ValueCell.OperandIndex;
+        if (Field.TargetWireID) {
+          Node.Fields.push_back(DeoptPoolFieldInput::reference(
+              Cell, Field.Offset,
+              DeoptPoolNodeRef::legacy(
+                  static_cast<uint32_t>(*Field.TargetWireID))));
+          continue;
+        }
+        Value *V = SourceValue(Cell);
+        Node.Fields.push_back(DeoptPoolFieldInput::scalar(
+            Cell, Field.Offset, Field.Encoding.BasicType, BindScalar(V)));
+        if (Field.Encoding.BasicType == jeandle::T_OBJECT)
+          AddCurrentOverlay(Cell, V);
+      }
+      Input.LegacyNodes.push_back(std::move(Node));
+    }
+
+    auto AddRoot = [&](const DeoptSemanticCell &Cell,
+                       jeandle::HotspotBasicType BasicType,
+                       std::optional<int32_t> TargetWireID,
+                       DeoptPoolRootKind Kind) {
+      if (TargetWireID) {
+        Input.Roots.push_back(DeoptPoolRootInput::reference(
+            Cell.OperandIndex, Kind,
+            DeoptPoolNodeRef::legacy(static_cast<uint32_t>(*TargetWireID))));
+        return;
+      }
+      Value *V = SourceValue(Cell.OperandIndex);
+      Input.Roots.push_back(
+          DeoptPoolRootInput::scalar(Cell.OperandIndex, Kind, BindScalar(V)));
+      if (BasicType == jeandle::T_OBJECT)
+        AddCurrentOverlay(Cell.OperandIndex, V);
+    };
+
+    // Preserve scope wire order: locals, expression stack, then monitors,
+    // repeated for every inlined scope.
+    for (const ParsedDeoptScope &Scope : Parsed.Scopes) {
+      for (const ParsedDeoptScopeValue &Local : Scope.Locals)
+        AddRoot(Local.ValueCell, Local.Encoding.BasicType, Local.TargetWireID,
+                DeoptPoolRootKind::Local);
+      for (const ParsedDeoptScopeValue &Stack : Scope.Stack)
+        AddRoot(Stack.ValueCell, Stack.Encoding.BasicType, Stack.TargetWireID,
+                DeoptPoolRootKind::Stack);
+      for (const ParsedDeoptMonitor &Monitor : Scope.Monitors)
+        AddRoot(Monitor.OwnerCell, Monitor.Encoding.BasicType,
+                Monitor.OwnerWireID, DeoptPoolRootKind::MonitorOwner);
+    }
+
+    // All exact legacy/root overlay seeds are registered before field
+    // expansion. Expanding in queue order then appends newly discovered field
+    // targets in field semantic order; registration before expansion also
+    // makes current-object cycles finite.
+    for (unsigned Index = 0; Index < CurrentExpansionQueue.size(); ++Index)
+      ExpandCurrentNode(CurrentExpansionQueue[Index]);
+
+    DeoptPoolPlannerResult Planned = planDeoptPool(Input);
+    if (Planned.Error)
+      return;
+    if (!Planned.FallbackSeeds.empty()) {
+      bool MadeProgress = false;
+      for (CurrentDeoptNodeID CurrentID : Planned.FallbackSeeds) {
+        jeandle::ObjectID ID = static_cast<jeandle::ObjectID>(CurrentID);
+        if (!IsCurrentVirtual(ID))
+          continue;
+        materializeAt(ID, CB, MatReason::Unhandled);
+        if (!IsCurrentVirtual(ID))
+          MadeProgress = true;
+      }
+      if (!MadeProgress)
+        return;
+      continue;
+    }
+    if (!Planned.Plan)
+      return;
+    if (!Planned.Plan->needsRewrite()) {
+      assert(Planned.Plan->currentMembers().empty() &&
+             "a current virtual identity must change the deopt pool");
       return;
     }
 
-    // Instance: emit only TOUCHED fields (the parser pads untouched fields with
-    // defaults via the InstanceKlass layout walk, so they need no wire entry).
-    if (ItFS == FieldStates.end())
-      return; // no touched fields -> field_count=0 descriptor (all defaults).
-    for (const auto &OffKV : ItFS->second)
-      P.Cells.push_back(classifyFieldValue(OffKV.first, OffKV.second));
-  };
+    PrepareFinalDeoptPoolBundleResult Prepared =
+        prepareFinalDeoptPoolBundlePlan(Parsed, *Planned.Plan, ScalarBindings,
+                                        CurrentCells, *CB);
+    if (!Prepared.Plan)
+      return;
 
-  // ---- Step 1: collect roots. A root is a "deopt" bundle operand that
-  // resolves to a VO virtual-at-this-safepoint. A root whose bundle operand is
-  // a DERIVED pointer (V != AllocationCall) is banned: its bundle slot cannot
-  // be rewritten to a VORef without losing the derived shape, and the derived
-  // operand would otherwise be left for Pass-2 poison-RAUW. Resolve V to a
-  // virtual ObjectID that is STILL VIRTUAL AT THIS SAFEPOINT.
-  // Roots are collected in bundle-operand ENCOUNTER ORDER (not DenseSet hash
-  // order). This also includes banned roots: descriptor planning excludes
-  // them, but coherent fallback still needs their current VirtualRef
-  // descendants.
-  //
-  // MULTI-SCOPE (root-scope pool): the bundle is [root scope][inlinee
-  // scope]... with the innermost (current-method) scope LAST. ALL VO
-  // descriptors are emitted into the ROOT scope's VO section (right after the
-  // FIRST duplicated-BCI pair), which serves as the deopt-point-level object
-  // pool — mirrors C2 dumping its object pool before the scope values
-  // (dump_object_pool before create_scope_values) and Graal/JVMCI's
-  // per-DebugInfo VirtualObject[] pool. Roots are therefore collected across
-  // the WHOLE bundle: a VO referenced from ANY scope — an outer-scope
-  // locals/stack slot or an outer-scope monitor owner — is describable, and
-  // the transform rewrites every such slot in place to a VORef by vo-id. The
-  // JDK parser resolves every VORef through a record-level (whole-deopt-
-  // point) vo_map populated from the root scope's VO section, which always
-  // precedes any reference. (Scope headers — the i64 should_reexecute, the
-  // BCI pair, the inlinee MethodType pair — hold only integer constants, so
-  // no header operand can resolve to a virtual ref and no per-scope boundary
-  // tracking is needed on this scan.) When the root scope boundary cannot be
-  // computed (malformed bundle — never the case for frontend IR, but PEA must
-  // not crash on arbitrary IR), bail the whole recording: DeoptBundleHandled
-  // stays empty and every virtual bundle operand is materialized by the
-  // generic path.
-  // (The position value itself is not needed — the slot-rewrite scan covers
-  // the whole bundle; the finder is used here only as a malformed-bundle
-  // probe.)
-  std::optional<unsigned> RootScopeStart =
-      jeandle::pea::findFirstDeoptScopeBCIPairStart(*CB);
-  if (!RootScopeStart)
-    return;
-  SmallVector<jeandle::ObjectID, 4> Roots;
-  DenseSet<jeandle::ObjectID> RootSeen;
-  DenseSet<jeandle::ObjectID> OrigAllocInBundle;
-  DenseSet<jeandle::ObjectID> Banned;
-  // Every admitted in-scope root operand per VO (the OrigAlloc itself and/or
-  // identity aliases), recorded verbatim for the transform's slot rewrite
-  // (see RewriteDeoptBundleEffect::RootOperands).
-  DenseMap<jeandle::ObjectID, SmallVector<Value *, 2>> RootOperandsMap;
-  for (unsigned OpIdx = 0; OpIdx < Deopt->Inputs.size(); ++OpIdx) {
-    Value *V = Deopt->Inputs[OpIdx].get();
-    if (!V)
-      continue;
-    auto Identity = jeandle::pea::resolveVirtualIdentity(
-        V, CurrentState, Aliases, DL,
-        jeandle::pea::VirtualIdentityMode::WholeObject);
-    if (!Identity.isDefined())
-      continue;
-    jeandle::ObjectID ID = Identity.getObjectID();
-    if (!isVirtualHere(ID))
-      continue;
-    if (RootSeen.insert(ID).second)
-      Roots.push_back(ID);
-    jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
-    // V is a describable root iff it is the VO's OrigAlloc OR an alias-map
-    // virtual-alias entry for this VO denoting the WHOLE object (object
-    // identity, e.g. the result of a load-through-virtual-ref folded by
-    // processLoad, a Case-B PHI, a freeze, or an offset-0 select). A
-    // byte-offset DERIVED pointer is banned: its bundle slot cannot become a
-    // VORef without losing the derived shape, and it would be left for
-    // Pass-2 poison-RAUW. The offset guard is load-bearing:
-    // propagatePointerAlias registers GEP results in the alias map
-    // UNCONDITIONALLY (any offset), so an alias-map hit alone does NOT prove
-    // identity — resolveFieldOffset(V)==0 is what makes the alias an
-    // identity (resolveFieldOffset peels freeze/bitcast/JavaHeap
-    // addrspacecast/inttoptr round-trip and constant-offset GEPs; selects
-    // and PHIs have no case and return 0 — both are offset-guarded at their
-    // registration sites, see propagatePointerAlias / processBlockPhis).
-    // Roots are recorded verbatim in RootOperands so the transform rewrites
-    // exactly these slots (an alias is only RAUW'd to OrigAlloc for the
-    // load-through case; the other shapes are never RAUW'd).
-    bool IsIdentityAlias = Aliases.getVirtualAlias(V) == ID;
-    if (V != VObj.AllocationCall && !IsIdentityAlias) {
-      Banned.insert(ID); // genuinely derived bundle operand — do not describe.
-      continue;
-    }
-    // At transform time a ReplaceLoad has RAUW'd an identity alias to OrigAlloc
-    // (Pass-1 SeqNo order runs processLoad before this safepoint), so the
-    // slot-rewrite (V == OrigAlloc) in RewriteDeoptBundleEffect::apply fires
-    // for it. Mark it OrigAllocInBundle so the transform's root guard still
-    // holds (bail if, unexpectedly, the RAUW left OrigAlloc absent from the
-    // bundle).
-    OrigAllocInBundle.insert(ID);
-    RootOperandsMap[ID].push_back(V);
-  }
+    auto ImmutablePlan = std::make_shared<const FinalDeoptPoolBundlePlan>(
+        std::move(*Prepared.Plan));
+    for (CurrentDeoptNodeID CurrentID : ImmutablePlan->graph().currentMembers())
+      observeFieldDefinitions(static_cast<jeandle::ObjectID>(CurrentID),
+                              FieldDefinitions);
 
-  // ---- Step 2: build the CURRENT materialization graph independently of
-  // descriptor planning. An Outer -> Inner edge exists exactly when
-  // ensureMaterialized(Outer) would recursively materialize a current
-  // FieldValue::VirtualRef(Inner). Keeping this graph separate is essential:
-  // planFields may stop at a malformed array cell before visiting a later
-  // valid VORef element, but generic fallback still follows that element.
-  DenseMap<jeandle::ObjectID, SmallVector<jeandle::ObjectID, 4>>
-      CurrentVirtualRefs;
-  DenseMap<jeandle::ObjectID, SmallVector<jeandle::ObjectID, 4>>
-      DescriptorReferrers;
-  SmallVector<jeandle::ObjectID, 8> ReachableOrder;
-  SmallVector<jeandle::ObjectID, 8> Work;
-  DenseSet<jeandle::ObjectID> Reachable;
-  // Preserve the established LIFO traversal of bundle encounter-order roots.
-  // Current references are sorted before being pushed, so their LIFO order is
-  // deterministic too.
-  for (jeandle::ObjectID ID : Roots)
-    Work.push_back(ID);
-  while (!Work.empty()) {
-    jeandle::ObjectID ID = Work.pop_back_val();
-    if (!Reachable.insert(ID).second)
-      continue;
-    ReachableOrder.push_back(ID);
+    auto Effect =
+        std::make_unique<jeandle::RewriteDeoptPoolEffect>(CB, ImmutablePlan);
+    Effect->Block = CB->getParent();
+    Effect->SeqNo = Result.nextSeqNo();
+    Result.addBlockEffect(std::move(Effect));
 
-    SmallVector<jeandle::ObjectID, 4> Refs;
-    auto FSIt = FieldStates.find(ID);
-    if (FSIt != FieldStates.end())
-      for (const auto &OffKV : FSIt->second)
-        if (OffKV.second.isVirtualRef())
-          Refs.push_back(OffKV.second.getVirtualRef());
-    llvm::sort(Refs);
-    Refs.erase(std::unique(Refs.begin(), Refs.end()), Refs.end());
-    for (jeandle::ObjectID Inner : Refs)
-      if (!Reachable.count(Inner))
-        Work.push_back(Inner);
-    CurrentVirtualRefs.try_emplace(ID, std::move(Refs));
-  }
-
-  // Plan every reachable candidate in stable graph order. Do not use
-  // operator[] for Plans: an unplannable graph node must never become a
-  // default-constructed good plan by lookup.
-  DenseSet<jeandle::ObjectID> Fallback;
-  SmallVector<jeandle::ObjectID, 8> FallbackWork;
-  auto AddFallback = [&](jeandle::ObjectID ID) {
-    if (Fallback.insert(ID).second)
-      FallbackWork.push_back(ID);
-  };
-  for (jeandle::ObjectID ID : ReachableOrder) {
-    if (Banned.count(ID) || !isVirtualHere(ID) || !structurallyEligible(ID)) {
-      AddFallback(ID);
-      continue;
-    }
-    auto [PIt, Inserted] = Plans.try_emplace(ID);
-    assert(Inserted && "reachable object planned more than once");
-    Plan &P = PIt->second;
-    Order.push_back(ID);
-    planFields(ID, P);
-    // Descriptor operands are real SSA uses at CB after the transform rewrites
-    // the bundle. A structurally describable value is therefore still Bad if
-    // it cannot be produced at this safepoint.  This is a release-build
-    // correctness gate, not merely an assertion: parented values must dominate
-    // CB, analyzer-built instruction chains must bottom out in dominating
-    // leaves, and analyzer-built PHIs must have a home block that dominates
-    // CB. MaterializedRef cells reach this check as Scalar cells, so a
-    // non-dominating materialized oop takes the same coherent fallback as a
-    // primitive scalar.
-    for (Cell &C : P.Cells)
-      if (C.Kind == Cell::Scalar &&
-          (!C.ScalarV || !isValueAvailableAt(C.ScalarV, CB))) {
-        C.Kind = Cell::Bad;
-        C.ScalarV = nullptr;
-        break;
-      }
-  }
-
-  // ---- Step 3: coherent descriptor/materialization closure. Seed malformed
-  // plans and plans that reference an unplanned object. Then propagate:
-  //   * parent -> current VirtualRef descendants, matching generic recursive
-  //     materialization;
-  //   * child -> descriptor referrers, preventing a VORef descriptor from
-  //     naming an object that the same safepoint keeps real.
-  // Each finite ObjectID enters Fallback once, so shared and cyclic graphs
-  // terminate without an iteration cap. Disconnected good components remain
-  // describable.
-  for (jeandle::ObjectID ID : Order) {
-    auto PIt = Plans.find(ID);
-    assert(PIt != Plans.end() && "descriptor order contains no plan");
-    Plan &P = PIt->second;
-    for (const Cell &C : P.Cells) {
-      if (C.Kind == Cell::Bad) {
-        AddFallback(ID);
-        break;
-      }
-      if (C.Kind != Cell::VORef)
+    // Only exact source occurrences rewritten to a VORef or removed with a
+    // pruned legacy descriptor are non-escaping. Scalar cells merely copied
+    // by the complete plan remain ordinary executable uses.
+    HandledDeoptCall = CB;
+    for (const FinalDeoptPoolCurrentOccurrence &Occurrence :
+         ImmutablePlan->currentOccurrences()) {
+      if (!Occurrence.SemanticCell)
         continue;
-      DescriptorReferrers[C.VORefID].push_back(ID);
-      if (Plans.find(C.VORefID) == Plans.end())
-        AddFallback(ID);
+      unsigned Cell = *Occurrence.SemanticCell;
+      if (Cell < Deopt->Inputs.size())
+        HandledDeoptOperandNos.insert(Deopt->Inputs[Cell].getOperandNo());
     }
-  }
-  for (auto &KV : DescriptorReferrers) {
-    llvm::sort(KV.second);
-    KV.second.erase(std::unique(KV.second.begin(), KV.second.end()),
-                    KV.second.end());
-  }
-  while (!FallbackWork.empty()) {
-    jeandle::ObjectID ID = FallbackWork.pop_back_val();
-    if (auto It = CurrentVirtualRefs.find(ID); It != CurrentVirtualRefs.end())
-      for (jeandle::ObjectID Inner : It->second)
-        AddFallback(Inner);
-    if (auto It = DescriptorReferrers.find(ID); It != DescriptorReferrers.end())
-      for (jeandle::ObjectID Outer : It->second)
-        AddFallback(Outer);
-  }
-
-  // ---- Step 4: record one RewriteDeoptBundleEffect per describable VO.
-  // Each surviving Scalar cell passed the release-build availability gate
-  // above. VORef cells carry no Value* — only the vo-id — so they are
-  // inherently transform-safe.
-  for (jeandle::ObjectID ID : Order) {
-    if (Fallback.count(ID))
-      continue;
-    auto PIt = Plans.find(ID);
-    assert(PIt != Plans.end() && "descriptor order contains no plan");
-    Plan &P = PIt->second;
-    observeFieldDefinitions(ID, FieldDefinitions);
-    SmallVector<jeandle::MaterializeEffect::FieldEntry, 8> Snap;
-    for (const Cell &C : P.Cells) {
-      if (C.Kind == Cell::VORef) {
-        // Reconstruct a VirtualRef FieldValue the transform recognizes as a
-        // VORef field. AllocationCall's type is the managed-oop pointer type,
-        // so LLVM2JavaComputational yields T_OBJECT on the transform side.
-        Snap.push_back(
-            {C.Offset,
-             jeandle::FieldValue::virtualRef(
-                 C.VORefID,
-                 Result.VirtualObjects[C.VORefID]->AllocationCall->getType())});
-      } else {
-        // The release-build gate above already rejected unavailable cells.
-        // Keep the assertion as a local postcondition for debug builds.
-        assert(isValueAvailableAt(C.ScalarV, CB) &&
-               "deopt descriptor scalar cell must be available at the "
-               "safepoint");
-        Snap.push_back({C.Offset, jeandle::FieldValue::scalar(C.ScalarV)});
-      }
-    }
-
-    auto E = std::make_unique<jeandle::RewriteDeoptBundleEffect>();
-    E->Block = CB->getParent();
-    E->SeqNo = Result.nextSeqNo();
-    E->ObjID = ID;
-    E->Safepoint = CB;
-    E->SafepointVH = CB;
-    E->Fields = std::move(Snap);
-    E->OrigAllocInBundle = OrigAllocInBundle.count(ID) > 0;
-    if (auto It = RootOperandsMap.find(ID); It != RootOperandsMap.end())
-      for (Value *RO : It->second)
-        E->RootOperands.push_back(RO);
-    Result.addBlockEffect(std::move(E));
-    DeoptBundleHandled.insert(ID);
+    return;
   }
 }
 
@@ -6776,11 +6586,13 @@ void Analyzer::materializeUnhandledDeoptBundleOperands(CallBase *CB) {
   SmallVector<jeandle::ObjectID, 4> ToMaterialize;
   DenseSet<jeandle::ObjectID> Seen;
   for (const Use &U : Deopt->Inputs) {
+    if (isHandledDeoptBundleOperand(U, CB))
+      continue;
     Value *V = U.get();
     if (!V)
       continue;
     auto ID = jeandle::pea::resolveVirtualRef(V, CurrentState, Aliases, DL);
-    if (!ID || DeoptBundleHandled.count(*ID))
+    if (!ID)
       continue;
     if (Seen.insert(*ID).second)
       ToMaterialize.push_back(*ID);
@@ -7411,7 +7223,7 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
   E->SeqNo = Result.nextSeqNo();
   E->InsertBefore = SafeIP;
   E->Target = ReplayReceiver;
-  E->ObjID = ID;
+  E->setMutationOwner(ID);
   E->LogicalEscape = C.LogicalEscape;
   E->ReplaySource = C.ReplaySource;
   E->ReplayTarget = C.ReplayTarget;
@@ -7545,7 +7357,7 @@ void Analyzer::dropEffectsFor(jeandle::ObjectID ID) {
   bool DroppedAllocation = false;
   for (auto &Kv : Result.BlockEffects) {
     Kv.second.eraseIf([&](const jeandle::Effect &E) {
-      if (E.ObjID != ID)
+      if (!E.hasMutationOwner() || E.getMutationOwner() != ID)
         return false;
       if (effectSurvivesIneligibleOwner(E))
         return false;
@@ -7596,30 +7408,21 @@ void Analyzer::commit() {
   }
 
   // -------------------------------------------------------------------------
-  // Unified ineligibility fixpoint, iterated until the set is stable. Three
-  // producers:
+  // Unified ordinary-effect ineligibility fixpoint, iterated until the set is
+  // stable. Two producers:
   //
   //  (a) Transitive ineligibility cascade over LIVE reaching VirtualRef store
   //      definitions plus the synthetic-Case-C source cascade. A definition
   //      becomes live when a load, materialization, deopt snapshot, or
   //      conservative fallback observes it. If its outer is kept real, the
   //      referenced inner must also be real; otherwise the restored store
-  //      would write an OrigAlloc that Pass 2 RAUWs to poison. A definition
-  //      overwritten before every observation is absent from this relation
-  //      and its EliminateStore effect survives outer fallback. This mirrors
-  //      Graal's point-sensitive ObjectState entries while retaining
+  //      would write an OrigAlloc that the cfg-kill phase RAUWs to poison. A
+  //      definition overwritten before every observation is absent from this
+  //      relation and its EliminateStore effect survives outer fallback. This
+  //      mirrors Graal's point-sensitive ObjectState entries while retaining
   //      Jeandle's deferred analysis/transform split.
   //
-  //  (b) Deopt-descriptor dependency cascade: a
-  //      RewriteDeoptBundleEffect whose Fields hold a VORef to an ineligible
-  //      (undescribed) VO would emit a DANGLING VORef — the JDK parser's
-  //      deferred-voref resolution asserts / writes nullptr. The dependent
-  //      (outer) VO must be kept real too: dropEffectsFor strips its
-  //      elimination + descriptor, so its OrigAlloc survives and its bundle
-  //      slots stay live oops. DeoptRefDeps maps referenced-inner -> referrers
-  //      and is built from the effects as they stand at commit start.
-  //
-  //  (c) Field-value availability sweep. Every value
+  //  (b) Field-value availability sweep. Every value
   //      referenced by a surviving effect's field snapshot must be
   //      PRODUCIBLE at apply time: a Constant / Argument / in-IR instruction
   //      (a WeakTrackingVH follows any RAUW), or an unparented analyzer-built
@@ -7628,9 +7431,13 @@ void Analyzer::commit() {
   //      shell whose owning CreatePHI effect survives (the effect inserts it
   //      at apply). An unparented PHI whose producer VO became ineligible
   //      (its CreatePHI is dropped below) will never exist — any VO whose
-  //      surviving Materialize / RewriteDeoptBundle / field-CreatePHI effects
-  //      reference it is kept real too. Dropping one VO can orphan more PHIs,
-  //      hence the fixpoint.
+  //      surviving Materialize / field-CreatePHI effects reference it is kept
+  //      real too. Dropping one VO can orphan more PHIs, hence the fixpoint.
+  //
+  // Deopt pools are not part of this owner fixpoint. Each pool is an atomic
+  // safepoint transaction with no mutation owner. A late-invalid member or
+  // output token marks the complete pool invalid for the final retry audit;
+  // the pool effect is never edited or removed per virtual object.
   // -------------------------------------------------------------------------
   auto IsAvailableValue = [&](Value *V,
                               const DenseSet<Value *> &OwnedPhis) -> bool {
@@ -7659,7 +7466,7 @@ void Analyzer::commit() {
                                   const DenseSet<Value *> &OwnedPhis) -> bool {
     for (const auto &Kv : Result.BlockEffects)
       for (const auto &E : Kv.second) {
-        if (E.ObjID != ID)
+        if (!E.hasMutationOwner() || E.getMutationOwner() != ID)
           continue;
         if (const auto *ME = dyn_cast<jeandle::MaterializeEffect>(&E)) {
           for (const auto &FE : ME->FieldEntries) {
@@ -7670,12 +7477,6 @@ void Analyzer::commit() {
                 !IsAvailableValue(FE.Value.getMaterialized(), OwnedPhis))
               return false;
           }
-        } else if (const auto *RE =
-                       dyn_cast<jeandle::RewriteDeoptBundleEffect>(&E)) {
-          for (const auto &FE : RE->Fields)
-            if (FE.Value.isScalar() &&
-                !IsAvailableValue(FE.Value.getScalar(), OwnedPhis))
-              return false;
         } else if (const auto *PE = dyn_cast<jeandle::CreatePHIEffect>(&E)) {
           // Field-value PHI (the only remaining CreatePHI variant): every
           // incoming must be producible at apply time.
@@ -7684,6 +7485,19 @@ void Analyzer::commit() {
               return false;
         }
       }
+    return true;
+  };
+  auto PoolTokensAvailable = [&](const jeandle::RewriteDeoptPoolEffect &Pool,
+                                 const DenseSet<Value *> &OwnedPhis) {
+    for (const jeandle::pea::FinalDeoptPoolBundleToken &Token :
+         Pool.getPlan().tokens()) {
+      if (Token.kind() !=
+          jeandle::pea::FinalDeoptPoolBundleTokenKind::TrackedValue)
+        continue;
+      Value *Tracked = Token.trackedValue();
+      if (!Tracked || !IsAvailableValue(Tracked, OwnedPhis))
+        return false;
+    }
     return true;
   };
   auto ComputeLivePreparedSyntheticClosure =
@@ -7724,6 +7538,8 @@ void Analyzer::commit() {
     DenseMap<jeandle::ObjectID, SmallDenseSet<jeandle::ObjectID>>
         LiveVirtualRefDeps;
     DenseSet<uint32_t> SurvivingMaterializationPlans;
+    DenseMap<CallBase *, const jeandle::RewriteDeoptPoolEffect *> PoolsAt;
+    DenseSet<CallBase *> DuplicatePools;
     for (const auto &Kv : Result.BlockEffects)
       for (const auto &E : Kv.second)
         if (const auto *ME = dyn_cast<jeandle::MaterializeEffect>(&E)) {
@@ -7735,18 +7551,19 @@ void Analyzer::commit() {
             if (ObservedFieldStores.count(SI))
               if (auto RIt = VirtualRefStoreTargets.find(SI);
                   RIt != VirtualRefStoreTargets.end())
-                LiveVirtualRefDeps[E.ObjID].insert(RIt->second);
-
-    // (b) Deopt-descriptor dependency map, built from the effects as they
-    // stand at commit start (a RewriteDeoptBundleEffect's VirtualRef fields
-    // point from the effect's ObjID/outer to the referenced inner).
-    DenseMap<jeandle::ObjectID, SmallDenseSet<jeandle::ObjectID>> DeoptRefDeps;
+                if (E.hasMutationOwner())
+                  LiveVirtualRefDeps[E.getMutationOwner()].insert(RIt->second);
     for (const auto &Kv : Result.BlockEffects)
       for (const auto &E : Kv.second)
-        if (const auto *RE = dyn_cast<jeandle::RewriteDeoptBundleEffect>(&E))
-          for (const auto &FE : RE->Fields)
-            if (FE.Value.isVirtualRef())
-              DeoptRefDeps[FE.Value.getVirtualRef()].insert(RE->ObjID);
+        if (const auto *Pool = dyn_cast<jeandle::RewriteDeoptPoolEffect>(&E)) {
+          CallBase *Safepoint = dyn_cast_or_null<CallBase>(Pool->getTarget());
+          if (!Safepoint)
+            continue;
+          if (!PoolsAt.try_emplace(Safepoint, Pool).second)
+            DuplicatePools.insert(Safepoint);
+        }
+    LateInvalidDeoptPools.clear();
+    LateInvalidDeoptPools.insert(DuplicatePools.begin(), DuplicatePools.end());
 
     bool AnyChange = true;
     while (AnyChange) {
@@ -7781,9 +7598,11 @@ void Analyzer::commit() {
       DenseSet<jeandle::ObjectID> HasMaterialize;
       for (const auto &Kv : Result.BlockEffects)
         for (const jeandle::Effect &E : Kv.second) {
-          bool OwnerEligible = Eligible.lookup(E.ObjID);
+          if (!E.hasMutationOwner())
+            continue;
+          bool OwnerEligible = Eligible.lookup(E.getMutationOwner());
           if (OwnerEligible && isa<jeandle::MaterializeEffect>(E))
-            HasMaterialize.insert(E.ObjID);
+            HasMaterialize.insert(E.getMutationOwner());
           bool Survives = OwnerEligible || effectSurvivesIneligibleOwner(E);
           if (Survives && (isa<jeandle::ReplaceLoadEffect>(E) ||
                            isa<jeandle::ReplaceCallEffect>(E) ||
@@ -7824,23 +7643,42 @@ void Analyzer::commit() {
               if (!Bundle.isDeoptOperandBundle())
                 return jeandle::pea::isPEAHandledNonEscapingIntrinsic(
                     dyn_cast<IntrinsicInst>(CB));
-              for (const auto &Kv : Result.BlockEffects)
-                for (const jeandle::Effect &E : Kv.second) {
-                  if (!Eligible.lookup(E.ObjID))
-                    continue;
-                  const auto *RE =
-                      dyn_cast<jeandle::RewriteDeoptBundleEffect>(&E);
-                  if (!RE || RE->Safepoint != CB)
-                    continue;
-                  if (E.ObjID == ID && RE->OrigAllocInBundle &&
-                      U.get() == Allocation)
-                    return true;
-                  if (llvm::any_of(RE->RootOperands,
-                                   [&](const WeakTrackingVH &Root) {
-                                     return (Value *)Root == U.get();
-                                   }))
-                    return true;
+              if (DuplicatePools.count(CB))
+                return false;
+              auto PoolIt = PoolsAt.find(CB);
+              if (PoolIt == PoolsAt.end())
+                return false;
+              unsigned SemanticCell = 0;
+              bool FoundCell = false;
+              for (const Use &BundleInput : Bundle.Inputs) {
+                if (BundleInput.getOperandNo() == U.getOperandNo()) {
+                  FoundCell = true;
+                  break;
                 }
+                ++SemanticCell;
+              }
+              if (FoundCell) {
+                const auto &Plan = PoolIt->second->getPlan();
+                for (jeandle::pea::CurrentDeoptNodeID CurrentID :
+                     Plan.graph().currentMembers())
+                  if (PoolIt->second->coversExactOccurrence(SemanticCell,
+                                                            CurrentID) &&
+                      Result.currentIdentityRepresentsSource(CurrentID, ID))
+                    return true;
+                // A current occurrence in an unreachable legacy descriptor is
+                // removed rather than emitted as a final current member. Its
+                // exact source use is nevertheless eliminated by the atomic
+                // pool rewrite.
+                for (const auto &Occurrence : Plan.currentOccurrences())
+                  if (Occurrence.Disposition ==
+                          jeandle::pea::FinalDeoptPoolOccurrenceDisposition::
+                              RemovedByPruning &&
+                      Occurrence.SemanticCell &&
+                      *Occurrence.SemanticCell == SemanticCell &&
+                      Result.currentIdentityRepresentsSource(
+                          Occurrence.CurrentID, ID))
+                    return true;
+              }
               return false;
             });
         if (HasSurvivingUse) {
@@ -7851,7 +7689,8 @@ void Analyzer::commit() {
           AnyChange = true;
         }
       }
-      // (a)+(b) Unified cascade. Visited defends cycles (a.f=b, b.g=a).
+      // Path-sensitive ordinary-state cascade. Visited defends cycles
+      // (a.f=b, b.g=a).
       {
         SmallVector<jeandle::ObjectID, 8> WList;
         DenseSet<jeandle::ObjectID> VSet;
@@ -7881,13 +7720,9 @@ void Analyzer::commit() {
               EIt != LiveVirtualRefDeps.end())
             for (jeandle::ObjectID Inner : EIt->second)
               WList.push_back(Inner);
-          // Deopt-descriptor dependents.
-          if (auto DIt = DeoptRefDeps.find(Cur); DIt != DeoptRefDeps.end())
-            for (jeandle::ObjectID Outer : DIt->second)
-              WList.push_back(Outer);
         }
       }
-      // (c) Availability sweep: rebuild the owned-PHI set from the effects
+      // Availability sweep: rebuild the owned-PHI set from the effects
       // that survive the CURRENT eligibility set, then keep every VO whose
       // effects reference unavailable values real.
       {
@@ -7895,7 +7730,7 @@ void Analyzer::commit() {
         for (const auto &Kv : Result.BlockEffects)
           for (const auto &E : Kv.second)
             if (const auto *PE = dyn_cast<jeandle::CreatePHIEffect>(&E))
-              if (Eligible.lookup(E.ObjID))
+              if (E.hasMutationOwner() && Eligible.lookup(E.getMutationOwner()))
                 OwnedPhis.insert(PE->PhiInst);
         for (auto &VObjUP : Result.VirtualObjects) {
           jeandle::ObjectID ID = VObjUP->getID();
@@ -7905,6 +7740,18 @@ void Analyzer::commit() {
             Eligible[ID] = false;
             AnyChange = true;
           }
+        }
+        for (const auto &[Safepoint, Pool] : PoolsAt) {
+          bool InvalidMember =
+              llvm::any_of(Pool->getPlan().graph().currentMembers(),
+                           [&](jeandle::pea::CurrentDeoptNodeID CurrentID) {
+                             jeandle::ObjectID ID =
+                                 static_cast<jeandle::ObjectID>(CurrentID);
+                             return ID >= Result.VirtualObjects.size() ||
+                                    !Eligible.lookup(ID);
+                           });
+          if (InvalidMember || !PoolTokensAvailable(*Pool, OwnedPhis))
+            LateInvalidDeoptPools.insert(Safepoint);
         }
       }
     }
@@ -7943,8 +7790,8 @@ void Analyzer::commit() {
   DenseSet<jeandle::ObjectID> HasSurvivingMaterialize;
   for (const auto &Kv : Result.BlockEffects) {
     for (const auto &E : Kv.second) {
-      if (isa<jeandle::MaterializeEffect>(E))
-        HasSurvivingMaterialize.insert(E.ObjID);
+      if (isa<jeandle::MaterializeEffect>(E) && E.hasMutationOwner())
+        HasSurvivingMaterialize.insert(E.getMutationOwner());
     }
   }
 
@@ -7992,10 +7839,10 @@ void Analyzer::commit() {
   }
 
   // For every VO that ended up NeverEscapes (alloc will be
-  // EliminateAllocation'd and its OrigAlloc users will RAUW to poison
-  // in Pass 2), schedule the Case-B aliased PHIs for explicit erasure.
-  // The transform's post-Pass-2 hook walks Result.CaseBAliasedPhisToErase
-  // and runs RAUW(poison) + eraseFromParent on each surviving handle.
+  // EliminateAllocation'd and its OrigAlloc users will RAUW to poison in the
+  // cfg-kill phase), schedule the Case-B aliased PHIs for explicit erasure.
+  // The transform's post-cfg-kill hook walks Result.CaseBAliasedPhisToErase and
+  // runs RAUW(poison) + eraseFromParent on each surviving handle.
   // We deliberately do NOT schedule erasure for PartiallyEscapes or
   // AlwaysEscapes VOs: there, the PHI still routes a live materialized
   // pointer (or the OrigAlloc itself) and erasing would corrupt SSA.
@@ -8028,44 +7875,46 @@ void Analyzer::commit() {
 }
 
 void Analyzer::validateFinalDeoptObligations() {
+  using namespace jeandle::pea;
+
   InvalidDeoptObligation = false;
   InvalidDeoptAllocationSites.clear();
 
-  // Precompute, in a single pass over the committed effects, the earliest
-  // (lowest SeqNo) ReplaceLoad/ReplaceCall effect and the earliest
-  // EliminateAllocationEffect targeting each instruction. The audits below
-  // resolve every deopt operand through these replacement chains and query the
-  // earliest effect per node; a deopt operand whose resolution transitively
-  // reaches a NeverEscapes allocation identity must keep that allocation real.
-  // Rescanning all of BlockEffects on every resolution step made that audit
-  // O(deopt_operands * graph_size * effect_count) — catastrophic on large
-  // methods (hundreds of safepoints), which never finished compiling. The maps
-  // turn each lookup into O(1) while preserving the exact earliest-SeqNo
-  // selection of the former scans.
   DenseMap<Instruction *, const jeandle::Effect *> EarliestReplFor;
   DenseMap<Instruction *, const jeandle::EliminateAllocationEffect *>
       EarliestAllocElimFor;
+  DenseMap<CallBase *, SmallVector<const jeandle::RewriteDeoptPoolEffect *, 2>>
+      PoolsAt;
+  SmallVector<const jeandle::RewriteDeoptPoolEffect *, 2> OrphanPools;
+  DenseSet<Value *> OwnedPhis;
+
   for (const auto &KV : Result.BlockEffects)
     for (const jeandle::Effect &E : KV.second) {
-      Instruction *T = E.getTarget();
-      if (!T)
-        continue;
-      if (isa<jeandle::ReplaceLoadEffect>(E) ||
-          isa<jeandle::ReplaceCallEffect>(E)) {
-        auto [It, Inserted] = EarliestReplFor.try_emplace(T, &E);
+      Instruction *Target = E.getTarget();
+      if (Target && (isa<jeandle::ReplaceLoadEffect>(E) ||
+                     isa<jeandle::ReplaceCallEffect>(E))) {
+        auto [It, Inserted] = EarliestReplFor.try_emplace(Target, &E);
         if (!Inserted && E.SeqNo < It->second->SeqNo)
           It->second = &E;
       }
-      if (const auto *AE = dyn_cast<jeandle::EliminateAllocationEffect>(&E)) {
-        auto [It, Inserted] = EarliestAllocElimFor.try_emplace(T, AE);
-        if (!Inserted && AE->SeqNo < It->second->SeqNo)
+      if (Target)
+        if (const auto *AE = dyn_cast<jeandle::EliminateAllocationEffect>(&E)) {
+          auto [It, Inserted] = EarliestAllocElimFor.try_emplace(Target, AE);
+          if (!Inserted && AE->SeqNo < It->second->SeqNo)
             It->second = AE;
+        }
+      if (const auto *PE = dyn_cast<jeandle::CreatePHIEffect>(&E))
+        if (E.hasMutationOwner())
+          OwnedPhis.insert(PE->PhiInst);
+      if (const auto *Pool = dyn_cast<jeandle::RewriteDeoptPoolEffect>(&E)) {
+        auto *Safepoint = dyn_cast_or_null<CallBase>(Pool->getTarget());
+        if (Safepoint)
+          PoolsAt[Safepoint].push_back(Pool);
+        else
+          OrphanPools.push_back(Pool);
       }
     }
 
-  // Resolve a value through the committed replacement chain (ReplaceLoad /
-  // ReplaceCall effects) to its final surviving SSA value, or to Deleted /
-  // DependencyFreeOopHandle when the chain ends in an eliminated value.
   auto ResolveFinalValue = [&](Value *Root) -> FinalValue {
     Value *Current = Root;
     SmallPtrSet<Value *, 8> Seen;
@@ -8093,15 +7942,6 @@ void Analyzer::validateFinalDeoptObligations() {
     return {FinalValue::ResolvedValue, Current};
   };
 
-  DenseMap<CallBase *,
-           SmallVector<const jeandle::RewriteDeoptBundleEffect *, 2>>
-      DescriptorsAt;
-  for (const auto &KV : Result.BlockEffects)
-    for (const jeandle::Effect &E : KV.second)
-      if (const auto *RE = dyn_cast<jeandle::RewriteDeoptBundleEffect>(&E))
-        if (RE->Safepoint)
-          DescriptorsAt[RE->Safepoint].push_back(RE);
-
   DenseMap<Value *, jeandle::ObjectID> ObjectIdentity;
   for (const auto &VObjUP : Result.VirtualObjects) {
     const jeandle::VirtualObject &VObj = *VObjUP;
@@ -8117,15 +7957,10 @@ void Analyzer::validateFinalDeoptObligations() {
     SmallVector<jeandle::ObjectID, 8> Worklist(1, RootID);
     while (!Worklist.empty()) {
       jeandle::ObjectID ID = Worklist.pop_back_val();
-      if (!Visited.insert(ID).second)
-        continue;
-      if (ID == jeandle::InvalidObjectID || ID >= Result.VirtualObjects.size())
+      if (!Visited.insert(ID).second || ID == jeandle::InvalidObjectID ||
+          ID >= Result.VirtualObjects.size())
         continue;
       const jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
-      auto CIt = Result.EscapeClassification.find(ID);
-      if (CIt == Result.EscapeClassification.end() ||
-          CIt->second != jeandle::PEAResult::EscapeKind::NeverEscapes)
-        continue;
       if (VObj.IsSynthetic) {
         Worklist.append(VObj.SyntheticSourceIDs.begin(),
                         VObj.SyntheticSourceIDs.end());
@@ -8141,47 +7976,29 @@ void Analyzer::validateFinalDeoptObligations() {
     InvalidDeoptObligation = true;
     CollectOrdinarySites(ID);
   };
-
-  auto HasDescriptorForObject = [&](CallBase *CB,
-                                    jeandle::ObjectID ID) -> bool {
-    auto It = DescriptorsAt.find(CB);
-    if (It == DescriptorsAt.end())
-      return false;
-    return llvm::any_of(It->second,
-                        [&](const jeandle::RewriteDeoptBundleEffect *RE) {
-                          return RE->ObjID == ID;
-                        });
+  auto RejectPool = [&](const jeandle::RewriteDeoptPoolEffect &Pool) {
+    InvalidDeoptObligation = true;
+    for (CurrentDeoptNodeID CurrentID : Pool.getPlan().graph().currentMembers())
+      CollectOrdinarySites(static_cast<jeandle::ObjectID>(CurrentID));
+    for (const FinalDeoptPoolCurrentOccurrence &Occurrence :
+         Pool.getPlan().currentOccurrences())
+      CollectOrdinarySites(
+          static_cast<jeandle::ObjectID>(Occurrence.CurrentID));
   };
 
-  auto HasWholeRootDescriptor = [&](CallBase *CB, Value *Root) -> bool {
-    auto It = DescriptorsAt.find(CB);
-    if (It == DescriptorsAt.end())
-      return false;
-    for (const jeandle::RewriteDeoptBundleEffect *RE : It->second) {
-      if (!RE->OrigAllocInBundle)
-        continue;
-      for (const WeakTrackingVH &RootOperand : RE->RootOperands)
-        if ((Value *)RootOperand == Root)
-          return true;
-    }
-    return false;
-  };
+  for (const jeandle::RewriteDeoptPoolEffect *Pool : OrphanPools)
+    RejectPool(*Pool);
 
   auto AuditObjectIdentity = [&](jeandle::ObjectID RootID) {
     DenseSet<jeandle::ObjectID> Visited;
     SmallVector<jeandle::ObjectID, 8> Worklist(1, RootID);
     while (!Worklist.empty()) {
       jeandle::ObjectID ID = Worklist.pop_back_val();
-      if (!Visited.insert(ID).second)
-        continue;
-      if (ID == jeandle::InvalidObjectID || ID >= Result.VirtualObjects.size())
+      if (!Visited.insert(ID).second || ID == jeandle::InvalidObjectID ||
+          ID >= Result.VirtualObjects.size())
         continue;
       const jeandle::VirtualObject &VObj = *Result.VirtualObjects[ID];
       if (VObj.IsSynthetic) {
-        // A synthetic has no retained allocation of its own. Walk through
-        // the complete synthetic-source graph until ordinary allocation
-        // leaves are reached. Loop-carried Case-C merges can make this graph
-        // cyclic, so each identity is visited at most once.
         Worklist.append(VObj.SyntheticSourceIDs.begin(),
                         VObj.SyntheticSourceIDs.end());
         continue;
@@ -8200,7 +8017,6 @@ void Analyzer::validateFinalDeoptObligations() {
       Value *Current = Worklist.pop_back_val();
       if (!Current)
         continue;
-
       FinalValue Final = ResolveFinalValue(Current);
       if (Final.K == FinalValue::Deleted ||
           Final.K == FinalValue::DependencyFreeOopHandle)
@@ -8208,20 +8024,13 @@ void Analyzer::validateFinalDeoptObligations() {
       Current = Final.V;
       if (!Current || !Visited.insert(Current).second)
         continue;
-
       if (auto It = ObjectIdentity.find(Current); It != ObjectIdentity.end()) {
         AuditObjectIdentity(It->second);
         continue;
       }
-
-      // A Jeandle allocation absent from ObjectIdentity was never virtualized
-      // in this attempt, so its result is already a real oop. Do not traverse
-      // the call's arguments or its own operand bundles: those are not SSA
-      // dependencies of the surviving allocation result.
       if (auto *CB = dyn_cast<CallBase>(Current))
-        if (jeandle::pea::isJeandleAllocation(CB))
+        if (isJeandleAllocation(CB))
           continue;
-
       if (auto *II = dyn_cast<IntrinsicInst>(Current)) {
         Intrinsic::ID IID = II->getIntrinsicID();
         if (IID == Intrinsic::launder_invariant_group ||
@@ -8231,28 +8040,49 @@ void Analyzer::validateFinalDeoptObligations() {
           continue;
         }
       }
-
-      // A surviving call result is already an SSA value at this safepoint.
-      // Its arguments and operand bundles describe how the earlier call ran;
-      // they are not dependencies that will be rebuilt from the result.
-      // Transparent identity intrinsics are handled above because their
-      // result deliberately preserves the input object's identity.
       if (isa<CallBase>(Current))
         continue;
-
       if (auto *U = dyn_cast<User>(Current))
         for (Value *Operand : U->operand_values())
           Worklist.push_back(Operand);
     }
   };
 
-  auto SafepointDeleted = [&](CallBase *CB) -> bool {
-    if (isa_and_nonnull<jeandle::ReplaceCallEffect>(EarliestReplFor.lookup(CB)))
-      return true;
+  auto IsAvailableValue = [&](Value *Root) {
+    SmallPtrSet<Value *, 8> Visited;
+    SmallVector<Value *, 8> Worklist(1, Root);
+    while (!Worklist.empty()) {
+      Value *Current = Worklist.pop_back_val();
+      if (!Current || !Visited.insert(Current).second)
+        continue;
+      auto *I = dyn_cast<Instruction>(Current);
+      if (!I || I->getParent())
+        continue;
+      if (auto *PN = dyn_cast<PHINode>(I)) {
+        if (OwnedPhis.contains(PN))
+          continue;
+        return false;
+      }
+      for (Value *Operand : I->operand_values())
+        Worklist.push_back(Operand);
+    }
+    return true;
+  };
+
+  auto SafepointDeleted = [&](CallBase *CB) {
+    if (const auto *Replace = dyn_cast_or_null<jeandle::ReplaceCallEffect>(
+            EarliestReplFor.lookup(CB))) {
+      Value *Replacement = Replace->Replacement;
+      if (Replace->getTarget() == CB && !isJeandleMonitorEnter(CB) &&
+          ((!Replacement && CB->use_empty()) || Replace->OopHandleId >= 0 ||
+           isa_and_nonnull<Constant>(Replacement) ||
+           isa_and_nonnull<Argument>(Replacement)))
+        return true;
+    }
     const auto *AE = EarliestAllocElimFor.lookup(CB);
-    if (!AE)
+    if (!AE || !AE->hasMutationOwner())
       return false;
-    auto CIt = Result.EscapeClassification.find(AE->ObjID);
+    auto CIt = Result.EscapeClassification.find(AE->getMutationOwner());
     return CIt != Result.EscapeClassification.end() &&
            CIt->second == jeandle::PEAResult::EscapeKind::NeverEscapes;
   };
@@ -8262,43 +8092,61 @@ void Analyzer::validateFinalDeoptObligations() {
     if (!CB || !hasDeoptBundle(CB) || SafepointDeleted(CB))
       continue;
     auto ExitIt = BlockExits.find(CB->getParent());
-    // A safepoint in a proven-dead block is removed by the same committed CFG
-    // plan and has no final frame-state obligation. The deadness proof is
-    // validated immediately after this audit; an invalid proof discards the
-    // whole attempt before any effect is published.
     if (ExitIt != BlockExits.end() && ExitIt->second.IsDead)
       continue;
 
-    auto Deopt = CB->getOperandBundle(LLVMContext::OB_deopt);
-    assert(Deopt && "hasDeoptBundle lied");
-    for (const Use &U : Deopt->Inputs) {
-      Value *Root = U.get();
-      if (!Root || HasWholeRootDescriptor(CB, Root))
+    auto PoolIt = PoolsAt.find(CB);
+    if (PoolIt != PoolsAt.end()) {
+      const jeandle::RewriteDeoptPoolEffect *Pool = nullptr;
+      const auto &PoolEffects = PoolIt->second;
+      if (PoolEffects.size() != 1) {
+        for (const jeandle::RewriteDeoptPoolEffect *Duplicate : PoolEffects)
+          RejectPool(*Duplicate);
+      } else {
+        Pool = PoolEffects.front();
+      }
+
+      bool PoolValid = Pool != nullptr;
+      if (!Pool)
         continue;
-      AuditValue(Root);
+      if (LateInvalidDeoptPools.contains(CB))
+        PoolValid = false;
+      for (CurrentDeoptNodeID CurrentID :
+           Pool->getPlan().graph().currentMembers()) {
+        jeandle::ObjectID ID = static_cast<jeandle::ObjectID>(CurrentID);
+        if (ID >= Result.VirtualObjects.size() || !Eligible.lookup(ID)) {
+          PoolValid = false;
+          break;
+        }
+      }
+      for (const FinalDeoptPoolBundleToken &Token : Pool->getPlan().tokens()) {
+        if (Token.kind() != FinalDeoptPoolBundleTokenKind::TrackedValue)
+          continue;
+        Value *Tracked = Token.trackedValue();
+        if (!Tracked || !IsAvailableValue(Tracked))
+          PoolValid = false;
+        AuditValue(Tracked);
+      }
+      SerializeFinalDeoptPoolBundleResult Serialized =
+          serializeFinalDeoptPoolBundlePlan(Pool->getPlan(), *CB);
+      if (!Serialized.Inputs)
+        PoolValid = false;
+      if (!PoolValid)
+        RejectPool(*Pool);
+      // The immutable final token stream is the exact dependency set. Source
+      // cells removed by pruning must not be resurrected by auditing the
+      // original bundle after a successful whole-pool plan.
+      continue;
     }
 
-    auto DIt = DescriptorsAt.find(CB);
-    if (DIt == DescriptorsAt.end())
-      continue;
-    for (const jeandle::RewriteDeoptBundleEffect *RE : DIt->second)
-      for (const jeandle::MaterializeEffect::FieldEntry &FE : RE->Fields) {
-        if (FE.Value.isVirtualRef()) {
-          jeandle::ObjectID Referenced = FE.Value.getVirtualRef();
-          if (!HasDescriptorForObject(CB, Referenced))
-            RejectVirtualObject(Referenced);
-          continue;
-        }
-        if (FE.Value.isScalar())
-          AuditValue(FE.Value.getScalar());
-        else if (FE.Value.isMaterializedRef())
-          AuditValue(FE.Value.getMaterialized());
-      }
+    auto Deopt = CB->getOperandBundle(LLVMContext::OB_deopt);
+    assert(Deopt && "hasDeoptBundle lied");
+    for (const Use &Input : Deopt->Inputs)
+      AuditValue(Input.get());
   }
 }
 
-SmallVector<Instruction *, 8>
-Analyzer::validateCFGDeadnessProofs() const {
+SmallVector<Instruction *, 8> Analyzer::validateCFGDeadnessProofs() const {
   // Precompute the earliest (lowest SeqNo) ReplaceLoad/ReplaceCall effect and
   // the earliest EliminateAllocationEffect per target instruction in a single
   // pass. Each proof is validated with O(1) lookups instead of rescanning all
@@ -8386,7 +8234,12 @@ Analyzer::validateCFGDeadnessProofs() const {
         InvalidKillers.push_back(Proof.Killer);
         break;
       }
-      auto CIt = Result.EscapeClassification.find(It->second->ObjID);
+      if (!It->second->hasMutationOwner()) {
+        InvalidKillers.push_back(Proof.Killer);
+        break;
+      }
+      auto CIt =
+          Result.EscapeClassification.find(It->second->getMutationOwner());
       RecordIfInvalid(CIt == Result.EscapeClassification.end() ||
                               CIt->second !=
                                   jeandle::PEAResult::EscapeKind::NeverEscapes

@@ -17,6 +17,7 @@
 #include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/Constants.h"
@@ -476,11 +477,9 @@ resolveVirtualIdentityImpl(Value *V, const PEABlockState &State,
   // they have no structural relationship with their allocation site.
   if (Aliases.getVirtualAlias(V).has_value() ||
       Aliases.getScalarAlias(V) != nullptr) {
-    if (Mode == VirtualIdentityMode::WholeObject) {
-      std::optional<int64_t> Offset = resolveFieldOffset(V, DL);
-      if (!Offset || *Offset != 0)
-        return VirtualIdentityResult::unknown();
-    }
+    if (Mode == VirtualIdentityMode::WholeObject &&
+        !Aliases.isWholeObjectVirtualAlias(V))
+      return VirtualIdentityResult::unknown();
     return checkAliasMap(V, State, Aliases);
   }
 
@@ -813,6 +812,590 @@ std::optional<uint32_t> extractArrayLength(const CallBase *NewArray) {
 // ===========================================================================
 // Deopt bundle scope structure
 // ===========================================================================
+
+std::optional<CheckedDeoptValueEncoding>
+decodeDeoptValueEncoding(const Value *V) {
+  auto *CI = dyn_cast_or_null<ConstantInt>(V);
+  if (!CI || !CI->getType()->isIntegerTy(64))
+    return std::nullopt;
+
+  uint64_t Raw = CI->getZExtValue();
+  uint16_t RawValueType = static_cast<uint16_t>((Raw >> 16) & 0xffff);
+  DeoptValueEncoding::DeoptValueType ValueType;
+  switch (RawValueType) {
+  case DeoptValueEncoding::LocalType:
+  case DeoptValueEncoding::StackType:
+  case DeoptValueEncoding::MonitorType:
+  case DeoptValueEncoding::ScalarValueType:
+  case DeoptValueEncoding::OrigPcSlotType:
+  case DeoptValueEncoding::MethodType:
+  case DeoptValueEncoding::NarrowOopMarkerType:
+  case DeoptValueEncoding::VORefLocalType:
+  case DeoptValueEncoding::VORefStackType:
+    ValueType = static_cast<DeoptValueEncoding::DeoptValueType>(RawValueType);
+    break;
+  default:
+    return std::nullopt;
+  }
+
+  uint16_t RawBasicType = static_cast<uint16_t>(Raw & 0xffff);
+  HotspotBasicType BasicType;
+  switch (RawBasicType) {
+  case T_BOOLEAN:
+  case T_CHAR:
+  case T_FLOAT:
+  case T_DOUBLE:
+  case T_BYTE:
+  case T_SHORT:
+  case T_INT:
+  case T_LONG:
+  case T_OBJECT:
+  case T_ARRAY:
+  case T_VOID:
+  case T_ADDRESS:
+  case T_NARROWOOP:
+  case T_METADATA:
+  case T_NARROWKLASS:
+  case T_CONFLICT:
+  case T_ILLEGAL:
+    BasicType = static_cast<HotspotBasicType>(RawBasicType);
+    break;
+  default:
+    return std::nullopt;
+  }
+
+  return CheckedDeoptValueEncoding{
+      static_cast<int32_t>(static_cast<uint32_t>(Raw >> 32)), ValueType,
+      BasicType};
+}
+
+namespace {
+
+class SemanticDeoptBundleParser {
+public:
+  explicit SemanticDeoptBundleParser(ArrayRef<Value *> Inputs)
+      : Inputs(Inputs) {
+    for (Value *Input : Inputs)
+      Bundle.OriginalInputs.emplace_back(Input);
+  }
+
+  DeoptBundleParseResult parse() {
+    ParsedDeoptScope Root;
+    if (!parseScopeHeader(Root))
+      return result();
+
+    if (!parseRootPool())
+      return result();
+    if (!parseScopeBody(Root, /*IsRoot=*/true))
+      return result();
+    Bundle.Scopes.push_back(std::move(Root));
+
+    while (Pos < Inputs.size()) {
+      std::optional<CheckedDeoptValueEncoding> Encoding =
+          decodeDeoptValueEncoding(Inputs[Pos]);
+      if (!Encoding)
+        return fail(DeoptBundleParseErrorCode::InvalidEncoding, Pos);
+      if (Encoding->ValueType == DeoptValueEncoding::NarrowOopMarkerType)
+        break;
+      if (Encoding->ValueType != DeoptValueEncoding::MethodType)
+        return fail(DeoptBundleParseErrorCode::InvalidScopeOrder, Pos);
+
+      ParsedDeoptScope InlineScope;
+      if (!parseMethodMarker(InlineScope) || !parseScopeHeader(InlineScope) ||
+          !parseScopeBody(InlineScope, /*IsRoot=*/false))
+        return result();
+      Bundle.Scopes.push_back(std::move(InlineScope));
+    }
+
+    if (!parseNarrowOopTail() || !validateReferences())
+      return result();
+    return DeoptBundleParseResult{std::move(Bundle), {}};
+  }
+
+private:
+  enum class ScopePhase : uint8_t { Locals, Stack, Monitors, OrigPc };
+
+  DeoptBundleParseResult fail(DeoptBundleParseErrorCode Code,
+                              unsigned OperandIndex) {
+    Error = {Code, OperandIndex};
+    return result();
+  }
+
+  bool failBool(DeoptBundleParseErrorCode Code, unsigned OperandIndex) {
+    Error = {Code, OperandIndex};
+    return false;
+  }
+
+  DeoptBundleParseResult result() {
+    return DeoptBundleParseResult{std::nullopt, Error};
+  }
+
+  static ConstantInt *getIntegerConstant(Value *V, unsigned BitWidth) {
+    auto *CI = dyn_cast_or_null<ConstantInt>(V);
+    return CI && CI->getType()->isIntegerTy(BitWidth) ? CI : nullptr;
+  }
+
+  DeoptSemanticCell recordCell(DeoptSemanticCellRole Role, unsigned Index,
+                               bool KeepConstant) {
+    DeoptStructuralCell Structural{Role, Index, Inputs[Index]->getType(),
+                                   std::nullopt};
+    if (KeepConstant)
+      if (auto *CI = dyn_cast<ConstantInt>(Inputs[Index]))
+        Structural.ConstantValue = CI->getZExtValue();
+    Bundle.Fingerprint.Cells.push_back(Structural);
+    return {Role, Index};
+  }
+
+  bool parseScopeHeader(ParsedDeoptScope &Scope) {
+    if (Pos >= Inputs.size())
+      return failBool(DeoptBundleParseErrorCode::InvalidScopeHeader, Pos);
+
+    // Production records carry should_reexecute before the duplicated BCI.
+    // Hand-written PEA tests intentionally use only the duplicated pair.
+    if (Pos + 2 < Inputs.size()) {
+      ConstantInt *Should = getIntegerConstant(Inputs[Pos], 64);
+      ConstantInt *BCI0 = getIntegerConstant(Inputs[Pos + 1], 32);
+      ConstantInt *BCI1 = getIntegerConstant(Inputs[Pos + 2], 32);
+      if (Should && BCI0 && BCI1) {
+        if (Should->getZExtValue() > 1)
+          return failBool(DeoptBundleParseErrorCode::InvalidScopeHeader, Pos);
+        Scope.ShouldReexecute = Should->getZExtValue();
+        Scope.ShouldReexecuteCell =
+            recordCell(DeoptSemanticCellRole::ShouldReexecute, Pos, true);
+        ++Pos;
+      }
+    }
+
+    if (Pos + 1 >= Inputs.size())
+      return failBool(DeoptBundleParseErrorCode::InvalidScopeHeader, Pos);
+    ConstantInt *BCI0 = getIntegerConstant(Inputs[Pos], 32);
+    ConstantInt *BCI1 = getIntegerConstant(Inputs[Pos + 1], 32);
+    if (!BCI0 || !BCI1)
+      return failBool(DeoptBundleParseErrorCode::InvalidScopeHeader, Pos);
+    if (BCI0->getValue() != BCI1->getValue())
+      return failBool(DeoptBundleParseErrorCode::MismatchedBCI, Pos);
+
+    Scope.BCI = static_cast<int32_t>(BCI0->getSExtValue());
+    Scope.FirstBCICell = recordCell(DeoptSemanticCellRole::BCI, Pos, true);
+    ++Pos;
+    Scope.SecondBCICell = recordCell(DeoptSemanticCellRole::BCI, Pos, true);
+    ++Pos;
+    return true;
+  }
+
+  bool parseRootPool() {
+    while (Pos < Inputs.size()) {
+      std::optional<CheckedDeoptValueEncoding> Encoding =
+          decodeDeoptValueEncoding(Inputs[Pos]);
+      if (!Encoding ||
+          Encoding->ValueType != DeoptValueEncoding::ScalarValueType)
+        return true;
+      if (!parseDescriptor(*Encoding))
+        return false;
+    }
+    return true;
+  }
+
+  bool parseDescriptor(const CheckedDeoptValueEncoding &Header) {
+    unsigned HeaderIndex = Pos;
+    if (Header.Index < 0 ||
+        (Header.BasicType != T_OBJECT && Header.BasicType != T_ARRAY))
+      return failBool(DeoptBundleParseErrorCode::InvalidEncoding, Pos);
+    if (!DescriptorIDs.insert(Header.Index).second)
+      return failBool(DeoptBundleParseErrorCode::DuplicateDescriptorID, Pos);
+    if (Inputs.size() - Pos < 3)
+      return failBool(DeoptBundleParseErrorCode::TruncatedRecord, Pos);
+
+    ParsedDeoptDescriptor Descriptor;
+    Descriptor.WireID = Header.Index;
+    Descriptor.IsArray = Header.BasicType == T_ARRAY;
+    Descriptor.HeaderCell =
+        recordCell(DeoptSemanticCellRole::DescriptorHeader, Pos, true);
+    ++Pos;
+
+    ConstantInt *Klass = getIntegerConstant(Inputs[Pos], 64);
+    if (!Klass || Klass->isZero())
+      return failBool(DeoptBundleParseErrorCode::InvalidSemanticValue, Pos);
+    Descriptor.Klass = Klass->getZExtValue();
+    Descriptor.KlassCell =
+        recordCell(DeoptSemanticCellRole::DescriptorKlass, Pos, true);
+    ++Pos;
+
+    ConstantInt *FieldCount = getIntegerConstant(Inputs[Pos], 32);
+    if (!FieldCount || FieldCount->isNegative())
+      return failBool(DeoptBundleParseErrorCode::InvalidSemanticValue, Pos);
+    uint64_t Count = FieldCount->getZExtValue();
+    Descriptor.FieldCountCell =
+        recordCell(DeoptSemanticCellRole::DescriptorFieldCount, Pos, true);
+    ++Pos;
+    if (Count > (Inputs.size() - Pos) / 2)
+      return failBool(DeoptBundleParseErrorCode::TruncatedRecord, HeaderIndex);
+
+    SmallSet<int32_t, 8> FieldOffsets;
+    Descriptor.Fields.reserve(static_cast<unsigned>(Count));
+    for (uint64_t I = 0; I < Count; ++I) {
+      unsigned EncodingIndex = Pos;
+      std::optional<CheckedDeoptValueEncoding> FieldEncoding =
+          decodeDeoptValueEncoding(Inputs[Pos]);
+      if (!FieldEncoding || FieldEncoding->Index < 0)
+        return failBool(DeoptBundleParseErrorCode::InvalidEncoding, Pos);
+      if (FieldEncoding->ValueType != DeoptValueEncoding::LocalType &&
+          FieldEncoding->ValueType != DeoptValueEncoding::VORefLocalType)
+        return failBool(DeoptBundleParseErrorCode::InvalidEncoding, Pos);
+      if (!FieldOffsets.insert(FieldEncoding->Index).second)
+        return failBool(DeoptBundleParseErrorCode::DuplicateFieldOffset, Pos);
+
+      ParsedDeoptField Field;
+      Field.Offset = FieldEncoding->Index;
+      Field.Encoding = *FieldEncoding;
+      Field.EncodingCell =
+          recordCell(DeoptSemanticCellRole::DescriptorFieldEncoding, Pos, true);
+      ++Pos;
+      Field.ValueCell = {DeoptSemanticCellRole::DescriptorFieldValue, Pos};
+
+      if (FieldEncoding->ValueType == DeoptValueEncoding::VORefLocalType) {
+        if (FieldEncoding->BasicType != T_OBJECT)
+          return failBool(DeoptBundleParseErrorCode::InvalidEncoding,
+                          EncodingIndex);
+        std::optional<int32_t> Target = parseWireID(Inputs[Pos]);
+        if (!Target)
+          return failBool(DeoptBundleParseErrorCode::InvalidSemanticValue, Pos);
+        Field.TargetWireID = *Target;
+        References.push_back({*Target, Pos});
+        recordCell(DeoptSemanticCellRole::DescriptorFieldValue, Pos, true);
+      } else {
+        if (!isValidScalarValue(FieldEncoding->BasicType, Inputs[Pos]))
+          return failBool(DeoptBundleParseErrorCode::InvalidSemanticValue, Pos);
+        recordCell(DeoptSemanticCellRole::DescriptorFieldValue, Pos,
+                   FieldEncoding->BasicType == T_ILLEGAL);
+      }
+      ++Pos;
+      Descriptor.Fields.push_back(std::move(Field));
+    }
+    Bundle.Descriptors.push_back(std::move(Descriptor));
+    return true;
+  }
+
+  bool parseScopeBody(ParsedDeoptScope &Scope, bool IsRoot) {
+    ScopePhase Phase = ScopePhase::Locals;
+    int64_t NextLocalIndex = 0;
+    int64_t NextStackIndex = 0;
+    while (Pos < Inputs.size()) {
+      std::optional<CheckedDeoptValueEncoding> Encoding =
+          decodeDeoptValueEncoding(Inputs[Pos]);
+      if (!Encoding)
+        return failBool(DeoptBundleParseErrorCode::InvalidEncoding, Pos);
+
+      switch (Encoding->ValueType) {
+      case DeoptValueEncoding::MethodType:
+      case DeoptValueEncoding::NarrowOopMarkerType:
+        return true;
+      case DeoptValueEncoding::ScalarValueType:
+        return failBool(DeoptBundleParseErrorCode::DescriptorNotInRootPool,
+                        Pos);
+      case DeoptValueEncoding::LocalType:
+      case DeoptValueEncoding::VORefLocalType:
+        if (Phase != ScopePhase::Locals)
+          return failBool(DeoptBundleParseErrorCode::InvalidScopeOrder, Pos);
+        if (!parseScopeValue(Scope.Locals, *Encoding, NextLocalIndex))
+          return false;
+        break;
+      case DeoptValueEncoding::StackType:
+      case DeoptValueEncoding::VORefStackType:
+        if (Phase > ScopePhase::Stack)
+          return failBool(DeoptBundleParseErrorCode::InvalidScopeOrder, Pos);
+        Phase = ScopePhase::Stack;
+        if (!parseScopeValue(Scope.Stack, *Encoding, NextStackIndex))
+          return false;
+        break;
+      case DeoptValueEncoding::MonitorType:
+        if (Phase > ScopePhase::Monitors)
+          return failBool(DeoptBundleParseErrorCode::InvalidScopeOrder, Pos);
+        Phase = ScopePhase::Monitors;
+        if (!parseMonitor(Scope, *Encoding))
+          return false;
+        break;
+      case DeoptValueEncoding::OrigPcSlotType:
+        if (!IsRoot || Scope.OrigPc || Phase == ScopePhase::OrigPc)
+          return failBool(DeoptBundleParseErrorCode::InvalidOrigPc, Pos);
+        Phase = ScopePhase::OrigPc;
+        if (!parseOrigPc(Scope, *Encoding))
+          return false;
+        break;
+      default:
+        return failBool(DeoptBundleParseErrorCode::InvalidScopeOrder, Pos);
+      }
+    }
+    return true;
+  }
+
+  bool parseScopeValue(SmallVectorImpl<ParsedDeoptScopeValue> &Values,
+                       const CheckedDeoptValueEncoding &Encoding,
+                       int64_t &NextSlotIndex) {
+    if (Inputs.size() - Pos < 2)
+      return failBool(DeoptBundleParseErrorCode::TruncatedRecord, Pos);
+
+    bool IsVORef = Encoding.ValueType == DeoptValueEncoding::VORefLocalType ||
+                   Encoding.ValueType == DeoptValueEncoding::VORefStackType;
+    if (!IsVORef && (Encoding.Index < 0 || Encoding.Index != NextSlotIndex))
+      return failBool(DeoptBundleParseErrorCode::InvalidEncoding, Pos);
+    if (IsVORef && (Encoding.Index < 0 || Encoding.BasicType != T_OBJECT))
+      return failBool(DeoptBundleParseErrorCode::InvalidEncoding, Pos);
+
+    ParsedDeoptScopeValue Parsed;
+    Parsed.PhysicalSlot = static_cast<unsigned>(NextSlotIndex);
+    Parsed.SlotWidth = IsVORef || !isDoubleWordType(Encoding.BasicType) ? 1 : 2;
+    Parsed.Encoding = Encoding;
+    Parsed.EncodingCell =
+        recordCell(DeoptSemanticCellRole::ScopeValueEncoding, Pos, true);
+    ++Pos;
+    Parsed.ValueCell = {DeoptSemanticCellRole::ScopeValue, Pos};
+    if (IsVORef) {
+      std::optional<int32_t> Target = parseWireID(Inputs[Pos]);
+      if (!Target || *Target != Encoding.Index)
+        return failBool(DeoptBundleParseErrorCode::InvalidSemanticValue, Pos);
+      Parsed.TargetWireID = *Target;
+      References.push_back({*Target, Pos});
+      recordCell(DeoptSemanticCellRole::ScopeValue, Pos, true);
+    } else {
+      if (!isValidScalarValue(Encoding.BasicType, Inputs[Pos]))
+        return failBool(DeoptBundleParseErrorCode::InvalidSemanticValue, Pos);
+      recordCell(DeoptSemanticCellRole::ScopeValue, Pos,
+                 Encoding.BasicType == T_ILLEGAL);
+    }
+    ++Pos;
+    NextSlotIndex += Parsed.SlotWidth;
+    Values.push_back(std::move(Parsed));
+    return true;
+  }
+
+  bool parseMonitor(ParsedDeoptScope &Scope,
+                    const CheckedDeoptValueEncoding &Encoding) {
+    if (Inputs.size() - Pos < 3)
+      return failBool(DeoptBundleParseErrorCode::TruncatedRecord, Pos);
+    if ((Encoding.Index != 0 && Encoding.Index != 1) ||
+        Encoding.BasicType != T_OBJECT)
+      return failBool(DeoptBundleParseErrorCode::InvalidMonitor, Pos);
+
+    ParsedDeoptMonitor Monitor;
+    Monitor.Encoding = Encoding;
+    Monitor.Eliminated = Encoding.Index == 1;
+    Monitor.EncodingCell =
+        recordCell(DeoptSemanticCellRole::MonitorEncoding, Pos, true);
+    ++Pos;
+    Monitor.OwnerCell = {DeoptSemanticCellRole::MonitorOwner, Pos};
+    if (Monitor.Eliminated) {
+      std::optional<int32_t> Owner = parseWireID(Inputs[Pos]);
+      if (!Owner)
+        return failBool(DeoptBundleParseErrorCode::InvalidMonitor, Pos);
+      Monitor.OwnerWireID = *Owner;
+      References.push_back({*Owner, Pos});
+      recordCell(DeoptSemanticCellRole::MonitorOwner, Pos, true);
+    } else {
+      if (!isValidWideOop(Inputs[Pos]))
+        return failBool(DeoptBundleParseErrorCode::InvalidMonitor, Pos);
+      recordCell(DeoptSemanticCellRole::MonitorOwner, Pos, false);
+    }
+    ++Pos;
+    Monitor.LockCell = {DeoptSemanticCellRole::MonitorLock, Pos};
+    auto *LockTy = dyn_cast<PointerType>(Inputs[Pos]->getType());
+    if (!LockTy || LockTy->getAddressSpace() != 0)
+      return failBool(DeoptBundleParseErrorCode::InvalidMonitor, Pos);
+    recordCell(DeoptSemanticCellRole::MonitorLock, Pos, false);
+    ++Pos;
+    Scope.Monitors.push_back(std::move(Monitor));
+    return true;
+  }
+
+  bool parseOrigPc(ParsedDeoptScope &Scope,
+                   const CheckedDeoptValueEncoding &Encoding) {
+    if (Inputs.size() - Pos < 2)
+      return failBool(DeoptBundleParseErrorCode::TruncatedRecord, Pos);
+    if (Encoding.Index != 0 || Encoding.BasicType != T_ADDRESS)
+      return failBool(DeoptBundleParseErrorCode::InvalidOrigPc, Pos);
+    ParsedDeoptMarker Marker;
+    Marker.Encoding = Encoding;
+    Marker.EncodingCell =
+        recordCell(DeoptSemanticCellRole::OrigPcEncoding, Pos, true);
+    ++Pos;
+    auto *OrigPcTy = dyn_cast<PointerType>(Inputs[Pos]->getType());
+    if (!OrigPcTy || OrigPcTy->getAddressSpace() != 0)
+      return failBool(DeoptBundleParseErrorCode::InvalidOrigPc, Pos);
+    Marker.ValueCell =
+        recordCell(DeoptSemanticCellRole::OrigPcValue, Pos, false);
+    ++Pos;
+    Scope.OrigPc = Marker;
+    return true;
+  }
+
+  bool parseMethodMarker(ParsedDeoptScope &Scope) {
+    if (Inputs.size() - Pos < 2)
+      return failBool(DeoptBundleParseErrorCode::TruncatedRecord, Pos);
+    std::optional<CheckedDeoptValueEncoding> Encoding =
+        decodeDeoptValueEncoding(Inputs[Pos]);
+    if (!Encoding || Encoding->ValueType != DeoptValueEncoding::MethodType ||
+        Encoding->Index != 0 || Encoding->BasicType != T_METADATA)
+      return failBool(DeoptBundleParseErrorCode::InvalidMethodMarker, Pos);
+
+    ParsedDeoptMethod Method;
+    Method.EncodingCell =
+        recordCell(DeoptSemanticCellRole::MethodEncoding, Pos, true);
+    ++Pos;
+    ConstantInt *MethodValue = getIntegerConstant(Inputs[Pos], 64);
+    if (!MethodValue || MethodValue->isZero())
+      return failBool(DeoptBundleParseErrorCode::InvalidMethodMarker, Pos);
+    Method.Method = MethodValue->getZExtValue();
+    Method.ValueCell =
+        recordCell(DeoptSemanticCellRole::MethodValue, Pos, true);
+    ++Pos;
+    Scope.Method = Method;
+    return true;
+  }
+
+  bool parseNarrowOopTail() {
+    while (Pos < Inputs.size()) {
+      if (Inputs.size() - Pos < 2)
+        return failBool(DeoptBundleParseErrorCode::TruncatedRecord, Pos);
+      std::optional<CheckedDeoptValueEncoding> Encoding =
+          decodeDeoptValueEncoding(Inputs[Pos]);
+      if (!Encoding ||
+          Encoding->ValueType != DeoptValueEncoding::NarrowOopMarkerType ||
+          Encoding->Index != 0 || Encoding->BasicType != T_NARROWOOP)
+        return failBool(DeoptBundleParseErrorCode::InvalidNarrowOopMarker, Pos);
+
+      ParsedDeoptMarker Marker;
+      Marker.Encoding = *Encoding;
+      Marker.EncodingCell =
+          recordCell(DeoptSemanticCellRole::NarrowOopEncoding, Pos, true);
+      ++Pos;
+      auto *NarrowTy = dyn_cast<PointerType>(Inputs[Pos]->getType());
+      if (!NarrowTy ||
+          NarrowTy->getAddressSpace() != AddrSpace::NarrowOopAddrSpace)
+        return failBool(DeoptBundleParseErrorCode::InvalidNarrowOopMarker, Pos);
+      Marker.ValueCell =
+          recordCell(DeoptSemanticCellRole::NarrowOopValue, Pos, false);
+      ++Pos;
+      Bundle.NarrowOopMarkers.push_back(Marker);
+    }
+    return true;
+  }
+
+  bool validateReferences() {
+    for (const auto &[WireID, OperandIndex] : References)
+      if (!DescriptorIDs.contains(WireID))
+        return failBool(DeoptBundleParseErrorCode::DanglingVORef, OperandIndex);
+    return true;
+  }
+
+  static std::optional<int32_t> parseWireID(Value *V) {
+    ConstantInt *CI = getIntegerConstant(V, 32);
+    if (!CI || CI->isNegative())
+      return std::nullopt;
+    return static_cast<int32_t>(CI->getZExtValue());
+  }
+
+  static bool isValidWideOop(Value *V) {
+    auto *Ty = dyn_cast<PointerType>(V->getType());
+    if (!Ty || Ty->getAddressSpace() != AddrSpace::JavaHeapAddrSpace)
+      return false;
+    return !isa<Constant>(V) || isa<ConstantPointerNull>(V);
+  }
+
+  static bool isValidScalarValue(HotspotBasicType BasicType, Value *V) {
+    Type *Ty = V->getType();
+    switch (BasicType) {
+    case T_INT:
+      return Ty->isIntegerTy() && Ty->getIntegerBitWidth() <= 32;
+    case T_LONG:
+      return Ty->isIntegerTy(64);
+    case T_FLOAT:
+      return Ty->isFloatTy();
+    case T_DOUBLE:
+      return Ty->isDoubleTy();
+    case T_OBJECT:
+      return isValidWideOop(V);
+    case T_ILLEGAL: {
+      auto *CI = dyn_cast<ConstantInt>(V);
+      return CI && CI->isZero();
+    }
+    default:
+      return false;
+    }
+  }
+
+  ArrayRef<Value *> Inputs;
+  unsigned Pos = 0;
+  ParsedDeoptBundle Bundle;
+  DeoptBundleParseError Error;
+  SmallSet<int32_t, 8> DescriptorIDs;
+  SmallVector<std::pair<int32_t, unsigned>, 8> References;
+};
+
+} // namespace
+
+DeoptBundleParseResult parseDeoptBundleInputs(ArrayRef<Value *> Inputs) {
+  return SemanticDeoptBundleParser(Inputs).parse();
+}
+
+DeoptBundleParseResult parseDeoptBundle(const CallBase &CB) {
+  auto Deopt = CB.getOperandBundle(LLVMContext::OB_deopt);
+  if (!Deopt)
+    return {std::nullopt, {DeoptBundleParseErrorCode::MissingBundle, 0}};
+  SmallVector<Value *, 16> Inputs;
+  Inputs.reserve(Deopt->Inputs.size());
+  for (const Use &Input : Deopt->Inputs)
+    Inputs.push_back(Input.get());
+  return parseDeoptBundleInputs(Inputs);
+}
+
+static bool matchesFingerprint(const ParsedDeoptBundle &Bundle,
+                               ArrayRef<Value *> Inputs) {
+  if (Inputs.size() != Bundle.OriginalInputs.size() ||
+      Inputs.size() != Bundle.Fingerprint.Cells.size())
+    return false;
+  for (unsigned I = 0; I < Inputs.size(); ++I) {
+    Value *Tracked = Bundle.OriginalInputs[I];
+    Value *Input = Inputs[I];
+    const DeoptStructuralCell &Cell = Bundle.Fingerprint.Cells[I];
+    if (!Tracked || Input != Tracked || Cell.OperandIndex != I ||
+        Cell.OperandType != Input->getType())
+      return false;
+    if (Cell.ConstantValue) {
+      auto *CI = dyn_cast<ConstantInt>(Input);
+      if (!CI || CI->getZExtValue() != *Cell.ConstantValue)
+        return false;
+    }
+  }
+  return true;
+}
+
+bool matchesParsedDeoptBundle(const ParsedDeoptBundle &Bundle,
+                              const CallBase &CB) {
+  auto Deopt = CB.getOperandBundle(LLVMContext::OB_deopt);
+  if (!Deopt)
+    return false;
+  SmallVector<Value *, 16> Inputs;
+  Inputs.reserve(Deopt->Inputs.size());
+  for (const Use &Input : Deopt->Inputs)
+    Inputs.push_back(Input.get());
+  return matchesFingerprint(Bundle, Inputs);
+}
+
+bool copyParsedDeoptBundleInputs(const ParsedDeoptBundle &Bundle,
+                                 SmallVectorImpl<Value *> &Out) {
+  SmallVector<Value *, 16> Inputs;
+  Inputs.reserve(Bundle.OriginalInputs.size());
+  for (const WeakTrackingVH &Input : Bundle.OriginalInputs) {
+    Value *V = Input;
+    if (!V)
+      return false;
+    Inputs.push_back(V);
+  }
+  if (!matchesFingerprint(Bundle, Inputs))
+    return false;
+  Out.append(Inputs.begin(), Inputs.end());
+  return true;
+}
 
 std::optional<unsigned>
 findInnermostDeoptScopeBCIPairStart(const CallBase &CB) {

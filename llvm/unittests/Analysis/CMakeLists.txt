@@ -25,6 +25,8 @@ set(ANALYSIS_TEST_SOURCES
   ConstraintSystemTest.cpp
   CtxProfAnalysisTest.cpp
   DDGTest.cpp
+  DeoptPoolBundleLoweringTest.cpp
+  DeoptPoolPlannerTest.cpp
   DomTreeUpdaterTest.cpp
   DXILResourceTest.cpp
   EphemeralValuesCacheTest.cpp

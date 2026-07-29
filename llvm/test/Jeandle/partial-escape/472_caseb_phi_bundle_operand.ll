@@ -3,7 +3,7 @@
 ; Case-B PHI as a deopt-bundle operand. %p = phi(%o, %o) is a Case-B alias
 ; of VO 0 — object IDENTITY, not a derived pointer — so VO 0 is describable
 ; and %p's bundle slot must be rewritten to a VORef. The analysis records the exact
-; root operand in RootOperands and the transform matches it; the PHI itself
+; exact root occurrence in the complete pool plan; the PHI itself
 ; is erased as redundant (its only remaining use was the bundle slot).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)

@@ -75,11 +75,11 @@ handler:
 ; CHECK: live.lpad:
 ; CHECK: handler:
 ; CHECK-NOT: poison
-; The transitive inner descriptor is emitted first: vo_id=0, klass=71602,
-; one offset-16 integer field with value 73.
-; The outer descriptor follows: vo_id=1, klass=71601, one offset-16 VORef
-; field to inner vo_id=0.  The original outer local becomes a VORef to id 1.
-; CHECK-NEXT: call void @safepoint() [ "deopt"(i32 71, i32 71, i64 262156, i64 71602, i32 1, i64 68719476746, i32 73, i64 4295229452, i64 71601, i32 1, i64 68720001036, i32 0, i64 4295491596, i32 1) ]{{$}}
+; Root-first dense numbering emits outer at wire id 0, with one offset-16
+; VORef field to the transitively discovered inner at wire id 1. The inner
+; descriptor has one offset-16 integer field with value 73. The original outer
+; local becomes a VORef to wire id 0.
+; CHECK-NEXT: call void @safepoint() [ "deopt"(i32 71, i32 71, i64 262156, i64 71601, i32 1, i64 68720001036, i32 1, i64 4295229452, i64 71602, i32 1, i64 68719476746, i32 73, i64 524300, i32 0) ]{{$}}
 ; CHECK-NOT: poison
 ; CHECK-NEXT: ret i32 73
 ; CHECK-NOT: load atomic

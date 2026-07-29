@@ -7,17 +7,19 @@
 // SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 //
 // Consume the PEAResult from PartialEscapeAnalysis and apply its effects in
-// two ordered passes driven by Effect::isCfgKill() (Jeandle's analog of
-// Graal's EffectList.apply(graph, obsoleteNodes, cfgKills)).
+// three ordered phases. Ordinary value/state mutations run first, the atomic
+// deopt-pool rewrite observes their final SSA replacements next, and
+// allocation/CFG deletion runs last.
 //
-//   Pass 1 (non-cfgKill): ReplaceLoad, ReplaceCall, EliminateStore,
-//   Materialize, CreatePHI, RewriteDeoptBundle — applied per-block in RPO via
-//   EffectList::apply, which sorts by SeqNo and dispatches each effect's
-//   apply() through TransformContext.
+//   Phase 1 (Ordinary): ReplaceLoad, ReplaceCall, EliminateStore,
+//   Materialize, CreatePHI.
 //
-//   Pass 2 (cfgKill): EliminateAllocation — rewrites a NeverEscapes invoke
-//   alloc into an unconditional branch (dropping the unwind edge) or plain-
-//   erases a call alloc. isCfgKill() is true ONLY for this effect.
+//   Phase 2 (DeoptPool): one atomic whole-pool rewrite per surviving
+//   safepoint.
+//
+//   Phase 3 (CfgKill): EliminateAllocation rewrites a NeverEscapes invoke
+//   allocation into an unconditional branch (dropping the unwind edge) or
+//   erases a plain call allocation.
 //
 // Materialization model: a PartiallyEscapes VO materializes by replaying its
 // tracked field stores and re-emitting its surviving monitorenters onto its
@@ -48,6 +50,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/Jeandle/DeoptPoolBundleLowering.h"
 #include "llvm/Analysis/Jeandle/PartialEscape.h"
 #include "llvm/Analysis/Jeandle/PartialEscapeAnalysis.h"
 #include "llvm/Analysis/Jeandle/PartialEscapeUtils.h"
@@ -68,6 +71,7 @@
 #include "llvm/IR/Metadata.h"
 #include "llvm/IR/Module.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/ErrorHandling.h"
 #include "llvm/Support/MathExtras.h"
 #include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Jeandle/JeandleTransformUtils.h"
@@ -358,11 +362,14 @@ static bool matchExistingReplaySuffix(
   const jeandle::LockReplayBatch *ReplayBatch =
       Result.getLockReplayBatch(InsertBefore);
   for (jeandle::MaterializeEffect *Effect : Ordered) {
+    if (!Effect->hasMutationOwner())
+      return false;
+    jeandle::ObjectID MutationOwner = Effect->getMutationOwner();
     ExpectedReplayFieldGroup Group;
     Group.Receiver = Effect->Target;
-    if (Effect->ObjID < Result.VirtualObjects.size()) {
+    if (MutationOwner < Result.VirtualObjects.size()) {
       const jeandle::VirtualObject &VObj =
-          *Result.VirtualObjects[Effect->ObjID];
+          *Result.VirtualObjects[MutationOwner];
       auto *Allocation = dyn_cast_or_null<CallBase>((Value *)Effect->Target);
       Group.HasDistinctRealAllocation =
           !VObj.IsSynthetic && Allocation &&
@@ -661,10 +668,10 @@ static bool applyMaterialize(Function &F, const jeandle::PEAResult &Result,
                                       Value *> &MaterializedReceiverOf,
                              const DenseMap<const jeandle::MaterializeEffect *,
                                             Instruction *> &OrigInsertBefore) {
-  assert(E.ObjID != jeandle::InvalidObjectID);
+  assert(E.hasMutationOwner());
   assert(E.Target && "Materialize effect must carry a replay receiver");
 
-  jeandle::VirtualObject &VObj = *Result.VirtualObjects[E.ObjID];
+  jeandle::VirtualObject &VObj = *Result.VirtualObjects[E.getMutationOwner()];
   CallBase *OrigAlloc = cast_or_null<CallBase>((Value *)VObj.AllocationCall);
   Value *MatVal = E.Target;
   if (VObj.IsSynthetic)
@@ -834,8 +841,8 @@ struct jeandle::TransformContext {
   DenseMap<Instruction *, SmallVector<jeandle::MaterializeEffect *, 4>>
       &InsertBeforeDependents;
 
-  // effect -> its ORIGINAL escape-point InsertBefore (captured before Pass 1,
-  // before any eager-update re-aim). The lock re-emit looks up
+  // effect -> its ORIGINAL escape-point InsertBefore (captured before the
+  // ordinary phase, before any eager-update re-aim). The lock re-emit looks up
   // LockReplayBatchForSite with this — the key computeEscapePointLocks used —
   // NOT the re-aimed E.InsertBefore, which
   // could miss the key at a multi-object escape point.
@@ -848,14 +855,11 @@ struct jeandle::TransformContext {
   DenseSet<Instruction *> &PreservedReplayInstructions;
   DenseSet<const jeandle::MaterializeEffect *> &ReusedMaterializations;
 
-  // ORIGINAL safepoint CallBase -> its latest rebuilt replacement, so multiple
-  // RewriteDeoptBundleEffects at the same safepoint (a VO plus its transitive
-  // members) accumulate descriptors on ONE rebuilt bundle. Each
-  // RewriteDeoptBundleEffect::apply erases its CB and records the replacement
-  // here; the next effect follows the chain. Keyed on the analysis-time
-  // Safepoint pointer (stable identity; never dereferenced after erasure —
-  // used only as a DenseMap key).
-  DenseMap<CallBase *, CallBase *> SafepointReplacements = {};
+  // Whole-pool effects whose safepoints are guaranteed to be deleted by an
+  // ordinary or cfg-kill effect. They were validated as a unit by preflight
+  // and intentionally do not rebuild a soon-to-die call.
+  const DenseSet<const jeandle::RewriteDeoptPoolEffect *>
+      &SkippedDeoptPoolEffects;
 };
 
 void jeandle::ReplaceLoadEffect::apply(jeandle::TransformContext &Ctx) {
@@ -992,10 +996,11 @@ void jeandle::EliminateAllocationEffect::apply(jeandle::TransformContext &Ctx) {
   // eraseAllocation's existing isJeandleAllocation asserts — the skip here only
   // suppresses the case the model requires (PartiallyEscapes OrigAlloc kept
   // alive). The check is classification-based (not OrigAlloc-pointer-based):
-  // a RewriteDeoptBundleEffect may have cloned this allocation's invoke in
-  // Pass 1 (its deopt bundle carries another VO's descriptor), so the live
+  // the deopt-pool phase may have cloned this allocation's invoke, so the live
   // instruction is the clone — the classification is clone-proof.
-  auto ClassIt = Ctx.Result.EscapeClassification.find(ObjID);
+  assert(hasMutationOwner() &&
+         "allocation elimination must have a mutation owner");
+  auto ClassIt = Ctx.Result.EscapeClassification.find(getMutationOwner());
   if (ClassIt != Ctx.Result.EscapeClassification.end() &&
       ClassIt->second == jeandle::PEAResult::EscapeKind::PartiallyEscapes)
     return;
@@ -1044,244 +1049,46 @@ void jeandle::CreatePHIEffect::apply(jeandle::TransformContext &Ctx) {
   Ctx.Changed = true;
 }
 
-// Rewrite a safepoint's "deopt" operand bundle so a never-escaping virtual
-// object referenced in it is described by a VO descriptor instead of a
-// (soon-to-be-poisoned) OrigAlloc reference. Non-cfgKill (Pass 1): MUST run
-// before Pass 2's EliminateAllocation RAUWs OrigAlloc to poison, otherwise
-// the bundle operand would be poisoned (the analysis records this effect and
-// the analyzer's generic escape path skips the handled bundle operand, so the
-// object stays NeverEscapes and reaches Pass 2 with the bundle already
-// rewritten).
-void jeandle::RewriteDeoptBundleEffect::apply(jeandle::TransformContext &Ctx) {
-  // The analyzer records this effect ONLY for a VO that is virtual at this
-  // safepoint (recordDeoptBundleMappings gates on resolveVirtualRef =
-  // ObjectState present & virtual). NeverEscapes VOs are virtual at every
-  // safepoint; a PartiallyEscapes VO is virtual before its escape point
-  // (described here) and materialized at/after it (NOT recorded → its real
-  // OrigAlloc bundle operand is left untouched). So every recorded effect
-  // becomes a descriptor — no classification guard. (AlwaysEscapes effects were
-  // dropped by the analyzer.)
-  //
-  // Several RewriteDeoptBundleEffects may target the SAME safepoint (a VO plus
-  // its transitive members). Each effect rebuilds the deopt bundle and erases
-  // the prior CB; resolve the CURRENT CB by following the replacement chain
-  // keyed on the analysis-time Safepoint (never dereferenced post-erasure —
-  // used only as a DenseMap identity key). If there is no recorded replacement,
-  // fall back to SafepointVH (the WeakTrackingVH follower): it must still be
-  // the ORIGINAL safepoint — a follow to a DIFFERENT value means the call was
-  // RAUW'd by a sibling effect (e.g. a JavaOp fold replaced it with a
-  // constant), so its bundle is gone and the rewrite must no-op. (This is what
-  // makes co-emitting a Rewrite with a ReplaceCall on the same call safe.)
-  CallBase *CB = nullptr;
-  if (auto It = Ctx.SafepointReplacements.find(Safepoint);
-      It != Ctx.SafepointReplacements.end())
-    CB = It->second;
-  else if ((Value *)SafepointVH == (Value *)Safepoint)
-    CB = Safepoint;
-  if (!CB || !CB->getParent())
-    return; // safepoint erased (e.g. folded away) — nothing to rewrite.
-  auto Deopt = CB->getOperandBundle(LLVMContext::OB_deopt);
-  if (!Deopt)
-    return; // bundle gone — nothing to rewrite.
-
-  jeandle::VirtualObject &VObj = *Ctx.Result.VirtualObjects[ObjID];
-  // The root identity matched in bundle slots: SyntheticPhi for a synthetic
-  // VO, AllocationCall (OrigAlloc) for an ordinary VO. A synthetic's
-  // AllocationCall is BORROWED from a source and MUST NOT be matched here —
-  // matching it would cross-rewrite a source's own bundle slot when pred-0
-  // dominates the safepoint (e.g. a loop-preheader Case-C shape). Mirrors
-  // applyMaterialize, which replays a synthetic onto SyntheticPhi.
-  Value *RootIdentity =
-      VObj.IsSynthetic ? VObj.SyntheticPhi : VObj.AllocationCall;
-  assert(RootIdentity && "virtual VO missing root identity");
-  uint64_t Klass = VObj.Klass;
-  unsigned VObjID = ObjID;
-
-  // Build the (basic_type, value) field pairs in declaration (byte-offset)
-  // order. Each FieldValue is either Scalar (a plain scalar field) or
-  // VirtualRef(InnerID) (a field referencing another in-scope VO, emitted as a
-  // VORef field by id). The analyzer's greatest-fixpoint guarantees every
-  // VORef target is itself described at this safepoint.
-  SmallVector<MaterializeEffect::FieldEntry, 8> SortedFields(Fields);
-  llvm::sort(SortedFields, [](const MaterializeEffect::FieldEntry &A,
-                              const MaterializeEffect::FieldEntry &B) {
-    return A.Offset < B.Offset;
-  });
-  SmallVector<VODescriptorField, 8> FieldPairs;
-  for (const MaterializeEffect::FieldEntry &FE : SortedFields) {
-    if (FE.Value.isVirtualRef()) {
-      FieldPairs.push_back({FE.Offset, jeandle::T_OBJECT, /*IsVORef=*/true,
-                            nullptr, FE.Value.getVirtualRef()});
-    } else {
-      assert(FE.Value.isScalar() &&
-             "scoped deopt field must be Scalar or VirtualRef");
-      jeandle::HotspotBasicType BT =
-          jeandle::LLVM2JavaComputational(FE.Value.getDeclaredType());
-      assert(BT != jeandle::T_ILLEGAL && "scoped deopt field has illegal type");
-      Value *FieldV = FE.Value.getScalar();
-      // Same unparented-value hardening as applyMaterialize.
-      if (FieldV) {
-        spliceUnparentedAt(CB, FieldV);
-        assert((isa<Constant>(FieldV) || isa<Argument>(FieldV) ||
-                cast<Instruction>(FieldV)->getParent() != nullptr) &&
-               "deopt descriptor field value must be a constant, argument, "
-               "or in-IR instruction");
-      }
-      FieldPairs.push_back({FE.Offset, BT, /*IsVORef=*/false, FieldV, 0});
-    }
-  }
-
-  // The VO descriptor section sits in the ROOT (outermost) scope, AFTER the
-  // FIRST duplicated-BCI marker and BEFORE the root scope's locals section —
-  // the deopt-point-level object pool (see getDeoptScopeVOInsertPos).
-  // Anything before InsertPos (the root scope's header) is preserved
-  // verbatim; everything from InsertPos on — ALL scopes' locals/stack/monitor
-  // sections — is scanned for slots to rewrite.
-  unsigned InsertPos = getDeoptScopeVOInsertPos(*CB);
-
-  // A bundle operand denotes this VO iff it is the RootIdentity (SyntheticPhi
-  // for a synthetic, OrigAlloc for an ordinary VO) OR one of the
-  // analysis-recorded RootOperands (identity aliases: Case-B PHI / freeze /
-  // offset-0 select / offset-0 GEP / load-through result — see
-  // RewriteDeoptBundleEffect::RootOperands in PartialEscape.h). A load-through
-  // alias is RAUW'd to OrigAlloc by its ReplaceLoad before this effect applies
-  // (covered by the RootIdentity match for an ordinary VO); the other shapes
-  // are never RAUW'd and are covered by RootOperands (WeakTrackingVH, so each
-  // handle follows any earlier RAUW). A synthetic's SyntheticPhi is itself an
-  // identity alias registered by synthesizeCaseC, so it appears in RootOperands
-  // as well as being the RootIdentity.
-  auto IsRootOperand = [&](Value *V) {
-    if (V == RootIdentity)
-      return true;
-    for (const WeakTrackingVH &RO : RootOperands)
-      if ((Value *)RO == V)
-        return true;
-    return false;
-  };
-
-  // Confirm the VO is still a bundle input (it may have been scrubbed by an
-  // earlier transform step). A ROOT (OrigAllocInBundle) requires a root
-  // operand present — bail to avoid an orphan descriptor whose slot is
-  // already gone. A TRANSITIVE member (OrigAllocInBundle=false) is referenced
-  // only via another VO's VORef field, so it is never a bundle operand itself
-  // — proceed and emit the descriptor unconditionally.
-  bool OrigAllocPresent = false;
-  for (unsigned i = InsertPos; i < Deopt->Inputs.size(); ++i)
-    if (IsRootOperand(Deopt->Inputs[i].get())) {
-      OrigAllocPresent = true;
-      break;
-    }
-  if (!OrigAllocPresent && OrigAllocInBundle)
+void jeandle::RewriteDeoptPoolEffect::apply(jeandle::TransformContext &Ctx) {
+  if (Ctx.SkippedDeoptPoolEffects.count(this))
     return;
 
-  LLVMContext &CtxV = CB->getContext();
+  // SafepointVH may follow an ordinary replacement. The raw key is deliberately
+  // not followed: only the original call carries the source bundle validated
+  // by this effect's immutable plan.
+  Value *Tracked = SafepointVH;
+  if (Tracked != SafepointKey)
+    return;
+  CallBase *CB = SafepointKey;
+  assert(CB->getParent() && CB->getFunction() == &Ctx.F &&
+         "preflighted deopt-pool safepoint must remain in its function");
+  if (!getPlan().needsRewrite())
+    return;
 
-  SmallVector<Value *, 16> Args;
-  Args.reserve(Deopt->Inputs.size() + 4 + FieldPairs.size() * 2);
-  IRBuilder<> B(CtxV);
+  pea::SerializeFinalDeoptPoolBundleResult Serialized =
+      pea::serializeFinalDeoptPoolBundlePlan(getPlan(), *CB);
+  if (!Serialized.Inputs)
+    llvm_unreachable(
+        "preflighted deopt-pool plan became stale before application");
 
-  // 1. prefix + duplicated-BCI pair.
-  for (unsigned i = 0; i < InsertPos; ++i)
-    Args.push_back(Deopt->Inputs[i].get());
-
-  // 2. VO descriptor (ScalarValueType header + klass + field_count + fields).
-  // The header basicType is T_ARRAY for an array VO (HotSpot's parser
-  // dispatches on it to rebuild a uniform array rather than walk an
-  // InstanceKlass layout) and T_OBJECT for an instance VO.
-  appendVirtualObjectDescriptor(Args, B, Klass, VObjID, VObj.isArray(),
-                                FieldPairs);
-
-  // 3. remainder (locals/stack/monitors/orig_pc): copy verbatim, but each
-  //    slot whose value is OrigAlloc becomes a VORefType reference
-  //    (encoding + vo_id). The preceding appended entry was that slot's
-  //    encoding; pop it and emit the VORef slot in its place. OrigAlloc is a
-  //    pointer, so it only ever appears at a value position (preceded by its
-  //    ConstantInt encoding), never at an encoding position.
-  //
-  //    A MONITOR entry whose owner is OrigAlloc (a PEA-eliminated lock on this
-  //    virtual VO) is rewritten in place to {enc(MonitorType, index=1), vo-id,
-  //    basic_lock} — the owner becomes a VORef by vo-id and the lock is marked
-  //    eliminated so HotSpot relock_objects re-acquires it on the realloc'd
-  //    owner. The basic_lock slot (the bundle input AFTER the owner) is
-  //    preserved verbatim; ObjectSynchronizer::enter initializes it at relock,
-  //    so a never-written (folded-monitorenter) slot is safe. A real (non-
-  //    eliminated) lock on a MATERIALIZED VO has no RewriteDeoptBundleEffect
-  //    (its OrigAlloc is never rewritten), so it is left untouched here — the
-  //    standard eliminated=false, owner=OrigAlloc path.
-  for (unsigned i = InsertPos; i < Deopt->Inputs.size(); ++i) {
-    Value *V = Deopt->Inputs[i].get();
-    if (IsRootOperand(V)) {
-      assert(i > InsertPos && !Args.empty() &&
-             "root-identity slot missing its preceding encoding");
-      assert(isa<ConstantInt>(Args.back()) &&
-             "deopt slot encoding must be a ConstantInt");
-      uint64_t SlotEnc = cast<ConstantInt>(Args.back())->getZExtValue();
-      auto SlotVT = jeandle::DeoptValueEncoding::decode(SlotEnc).valueType();
-      if (SlotVT == jeandle::DeoptValueEncoding::MonitorType) {
-        // Eliminated-lock monitor: owner = VORef(vo-id), eliminated=true.
-        // index=1 in the monitor encoding is the eliminated-VORef-owner tag
-        // (see DeoptValueEncoding::MonitorType in Deoptimization.h).
-        Args.pop_back();
-        Constant *MonEnc = ConstantInt::get(
-            Type::getInt64Ty(CtxV),
-            jeandle::DeoptValueEncoding(
-                /*Index=*/1, jeandle::DeoptValueEncoding::MonitorType,
-                jeandle::T_OBJECT)
-                .encode());
-        Args.push_back(MonEnc);
-        Args.push_back(B.getInt32(VObjID));
-      } else {
-        // Preserve the slot's Local/Stack identity so the HotSpot parser
-        // routes the VORef to the correct interpreter array (locals vs
-        // expression stack); the parser routes every entry by encoding type,
-        // so a single VORef type would misroute a VO-ref living in a stack
-        // slot.
-        assert((SlotVT == jeandle::DeoptValueEncoding::LocalType ||
-                SlotVT == jeandle::DeoptValueEncoding::StackType) &&
-               "root-identity deopt slot must be Local/Stack/Monitor");
-        Args.pop_back();
-        auto RefVT = (SlotVT == jeandle::DeoptValueEncoding::LocalType)
-                         ? jeandle::DeoptValueEncoding::VORefLocalType
-                         : jeandle::DeoptValueEncoding::VORefStackType;
-        Constant *VORefEnc = ConstantInt::get(
-            Type::getInt64Ty(CtxV),
-            jeandle::DeoptValueEncoding(VObjID, RefVT, jeandle::T_OBJECT)
-                .encode());
-        Args.push_back(VORefEnc);
-        Args.push_back(B.getInt32(VObjID));
-      }
-    } else {
-      Args.push_back(V);
-    }
+  for (Value *V : *Serialized.Inputs) {
+    spliceUnparentedAt(CB, V);
+    assert((!isa<Instruction>(V) || cast<Instruction>(V)->getParent()) &&
+           "deopt-pool token must be available before the safepoint");
   }
 
-  // 4. Rebuild the safepoint with the new "deopt" bundle. CallBase::Create
-  //    clones CB with the bundle matching the tag replaced and every other
-  //    bundle (funclet, gc-transition, ...) preserved; the clone is inserted
-  //    before CB, then CB is RAUW'd and erased (same pattern as
-  //    CFGuard/GlobalOpt). NewCB lands in CB's block, so its normal/unwind
-  //    dests keep CB's block as a predecessor — no PHI unwiring is needed.
-  CallBase *NewCB =
-      CallBase::Create(CB, OperandBundleDef("deopt", Args), CB->getIterator());
+  CallBase *NewCB = CallBase::Create(
+      CB, OperandBundleDef("deopt", *Serialized.Inputs), CB->getIterator());
   NewCB->takeName(CB);
-  // Eager-update: re-aim any Materialize whose InsertBefore is CB to the clone
-  // (same program point) — the InsertBeforeDependents index is keyed on the
-  // old CB, which is about to be erased.
-  relocateDependentMaterializes(Ctx.InsertBeforeDependents, CB, NewCB);
   CB->replaceAllUsesWith(NewCB);
   CB->eraseFromParent();
-  // Record the replacement keyed on the ORIGINAL Safepoint so a subsequent
-  // RewriteDeoptBundleEffect at this safepoint resolves NewCB (CB has been
-  // erased above).
-  Ctx.SafepointReplacements[Safepoint] = NewCB;
   Ctx.Changed = true;
 }
 
-// Apply every effect where isCfgKill()==CfgKills, in SeqNo order (Jeandle's
-// substitute for Graal's list-order — see Effect::SeqNo). Pass 1 calls this
-// with CfgKills=false (every effect except EliminateAllocation); Pass 2 with
-// CfgKills=true (EliminateAllocation only).
-void jeandle::EffectList::apply(jeandle::TransformContext &Ctx, bool CfgKills) {
+// Apply one explicit effect phase in SeqNo order (Jeandle's substitute for
+// Graal's list-order — see Effect::SeqNo).
+void jeandle::EffectList::apply(jeandle::TransformContext &Ctx,
+                                jeandle::Effect::Phase Phase) {
   SmallVector<jeandle::Effect *, 16> Order;
   Order.reserve(Effects.size());
   for (auto &E : Effects)
@@ -1290,9 +1097,105 @@ void jeandle::EffectList::apply(jeandle::TransformContext &Ctx, bool CfgKills) {
     return A->SeqNo < B->SeqNo;
   });
   for (jeandle::Effect *E : Order)
-    if (E->isCfgKill() == CfgKills)
+    if (E->getPhase() == Phase)
       E->apply(Ctx);
 }
+
+namespace {
+
+struct DeoptPoolPreflight {
+  DenseSet<CallBase *> GuaranteedDeletedSafepoints;
+  DenseSet<const jeandle::RewriteDeoptPoolEffect *> SkippedEffects;
+};
+
+// A matching ReplaceCall is guaranteed to erase Site unless replay-suffix
+// matching retains it. Calls retained by that mechanism are monitorenters;
+// an oop-handle replacement or an immutable SSA replacement is
+// unconditionally available when the effect applies.
+static bool
+guaranteesSafepointDeletion(const jeandle::ReplaceCallEffect &Effect,
+                            CallBase *Site) {
+  if (Effect.getTarget() != Site || jeandle::pea::isJeandleMonitorEnter(Site))
+    return false;
+  Value *Replacement = Effect.Replacement;
+  return (!Replacement && Site->use_empty()) || Effect.OopHandleId >= 0 ||
+         isa_and_nonnull<Constant>(Replacement) ||
+         isa_and_nonnull<Argument>(Replacement);
+}
+
+static bool
+guaranteesSafepointDeletion(const jeandle::EliminateAllocationEffect &Effect,
+                            const jeandle::PEAResult &Result, CallBase *Site) {
+  if (Effect.getTarget() != Site || !Effect.hasMutationOwner())
+    return false;
+  auto It = Result.EscapeClassification.find(Effect.getMutationOwner());
+  return It != Result.EscapeClassification.end() &&
+         It->second == jeandle::PEAResult::EscapeKind::NeverEscapes;
+}
+
+// Validate every whole-pool transaction before splitReplayEdges or any other
+// IR mutation. Serialization checks both the exact source fingerprint and all
+// tracked output values/types. A site that is provably deleted does not need a
+// rebuilt bundle, but still participates in the one-effect-per-safepoint
+// invariant.
+static bool preflightDeoptPoolEffects(const Function &F,
+                                      const jeandle::PEAResult &Result,
+                                      DeoptPoolPreflight &Preflight) {
+  for (const auto &KV : Result.BlockEffects)
+    for (const jeandle::Effect &Effect : KV.second) {
+      if (const auto *Replace = dyn_cast<jeandle::ReplaceCallEffect>(&Effect)) {
+        auto *Site = dyn_cast_or_null<CallBase>(Replace->getTarget());
+        if (Site && guaranteesSafepointDeletion(*Replace, Site))
+          Preflight.GuaranteedDeletedSafepoints.insert(Site);
+        continue;
+      }
+      if (const auto *Eliminate =
+              dyn_cast<jeandle::EliminateAllocationEffect>(&Effect)) {
+        auto *Site = dyn_cast_or_null<CallBase>(Eliminate->getTarget());
+        if (Site && guaranteesSafepointDeletion(*Eliminate, Result, Site))
+          Preflight.GuaranteedDeletedSafepoints.insert(Site);
+      }
+    }
+
+  DenseSet<CallBase *> SeenSafepoints;
+  for (const auto &KV : Result.BlockEffects)
+    for (const jeandle::Effect &Effect : KV.second) {
+      const auto *Pool = dyn_cast<jeandle::RewriteDeoptPoolEffect>(&Effect);
+      if (!Pool)
+        continue;
+      CallBase *Site = Pool->getSafepointKey();
+      if (!Site || !Pool->hasPlan() || Effect.hasMutationOwner() ||
+          !SeenSafepoints.insert(Site).second)
+        return false;
+      if (Pool->getTarget() != Site || !Site->getParent() ||
+          Site->getFunction() != &F)
+        return false;
+      if (Preflight.GuaranteedDeletedSafepoints.count(Site)) {
+        Preflight.SkippedEffects.insert(Pool);
+        continue;
+      }
+      jeandle::pea::SerializeFinalDeoptPoolBundleResult Serialized =
+          jeandle::pea::serializeFinalDeoptPoolBundlePlan(Pool->getPlan(),
+                                                          *Site);
+      if (!Serialized.Inputs)
+        return false;
+    }
+  return true;
+}
+
+static std::optional<unsigned> getDeoptSemanticCell(const CallBase &Site,
+                                                    const Use &U) {
+  std::optional<OperandBundleUse> Deopt =
+      Site.getOperandBundle(LLVMContext::OB_deopt);
+  if (!Deopt)
+    return std::nullopt;
+  for (unsigned I = 0; I < Deopt->Inputs.size(); ++I)
+    if (&Deopt->Inputs[I] == &U)
+      return I;
+  return std::nullopt;
+}
+
+} // namespace
 
 PreservedAnalyses PartialEscapeTransform::run(Function &F,
                                               FunctionAnalysisManager &FAM) {
@@ -1310,6 +1213,15 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
     return PreservedAnalyses::all();
   assert(Result.hasUniqueEffectSequenceNumbers() &&
          "PEA effect sequence numbers must be globally unique");
+  for (const auto &KV : Result.BlockEffects)
+    for (const jeandle::Effect &Effect : KV.second)
+      assert(Effect.hasValidMutationOwner() &&
+             "only an atomic deopt-pool effect may be ownerless");
+
+  DeoptPoolPreflight PoolPreflight;
+  if (!preflightDeoptPoolEffects(F, Result, PoolPreflight))
+    return PreservedAnalyses::all();
+
 #ifndef NDEBUG
   DenseSet<Instruction *> RemovedTargets;
   for (const auto &KV : Result.BlockEffects)
@@ -1345,19 +1257,33 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
           if (!Bundle.isDeoptOperandBundle())
             return jeandle::pea::isPEAHandledNonEscapingIntrinsic(
                 dyn_cast<IntrinsicInst>(CB));
+          if (PoolPreflight.GuaranteedDeletedSafepoints.count(CB))
+            return true;
+          std::optional<unsigned> SemanticCell = getDeoptSemanticCell(*CB, U);
+          if (!SemanticCell)
+            return false;
           for (const auto &EffectsKV : Result.BlockEffects)
             for (const jeandle::Effect &E : EffectsKV.second) {
-              const auto *RE = dyn_cast<jeandle::RewriteDeoptBundleEffect>(&E);
-              if (!RE || RE->Safepoint != CB)
+              const auto *Pool = dyn_cast<jeandle::RewriteDeoptPoolEffect>(&E);
+              if (!Pool || Pool->getSafepointKey() != CB)
                 continue;
-              if (E.ObjID == KV.first && RE->OrigAllocInBundle &&
-                  U.get() == Allocation)
+              if (Pool->coversExactOccurrence(*SemanticCell, KV.first))
                 return true;
-              if (llvm::any_of(RE->RootOperands,
-                               [&](const WeakTrackingVH &Root) {
-                                 return (Value *)Root == U.get();
-                               }))
-                return true;
+              for (jeandle::pea::CurrentDeoptNodeID CurrentID :
+                   Pool->getPlan().graph().currentMembers())
+                if (Pool->coversExactOccurrence(*SemanticCell, CurrentID) &&
+                    Result.currentIdentityRepresentsSource(CurrentID, KV.first))
+                  return true;
+              for (const auto &Occurrence :
+                   Pool->getPlan().currentOccurrences())
+                if (Occurrence.Disposition ==
+                        jeandle::pea::FinalDeoptPoolOccurrenceDisposition::
+                            RemovedByPruning &&
+                    Occurrence.SemanticCell &&
+                    *Occurrence.SemanticCell == *SemanticCell &&
+                    Result.currentIdentityRepresentsSource(Occurrence.CurrentID,
+                                                           KV.first))
+                  return true;
             }
           return false;
         });
@@ -1381,7 +1307,8 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
   ReversePostOrderTraversal<Function *> RPOT(&F);
 
   // Build the per-escape-point merged lock lists (one global depth-sort per
-  // materialize point) before Pass 1 applies effects. Re-entrant interleaved
+  // materialize point) before the ordinary phase applies effects. Re-entrant
+  // interleaved
   // lock stacks across objects at one escape point MUST be re-emitted as ONE
   // globally depth-sorted list (per-object emission would mis-order them on
   // the runtime lock stack).
@@ -1397,9 +1324,9 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
   DenseMap<Instruction *, SmallVector<jeandle::MaterializeEffect *, 4>>
       InsertBeforeDependents;
   // Each Materialize effect's edge-normalized InsertBefore, captured here
-  // before Pass 1 and before any eager-update re-aim. computeEscapePointLocks
-  // keys LockReplayBatchForSite by this same normalized instruction, so the
-  // lock re-emit must look up with it — NOT with
+  // before the ordinary phase and before any eager-update re-aim.
+  // computeEscapePointLocks keys LockReplayBatchForSite by this same
+  // normalized instruction, so the lock re-emit must look up with it — NOT with
   // E.InsertBefore, which relocateDependentMaterializes may re-aim to the
   // in-block successor for a materialize. Using the re-aimed value would
   // miss the final physical batch.
@@ -1431,12 +1358,7 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
   }
 
   // -------------------------------------------------------------------------
-  // Pass 1: non-cfgKill effects (ReplaceLoad, ReplaceCall, EliminateStore,
-  // Materialize, CreatePHI) — applied per-block in RPO via EffectList::apply,
-  // which sorts by SeqNo and dispatches each effect's apply() through
-  // TransformContext (Jeandle's analog of Graal's
-  // apply(graph, obsoleteNodes, cfgKills=false)). isCfgKill() partitions the
-  // two passes; EliminateAllocation is the only cfgKill, so it is skipped here.
+  // Phase 1: ordinary effects establish the final SSA values and replay state.
   // -------------------------------------------------------------------------
   jeandle::TransformContext Ctx{F,
                                 Result,
@@ -1445,30 +1367,41 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
                                 InsertBeforeDependents,
                                 OrigInsertBefore,
                                 PreservedReplayInstructions,
-                                ReusedMaterializations};
+                                ReusedMaterializations,
+                                PoolPreflight.SkippedEffects};
 
   for (BasicBlock *BB : RPOT) {
     auto It = Result.BlockEffects.find(BB);
     if (It == Result.BlockEffects.end())
       continue;
-    It->second.apply(Ctx, /*CfgKills=*/false);
+    It->second.apply(Ctx, jeandle::Effect::Phase::Ordinary);
   }
 
   // -------------------------------------------------------------------------
-  // Pass 2: cfgKill effects (EliminateAllocation only) — same dispatch with
-  // CfgKills=true. NeverEscapes OrigAllocs are erased here; PartiallyEscapes
-  // OrigAllocs are skipped (EscapeClassification check in
-  // EliminateAllocationEffect::apply) and stay alive.
+  // Phase 2: rewrite each surviving safepoint's complete deopt object pool
+  // after ordinary replacements have settled and before allocation identities
+  // can be deleted.
   // -------------------------------------------------------------------------
   for (BasicBlock *BB : RPOT) {
     auto It = Result.BlockEffects.find(BB);
     if (It == Result.BlockEffects.end())
       continue;
-    It->second.apply(Ctx, /*CfgKills=*/true);
+    It->second.apply(Ctx, jeandle::Effect::Phase::DeoptPool);
+  }
+
+  // -------------------------------------------------------------------------
+  // Phase 3: allocation/CFG kills. NeverEscapes OrigAllocs are erased here;
+  // PartiallyEscapes OrigAllocs remain alive.
+  // -------------------------------------------------------------------------
+  for (BasicBlock *BB : RPOT) {
+    auto It = Result.BlockEffects.find(BB);
+    if (It == Result.BlockEffects.end())
+      continue;
+    It->second.apply(Ctx, jeandle::Effect::Phase::CfgKill);
   }
 
   // Erase parented Case-B alias PHIs that the analyzer flagged
-  // as redundant for NeverEscapes VOs. Pass 2 above already RAUW'd
+  // as redundant for NeverEscapes VOs. The cfg-kill phase above already RAUW'd
   // every OrigAlloc incoming to poison via eraseAllocation, so the
   // PHIs survive as `phi [poison, poison]`. Replace each with poison
   // and erase. WeakTrackingVH auto-nulls if some other code path
@@ -1529,7 +1462,8 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
 
   // Sweep trivially-dead instructions that became unused after our rewrites
   // (e.g., GEPs derived from eliminated allocations whose only users were the
-  // loads/stores we replaced in Pass 1). Iterate to fixpoint so cascading
+  // loads/stores we replaced in the ordinary phase). Iterate to fixpoint so
+  // cascading
   // deaths are caught.
   bool LocalChanged = true;
   while (LocalChanged) {

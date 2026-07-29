@@ -292,13 +292,14 @@ unwind:
 ; CHECK-NEXT: %[[ELEM:[-A-Za-z$._0-9]+]] = getelementptr inbounds i8, ptr addrspace(1) %outer, i64 24
 ; CHECK-NEXT: store atomic ptr addrspace(1) %child, ptr addrspace(1) %[[ELEM]] unordered, align 8
 ; CHECK-NEXT: call void @safepoint()
-; independent descriptor: vo-id 2, klass 68911, zero fields.
+; The independent object is the only descriptor, so dense numbering assigns
+; it wire id 0: klass 68911, zero fields.
 ; CHECK-SAME: [ "deopt"(i32 6, i32 6,
-; CHECK-SAME: i64 8590196748, i64 68911, i32 0,
+; CHECK-SAME: i64 262156, i64 68911, i32 0,
 ; CHECK-SAME: i64 12, ptr addrspace(1) %outer,
 ; CHECK-SAME: i64 4294967308, ptr addrspace(1) %child,
-; independent root slot -> VORef id 2.
-; CHECK-SAME: i64 8590458892, i32 2) ]
+; independent root slot -> VORef wire id 0.
+; CHECK-SAME: i64 524300, i32 0) ]
 ; CHECK-NEXT: ret void
 
 ; A malformed root connected to a cycle must make the entire cycle real.

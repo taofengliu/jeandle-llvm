@@ -39,15 +39,16 @@ u:
 ; CHECK: %x = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
 ; %y is NeverEscapes — eliminated; only %x's invoke survives.
 ; CHECK-NOT: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
-; The bundle describes %y (vo_id=1: (1<<32)|(4<<16)|12 = 4295229452) with its
-; field as a LIVE oop reference to %x's OrigAlloc (LocalType/T_OBJECT at
+; The bundle's only reachable virtual object is %y, so its canonical wire ID
+; is 0 and its descriptor header is (0<<32)|(4<<16)|12 = 262156. Its field is
+; a LIVE oop reference to %x's OrigAlloc (LocalType/T_OBJECT at
 ; offset 8: (8<<32)|(0<<16)|12 = 34359738380), followed by %x itself.
 ; CHECK: call void @foo(ptr addrspace(1) %x)
-; CHECK-SAME: [ "deopt"(i32 99, i32 99, i64 4295229452, i64 22222, i32 1,
+; CHECK-SAME: [ "deopt"(i32 99, i32 99, i64 262156, i64 22222, i32 1,
 ; CHECK-SAME: i64 34359738380, ptr addrspace(1) %x,
-; %y's locals slot becomes a VORefLocalType reference (vo_id=1):
-; (1<<32)|(8<<16)|12 = 4295491596, followed by i32 1.
-; CHECK-SAME: i64 4295491596, i32 1) ]
+; %y's locals slot becomes a VORefLocalType reference to wire ID 0:
+; (0<<32)|(8<<16)|12 = 524300, followed by i32 0.
+; CHECK-SAME: i64 524300, i32 0) ]
 ; CHECK-NOT: poison
 
 !java-method-compilation = !{}

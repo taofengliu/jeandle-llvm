@@ -8,11 +8,11 @@
 ; TRANSITIVE member of the described set.
 ;
 ; Both must be described: %a's ref field is a VORef FIELD (encoding ValueTy =
-; VORefLocalType, value slot = i32 vo-id of %b), and %b gets its own descriptor
-; (referenced by id from %a's field) with NO bundle slot rewritten (its OrigAlloc
-; is not a bundle operand). This mirrors C2/Graal nested ObjectValue + id
-; back-ref. Asserts the transitive closure is complete: no VORef to an
-; undescribed VO.
+; VORefLocalType, value slot = i32 wire ID of %b), and %b gets its own
+; descriptor (referenced by ID from %a's field) with NO bundle slot rewritten
+; (its OrigAlloc is not a bundle operand). This mirrors C2/Graal nested
+; ObjectValue + ID back-ref. Asserts the transitive closure is complete: no
+; VORef to an undescribed VO.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(i32, i32)
@@ -49,29 +49,30 @@ u:
 }
 
 ; Check the high-level shape via -jeandle-trace-pea-free reasoning: FileCheck
-; the emitted bundle. vo-ids: %a=0 (allocated first), %b=1.
+; the emitted bundle. Canonical root-first pool order assigns wire ID 0 to %a
+; and wire ID 1 to its transitive dependency %b.
 ; CHECK-LABEL: define void @transitive_voref_field
 ; Both OrigAllocs are eliminated (NeverEscapes).
 ; CHECK-NOT: jeandle.new_instance
 ; CHECK: call void @sink(i32 %x, i32 %y)
 ; CHECK-SAME: [ "deopt"(
 ; CHECK-SAME: i32 99, i32 99,
-; Descriptors are emitted at the VO-section front in SeqNo order; the second
-; effect (transitive %b) inserts before %a's descriptor. So %b's descriptor
-; (vo_id=1) precedes %a's (vo_id=0).
-; descriptor b header (vo_id=1, ScalarValueType, T_OBJECT): (1<<32)|(4<<16)|12 = 4295229452
-; CHECK-SAME: i64 4295229452, i64 200, i32 1,
-; b field 0 (offset 8, LocalType/T_INT): (8<<32)|10 = 34359738378 -> value %y
-; CHECK-SAME: i64 34359738378, i32 %y,
-; descriptor a header (vo_id=0, ScalarValueType, T_OBJECT): (0<<32)|(4<<16)|12 = 262156
+; Descriptors are emitted in canonical wire-ID order.
+; Descriptor a header (wire ID 0, ScalarValueType, T_OBJECT):
+; (0<<32)|(4<<16)|12 = 262156.
 ; CHECK-SAME: i64 262156, i64 100, i32 2,
 ; a field 0 (offset 8, LocalType/T_INT): (8<<32)|10 = 34359738378 -> value %x
 ; CHECK-SAME: i64 34359738378, i32 %x,
 ; a field 1 (offset 16, VORefLocalType/T_OBJECT): (16<<32)|(8<<16)|12 = 68720001036
-;   -> value is the i32 vo-id of %b (1)
+;   -> value is the i32 wire ID of %b (1)
 ; CHECK-SAME: i64 68720001036, i32 1,
+; Descriptor b header (wire ID 1, ScalarValueType, T_OBJECT):
+; (1<<32)|(4<<16)|12 = 4295229452.
+; CHECK-SAME: i64 4295229452, i64 200, i32 1,
+; b field 0 (offset 8, LocalType/T_INT): (8<<32)|10 = 34359738378 -> value %y
+; CHECK-SAME: i64 34359738378, i32 %y,
 ; the OrigAlloc locals slot for %a is replaced by a VORefLocalType reference
-; (vo_id=0): (0<<32)|(8<<16)|12 = 524300, followed by vo_id i32 0.
+; to wire ID 0: (0<<32)|(8<<16)|12 = 524300, followed by i32 0.
 ; CHECK-SAME: i64 524300, i32 0) ]
 ; The eliminated OrigAllocs must not appear in the bundle.
 ; CHECK-NOT: addrspace(1) %a

@@ -4,7 +4,7 @@
 ; from a virtual VO stored into another virtual VO (o.f = p.g), then the
 ; outer VO is described in a deopt bundle. The folded load (%lg) gets a
 ; scalar alias + a ReplaceLoad effect that erases it in Pass 1;
-; RewriteDeoptBundleEffect::apply must emit the NORMALIZED terminal %x in
+; the whole-pool rewrite must emit the NORMALIZED terminal %x in
 ; the VO descriptor, not the freed %lg.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
@@ -36,22 +36,21 @@ u:
   resume i64 %lp
 }
 
-; Both VOs are NeverEscapes (eliminated); %o is described in the bundle.
-; vo-ids: %p=0 (allocated first, described nowhere — it has no bundle use and
-; is not referenced by %o's descriptor... wait: %o's only field is the scalar
-; %x, so %p needs no descriptor; %o gets vo-id 1 after %p's registration).
-; Descriptor %o (vo_id=1, ScalarValueType, T_OBJECT): (1<<32)|(4<<16)|12 = 4295229452
+; Both VOs are NeverEscapes (eliminated). Only %o is reachable from the bundle,
+; so the canonical deopt pool contains one descriptor with wire ID 0.
+; Descriptor %o (wire ID 0, ScalarValueType, T_OBJECT):
+; (0<<32)|(4<<16)|12 = 262156.
 ; CHECK-LABEL: define void @scalar_folded_load_in_descriptor(
 ; CHECK-NOT: jeandle.new_instance
 ; CHECK: call void @sink(i32 %x)
 ; CHECK-SAME: [ "deopt"(i32 99, i32 99,
-; CHECK-SAME: i64 4295229452, i64 200, i32 1,
+; CHECK-SAME: i64 262156, i64 200, i32 1,
 ; field (offset 8, LocalType/T_INT): (8<<32)|10 = 34359738378 -> value %x (the
 ; normalized terminal, NOT the erased %lg)
 ; CHECK-SAME: i64 34359738378, i32 %x,
-; the OrigAlloc locals slot becomes a VORefLocalType reference (vo_id=1):
-; (1<<32)|(8<<16)|12 = 4295491596, followed by i32 1.
-; CHECK-SAME: i64 4295491596, i32 1) ]
+; the locals root becomes a VORefLocalType reference to wire ID 0:
+; (0<<32)|(8<<16)|12 = 524300, followed by i32 0.
+; CHECK-SAME: i64 524300, i32 0) ]
 ; CHECK-NOT: poison
 
 !java-method-compilation = !{}

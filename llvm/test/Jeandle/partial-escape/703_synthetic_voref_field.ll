@@ -41,15 +41,15 @@ merge:
 ; IR-NOT: store atomic
 ; IR: call void @safepoint() [ "deopt"(
 ; IR-SAME: i32 99, i32 99,
-; %inner descriptor (vo_id=0): klass 70302, field_count 1, offset 8 = 77.
-; IR-SAME: i64 262156, i64 70302, i32 1,
+; Root-first dense numbering assigns synthetic %p wire id 0. Its offset-8
+; field is a VORef to the transitively discovered %inner at wire id 1.
+; IR-SAME: i64 262156, i64 70301, i32 1,
+; IR-SAME: i64 34360262668, i32 1,
+; %inner descriptor (wire id 1): klass 70302, field_count 1, offset 8 = 77.
+; IR-SAME: i64 4295229452, i64 70302, i32 1,
 ; IR-SAME: i64 34359738378, i32 77,
-; synthetic %p descriptor (vo_id=3): klass 70301, field_count 1, field offset 8
-; = VORef to %inner (vo_id=0): (8<<32)|(8<<16)|12 = 34360262668.
-; IR-SAME: i64 12885164044, i64 70301, i32 1,
-; IR-SAME: i64 34360262668, i32 0,
-; %p slot -> VORef vo_id=3.
-; IR-SAME: i64 12885426188, i32 3) ]
+; %p slot -> VORef wire id 0.
+; IR-SAME: i64 524300, i32 0) ]
 ; IR-NOT: poison
 
 !java-method-compilation = !{}

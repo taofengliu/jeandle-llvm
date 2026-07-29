@@ -157,7 +157,7 @@ public:
     //            (C2/Graal MonitorValue{owner=ObjectValue, eliminated=true}
     //            analog). The basic_lock slot is preserved verbatim;
     //            ObjectSynchronizer::enter initializes it. The PEA transform
-    //            emits this form (RewriteDeoptBundleEffect).
+    //            emits this form as part of the complete deopt-pool rewrite.
     MonitorType = 3,
     // ScalarValueType encodes a PEA virtual-object (VO) descriptor inside a
     // "deopt" operand bundle so HotSpot can reallocate the object at deopt
@@ -178,7 +178,8 @@ public:
     //   [klass]        ; i64 constant = raw InstanceKlass/ArrayKlass identity
     //   [field_count]  ; i32 constant = number of (enc,value) field pairs that
     //                   ; follow (non-static fields in InstanceKlass declaration
-    //                   ; order; long/double occupy TWO pairs)
+    //                   ; order; long/double occupy one pair and the HotSpot
+    //                   ; parser expands the value to two interpreter slots)
     //   [field 0]      ; (enc(LocalType/StackType, basic_type), value) — parsed
     //   ...            ;   by the existing fill_one_scope_value, so a field's
     //   [field N-1]    ;   value may itself be a VORef referencing another VO

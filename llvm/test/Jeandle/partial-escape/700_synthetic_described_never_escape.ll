@@ -45,12 +45,12 @@ merge:
 ; IR: %[[F:pea.casec.field.phi]] = phi i32 [ 41, %left ], [ 42, %right ]
 ; IR: call void @safepoint() [ "deopt"(
 ; IR-SAME: i32 88, i32 88,
-; VO descriptor: header (vo_id=2, ScalarValueType, T_OBJECT), klass 70001,
+; VO descriptor: header (wire id 0, ScalarValueType, T_OBJECT), klass 70001,
 ; field_count 1, field offset 8 (LocalType, T_INT) = merged field value.
-; IR-SAME: i64 8590196748, i64 70001, i32 1,
+; IR-SAME: i64 262156, i64 70001, i32 1,
 ; IR-SAME: i64 34359738378, i32 %[[F]],
-; The %p slot is rewritten to a VORefLocalType reference (vo_id=2).
-; IR-SAME: i64 8590458892, i32 2) ]
+; The %p slot is rewritten to a VORefLocalType reference (wire id 0).
+; IR-SAME: i64 524300, i32 0) ]
 ; IR-NOT: poison
 
 !java-method-compilation = !{}

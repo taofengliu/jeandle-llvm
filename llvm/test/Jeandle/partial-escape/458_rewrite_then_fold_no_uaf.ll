@@ -3,12 +3,10 @@
 ; UAF regression: a folded JavaOp (balanced monitorenter/exit
 ; on virtual %b) whose monitorenter carries a deopt bundle referencing
 ; ANOTHER virtual VO (%a). recordDeoptBundleMappings records a
-; RewriteDeoptBundleEffect (lower SeqNo) and foldMonitorEnter records a
-; ReplaceCallEffect (higher SeqNo) on the SAME call. Pass 1 applies the
-; rewrite first: it rebuilds the call and erases the original. Pre-fix, the
-; ReplaceCallEffect then dereferenced its freed Target (SIGSEGV). With
-; WeakTrackingVH effect targets, the ReplaceCall follows the RAUW to the
-; rebuilt call and erases THAT (the fold still fires).
+; RewriteDeoptPoolEffect and foldMonitorEnter records a
+; ReplaceCallEffect on the SAME call. The ordinary phase erases the folded
+; monitorenter before the deopt-pool phase. The pool effect's WeakTrackingVH
+; becomes null, so it safely skips the now-dead safepoint.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr) nounwind

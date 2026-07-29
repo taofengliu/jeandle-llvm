@@ -4,7 +4,7 @@
 ; IDENTITY for the VO (freeze is peeled by resolveFieldOffset; a select with
 ; both arms at offset 0 of the same VO is alias-forwarded by
 ; propagatePointerAlias). They are describable and their slots are rewritten
-; via RootOperands. Companion of 472 (Case-B PHI) and 473 (derived GEP
+; via exact pool occurrences. Companion of 472 (Case-B PHI) and 473 (derived GEP
 ; banned).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)

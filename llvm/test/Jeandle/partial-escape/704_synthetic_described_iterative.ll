@@ -40,11 +40,12 @@ merge:
 ; IR: = select i1 %choose, i32 41, i32 42
 ; IR: call void @safepoint() [ "deopt"(
 ; IR-SAME: i32 88, i32 88,
-; descriptor (vo_id=2): klass 70401, field_count 1, offset 8 = merged value.
-; IR-SAME: i64 8590196748, i64 70401, i32 1,
+; The root synthetic is assigned dense wire id 0: klass 70401, field_count 1,
+; offset 8 = merged value.
+; IR-SAME: i64 262156, i64 70401, i32 1,
 ; IR-SAME: i64 34359738378, i32 %{{[^,]+}},
-; %p slot -> VORef vo_id=2.
-; IR-SAME: i64 8590458892, i32 2) ]
+; %p slot -> VORef wire id 0.
+; IR-SAME: i64 524300, i32 0) ]
 ; IR-NOT: poison
 
 !java-method-compilation = !{}

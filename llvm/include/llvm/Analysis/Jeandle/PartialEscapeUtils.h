@@ -16,11 +16,15 @@
 #ifndef LLVM_ANALYSIS_JEANDLE_PARTIALESCAPEUTILS_H
 #define LLVM_ANALYSIS_JEANDLE_PARTIALESCAPEUTILS_H
 
+#include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/Analysis/Jeandle/PartialEscape.h"
+#include "llvm/IR/Jeandle/Deoptimization.h"
 #include "llvm/IR/Jeandle/VMConstants.h"
 #include "llvm/IR/Value.h"
+#include "llvm/IR/ValueHandle.h"
 #include <cstdint>
 #include <optional>
 
@@ -36,6 +40,196 @@ class Type;
 } // namespace llvm
 
 namespace llvm::jeandle::pea {
+
+// A checked, assertion-free view of a DeoptValueEncoding. Index remains
+// signed because descriptor IDs and field offsets have different semantic
+// validity rules.
+struct CheckedDeoptValueEncoding {
+  int32_t Index = 0;
+  DeoptValueEncoding::DeoptValueType ValueType = DeoptValueEncoding::LocalType;
+  HotspotBasicType BasicType = T_ILLEGAL;
+
+  bool operator==(const CheckedDeoptValueEncoding &Other) const {
+    return Index == Other.Index && ValueType == Other.ValueType &&
+           BasicType == Other.BasicType;
+  }
+};
+
+std::optional<CheckedDeoptValueEncoding>
+decodeDeoptValueEncoding(const Value *V);
+
+enum class DeoptSemanticCellRole : uint8_t {
+  ShouldReexecute,
+  BCI,
+  DescriptorHeader,
+  DescriptorKlass,
+  DescriptorFieldCount,
+  DescriptorFieldEncoding,
+  DescriptorFieldValue,
+  ScopeValueEncoding,
+  ScopeValue,
+  MonitorEncoding,
+  MonitorOwner,
+  MonitorLock,
+  OrigPcEncoding,
+  OrigPcValue,
+  MethodEncoding,
+  MethodValue,
+  NarrowOopEncoding,
+  NarrowOopValue
+};
+
+struct DeoptSemanticCell {
+  DeoptSemanticCellRole Role = DeoptSemanticCellRole::ScopeValue;
+  unsigned OperandIndex = 0;
+};
+
+// Exact structural data used to detect a stale bundle before transform. Values
+// which carry program state contribute their LLVM type but not their SSA
+// identity; grammar constants additionally contribute their exact bit value.
+struct DeoptStructuralCell {
+  DeoptSemanticCellRole Role = DeoptSemanticCellRole::ScopeValue;
+  unsigned OperandIndex = 0;
+  Type *OperandType = nullptr;
+  std::optional<uint64_t> ConstantValue;
+
+  bool operator==(const DeoptStructuralCell &Other) const {
+    return Role == Other.Role && OperandIndex == Other.OperandIndex &&
+           OperandType == Other.OperandType &&
+           ConstantValue == Other.ConstantValue;
+  }
+};
+
+struct DeoptBundleStructuralFingerprint {
+  SmallVector<DeoptStructuralCell, 16> Cells;
+
+  bool operator==(const DeoptBundleStructuralFingerprint &Other) const {
+    return Cells == Other.Cells;
+  }
+  bool operator!=(const DeoptBundleStructuralFingerprint &Other) const {
+    return !(*this == Other);
+  }
+};
+
+struct ParsedDeoptField {
+  int32_t Offset = 0;
+  CheckedDeoptValueEncoding Encoding;
+  DeoptSemanticCell EncodingCell;
+  DeoptSemanticCell ValueCell;
+  std::optional<int32_t> TargetWireID;
+};
+
+struct ParsedDeoptDescriptor {
+  int32_t WireID = 0;
+  bool IsArray = false;
+  uint64_t Klass = 0;
+  DeoptSemanticCell HeaderCell;
+  DeoptSemanticCell KlassCell;
+  DeoptSemanticCell FieldCountCell;
+  SmallVector<ParsedDeoptField, 4> Fields;
+};
+
+struct ParsedDeoptScopeValue {
+  unsigned PhysicalSlot = 0;
+  unsigned SlotWidth = 1;
+  CheckedDeoptValueEncoding Encoding;
+  DeoptSemanticCell EncodingCell;
+  DeoptSemanticCell ValueCell;
+  std::optional<int32_t> TargetWireID;
+};
+
+struct ParsedDeoptMonitor {
+  CheckedDeoptValueEncoding Encoding;
+  bool Eliminated = false;
+  DeoptSemanticCell EncodingCell;
+  DeoptSemanticCell OwnerCell;
+  DeoptSemanticCell LockCell;
+  std::optional<int32_t> OwnerWireID;
+};
+
+struct ParsedDeoptMarker {
+  CheckedDeoptValueEncoding Encoding;
+  DeoptSemanticCell EncodingCell;
+  DeoptSemanticCell ValueCell;
+};
+
+struct ParsedDeoptMethod {
+  uint64_t Method = 0;
+  DeoptSemanticCell EncodingCell;
+  DeoptSemanticCell ValueCell;
+};
+
+struct ParsedDeoptScope {
+  std::optional<ParsedDeoptMethod> Method;
+  std::optional<uint64_t> ShouldReexecute;
+  std::optional<DeoptSemanticCell> ShouldReexecuteCell;
+  int32_t BCI = 0;
+  DeoptSemanticCell FirstBCICell;
+  DeoptSemanticCell SecondBCICell;
+  SmallVector<ParsedDeoptScopeValue, 8> Locals;
+  SmallVector<ParsedDeoptScopeValue, 8> Stack;
+  SmallVector<ParsedDeoptMonitor, 2> Monitors;
+  std::optional<ParsedDeoptMarker> OrigPc;
+};
+
+struct ParsedDeoptBundle {
+  // The parsed bundle is analysis data that may outlive ordinary effect
+  // application. Tracking handles follow legitimate RAUW and become null when
+  // an input is erased without replacement.
+  SmallVector<WeakTrackingVH, 16> OriginalInputs;
+  SmallVector<ParsedDeoptDescriptor, 4> Descriptors;
+  SmallVector<ParsedDeoptScope, 2> Scopes;
+  SmallVector<ParsedDeoptMarker, 2> NarrowOopMarkers;
+  DeoptBundleStructuralFingerprint Fingerprint;
+};
+
+enum class DeoptBundleParseErrorCode : uint8_t {
+  None,
+  MissingBundle,
+  InvalidScopeHeader,
+  MismatchedBCI,
+  InvalidEncoding,
+  TruncatedRecord,
+  DescriptorNotInRootPool,
+  DuplicateDescriptorID,
+  DuplicateFieldOffset,
+  DanglingVORef,
+  InvalidScopeOrder,
+  InvalidSemanticValue,
+  InvalidMonitor,
+  InvalidOrigPc,
+  InvalidMethodMarker,
+  InvalidNarrowOopMarker
+};
+
+struct DeoptBundleParseError {
+  DeoptBundleParseErrorCode Code = DeoptBundleParseErrorCode::None;
+  unsigned OperandIndex = 0;
+};
+
+struct DeoptBundleParseResult {
+  std::optional<ParsedDeoptBundle> Bundle;
+  DeoptBundleParseError Error;
+};
+
+// Parse the complete record grammar used by Jeandle's "deopt" operand bundle.
+// Both the production header (i64 should_reexecute + duplicated i32 BCI) and
+// the deliberately simplified test header (duplicated i32 BCI) are accepted.
+// All failures are reported as data; this path never calls the assertion-based
+// DeoptValueEncoding::decode.
+DeoptBundleParseResult parseDeoptBundleInputs(ArrayRef<Value *> Inputs);
+DeoptBundleParseResult parseDeoptBundle(const CallBase &CB);
+
+// Return whether CB still has the exact bundle parsed into Bundle. Grammar
+// constants must retain their exact bits; semantic values may follow RAUW via
+// OriginalInputs' tracking handles.
+bool matchesParsedDeoptBundle(const ParsedDeoptBundle &Bundle,
+                              const CallBase &CB);
+
+// Copy the parsed representation in its original wire order. Returns false if
+// a tracked input died or its exact-cell/fingerprint indices are incoherent.
+bool copyParsedDeoptBundleInputs(const ParsedDeoptBundle &Bundle,
+                                 SmallVectorImpl<Value *> &Out);
 
 // Callee-name predicates. Match a CallBase by callee Function name. Tolerates
 // CallInst, InvokeInst, and any subclass of CallBase. Returns false on inline
@@ -59,7 +253,7 @@ bool isJeandleRegisterFinalizerIfNeeded(const CallBase *CB);
 
 // Whether processIntrinsic treats II's ordinary operands and non-deopt operand
 // bundles as non-escaping. Deopt bundles remain executable frame state and
-// require a surviving RewriteDeoptBundleEffect.
+// require a surviving whole-pool rewrite.
 bool isPEAHandledNonEscapingIntrinsic(const IntrinsicInst *II);
 
 // Extract the Java element basic type from an array klass pointer.

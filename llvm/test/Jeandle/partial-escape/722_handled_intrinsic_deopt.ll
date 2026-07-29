@@ -69,10 +69,14 @@ unwind:
 ; CHECK-NOT: jeandle.new_instance
 ; CHECK: call void @llvm.sideeffect()
 ; The transitive inner descriptor and the root outer descriptor must both be
-; present at this same intrinsic safepoint.
-; CHECK-SAME: i64 4295229452, i64 72203, i32 1
-; CHECK-SAME: i64 262156, i64 72202, i32 1
-; CHECK-SAME: i64 68720001036, i32 1
+; present at this same intrinsic safepoint. Root-first dense numbering assigns
+; outer wire id 0 and inner wire id 1.
+; CHECK-SAME: [ "deopt"(i32 99, i32 99,
+; CHECK-SAME: i64 262156, i64 72202, i32 1,
+; CHECK-SAME: i64 68720001036, i32 1,
+; CHECK-SAME: i64 4295229452, i64 72203, i32 1,
+; CHECK-SAME: i64 34359738378, i32 %value,
+; CHECK-SAME: i64 524300, i32 0) ]
 ; CHECK-NOT: poison
 
 define void @handled_intrinsic_synthetic_deopt(i1 %pick)
@@ -105,10 +109,12 @@ unwind:
 
 ; CHECK-LABEL: define void @handled_intrinsic_synthetic_deopt(
 ; CHECK-NOT: jeandle.new_instance
-; Synthetic VO id 2 is described at the sideeffect safepoint.
+; The synthetic root is described as dense wire id 0 at the sideeffect
+; safepoint.
 ; CHECK: call void @llvm.sideeffect()
-; CHECK-SAME: i64 8590196748, i64 72204, i32 0
-; CHECK-SAME: i64 8590458892, i32 2
+; CHECK-SAME: [ "deopt"(i32 99, i32 99,
+; CHECK-SAME: i64 262156, i64 72204, i32 0,
+; CHECK-SAME: i64 524300, i32 0) ]
 ; CHECK-NOT: poison
 
 define void @handled_intrinsic_derived_deopt()

@@ -49,14 +49,15 @@ merge:
 ; IR: %[[F:pea.casec.field.phi]] = phi i32 [ 41, %left ], [ 42, %right ]
 ; IR: call void @safepoint() [ "deopt"(
 ; IR-SAME: i32 99, i32 99,
-; descriptor (vo_id=2): klass 70201, field_count 1, field offset 8 = merged PHI.
-; IR-SAME: i64 8590196748, i64 70201, i32 1,
+; The root synthetic is assigned dense wire id 0: klass 70201, field_count 1,
+; field offset 8 = merged PHI.
+; IR-SAME: i64 262156, i64 70201, i32 1,
 ; IR-SAME: i64 34359738378, i32 %[[F]],
-; %p locals slot -> VORef vo_id=2.
-; IR-SAME: i64 8590458892, i32 2,
+; %p locals slot -> VORef wire id 0.
+; IR-SAME: i64 524300, i32 0,
 ; monitor entry rewritten to eliminated=true (index=1) with a VORef owner
-; (vo_id=2); the basic_lock %lock is preserved verbatim.
-; IR-SAME: i64 4295163916, i32 2, ptr %lock) ]
+; (wire id 0); the basic_lock %lock is preserved verbatim.
+; IR-SAME: i64 4295163916, i32 0, ptr %lock) ]
 ; IR-NOT: addrspace(1) %p
 ; IR-NOT: poison
 

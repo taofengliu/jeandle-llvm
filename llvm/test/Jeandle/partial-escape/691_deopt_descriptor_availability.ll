@@ -182,11 +182,10 @@ alloc.unwind:
 ; CHECK-SAME: i64 524300, i32 0) ]
 ; CHECK-NEXT: to label %normal unwind label %handler
 
-; If a transitive child cannot be described, the coherent fallback must keep
-; both descriptors out of the bundle. Generic operand handling materializes
-; the outer root and recursively the child, reusing both original allocations
-; before the invoke. Since replay executes before the invoke, both successors
-; inherit materialized state and must load from real memory.
+; If a transitive child cannot be described, fallback materializes that child
+; before the invoke. The outer remains virtual because its reference field can
+; then be encoded as the child's available live oop. Both successors inherit
+; the child's materialized state and must load from real memory.
 define i32 @transitive_fallback_invoke()
     gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
@@ -222,17 +221,23 @@ alloc.unwind:
 }
 
 ; CHECK-LABEL: define i32 @transitive_fallback_invoke(
-; Both original allocations survive; no materialization allocation is created.
-; CHECK-COUNT-2: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
+; Only the child allocation survives; the outer allocation is eliminated and
+; no materialization allocation is created.
+; CHECK-COUNT-1: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
+; CHECK-NOT: inttoptr (i64 69108 to ptr)
 ; CHECK-NOT: pea.mat = invoke
-; The recursively materialized child is replayed before the root.
-; CHECK: store atomic i32 7, ptr addrspace(1) %{{.*}} unordered, align 4
-; CHECK: store atomic ptr addrspace(1) inttoptr (i64 123 to ptr addrspace(1)), ptr addrspace(1) %{{.*}} unordered, align 8
-; CHECK: store atomic ptr addrspace(1) %child, ptr addrspace(1) %{{.*}} unordered, align 8
-; Neither the child nor its VORef parent may leave a descriptor behind.
-; CHECK-NOT: i64 262156
-; CHECK: invoke void @may_throw()
-; CHECK-SAME: [ "deopt"(i32 99, i32 99, i64 12, ptr addrspace(1) %outer) ]
+; The child's complete state is replayed before the invoke.
+; CHECK: %[[CHILD_SLOT8:pea\.matslot[^ ]*]] = getelementptr inbounds i8, ptr addrspace(1) %child, i64 8
+; CHECK-NEXT: store atomic i32 7, ptr addrspace(1) %[[CHILD_SLOT8]] unordered, align 4
+; CHECK-NEXT: %[[CHILD_SLOT16:pea\.matslot[^ ]*]] = getelementptr inbounds i8, ptr addrspace(1) %child, i64 16
+; CHECK-NEXT: store atomic ptr addrspace(1) inttoptr (i64 123 to ptr addrspace(1)), ptr addrspace(1) %[[CHILD_SLOT16]] unordered, align 8
+; The virtual outer is described as wire id 0. Its offset-16 field is the
+; materialized child oop, and the original outer root becomes VORef wire id 0.
+; CHECK-NEXT: invoke void @may_throw()
+; CHECK-SAME: [ "deopt"(i32 99, i32 99,
+; CHECK-SAME: i64 262156, i64 69108, i32 1,
+; CHECK-SAME: i64 68719476748, ptr addrspace(1) %child,
+; CHECK-SAME: i64 524300, i32 0) ]
 ; CHECK-NEXT: to label %normal unwind label %handler
 ; CHECK: normal:
 ; CHECK: %normal.value = load atomic i32, ptr addrspace(1) %child.value unordered, align 4

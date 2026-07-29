@@ -7,8 +7,8 @@
 ; size 16) has a T_INT field at offset 8 holding %x. %b is referenced ONLY
 ; by the ROOT scope's locals; %a ONLY by the INNERMOST scope's locals. Both
 ; descriptors go into the ROOT scope's VO section (after the first
-; duplicated-BCI pair); %a's T_OBJECT field becomes a VORef field by vo-id
-; (vo-ids follow allocation order: %a=0, %b=1).
+; duplicated-BCI pair); %a's T_OBJECT field becomes a VORef field by wire ID
+; in the canonical deopt pool.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(i32)
@@ -46,22 +46,26 @@ u:
 
 ; Both %a and %b are NeverEscapes: eliminated and described right AFTER THE
 ; ROOT SCOPE PREFIX (should_reexecute i64 0 + duplicated-BCI pair
-; i32 5, i32 5). Descriptor emission order follows the slot
-; scan order (root scope's referenced VO first), NOT the vo-id order:
-;   %b (vo_id=1): header (1<<32)|(4<<16)|12 = 4295229452; klass 200;
+; i32 5, i32 5). Canonical pool numbering follows root-slot scan order:
+; the root scope's %b is wire ID 0, then the inner scope's %a is wire ID 1.
+; Descriptor order follows those wire IDs:
+;   %b (wire ID 0): header (0<<32)|(4<<16)|12 = 262156; klass 200;
 ;     field_count 1; field (offset 8, LocalType/T_INT): (8<<32)|10 =
 ;     34359738378 -> %x.
-;   %a (vo_id=0): header (0<<32)|(4<<16)|12 = 262156; klass 100; field_count
+;   %a (wire ID 1): header (1<<32)|(4<<16)|12 = 4295229452; klass 100;
+;     field_count
 ;     2; field 0 (offset 8, VORef field, T_OBJECT): (8<<32)|(8<<16)|12 =
-;     34360262668 -> i32 vo-id 1 (%b); field 1 (offset 16, LocalType/T_INT):
+;     34360262668 -> i32 wire ID 0 (%b); field 1
+;     (offset 16, LocalType/T_INT):
 ;     (16<<32)|10 = 68719476746 -> %x.
-; The ROOT-scope slot (%b) becomes VORefLocalType vo_id=1:
-; (1<<32)|(8<<16)|12 = 4295491596, then i32 1; the INNERMOST slot (%a)
-; becomes VORefLocalType vo_id=0: (0<<32)|(8<<16)|12 = 524300, then i32 0.
+; The ROOT-scope slot (%b) becomes VORefLocalType wire ID 0:
+; (0<<32)|(8<<16)|12 = 524300, then i32 0; the INNERMOST slot (%a)
+; becomes VORefLocalType wire ID 1:
+; (1<<32)|(8<<16)|12 = 4295491596, then i32 1.
 ; CHECK-LABEL: define void @multiscope_xref(
 ; CHECK-NOT: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
 ; CHECK: call void @sink(i32 %x)
-; CHECK-SAME: [ "deopt"(i64 0, i32 5, i32 5, i64 4295229452, i64 200, i32 1, i64 34359738378, i32 %x, i64 262156, i64 100, i32 2, i64 34360262668, i32 1, i64 68719476746, i32 %x, i64 4295491596, i32 1, i64 393233, i64 777, i64 1, i32 9, i32 9, i64 524300, i32 0) ]
+; CHECK-SAME: [ "deopt"(i64 0, i32 5, i32 5, i64 262156, i64 200, i32 1, i64 34359738378, i32 %x, i64 4295229452, i64 100, i32 2, i64 34360262668, i32 0, i64 68719476746, i32 %x, i64 524300, i32 0, i64 393233, i64 777, i64 1, i32 9, i32 9, i64 4295491596, i32 1) ]
 ; CHECK-NOT: poison
 
 !java-method-compilation = !{}

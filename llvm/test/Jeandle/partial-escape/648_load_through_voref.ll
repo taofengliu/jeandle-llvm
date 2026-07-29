@@ -50,10 +50,10 @@ body:
   %ly = load atomic i32, ptr addrspace(1) %lf unordered, align 4
   %ox = load atomic i32, ptr addrspace(1) %of1 unordered, align 4
   ; %outer is a direct root; %loaded is %inner's identity (load-through-ref).
-  ; enc(LocalType, index=0, T_OBJECT) = 12 for each locals slot.
+  ; The two locals occupy physical slots 0 and 1.
   call void @sink(i32 %ox, i32 %ly)
        [ "deopt"(i32 99, i32 99, i64 12, ptr addrspace(1) %outer,
-                i64 12, ptr addrspace(1) %loaded) ]
+                i64 4294967308, ptr addrspace(1) %loaded) ]
   ret void
 u:
   %lp = landingpad i64 cleanup

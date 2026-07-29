@@ -33,7 +33,7 @@ merge:
   %p = phi ptr addrspace(1) [ %a, %left ], [ %b, %right ]
   call void @safepoint()
       [ "deopt"(i32 99, i32 99, i64 12, ptr addrspace(1) %o,
-               i64 12, ptr addrspace(1) %p) ]
+               i64 4294967308, ptr addrspace(1) %p) ]
   ret void
 }
 
@@ -49,13 +49,13 @@ merge:
 ; field offset 8 = 7.
 ; IR-SAME: i64 262156, i64 70101, i32 1,
 ; IR-SAME: i64 34359738378, i32 7,
-; Descriptor for the synthetic %p (vo_id=3): klass 70102, field_count 1,
+; Descriptor for the synthetic %p (wire id 1): klass 70102, field_count 1,
 ; field offset 8 = merged field PHI.
-; IR-SAME: i64 12885164044, i64 70102, i32 1,
+; IR-SAME: i64 4295229452, i64 70102, i32 1,
 ; IR-SAME: i64 34359738378, i32 %[[PF]],
-; %o slot -> VORef vo_id=0; %p slot -> VORef vo_id=3.
+; %o slot -> VORef wire id 0; %p slot -> VORef wire id 1.
 ; IR-SAME: i64 524300, i32 0,
-; IR-SAME: i64 12885426188, i32 3) ]
+; IR-SAME: i64 4295491596, i32 1) ]
 ; IR-NOT: poison
 
 !java-method-compilation = !{}

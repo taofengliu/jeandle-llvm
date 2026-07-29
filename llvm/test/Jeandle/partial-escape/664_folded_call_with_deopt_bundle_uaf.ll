@@ -3,11 +3,11 @@
 ; A folded JavaOp (balanced monitorenter/exit on virtual %b) whose
 ; monitorenter carries a deopt bundle referencing ANOTHER virtual object
 ; (%a). The fold records a ReplaceCallEffect and the bundle scan records a
-; RewriteDeoptBundleEffect on the SAME call. One effect erases (or clones
-; and erases) the call; the other must follow via its WeakTrackingVH handle
-; and no-op instead of dereferencing freed memory. Not reachable from the
-; current frontend (foldable JavaOps carry no deopt bundle), but legal IR
-; that the transform must survive.
+; RewriteDeoptPoolEffect on the SAME call. The ordinary replacement erases the
+; call first; the later pool rewrite must observe its nulled WeakTrackingVH and
+; no-op instead of dereferencing freed memory. Not reachable from the current
+; frontend (foldable JavaOps carry no deopt bundle), but legal IR that the
+; transform must survive.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr) nounwind

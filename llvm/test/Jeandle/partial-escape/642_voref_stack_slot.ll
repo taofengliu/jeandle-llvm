@@ -3,7 +3,7 @@
 ; Sibling of 640_never_escape_vo_in_deopt_bundle.ll, but the never-escaping VO
 ; is referenced from an EXPRESSION-STACK slot of the "deopt" bundle, not a
 ; locals slot. This drives the StackType branch of the VORef slot rewrite
-; (PartialEscapeTransform.cpp RewriteDeoptBundleEffect: a StackType slot becomes
+; (PartialEscapeTransform.cpp whole-pool rewrite: a StackType slot becomes
 ; VORefStackType, not VORefLocalType). The HotSpot parser routes a VORef by
 ; encoding type to the correct
 ; interpreter array (locals vs expression stack), so the two must stay distinct

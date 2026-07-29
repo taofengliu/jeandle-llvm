@@ -439,17 +439,17 @@ merge:
 ; IR: %[[DFIELD:pea.casec.field.phi[^ ]*]] = phi i32 [ 301, %left ], [ 302, %right ]
 ; The synthetic is VIRTUAL at the safepoint (it escapes only at @sink AFTER):
 ; no replay before the safepoint — it is DESCRIBED there.  Descriptor header
-; (vo_id=2, ScalarValueType, T_OBJECT) + klass 69210 + field_count 2; field
+; (wire id 0, ScalarValueType, T_OBJECT) + klass 69210 + field_count 2; field
 ; offset 8 = merged PHI, field offset 16 = 303 (the value AT the safepoint);
-; the %p slot is rewritten to a VORefLocalType reference (vo_id=2).
+; the %p slot is rewritten to a VORefLocalType reference (wire id 0).
 ; IR-NOT: pea.matslot
 ; IR-NOT: store atomic
 ; IR: call void @safepoint() [ "deopt"(
 ; IR-SAME: i32 77, i32 77,
-; IR-SAME: i64 8590196748, i64 69210, i32 2,
+; IR-SAME: i64 262156, i64 69210, i32 2,
 ; IR-SAME: i64 34359738378, i32 %[[DFIELD]],
 ; IR-SAME: i64 68719476746, i32 303,
-; IR-SAME: i64 8590458892, i32 2) ]
+; IR-SAME: i64 524300, i32 0) ]
 ; @sink escape: materialize ONCE here. offset 8 = merged PHI, offset 16 = 304
 ; (the value at the escape point).
 ; IR: %[[SLOT8:pea.matslot[^ ]*]] = getelementptr inbounds i8, ptr addrspace(1) %p, i64 8
