@@ -855,7 +855,8 @@ public:
     Effects.erase(Effects.begin() + I);
     return E;
   }
-  // IR-form extension: drop every effect matching Pred (dropEffectsFor).
+  // IR-form extension: drop every effect matching Pred
+  // (dropEffectsForIneligible).
   void eraseIf(function_ref<bool(const Effect &)> Pred) {
     SmallVector<std::unique_ptr<Effect>, 16> Kept;
     for (auto &E : Effects)
@@ -979,6 +980,11 @@ public:
   int VirtualizationDelta = 0;
   int AllocationDelta = 0;
   uint32_t NextSeqNo = 0;
+  // Monotone epoch bumped whenever the effect set changes (an effect is added
+  // via addBlockEffect, dropped via dropEffectsForIneligible, or rolled back
+  // via restoreLoopSnapshot). Lets the analyzer cache a per-owner view of the
+  // effects and invalidate it cheaply instead of rebuilding per query.
+  uint64_t EffectEpoch = 0;
   // Analysis proved that at least one structural CFG edge/terminator is dead.
   // The transform must run its terminator and unreachable-block cleanup even
   // when applying the surviving effects does not otherwise mutate the IR.

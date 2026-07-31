@@ -115,9 +115,10 @@ PreservedAnalyses PartialEscapeIterative::run(Function &F,
   // Run a sub-pass directly and invalidate FAM with its PreservedAnalyses,
   // mirroring what FunctionPassManager does between adjacent passes so the
   // cached analyses (DominatorTree, LoopInfo, ...) stay fresh for the next.
-  auto runAndInvalidate = [&](auto &&Pass) {
+  auto runAndInvalidate = [&](auto &&Pass) -> PreservedAnalyses {
     PreservedAnalyses Sub = Pass.run(F, FAM);
     FAM.invalidate(F, Sub);
+    return Sub;
   };
 
   // Dump-IR gating (legacy substring and exact allowlist matches are fixed
@@ -162,11 +163,18 @@ PreservedAnalyses PartialEscapeIterative::run(Function &F,
     SimplifyCFGPass Sc;
     LoopSimplifyPass Ls;
     InstCombinePass Ic;
-    runAndInvalidate(Dc);
-    runAndInvalidate(Sc);
-    runAndInvalidate(Ls);
-    runAndInvalidate(Ic);
-    const bool CanonChanged = BeforeCanonicalization != printFunctionIR(F);
+    // A pass returning PreservedAnalyses::all() guarantees it made no IR
+    // change. When every canonicalization pass does, the IR is unchanged so the
+    // after-print is skipped via short-circuit; otherwise fall back to the
+    // exact printed-IR compare. PreservedAnalyses is only a sound "unchanged"
+    // signal here — a non-all result can still leave the IR bit-identical.
+    bool AnyCanonMutated = false;
+    AnyCanonMutated |= !runAndInvalidate(Dc).areAllPreserved();
+    AnyCanonMutated |= !runAndInvalidate(Sc).areAllPreserved();
+    AnyCanonMutated |= !runAndInvalidate(Ls).areAllPreserved();
+    AnyCanonMutated |= !runAndInvalidate(Ic).areAllPreserved();
+    const bool CanonChanged =
+        AnyCanonMutated && BeforeCanonicalization != printFunctionIR(F);
     AnyChanged |= CanonChanged;
 
     if (DumpThisFunc) {

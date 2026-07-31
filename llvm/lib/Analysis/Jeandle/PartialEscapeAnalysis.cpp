@@ -642,6 +642,7 @@ public:
            const DenseSet<Instruction *> &SuppressedCFGProofs,
            const DenseSet<CallBase *> &SuppressedVirtualizations)
       : F(F), DT(DT), LI(LI), DL(F.getParent()->getDataLayout()),
+        VMConsts(jeandle::VMConstants::fromModule(*F.getParent())),
         MonitorDepth(computeMonitorDepthInfo(F)),
         StrictLockOrder(StrictLockOrder),
         SuppressedCFGProofs(SuppressedCFGProofs),
@@ -695,6 +696,12 @@ private:
   DominatorTree &DT;
   LoopInfo &LI;
   const DataLayout &DL;
+  // VMConstants read once from the module's runtime-defined globals (patched by
+  // HotSpot's RuntimeDefinedJavaOps::define_global_variables); see
+  // llvm/IR/Jeandle/VMConstants.h for the delivery model. Lit tests that never
+  // link the template module fall through to the compile-time defaults declared
+  // on `struct VMConstants`.
+  const jeandle::VMConstants VMConsts;
   const MonitorDepthInfo MonitorDepth;
   // Cached "strict lock order" decision shared by every fresh attempt in this
   // analysis run; see resolveStrictLockOrder() for the precedence rules.
@@ -715,6 +722,23 @@ private:
   // successor queries for the same terminator.
   SmallVector<CFGDeadnessProof, 8> CFGDeadnessProofs;
   DenseSet<Instruction *> RecordedCFGProofs;
+
+  // Per-owner view of Result.BlockEffects, rebuilt lazily when
+  // Result.EffectEpoch changes. Lets commit()'s availability sweep
+  // (FieldValuesAvailable) and Case-C identity analysis
+  // (hasObservableIdentityUse) find an owner's effects by lookup instead of
+  // re-scanning every block's EffectList per query.
+  DenseMap<jeandle::ObjectID, SmallVector<const jeandle::Effect *, 4>>
+      EffectsByOwnerCache;
+  uint64_t EffectsByOwnerCacheEpoch = UINT64_MAX;
+  void ensureEffectsByOwnerCache();
+
+  // Memoized deopt-bundle parse. The bundle is immutable during a single
+  // analysis attempt (the Analyzer is rebuilt from the original IR each
+  // attempt), so parseDeoptBundle is a pure function of the CallBase. Caching
+  // avoids re-parsing on every loop-fixpoint re-visit of an in-loop safepoint.
+  DenseMap<CallBase *, std::optional<jeandle::pea::ParsedDeoptBundle>>
+      DeoptParseCache;
 
   // ---------------------------------------------------------------------
   // STATE MODEL — intentional divergence from Graal (documented so each
@@ -898,7 +922,7 @@ private:
   // analog. Populated at every CreatePHI emission site. Entries for PHIs that
   // are rolled back by the loop fixpoint are harmless: the gate only treats a
   // stale entry as "dominates", and a rolled-back PHI is never referenced by
-  // surviving state (restoreLoopSnapshot truncates OwnedLoopFieldPhis).
+  // surviving state (restoreLoopSnapshot truncates OwnedPhis).
   DenseMap<Value *, BasicBlock *> PhiHome;
 
   // Per-merge-block deferred CreatePHI effects. mergeStates pushes every
@@ -993,7 +1017,8 @@ private:
           hash_combine(hash_value(K.Header), K.ID, K.Offset));
     }
   };
-  std::unordered_map<LoopPhiKey, PHINode *, LoopPhiKeyHash> LoopFieldPhiCache;
+  std::unordered_map<LoopPhiKey, WeakTrackingVH, LoopPhiKeyHash>
+      LoopFieldPhiCache;
 
   // Per-VO record of LLVM pointer-PHIs that processBlockPhis
   // aliased via Case-B (every incoming agrees on the same ObjectID).
@@ -1552,7 +1577,7 @@ private:
 
   void commit();
   bool effectSurvivesIneligibleOwner(const jeandle::Effect &E) const;
-  void dropEffectsFor(jeandle::ObjectID ID);
+  void dropEffectsForIneligible(const DenseSet<jeandle::ObjectID> &IDs);
   struct FinalValue {
     enum Kind : uint8_t {
       ResolvedValue,
@@ -2115,24 +2140,18 @@ PHINode *Analyzer::getOrCreateLoopFieldPhi(BasicBlock *BB, jeandle::ObjectID ID,
   LoopPhiKey K{BB, ID, Offset};
   auto It = LoopFieldPhiCache.find(K);
   if (It != LoopFieldPhiCache.end()) {
-    PHINode *Cached = It->second;
-    // Defensive: WeakTrackingVH would auto-null if the PHI was deleted via
-    // some other code path. The cache entry is plain PHINode*, so revalidate.
-    bool Valid = false;
-    for (auto &VH : Result.OwnedLoopFieldPhis) {
-      if (VH == Cached) {
-        Valid = true;
-        break;
-      }
-    }
-    // Validity check. During analysis the PHI is an unparented shell — the
-    // transform pass is responsible for inserting it into the merge block and
-    // calling addIncoming. Therefore a healthy cached PHI has
+    // The cache holds a WeakTrackingVH, which auto-nulls if the PHI was
+    // deleted via some other code path, so validity is an O(1) null check
+    // (no OwnedLoopFieldPhis scan).
+    PHINode *Cached = cast_or_null<PHINode>(static_cast<Value *>(It->second));
+    // During analysis the PHI is an unparented shell — the transform pass is
+    // responsible for inserting it into the merge block and calling
+    // addIncoming. Therefore a healthy cached PHI has
     // getNumIncomingValues() == 0 at every analysis-time touch. Any non-zero
     // count indicates a leak (e.g. an earlier code path mistakenly called
     // addIncoming on the shell) and we drop the cache entry to force
     // re-creation.
-    if (Valid && Cached->getType() == Ty &&
+    if (Cached && Cached->getType() == Ty &&
         Cached->getNumIncomingValues() == 0) {
       // On cache hit, defensively clear any operands the shell
       // might have accumulated. Today's caller-driven incoming-list
@@ -3379,8 +3398,8 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
         // Variable-index GEP, or a non-structural alias chain (select/load/PHI
         // embedded in the derivation): cannot soundly re-derive a constant
         // byte offset at the latch. Sound fallback — keep the object real.
-        // commit()->dropEffectsFor(ID) purges the materialize above (and this
-        // would-be effect by mutation owner), so the original allocation
+        // commit()->dropEffectsForIneligible purges the materialize above (and
+        // this would-be effect by mutation owner), so the original allocation
         // survives and no poison leaks.
         markIneligible(OID);
         continue;
@@ -3390,8 +3409,8 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
       // PartiallyEscapes and dominates the body GEP, so the GEP stays valid
       // as-is and the carrying PHI's incoming is left unchanged. The
       // per-pred Materialize above (SeqNo strictly less) already carries the
-      // materialization; commit()->dropEffectsFor(ID) purges it if the object
-      // turns ineligible.
+      // materialization; commit()->dropEffectsForIneligible purges it if the
+      // object turns ineligible.
       (void)Off;
     }
   }
@@ -3410,17 +3429,18 @@ bool Analyzer::hasObservableIdentityUse(
     return true;
 
   DenseSet<Instruction *> InternalTargets;
-  for (auto &KV : Result.BlockEffects)
-    for (const auto &E : KV.second)
-      if (E.hasMutationOwner() && E.getMutationOwner() == ID)
-        if (Instruction *Target = E.getTarget())
-          // A folded identity compare records the icmp as an effect target,
-          // but the compare still observes this VO's identity: the fold is
-          // valid only while the VO keeps a distinct identity (Graal
-          // refuses Case C when identity is observed). Keep icmps visible
-          // to the walk below.
-          if (!isa<ICmpInst>(Target))
-            InternalTargets.insert(Target);
+  ensureEffectsByOwnerCache();
+  auto OwnerIt = EffectsByOwnerCache.find(ID);
+  if (OwnerIt != EffectsByOwnerCache.end())
+    for (const jeandle::Effect *E : OwnerIt->second)
+      if (Instruction *Target = E->getTarget())
+        // A folded identity compare records the icmp as an effect target,
+        // but the compare still observes this VO's identity: the fold is
+        // valid only while the VO keeps a distinct identity (Graal
+        // refuses Case C when identity is observed). Keep icmps visible
+        // to the walk below.
+        if (!isa<ICmpInst>(Target))
+          InternalTargets.insert(Target);
 
   // The Case-C group, transitively closed through synthetic sources: a
   // nested synthetic's own sources belong to the same identity flow, so a
@@ -4690,15 +4710,7 @@ void Analyzer::processAllocation(CallBase *CB) {
     // resolveFieldOffset) will be eligible. ArrayBaseOffset is always set
     // (per-kind when known, else the VM's Object-kind default) so the
     // resolveAccess header guard never degrades to `< 0`.
-    const jeandle::VMConstants VMConsts =
-        jeandle::VMConstants::fromModule(*F.getParent());
     if (auto Kind = jeandle::pea::elementTypeForArrayKlass(Klass)) {
-      // VMConstants are read out of the module's runtime-defined globals
-      // (patched by HotSpot's
-      // RuntimeDefinedJavaOps::define_global_variables); see
-      // llvm/IR/Jeandle/VMConstants.h for the delivery model. Lit tests
-      // that never link the template module fall through to the
-      // compile-time defaults declared on `struct VMConstants`.
       VO->ArrayBaseOffset =
           static_cast<uint32_t>(VMConsts.arrayBaseOffsetFor(*Kind));
       if (Type *ElemTy =
@@ -4817,8 +4829,6 @@ std::optional<int64_t> Analyzer::resolveAccess(Value *Ptr,
   // into the array header, e.g. an offset-0 store to the mark word, would
   // otherwise replay as a Java-field write on materialization).
   if (VObj.isInstance()) {
-    const jeandle::VMConstants VMConsts =
-        jeandle::VMConstants::fromModule(*F.getParent());
     if (*Offset < VMConsts.instanceBaseOffset())
       return std::nullopt;
   } else if (VObj.isArray()) {
@@ -5069,8 +5079,6 @@ void Analyzer::processLoad(LoadInst *LI) {
   // elements, so the constant matches its header length.
   if (VObj.isArray() && LI->getType()->isIntegerTy(32)) {
     if (auto LenOff = jeandle::pea::resolveFieldOffset(Ptr, DL)) {
-      const jeandle::VMConstants VMConsts =
-          jeandle::VMConstants::fromModule(*F.getParent());
       if (*LenOff == VMConsts.arrayLengthOffset()) {
         auto E = std::make_unique<jeandle::ReplaceLoadEffect>();
         E->Block = LI->getParent();
@@ -6200,10 +6208,17 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
   if (!Deopt)
     return;
 
-  DeoptBundleParseResult ParsedResult = parseDeoptBundle(*CB);
-  if (!ParsedResult.Bundle)
-    return;
-  ParsedDeoptBundle Parsed = std::move(*ParsedResult.Bundle);
+  // The deopt bundle is immutable within one analysis attempt, so the parse is
+  // a pure function of CB; reuse the cached parse across loop-fixpoint
+  // revisits.
+  std::optional<ParsedDeoptBundle> &Cached = DeoptParseCache[CB];
+  if (!Cached) {
+    DeoptBundleParseResult ParsedResult = parseDeoptBundle(*CB);
+    if (!ParsedResult.Bundle)
+      return;
+    Cached = std::move(*ParsedResult.Bundle);
+  }
+  const ParsedDeoptBundle &Parsed = *Cached;
 
   auto SourceValue = [&](DeoptPoolSemanticCellID Cell) -> Value * {
     if (Cell >= Parsed.OriginalInputs.size())
@@ -6546,7 +6561,7 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
 
     PrepareFinalDeoptPoolBundleResult Prepared =
         prepareFinalDeoptPoolBundlePlan(Parsed, *Planned.Plan, ScalarBindings,
-                                        CurrentCells, *CB);
+                                        CurrentCells);
     if (!Prepared.Plan)
       return;
 
@@ -7353,25 +7368,44 @@ bool Analyzer::effectSurvivesIneligibleOwner(const jeandle::Effect &E) const {
   return SI && !ObservedFieldStores.count(SI);
 }
 
-void Analyzer::dropEffectsFor(jeandle::ObjectID ID) {
-  bool DroppedAllocation = false;
+void Analyzer::ensureEffectsByOwnerCache() {
+  if (EffectsByOwnerCacheEpoch == Result.EffectEpoch)
+    return;
+  EffectsByOwnerCache.clear();
+  for (const auto &Kv : Result.BlockEffects)
+    for (const auto &E : Kv.second)
+      if (E.hasMutationOwner())
+        EffectsByOwnerCache[E.getMutationOwner()].push_back(&E);
+  EffectsByOwnerCacheEpoch = Result.EffectEpoch;
+}
+
+void Analyzer::dropEffectsForIneligible(
+    const DenseSet<jeandle::ObjectID> &IDs) {
+  if (IDs.empty())
+    return;
+  // One pass over BlockEffects drops every effect owned by an ineligible VO
+  // (unless it must survive), accounting the allocation-elimination deltas per
+  // distinct owner. Replaces a per-VO full scan with a single scan.
+  SmallDenseSet<jeandle::ObjectID, 8> DroppedAllocOwners;
   for (auto &Kv : Result.BlockEffects) {
     Kv.second.eraseIf([&](const jeandle::Effect &E) {
-      if (!E.hasMutationOwner() || E.getMutationOwner() != ID)
+      if (!E.hasMutationOwner() || !IDs.count(E.getMutationOwner()))
         return false;
       if (effectSurvivesIneligibleOwner(E))
         return false;
       if (isa<jeandle::EliminateAllocationEffect>(E))
-        DroppedAllocation = true;
+        DroppedAllocOwners.insert(E.getMutationOwner());
       return true;
     });
   }
-  if (DroppedAllocation) {
-    --Result.VirtualizationDelta;
-    ++Result.AllocationDelta;
+  if (!DroppedAllocOwners.empty()) {
+    Result.VirtualizationDelta -= static_cast<int>(DroppedAllocOwners.size());
+    Result.AllocationDelta += static_cast<int>(DroppedAllocOwners.size());
   }
-  Result.EscapeClassification[ID] =
-      jeandle::PEAResult::EscapeKind::AlwaysEscapes;
+  for (jeandle::ObjectID ID : IDs)
+    Result.EscapeClassification[ID] =
+        jeandle::PEAResult::EscapeKind::AlwaysEscapes;
+  ++Result.EffectEpoch;
 }
 
 void Analyzer::commit() {
@@ -7464,11 +7498,11 @@ void Analyzer::commit() {
   };
   auto FieldValuesAvailable = [&](jeandle::ObjectID ID,
                                   const DenseSet<Value *> &OwnedPhis) -> bool {
-    for (const auto &Kv : Result.BlockEffects)
-      for (const auto &E : Kv.second) {
-        if (!E.hasMutationOwner() || E.getMutationOwner() != ID)
-          continue;
-        if (const auto *ME = dyn_cast<jeandle::MaterializeEffect>(&E)) {
+    ensureEffectsByOwnerCache();
+    auto OwnerIt = EffectsByOwnerCache.find(ID);
+    if (OwnerIt != EffectsByOwnerCache.end())
+      for (const jeandle::Effect *E : OwnerIt->second) {
+        if (const auto *ME = dyn_cast<jeandle::MaterializeEffect>(E)) {
           for (const auto &FE : ME->FieldEntries) {
             if (FE.Value.isScalar() &&
                 !IsAvailableValue(FE.Value.getScalar(), OwnedPhis))
@@ -7477,7 +7511,7 @@ void Analyzer::commit() {
                 !IsAvailableValue(FE.Value.getMaterialized(), OwnedPhis))
               return false;
           }
-        } else if (const auto *PE = dyn_cast<jeandle::CreatePHIEffect>(&E)) {
+        } else if (const auto *PE = dyn_cast<jeandle::CreatePHIEffect>(E)) {
           // Field-value PHI (the only remaining CreatePHI variant): every
           // incoming must be producible at apply time.
           for (const WeakTrackingVH &In : PE->PHIIncomingValues)
@@ -7767,20 +7801,22 @@ void Analyzer::commit() {
   // discovery; access-handler type mismatch / non-const offset; etc.).
   // Cross-block escapes trigger materialization (they do not disqualify an
   // object).
+  DenseSet<jeandle::ObjectID> IneligibleIDs;
   for (auto &VObjUP : Result.VirtualObjects) {
     jeandle::ObjectID ID = VObjUP->getID();
     auto EIt = Eligible.find(ID);
     bool IsEligible = (EIt != Eligible.end()) && EIt->second;
     if (!IsEligible)
-      dropEffectsFor(ID);
+      IneligibleIDs.insert(ID);
   }
+  dropEffectsForIneligible(IneligibleIDs);
 
   // -------------------------------------------------------------------------
   // EscapeClassification population.
   //
-  // dropEffectsFor() already stamped AlwaysEscapes onto every ineligible VO.
-  // For each surviving (eligible) VO, classify based on whether ANY
-  // Materialize effect survived in the committed plan:
+  // dropEffectsForIneligible() already stamped AlwaysEscapes onto every
+  // ineligible VO. For each surviving (eligible) VO, classify based on whether
+  // ANY Materialize effect survived in the committed plan:
   //   * no Materialize  -> NeverEscapes      (alloc fully eliminated)
   //   * any Materialize -> PartiallyEscapes  (original allocation retained;
   //                                           tracked fields and locks replayed
@@ -7810,7 +7846,7 @@ void Analyzer::commit() {
 
   for (auto &VObjUP : Result.VirtualObjects) {
     jeandle::ObjectID ID = VObjUP->getID();
-    // dropEffectsFor stamped AlwaysEscapes; skip those VOs.
+    // dropEffectsForIneligible stamped AlwaysEscapes; skip those VOs.
     if (Result.EscapeClassification.count(ID))
       continue;
     // A live prepared synthetic DAG routes these ordinary allocations through
@@ -8790,6 +8826,8 @@ void Analyzer::restoreLoopSnapshot(
     else
       MaterializedAtPred.erase(BB);
   }
+  // Restoring the per-block EffectLists changes the effect set.
+  ++Result.EffectEpoch;
 }
 
 SmallVector<BasicBlock *, 32>

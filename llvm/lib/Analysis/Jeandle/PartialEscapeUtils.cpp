@@ -417,25 +417,8 @@ static constexpr unsigned ResolveVirtualRefMaxDepth = 8;
 static VirtualIdentityResult
 resolveVirtualIdentityImpl(Value *V, const PEABlockState &State,
                            const AliasMap &Aliases, const DataLayout &DL,
-                           VirtualIdentityMode Mode, DenseSet<Value *> &Visited,
-                           unsigned Depth);
-
-static VirtualIdentityResult checkAliasMap(Value *V, const PEABlockState &State,
-                                           const AliasMap &Aliases) {
-  // Virtual alias: a Value* registered as standing for some ObjectID.
-  if (auto ID = Aliases.getVirtualAlias(V)) {
-    if (const ObjectState *OS = State.getObjectStateOptional(*ID)) {
-      if (OS->isVirtual())
-        return VirtualIdentityResult::defined(*ID);
-    }
-    // Materialized or missing: V no longer denotes a virtual object.
-    return VirtualIdentityResult::unknown();
-  }
-  // Scalar replacement aliases never resolve to a virtual object.
-  if (Aliases.getScalarAlias(V) != nullptr)
-    return VirtualIdentityResult::unknown();
-  return VirtualIdentityResult::unknown();
-}
+                           VirtualIdentityMode Mode,
+                           SmallDenseSet<Value *, 8> &Visited, unsigned Depth);
 
 // RAII helper: insert `V` into `Visited` on entry and erase on scope exit so
 // that the set tracks "values currently on the DFS stack", not "values ever
@@ -444,10 +427,10 @@ static VirtualIdentityResult checkAliasMap(Value *V, const PEABlockState &State,
 // two sibling subtrees share a value (e.g. `select i1 %c, %o, %o`).
 namespace {
 struct StackGuard {
-  DenseSet<Value *> &Set;
+  SmallDenseSet<Value *, 8> &Set;
   Value *V;
   bool Inserted;
-  StackGuard(DenseSet<Value *> &S, Value *Val) : Set(S), V(Val) {
+  StackGuard(SmallDenseSet<Value *, 8> &S, Value *Val) : Set(S), V(Val) {
     Inserted = Set.insert(V).second;
   }
   ~StackGuard() {
@@ -460,27 +443,37 @@ struct StackGuard {
 static VirtualIdentityResult
 resolveVirtualIdentityImpl(Value *V, const PEABlockState &State,
                            const AliasMap &Aliases, const DataLayout &DL,
-                           VirtualIdentityMode Mode, DenseSet<Value *> &Visited,
-                           unsigned Depth) {
+                           VirtualIdentityMode Mode,
+                           SmallDenseSet<Value *, 8> &Visited, unsigned Depth) {
   if (!V)
     return VirtualIdentityResult::unknown();
   if (Depth > ResolveVirtualRefMaxDepth)
     return VirtualIdentityResult::unknown();
   // Cycle detection: if V is already on the resolution stack we're in a
   // self-reference (e.g. phi referencing itself) — bail.
-  if (Visited.count(V))
-    return VirtualIdentityResult::unknown();
   StackGuard Guard(Visited, V);
+  if (!Guard.Inserted)
+    return VirtualIdentityResult::unknown();
 
   // (1) Alias map lookup takes precedence over structural peeling so that
   // alias-registered Values (loads, PHIs, ...) resolve correctly even though
-  // they have no structural relationship with their allocation site.
-  if (Aliases.getVirtualAlias(V).has_value() ||
-      Aliases.getScalarAlias(V) != nullptr) {
-    if (Mode == VirtualIdentityMode::WholeObject &&
-        !Aliases.isWholeObjectVirtualAlias(V))
+  // they have no structural relationship with their allocation site. The
+  // virtual and scalar aliases are each read exactly once here.
+  auto VirtAlias = Aliases.getVirtualAlias(V);
+  Value *ScalarAlias = Aliases.getScalarAlias(V);
+  if (VirtAlias || ScalarAlias) {
+    if (VirtAlias) {
+      if (Mode == VirtualIdentityMode::WholeObject &&
+          !Aliases.isWholeObjectVirtualAlias(V))
+        return VirtualIdentityResult::unknown();
+      if (const ObjectState *OS = State.getObjectStateOptional(*VirtAlias)) {
+        if (OS->isVirtual())
+          return VirtualIdentityResult::defined(*VirtAlias);
+      }
       return VirtualIdentityResult::unknown();
-    return checkAliasMap(V, State, Aliases);
+    }
+    // Scalar-replacement aliases never denote a virtual object.
+    return VirtualIdentityResult::unknown();
   }
 
   // (2) Constants and special values.
@@ -597,7 +590,7 @@ VirtualIdentityResult resolveVirtualIdentity(Value *V,
                                              const AliasMap &Aliases,
                                              const DataLayout &DL,
                                              VirtualIdentityMode Mode) {
-  DenseSet<Value *> Visited;
+  SmallDenseSet<Value *, 8> Visited;
   return resolveVirtualIdentityImpl(V, State, Aliases, DL, Mode, Visited,
                                     /*Depth=*/0);
 }
@@ -612,21 +605,28 @@ std::optional<ObjectID> resolveVirtualRef(Value *V, const PEABlockState &State,
   return R.getObjectID();
 }
 
-static bool isProvablyDistinctFromVirtualImpl(Value *V, ObjectID TargetID,
-                                              const PEABlockState &State,
-                                              const AliasMap &Aliases,
-                                              const DataLayout &DL,
-                                              DenseSet<Value *> &Visited,
-                                              unsigned Depth) {
-  if (!V || Depth > ResolveVirtualRefMaxDepth || Visited.count(V))
+static bool isProvablyDistinctFromVirtualImpl(
+    Value *V, ObjectID TargetID, const PEABlockState &State,
+    const AliasMap &Aliases, const DataLayout &DL,
+    SmallDenseSet<Value *, 8> &Visited,
+    SmallDenseSet<Value *, 8> &IdentityScratch, unsigned Depth) {
+  if (!V || Depth > ResolveVirtualRefMaxDepth)
     return false;
   StackGuard Guard(Visited, V);
+  if (!Guard.Inserted)
+    return false;
 
   if (isa<PoisonValue>(V) || isa<UndefValue>(V))
     return false;
 
-  VirtualIdentityResult Whole = resolveVirtualIdentity(
-      V, State, Aliases, DL, VirtualIdentityMode::WholeObject);
+  // Reuse a single scratch set across recursion nodes instead of allocating a
+  // fresh visited-set per call. clear() restores the empty-set semantics the
+  // public wrapper relied on; the outer Visited already contains V here, so the
+  // two sets must stay distinct.
+  IdentityScratch.clear();
+  VirtualIdentityResult Whole = resolveVirtualIdentityImpl(
+      V, State, Aliases, DL, VirtualIdentityMode::WholeObject, IdentityScratch,
+      /*Depth=*/0);
   if (Whole.isDefined())
     return Whole.getObjectID() != TargetID;
 
@@ -639,41 +639,45 @@ static bool isProvablyDistinctFromVirtualImpl(Value *V, ObjectID TargetID,
   }
   if (Value *Scalar = Aliases.getScalarAlias(V))
     return isProvablyDistinctFromVirtualImpl(Scalar, TargetID, State, Aliases,
-                                             DL, Visited, Depth + 1);
+                                             DL, Visited, IdentityScratch,
+                                             Depth + 1);
 
   if (auto *PN = dyn_cast<PHINode>(V)) {
     if (PN->getNumIncomingValues() == 0)
       return false;
     return llvm::all_of(PN->incoming_values(), [&](Value *Incoming) {
       return isProvablyDistinctFromVirtualImpl(Incoming, TargetID, State,
-                                               Aliases, DL, Visited, Depth + 1);
+                                               Aliases, DL, Visited,
+                                               IdentityScratch, Depth + 1);
     });
   }
   if (auto *Sel = dyn_cast<SelectInst>(V))
     return isProvablyDistinctFromVirtualImpl(Sel->getTrueValue(), TargetID,
                                              State, Aliases, DL, Visited,
-                                             Depth + 1) &&
+                                             IdentityScratch, Depth + 1) &&
            isProvablyDistinctFromVirtualImpl(Sel->getFalseValue(), TargetID,
                                              State, Aliases, DL, Visited,
-                                             Depth + 1);
+                                             IdentityScratch, Depth + 1);
 
   // Freeze makes an undef/poison choice observable. Recurse only when LLVM
   // can prove its operand already has a defined value.
   if (auto *FI = dyn_cast<FreezeInst>(V))
     return isGuaranteedNotToBeUndefOrPoison(FI->getOperand(0)) &&
            isProvablyDistinctFromVirtualImpl(FI->getOperand(0), TargetID, State,
-                                             Aliases, DL, Visited, Depth + 1);
+                                             Aliases, DL, Visited,
+                                             IdentityScratch, Depth + 1);
 
   if (auto *GEP = dyn_cast<GEPOperator>(V)) {
     std::optional<int64_t> Offset = resolveFieldOffset(V, DL);
     return Offset && *Offset == 0 &&
            isProvablyDistinctFromVirtualImpl(GEP->getPointerOperand(), TargetID,
                                              State, Aliases, DL, Visited,
-                                             Depth + 1);
+                                             IdentityScratch, Depth + 1);
   }
   if (auto *BC = dyn_cast<BitCastOperator>(V))
     return isProvablyDistinctFromVirtualImpl(BC->getOperand(0), TargetID, State,
-                                             Aliases, DL, Visited, Depth + 1);
+                                             Aliases, DL, Visited,
+                                             IdentityScratch, Depth + 1);
   if (auto *ASC = dyn_cast<AddrSpaceCastOperator>(V)) {
     auto *SrcPT = dyn_cast<PointerType>(ASC->getOperand(0)->getType());
     auto *DstPT = dyn_cast<PointerType>(ASC->getType());
@@ -681,14 +685,15 @@ static bool isProvablyDistinctFromVirtualImpl(Value *V, ObjectID TargetID,
         SrcPT->getAddressSpace() != jeandle::AddrSpace::JavaHeapAddrSpace ||
         DstPT->getAddressSpace() != jeandle::AddrSpace::JavaHeapAddrSpace)
       return false;
-    return isProvablyDistinctFromVirtualImpl(
-        ASC->getOperand(0), TargetID, State, Aliases, DL, Visited, Depth + 1);
+    return isProvablyDistinctFromVirtualImpl(ASC->getOperand(0), TargetID,
+                                             State, Aliases, DL, Visited,
+                                             IdentityScratch, Depth + 1);
   }
   if (isIntToPtrOp(V)) {
     Value *Inner = getIntToPtrRoundTripInner(V, DL);
-    return Inner &&
-           isProvablyDistinctFromVirtualImpl(Inner, TargetID, State, Aliases,
-                                             DL, Visited, Depth + 1);
+    return Inner && isProvablyDistinctFromVirtualImpl(
+                        Inner, TargetID, State, Aliases, DL, Visited,
+                        IdentityScratch, Depth + 1);
   }
 
   if (auto *II = dyn_cast<IntrinsicInst>(V)) {
@@ -698,7 +703,7 @@ static bool isProvablyDistinctFromVirtualImpl(Value *V, ObjectID TargetID,
     case Intrinsic::ptr_annotation:
       return isProvablyDistinctFromVirtualImpl(II->getArgOperand(0), TargetID,
                                                State, Aliases, DL, Visited,
-                                               Depth + 1);
+                                               IdentityScratch, Depth + 1);
     default:
       return false;
     }
@@ -720,9 +725,11 @@ bool isProvablyDistinctFromVirtual(Value *V, ObjectID TargetID,
                                    const AliasMap &Aliases,
                                    const DataLayout &DL) {
   assert(TargetID != InvalidObjectID);
-  DenseSet<Value *> Visited;
+  SmallDenseSet<Value *, 8> Visited;
+  SmallDenseSet<Value *, 8> IdentityScratch;
   return isProvablyDistinctFromVirtualImpl(V, TargetID, State, Aliases, DL,
-                                           Visited, /*Depth=*/0);
+                                           Visited, IdentityScratch,
+                                           /*Depth=*/0);
 }
 
 // ===========================================================================

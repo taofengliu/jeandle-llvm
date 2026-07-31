@@ -745,6 +745,7 @@ void PEAResult::addBlockEffect(std::unique_ptr<Effect> E) {
   assert(E->Block);
   BasicBlock *BB = E->Block;
   BlockEffects[BB].add(std::move(E));
+  ++EffectEpoch;
 }
 
 void PEAResult::publishEffectTrace() const {

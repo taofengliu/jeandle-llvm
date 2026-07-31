@@ -179,6 +179,21 @@ static bool splitReplayEdges(jeandle::PEAResult &Result) {
     }
   }
 
+  // Index unparented CreatePHIEffects by their target block so each split-edge
+  // plan finds its PHIs by lookup instead of re-scanning all BlockEffects. The
+  // landingpad insertion above has already parented the landingpad PHIs, and
+  // the plan loop below only renames PHI incoming blocks and MaterializeEffect
+  // targets — never a CreatePHIEffect's Block nor its parent — so this index
+  // stays valid for the whole loop.
+  DenseMap<BasicBlock *, SmallVector<jeandle::CreatePHIEffect *, 2>>
+      UnparentedPhisByBlock;
+  for (auto &KV : Result.BlockEffects)
+    for (jeandle::Effect &E : KV.second) {
+      auto *PE = dyn_cast<jeandle::CreatePHIEffect>(&E);
+      if (PE && !PE->PhiInst->getParent())
+        UnparentedPhisByBlock[PE->Block].push_back(PE);
+    }
+
   bool Changed = false;
   for (EdgePlan &Plan : Plans) {
     // CFG utilities preserve a terminator's successor indices while replacing
@@ -211,15 +226,12 @@ static bool splitReplayEdges(jeandle::PEAResult &Result) {
     // synchronized with the normalized CFG. replaceSuccessorWith redirects
     // every duplicate switch edge from Source, so matching incomings move
     // together.
-    for (auto &KV : Result.BlockEffects)
-      for (jeandle::Effect &E : KV.second) {
-        auto *PE = dyn_cast<jeandle::CreatePHIEffect>(&E);
-        if (!PE || PE->PhiInst->getParent() || PE->Block != CurrentTarget)
-          continue;
+    auto Found = UnparentedPhisByBlock.find(CurrentTarget);
+    if (Found != UnparentedPhisByBlock.end())
+      for (jeandle::CreatePHIEffect *PE : Found->second)
         for (BasicBlock *&Incoming : PE->PHIIncomingBlocks)
           if (Incoming == Plan.Source)
             Incoming = Edge;
-      }
 
     for (jeandle::MaterializeEffect *ME : Plan.Effects) {
       // Keep ownership in the original source bucket so EffectList references

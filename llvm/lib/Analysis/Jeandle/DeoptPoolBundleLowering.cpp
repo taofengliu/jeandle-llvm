@@ -18,8 +18,9 @@
 #include "llvm/Support/ErrorHandling.h"
 
 #include <limits>
-#include <map>
 #include <utility>
+
+#include "llvm/ADT/DenseMap.h"
 
 using namespace llvm;
 using namespace llvm::jeandle;
@@ -174,16 +175,17 @@ public:
   BundlePlanBuilder(const ParsedDeoptBundle &Source,
                     const FinalDeoptPoolGraphPlan &Graph,
                     ArrayRef<DeoptPoolScalarTokenBinding> ScalarTokens,
-                    ArrayRef<DeoptPoolCurrentCellBinding> CurrentCells,
-                    const CallBase &SourceSite)
+                    ArrayRef<DeoptPoolCurrentCellBinding> CurrentCells)
       : Source(Source), Graph(Graph), ScalarTokenInputs(ScalarTokens),
-        CurrentCellInputs(CurrentCells), SourceSite(SourceSite),
+        CurrentCellInputs(CurrentCells),
         AccountedSourceCells(Source.OriginalInputs.size()) {}
 
   PrepareFinalDeoptPoolBundleResult build() {
-    if (!matchesParsedDeoptBundle(Source, SourceSite))
-      return prepareError(FinalDeoptPoolBundleErrorCode::StaleSourceBundle);
-
+    // copyParsedDeoptBundleInputs follows the WeakTrackingVH-captured inputs,
+    // rejects any nulled value, and validates the fingerprint. build() runs
+    // during analysis where the IR is immutable, so the live bundle operands
+    // still equal the parsed snapshot; the post-RAUW live-operand recheck is
+    // performed by serializeFinalDeoptPoolBundlePlan in the transform phase.
     if (!copyParsedDeoptBundleInputs(Source, SourceValues))
       return prepareError(
           FinalDeoptPoolBundleErrorCode::InvalidSourceFingerprint);
@@ -520,7 +522,7 @@ private:
   }
 
   bool classifyCurrentOccurrences() {
-    std::map<DeoptPoolSemanticCellID, CurrentDeoptNodeID> UniqueCells;
+    DenseMap<DeoptPoolSemanticCellID, CurrentDeoptNodeID> UniqueCells;
     for (const DeoptPoolCurrentCellBinding &Binding : CurrentCellInputs) {
       if (Binding.SemanticCell == InvalidDeoptPoolSemanticCellID ||
           Binding.CurrentID == InvalidCurrentDeoptNodeID ||
@@ -860,22 +862,27 @@ private:
   const FinalDeoptPoolGraphPlan &Graph;
   ArrayRef<DeoptPoolScalarTokenBinding> ScalarTokenInputs;
   ArrayRef<DeoptPoolCurrentCellBinding> CurrentCellInputs;
-  const CallBase &SourceSite;
 
   SmallVector<Value *, 32> SourceValues;
   SmallBitVector AccountedSourceCells;
   SmallBitVector LegacySourceKept;
   std::optional<FinalDeoptPoolBundleError> Error;
 
-  std::map<uint64_t, WeakTrackingVH> ScalarTokens;
-  std::map<DeoptPoolSemanticCellID, SourceRootLocation> SourceRoots;
-  std::map<DeoptPoolSemanticCellID, SourceFieldLocation> SourceFields;
-  std::map<DeoptPoolSemanticCellID, const FinalDeoptPoolRoot *>
+  // Lookup maps for per-safepoint plan building. Keys can't reach DenseMap's
+  // integer sentinels: semantic cells are bundle operand indices bounded by the
+  // operand count (and InvalidDeoptPoolSemanticCellID == UINT32_MAX is rejected
+  // before insertion), wire IDs are bounded by MaxSignedWireValue (INT32_MAX),
+  // and scalar tokens are a 1-based counter — all far from
+  // numeric_limits<uint32_t>::max()/max()-1 and the uint64_t analogs.
+  DenseMap<uint64_t, WeakTrackingVH> ScalarTokens;
+  DenseMap<DeoptPoolSemanticCellID, SourceRootLocation> SourceRoots;
+  DenseMap<DeoptPoolSemanticCellID, SourceFieldLocation> SourceFields;
+  DenseMap<DeoptPoolSemanticCellID, const FinalDeoptPoolRoot *>
       FinalRootsByCell;
-  std::map<DeoptPoolSemanticCellID, const FinalDeoptPoolField *>
+  DenseMap<DeoptPoolSemanticCellID, const FinalDeoptPoolField *>
       FinalFieldsByCell;
-  std::map<uint32_t, CurrentDeoptNodeID> CurrentByWire;
-  std::map<DeoptPoolSemanticCellID, unsigned> ExactOccurrenceByCell;
+  DenseMap<uint32_t, CurrentDeoptNodeID> CurrentByWire;
+  DenseMap<DeoptPoolSemanticCellID, unsigned> ExactOccurrenceByCell;
 
   SmallVector<FinalDeoptPoolBundleToken, 32> Tokens;
   SmallVector<FinalDeoptPoolCurrentOccurrence, 8> CurrentOccurrences;
@@ -887,11 +894,8 @@ PrepareFinalDeoptPoolBundleResult
 llvm::jeandle::pea::prepareFinalDeoptPoolBundlePlan(
     const ParsedDeoptBundle &Source, const FinalDeoptPoolGraphPlan &Graph,
     ArrayRef<DeoptPoolScalarTokenBinding> ScalarTokens,
-    ArrayRef<DeoptPoolCurrentCellBinding> CurrentCells,
-    const CallBase &SourceSite) {
-  return BundlePlanBuilder(Source, Graph, ScalarTokens, CurrentCells,
-                           SourceSite)
-      .build();
+    ArrayRef<DeoptPoolCurrentCellBinding> CurrentCells) {
+  return BundlePlanBuilder(Source, Graph, ScalarTokens, CurrentCells).build();
 }
 
 SerializeFinalDeoptPoolBundleResult

@@ -182,8 +182,7 @@ struct SerializeFinalDeoptPoolBundleResult {
 LLVM_ABI PrepareFinalDeoptPoolBundleResult prepareFinalDeoptPoolBundlePlan(
     const ParsedDeoptBundle &Source, const FinalDeoptPoolGraphPlan &Graph,
     ArrayRef<DeoptPoolScalarTokenBinding> ScalarTokens,
-    ArrayRef<DeoptPoolCurrentCellBinding> CurrentCells,
-    const CallBase &SourceSite);
+    ArrayRef<DeoptPoolCurrentCellBinding> CurrentCells);
 
 LLVM_ABI SerializeFinalDeoptPoolBundleResult serializeFinalDeoptPoolBundlePlan(
     const FinalDeoptPoolBundlePlan &Plan, const CallBase &CurrentSite);

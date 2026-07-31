@@ -196,7 +196,7 @@ TEST(DeoptPoolBundleLoweringTest,
 
   DeoptPoolScalarTokenBinding ScalarBinding{700, IR.Int};
   PrepareFinalDeoptPoolBundleResult Prepared =
-      prepareFinalDeoptPoolBundlePlan(Source, Graph, {ScalarBinding}, {}, *CB);
+      prepareFinalDeoptPoolBundlePlan(Source, Graph, {ScalarBinding}, {});
   ASSERT_TRUE(Prepared.Plan.has_value());
   EXPECT_FALSE(Prepared.Error.has_value());
 
@@ -250,7 +250,7 @@ TEST(DeoptPoolBundleLoweringTest, RewritesOnlyTheExactCurrentScopeOccurrence) {
   DeoptPoolCurrentCellBinding CurrentCell{Root.ValueCell.OperandIndex,
                                           /*CurrentID=*/55};
   PrepareFinalDeoptPoolBundleResult Prepared = prepareFinalDeoptPoolBundlePlan(
-      Source, Graph, {ScalarBinding}, {CurrentCell}, *CB);
+      Source, Graph, {ScalarBinding}, {CurrentCell});
   ASSERT_TRUE(Prepared.Plan.has_value());
   ASSERT_TRUE(Prepared.Plan->needsRewrite());
 
@@ -306,7 +306,7 @@ TEST(DeoptPoolBundleLoweringTest,
   DeoptPoolCurrentCellBinding CurrentCell{Monitor.OwnerCell.OperandIndex,
                                           /*CurrentID=*/77};
   PrepareFinalDeoptPoolBundleResult Prepared =
-      prepareFinalDeoptPoolBundlePlan(Source, Graph, {}, {CurrentCell}, *CB);
+      prepareFinalDeoptPoolBundlePlan(Source, Graph, {}, {CurrentCell});
   ASSERT_TRUE(Prepared.Plan.has_value());
   const FinalDeoptPoolCurrentOccurrence *Occurrence = findOccurrence(
       *Prepared.Plan, FinalDeoptPoolOccurrenceKind::MonitorOwner);
@@ -358,7 +358,7 @@ TEST(DeoptPoolBundleLoweringTest,
   ASSERT_TRUE(Graph.currentMembers().empty());
 
   PrepareFinalDeoptPoolBundleResult Prepared =
-      prepareFinalDeoptPoolBundlePlan(Source, Graph, {}, {}, *CB);
+      prepareFinalDeoptPoolBundlePlan(Source, Graph, {}, {});
   ASSERT_TRUE(Prepared.Plan.has_value());
   EXPECT_TRUE(Prepared.Plan->currentOccurrences().empty());
   SerializeFinalDeoptPoolBundleResult Serialized =
@@ -395,7 +395,7 @@ TEST(DeoptPoolBundleLoweringTest,
   ASSERT_FALSE(Graph.needsRewrite());
 
   PrepareFinalDeoptPoolBundleResult Prepared =
-      prepareFinalDeoptPoolBundlePlan(Source, Graph, {}, {}, *CB);
+      prepareFinalDeoptPoolBundlePlan(Source, Graph, {}, {});
   ASSERT_TRUE(Prepared.Plan.has_value());
   EXPECT_FALSE(Prepared.Plan->needsRewrite());
   SerializeFinalDeoptPoolBundleResult Serialized =
@@ -432,8 +432,8 @@ TEST(DeoptPoolBundleLoweringTest, EmitsOneWirePairForEachLongAndDoubleField) {
                                                        {1200, IR.Double}};
   DeoptPoolCurrentCellBinding CurrentCell{Root.ValueCell.OperandIndex,
                                           /*CurrentID=*/88};
-  PrepareFinalDeoptPoolBundleResult Prepared = prepareFinalDeoptPoolBundlePlan(
-      Source, Graph, Bindings, {CurrentCell}, *CB);
+  PrepareFinalDeoptPoolBundleResult Prepared =
+      prepareFinalDeoptPoolBundlePlan(Source, Graph, Bindings, {CurrentCell});
   ASSERT_TRUE(Prepared.Plan.has_value());
   SerializeFinalDeoptPoolBundleResult Serialized =
       serializeFinalDeoptPoolBundlePlan(*Prepared.Plan, *CB);
@@ -465,7 +465,7 @@ TEST(DeoptPoolBundleLoweringTest, TrackedSourceValuesFollowRAUW) {
                  DeoptPoolRootKind::Local, 1400));
   FinalDeoptPoolGraphPlan Graph = plan(PlannerInput);
   PrepareFinalDeoptPoolBundleResult Prepared =
-      prepareFinalDeoptPoolBundlePlan(Source, Graph, {}, {}, *CB);
+      prepareFinalDeoptPoolBundlePlan(Source, Graph, {}, {});
   ASSERT_TRUE(Prepared.Plan.has_value());
 
   IR.Object->replaceAllUsesWith(IR.OtherObject);
@@ -492,7 +492,7 @@ TEST(DeoptPoolBundleLoweringTest,
                  DeoptPoolRootKind::Local, 1500));
   FinalDeoptPoolGraphPlan Graph = plan(PlannerInput);
   PrepareFinalDeoptPoolBundleResult Prepared =
-      prepareFinalDeoptPoolBundlePlan(Source, Graph, {}, {}, *CB);
+      prepareFinalDeoptPoolBundlePlan(Source, Graph, {}, {});
   ASSERT_TRUE(Prepared.Plan.has_value());
 
   unsigned BundleOperand = CB->getBundleOperandsStartIndex() +
@@ -529,7 +529,7 @@ TEST(DeoptPoolBundleLoweringTest,
     DeoptPoolCurrentCellBinding CurrentCell{
         Source.Scopes[0].FirstBCICell.OperandIndex, /*CurrentID=*/99};
     PrepareFinalDeoptPoolBundleResult Prepared =
-        prepareFinalDeoptPoolBundlePlan(Source, Graph, {}, {CurrentCell}, *CB);
+        prepareFinalDeoptPoolBundlePlan(Source, Graph, {}, {CurrentCell});
     EXPECT_FALSE(Prepared.Plan.has_value());
     ASSERT_TRUE(Prepared.Error.has_value());
     EXPECT_EQ(Prepared.Error->Code,
@@ -550,7 +550,7 @@ TEST(DeoptPoolBundleLoweringTest,
     DeoptPoolCurrentCellBinding CurrentCell{Root.ValueCell.OperandIndex,
                                             /*CurrentID=*/100};
     PrepareFinalDeoptPoolBundleResult Prepared =
-        prepareFinalDeoptPoolBundlePlan(Source, Graph, {}, {CurrentCell}, *CB);
+        prepareFinalDeoptPoolBundlePlan(Source, Graph, {}, {CurrentCell});
     EXPECT_FALSE(Prepared.Plan.has_value());
     ASSERT_TRUE(Prepared.Error.has_value());
     EXPECT_EQ(Prepared.Error->Code,
@@ -579,7 +579,7 @@ TEST(DeoptPoolBundleLoweringTest, RejectsANonObjectCurrentOverlay) {
   DeoptPoolCurrentCellBinding CurrentCell{Root.ValueCell.OperandIndex,
                                           /*CurrentID=*/101};
   PrepareFinalDeoptPoolBundleResult Prepared =
-      prepareFinalDeoptPoolBundlePlan(Source, Graph, {}, {CurrentCell}, *CB);
+      prepareFinalDeoptPoolBundlePlan(Source, Graph, {}, {CurrentCell});
   EXPECT_FALSE(Prepared.Plan.has_value());
   ASSERT_TRUE(Prepared.Error.has_value());
   EXPECT_EQ(Prepared.Error->Code,
@@ -628,7 +628,7 @@ TEST(DeoptPoolBundleLoweringTest,
   DeoptPoolCurrentCellBinding CurrentCell{PrunedField.ValueCell.OperandIndex,
                                           /*CurrentID=*/123};
   PrepareFinalDeoptPoolBundleResult Prepared =
-      prepareFinalDeoptPoolBundlePlan(Source, Graph, {}, {CurrentCell}, *CB);
+      prepareFinalDeoptPoolBundlePlan(Source, Graph, {}, {CurrentCell});
   ASSERT_TRUE(Prepared.Plan.has_value());
   EXPECT_TRUE(Prepared.Plan->coversExactOccurrence(
       PrunedField.ValueCell.OperandIndex, 123));
