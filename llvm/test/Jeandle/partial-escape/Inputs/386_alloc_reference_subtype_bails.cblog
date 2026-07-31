@@ -1,0 +1,9 @@
+# processAllocation queries CanVirtualize for every Instance
+# allocation. Klass 7777 represents a Reference / Thread subtype (or
+# any other identity-sensitive class) whose CanVirtualize returns
+# false. processAllocation refuses virtualization — the alloc survives in
+# IR untouched, no further callbacks fire for this site. HasFinalizer
+# is queried first (returns false) so the per-site sequence is:
+RequiresStrictLockOrder = 1
+HasFinalizer 7777 = false
+CanVirtualize 7777 = false

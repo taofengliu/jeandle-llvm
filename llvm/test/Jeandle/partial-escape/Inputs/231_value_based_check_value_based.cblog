@@ -1,0 +1,12 @@
+# B4: virtual whose exact klass (7777) IS a value-based class.
+# foldCheckIfValueBased queries IsValueBased(7777) = true and forces
+# materialization: the original allocation and check call must survive
+# so the runtime DiagnoseSyncOnValueBasedClasses warning fires on a real
+# oop.
+RequiresStrictLockOrder = 1
+# processAllocation(7777) calls IsBoxed (B10). Klass 7777 is not an autobox
+# wrapper, so the callback returns JBasicType::Count (9).
+HasFinalizer 7777 = false
+CanVirtualize 7777 = true
+IsBoxed 7777 = 9
+IsValueBased 7777 = true

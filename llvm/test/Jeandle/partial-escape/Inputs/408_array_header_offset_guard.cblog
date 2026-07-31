@@ -1,0 +1,4 @@
+# int[] (klass 9999): ElementBasicTypeOfArrayKlass populates ArrayBaseOffset=16
+# so the offset-4 access falls in the header region.
+RequiresStrictLockOrder = 1
+ElementBasicTypeOfArrayKlass 9999 = 4

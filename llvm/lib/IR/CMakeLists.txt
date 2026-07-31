@@ -3,6 +3,7 @@ add_llvm_component_library(LLVMCore
   Jeandle/VMCallback.cpp
   Jeandle/VMCallbackLog.cpp
   Jeandle/JavaType.cpp
+  Jeandle/VMConstants.cpp
   AbstractCallSite.cpp
   AsmWriter.cpp
   Assumptions.cpp

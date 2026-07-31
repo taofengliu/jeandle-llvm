@@ -1,0 +1,6 @@
+# Object[] klass 8888 has java.lang.Object as its element klass. The value has
+# no klass metadata, but every Java reference is compatible with Object[].
+RequiresStrictLockOrder = 1
+ElementBasicTypeOfArrayKlass 8888 = 8
+ArrayElementKlass 8888 = 4444
+IsObjectKlass 4444 = true

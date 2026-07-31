@@ -1,0 +1,4 @@
+# Object[] (8888) with element klass 4444; stored value is a constant null.
+RequiresStrictLockOrder = 1
+ElementBasicTypeOfArrayKlass 8888 = 8
+ArrayElementKlass 8888 = 4444
