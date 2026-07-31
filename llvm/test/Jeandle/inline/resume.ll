@@ -1,4 +1,5 @@
-; RUN: opt -S -passes=jeandle-inline-driver -jeandle-vm-callback-log=%S/Inputs/resume.cblog %s 2>&1 | FileCheck %s
+; RUN: opt -S -passes=jeandle-inline-driver -jeandle-vm-callback-log=%S/Inputs/resume.cblog %s 2>&1 | FileCheck --implicit-check-not=' resume ' %s
+; RUN: opt -S -passes='jeandle-inline-driver,rewrite-statepoints-for-gc,verify' -jeandle-vm-callback-log=%S/Inputs/resume.cblog %s 2>&1 | FileCheck --check-prefix=RS4GC --implicit-check-not=' resume ' %s
 
 ; Callee IR can unwind with either a normal landingpad value or a dummy zero
 ; resume value. Both forms should be redirected to the caller landingpad when
@@ -50,3 +51,8 @@ attributes #3 = { "monomorphic-target" }
 ; CHECK-NOT: @callee_resume_zero
 ; CHECK-NOT: define available_externally hotspotcc void @callee_resume_landingpad
 ; CHECK-NOT: define available_externally hotspotcc void @callee_resume_zero
+
+; RS4GC-LABEL: define hotspotcc i32 @root(
+; RS4GC: invoke hotspotcc token {{.*}}@llvm.experimental.gc.statepoint
+; RS4GC: %{{.*}} = landingpad token
+; RS4GC-NOT: landingpad i64

@@ -1,0 +1,5 @@
+# 219: two Object[] arrays (klasses 8881 and 8882), each with Object element
+# kind. No instance allocations.
+RequiresStrictLockOrder = 1
+ElementBasicTypeOfArrayKlass 8881 = 8
+ElementBasicTypeOfArrayKlass 8882 = 8

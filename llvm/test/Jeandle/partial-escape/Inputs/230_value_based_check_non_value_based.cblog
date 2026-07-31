@@ -1,0 +1,10 @@
+# B4: virtual whose exact klass (4444) is NOT a value-based class.
+# foldCheckIfValueBased queries IsValueBased(4444) = false and folds the
+# call to constant false; the virtual is then unused and disappears.
+RequiresStrictLockOrder = 1
+# processAllocation(4444) calls IsBoxed (B10). Klass 4444 is not an autobox
+# wrapper, so the callback returns JBasicType::Count (9).
+HasFinalizer 4444 = false
+CanVirtualize 4444 = true
+IsBoxed 4444 = 9
+IsValueBased 4444 = false

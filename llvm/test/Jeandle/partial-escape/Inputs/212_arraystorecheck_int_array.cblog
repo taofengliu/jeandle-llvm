@@ -1,0 +1,4 @@
+# B5: int[] primitive — ArrayElementKlass returns 0 (no element klass).
+RequiresStrictLockOrder = 1
+ElementBasicTypeOfArrayKlass 12345 = 4
+ArrayElementKlass 12345 = 0

@@ -1,0 +1,46 @@
+; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+
+; Regression — verify the loop-LOCAL alloc (= alloc inside the loop
+; body, never escapes) still virtualizes under the loop fixpoint driver.
+; This is the same shape as test 50. processAllocation registers a VO; the
+; AllocSiteToVO cache ensures the same ID is reused across iterations
+; (otherwise the fixpoint would diverge on Virtuals-set comparison).
+
+declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
+declare void @use(i32)
+declare i32 @__gxx_personality_v0(...)
+
+define void @test_loop_local(i32 %n) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
+entry:
+  br label %loop
+loop:
+  %i = phi i32 [ 0, %entry ], [ %i1, %cont ]
+  %c = icmp slt i32 %i, %n
+  br i1 %c, label %body, label %exit
+body:
+  %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+            ptr inttoptr (i64 12345 to ptr), i32 16)
+       to label %st unwind label %u
+st:
+  %s = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
+  store atomic i32 %i, ptr addrspace(1) %s unordered, align 4
+  %v = load atomic i32, ptr addrspace(1) %s unordered, align 4
+  call void @use(i32 %v)
+  br label %cont
+cont:
+  %i1 = add i32 %i, 1
+  br label %loop
+exit:
+  ret void
+u:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
+; CHECK-LABEL: define void @test_loop_local
+; CHECK-NOT: jeandle.new_instance
+; CHECK-NOT: store atomic
+; CHECK-NOT: load atomic
+; CHECK: call void @use(i32 %i)
+
+!java-method-compilation = !{}

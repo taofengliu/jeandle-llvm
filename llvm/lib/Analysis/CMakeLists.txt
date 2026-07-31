@@ -161,9 +161,15 @@ add_llvm_component_library(LLVMAnalysis
   ValueTracking.cpp
   VectorUtils.cpp
   ${GeneratedMLSources}
+  Jeandle/DeoptPoolBundleLowering.cpp
+  Jeandle/DeoptPoolPlanner.cpp
+  Jeandle/PartialEscape.cpp
+  Jeandle/PartialEscapeAnalysis.cpp
+  Jeandle/PartialEscapeUtils.cpp
 
   ADDITIONAL_HEADER_DIRS
   ${LLVM_MAIN_INCLUDE_DIR}/llvm/Analysis
+  ${LLVM_MAIN_INCLUDE_DIR}/llvm/Analysis/Jeandle
 
   DEPENDS
   analysis_gen

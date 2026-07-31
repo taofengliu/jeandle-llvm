@@ -191,7 +191,7 @@ Error VMCallbackLogRecorder::dump(StringRef FilePath) {
 
 static VMCallbacks RealCallbacks;
 
-#define RECORD_CALLBACK(Name, RetType, Params, Args)                           \
+#define RECORD_CALLBACK(Name, RetType, Params, Args, NumArgs)                  \
   static RetType record##Name Params {                                         \
     RetType Result = RealCallbacks.Name(JEANDLE_STRIP_PARENS Args);            \
     if (auto *R = VMCallbackLogRecorder::getActiveRecorder())                  \
@@ -201,7 +201,7 @@ static VMCallbacks RealCallbacks;
   }
 
 #define DEF_RECORD_CB(Name, RetType, ResType, Params, Args, ArgTypes, NumArgs) \
-  RECORD_CALLBACK(Name, RetType, Params, Args)
+  RECORD_CALLBACK(Name, RetType, Params, Args, NumArgs)
 
 ALL_JEANDLE_VM_CALLBACKS(DEF_RECORD_CB)
 

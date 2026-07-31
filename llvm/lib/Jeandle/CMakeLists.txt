@@ -10,6 +10,8 @@ add_llvm_component_library(LLVMJeandle
   Analysis
   JeandleTransforms
   Core
+  InstCombine
   Passes
+  Scalar
   Support
   )

@@ -145,6 +145,27 @@ enum class JeandleInlineReason : int {
   def(IsEffectivelyFinal, bool, Bool,                                            \
       (uintptr_t a1), (a1),                                                      \
       (VMCallbackValueType::Uintptr), 1)                                         \
+  def(RequiresStrictLockOrder, int, Int,                                         \
+      (), (),                                                                    \
+      (), 0)                                                                     \
+  def(ElementBasicTypeOfArrayKlass, int, Int,                                    \
+      (uintptr_t a1), (a1),                                                      \
+      (VMCallbackValueType::Uintptr), 1)                                         \
+  def(ArrayElementKlass, uintptr_t, Uintptr,                                     \
+      (uintptr_t a1), (a1),                                                      \
+      (VMCallbackValueType::Uintptr), 1)                                         \
+  def(IsValueBased, bool, Bool,                                                  \
+      (uintptr_t a1), (a1),                                                      \
+      (VMCallbackValueType::Uintptr), 1)                                         \
+  def(IsBoxed, int, Int,                                                         \
+      (uintptr_t a1), (a1),                                                      \
+      (VMCallbackValueType::Uintptr), 1)                                         \
+  def(HasFinalizer, bool, Bool,                                                  \
+      (uintptr_t a1), (a1),                                                      \
+      (VMCallbackValueType::Uintptr), 1)                                         \
+  def(CanVirtualize, bool, Bool,                                                 \
+      (uintptr_t a1), (a1),                                                      \
+      (VMCallbackValueType::Uintptr), 1)                                         \
   def(GetConstantFieldValue, int64_t, Long,                                      \
       (int a1, int a2), (a1, a2),                                                \
       (VMCallbackValueType::Int, VMCallbackValueType::Int), 2)                   \
@@ -157,6 +178,9 @@ enum class JeandleInlineReason : int {
   def(GetOopKlass, uintptr_t, Uintptr,                                           \
       (int a1), (a1),                                                            \
       (VMCallbackValueType::Int), 1)                                             \
+  def(GetJavaMirror, int, Int,                                               \
+      (uintptr_t a1), (a1),                                                  \
+      (VMCallbackValueType::Uintptr), 1)                                     \
   def(IsOkToInline, bool, Bool,                                                  \
       (int a1, int a2, uintptr_t a3), (a1, a2, a3),                              \
       (VMCallbackValueType::Int, VMCallbackValueType::Int,                       \
@@ -219,6 +243,74 @@ enum class JeandleInlineReason : int {
 ///                         whose bottom element is such an interface. Type info
 ///                         must not be attached to values of these types.
 ///   IsEffectivelyFinal  — Returns true if no subclass can exist at runtime.
+///   RequiresStrictLockOrder — Returns 1 if the runtime requires strict
+///                         monitor-stack nesting at materialization
+///                         (HotSpot LM_LIGHTWEIGHT); 0 otherwise.
+///   ElementBasicTypeOfArrayKlass — Given an array klass pointer, return the
+///                         Java basic type of its elements encoded as a
+///                         JBasicType integer (Boolean=0..Object=8). Returns
+///                         JBasicType::Count (9) for non-array klasses or
+///                         null/unknown inputs.
+///   ArrayElementKlass    — Given an object-array klass pointer, return its
+///                         element klass pointer. Returns 0 for primitive
+///                         (type-array) klasses, for null inputs, or when
+///                         the element klass is otherwise unavailable.
+///   IsValueBased         — Returns true iff the klass carries the
+///                         jdk.internal.ValueBased annotation (HotSpot's
+///                         access_flags().is_value_based_class()). Used by
+///                         PEA's foldCheckIfValueBased to decide whether a
+///                         virtual receiver of jeandle.check_if_value_based
+///                         should force-materialize (klass IS value-based —
+///                         the runtime warning must fire on a real oop) or
+///                         elide the check (klass is NOT value-based). For
+///                         null/unresolved klass inputs the implementation
+///                         must return false (PEA already gates the query
+///                         on VObj.Klass != 0 and callback availability).
+///                         Therefore false for a queried exact Klass means it
+///                         is provably not value-based and the check is folded
+///                         away; the null case is only defensive API behavior.
+///   IsBoxed              — Returns the JBasicType integer of the boxed
+///                         primitive if the klass is one of the eight
+///                         autobox wrapper classes (java.lang.Boolean,
+///                         Byte, Character, Short, Integer, Long, Float,
+///                         Double); returns JBasicType::Count (9) for any
+///                         other klass or null input. Currently UNUSED by
+///                         partial escape analysis (the frontend does not
+///                         inline the valueOf intrinsic that a boxing fold
+///                         would depend on, per the "no special-
+///                         optimization unsupported by the frontend" rule).
+///                         It is wired into the callback table and recorded
+///                         by the .cblog fixtures in anticipation of a
+///                         future structural icmp-eq boxed-primitive fold
+///                         mirroring Graal's VirtualBoxingNode +
+///                         ObjectEqualsNode boxed path; until that lands it
+///                         must stay conservatively "not boxed" for every
+///                         PEA query.
+///   HasFinalizer         — Returns true iff the klass has a non-trivial
+///                         finalize() method (HotSpot's
+///                         InstanceKlass::has_finalizer()). Mirrors
+///                         Graal's NewInstanceNode + RegisterFinalizerNode
+///                         interaction: a class with a finalizer must
+///                         have its allocation actually executed at the
+///                         original allocation site so HotSpot's
+///                         finalizer registration runs, otherwise the
+///                         finalize() method would never be invoked.
+///                         processAllocation refuses to virtualize the alloc
+///                         when this returns true. For null inputs the
+///                         implementation must return false.
+///   CanVirtualize        — Returns true iff the klass is safe to
+///                         virtualize (no identity-sensitive runtime
+///                         constraints). Mirrors Graal's
+///                         MetaAccessExtensionProvider.canVirtualize.
+///                         The JDK-side implementation enumerates
+///                         identity-sensitive subtypes (java.lang.ref.
+///                         Reference and Thread hierarchies) and returns
+///                         false for those; everything else returns
+///                         true. processAllocation refuses to virtualize
+///                         when this returns false. For null inputs the
+///                         implementation must return false (analogous
+///                         to the value-based / boxed callbacks: a null
+///                         klass cannot be proven safe).
 ///   GetConstantFieldValue
 ///                       — Returns the constant field value as int64_t.
 ///                         For boolean/byte/char/short/int: the widened value.
@@ -237,6 +329,12 @@ enum class JeandleInlineReason : int {
 ///   GetOopKlass         — Returns the actual runtime klass pointer of the
 ///                         constant oop with the given oop id, or 0 if it is
 ///                         unavailable. Pure (id -> klass).
+///   GetJavaMirror       — Given a VM Klass pointer, returns the oop id of its
+///                         Java mirror (the java.lang.Class object), or -1 if
+///                         unavailable. Used by PEA's foldGetClass to fold
+///                         jeandle.get_class on a virtual receiver (whose exact
+///                         klass is statically known) to the constant Class
+///                         mirror. Pure (Klass -> mirror oop id).
 ///   IsOkToInline        — Given an inline scope id, call-site BCI, and callee
 ///                         Java method pointer, returns whether the VM allows
 ///                         this inline attempt.

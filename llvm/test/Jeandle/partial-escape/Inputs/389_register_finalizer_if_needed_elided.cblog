@@ -1,0 +1,5 @@
+RequiresStrictLockOrder = 1
+HasFinalizer 8888 = false
+CanVirtualize 8888 = true
+IsBoxed 8888 = 9
+HasFinalizer 8888 = false
