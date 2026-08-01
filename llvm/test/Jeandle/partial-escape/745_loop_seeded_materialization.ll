@@ -12,6 +12,7 @@
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.safepoint_poll()
+declare void @use(i32)
 
 define ptr addrspace(1) @loop_seeded_materialization(i1 %first.done,
                                                       i1 %second.done)
@@ -58,6 +59,36 @@ late:
   br label %outer.header
 }
 
+; The post-body merge changes B from field value 0 to a loop-carried field
+; PHI.  The next traversal must consume that B directly: its load precedes the
+; store of the next iteration's value and therefore folds to the field PHI,
+; not back to the preheader's constant 0.
+define void @loop_seeded_field_value(i1 %done)
+    gc "hotspotgc" personality ptr null {
+entry:
+  %object = call hotspotcc ptr addrspace(1) @jeandle.new_instance(
+      ptr inttoptr (i64 74501 to ptr), i32 16)
+  %entry.field = getelementptr i8, ptr addrspace(1) %object, i64 8
+  store atomic i32 0, ptr addrspace(1) %entry.field unordered, align 4
+  br label %loop.preheader
+
+loop.preheader:
+  br label %loop.header
+
+loop.header:
+  %field = getelementptr i8, ptr addrspace(1) %object, i64 8
+  %current = load atomic i32, ptr addrspace(1) %field unordered, align 4
+  call void @use(i32 %current)
+  store atomic i32 1, ptr addrspace(1) %field unordered, align 4
+  br i1 %done, label %exit, label %loop.latch
+
+loop.latch:
+  br label %loop.header
+
+exit:
+  ret void
+}
+
 ; The seeded field is replayed once on the outer forward edge.
 ; CHECK-LABEL: define ptr addrspace(1) @loop_seeded_materialization(
 ; CHECK: entry:
@@ -65,6 +96,14 @@ late:
 ; CHECK-NEXT: store atomic i8 0, ptr addrspace(1) [[OBJECT]] unordered, align 1
 ; CHECK-NOT: .pea.replay:
 ; CHECK: }
+
+; CHECK-LABEL: define void @loop_seeded_field_value(
+; CHECK-NOT: jeandle.new_instance
+; CHECK: [[FIELD:%pea.field.phi[^ ]*]] = phi i32
+; CHECK: call void @use(i32 [[FIELD]])
+; CHECK-NOT: load atomic
+; CHECK-NOT: store atomic
+; CHECK: ret void
 
 ; TRACE-LABEL: PEA: EliminateAllocation function=@loop_seeded_materialization [VO=0]{{.*}}ptr nonnull
 ; TRACE: PEA: Materialize function=@loop_seeded_materialization [VO=0] block=%entry
