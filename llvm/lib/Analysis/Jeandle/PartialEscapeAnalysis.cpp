@@ -966,6 +966,12 @@ private:
   // and consumed (cleared) immediately before the MATERIALIZE_ALL retry.
   bool OverflowFlag = false;
 
+  // A completed loop traversal must publish every structural loop end, and a
+  // loop end that became live cannot become dead on a later non-converged
+  // traversal. A violation invalidates the whole analysis attempt; callers
+  // poll this flag like OverflowFlag so no half-built state reaches commit().
+  bool InvalidLoopMonotonicity = false;
+
   // Per-block list of VOs registered while CurrentMode was
   // MaterializeAll. processBlock drains this list at end-of-block (after
   // the instruction walk but before snapshotExitState) and emits a
@@ -8926,12 +8932,10 @@ void Analyzer::processLoopBodyOnePass(Loop *L, ArrayRef<BasicBlock *> LoopRPO,
     if (Inner && Inner != L && Inner->getHeader() == BB) {
       // Found a sub-loop's header — recurse.
       processLoop(Inner, FunctionRPO);
-      // A nested loop that overflowed latches OverflowFlag; stop walking this
-      // nest immediately (Graal's overflow exception unwinds at once). The
-      // caller (processLoop) polls OverflowFlag on our return and will restore
-      // the snapshot + redo the nest in MATERIALIZE_ALL, so there is no point
-      // processing the remaining blocks just to discard them.
-      if (OverflowFlag)
+      // A nested loop failure stops this traversal immediately. Overflow is
+      // recovered by the outermost loop; loop-end invariant failures discard
+      // the complete analysis attempt.
+      if (OverflowFlag || InvalidLoopMonotonicity)
         return;
       for (BasicBlock *SB : Inner->blocks())
         BodyPassProcessed.insert(SB);
@@ -8941,10 +8945,9 @@ void Analyzer::processLoopBodyOnePass(Loop *L, ArrayRef<BasicBlock *> LoopRPO,
       processSeededLoopHeader(BB, *HeaderSeed);
     else
       processBlock(BB);
-    // Defensive: processBlock does not currently latch OverflowFlag (it does
-    // not mutate STOP_NEW), but poll anyway so a future change cannot silently
-    // keep walking an overflowed nest.
-    if (OverflowFlag)
+    // Defensive polling keeps future block handlers from extending a
+    // half-built traversal after either attempt-local failure mode.
+    if (OverflowFlag || InvalidLoopMonotonicity)
       return;
     BodyPassProcessed.insert(BB);
   }
@@ -8961,6 +8964,8 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
     // Defensive: a loop with no header would be malformed LoopInfo state.
     return;
   }
+  if (InvalidLoopMonotonicity)
+    return;
   if (!Preheader) {
     // Loop without a unique preheader. Jeandle schedules LoopSimplifyPass
     // before PEA, so natural reducible-CFG loops reach the fixpoint path
@@ -9012,6 +9017,8 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
     // no way to verify convergence at a non-existent preheader). Loop-local
     // allocs that don't outlive a single iteration are still virtualised.
     processLoopBodyOnePass(L, loopBlocksInRPO(L, FunctionRPO), FunctionRPO);
+    if (InvalidLoopMonotonicity)
+      return;
 
     // Post-body merge (Graal doMergeWithoutDead run AFTER the body,
     // Graal EffectsClosure). The in-pass header merge (header first in
@@ -9046,6 +9053,13 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
   llvm::SmallPtrSet<BasicBlock *, 8> LoopBlocks;
   for (BasicBlock *BB : L->blocks())
     LoopBlocks.insert(BB);
+
+  // ReentrantBlockIterator numbers loop ends by the loop header's structural
+  // predecessor order. Preserve that order for every outer attempt.
+  SmallVector<BasicBlock *, 4> LoopEnds;
+  for (BasicBlock *Pred : predecessors(Header))
+    if (L->contains(Pred))
+      LoopEnds.push_back(Pred);
 
   // Loop blocks in function-RPO order, computed once and reused across the
   // inner fixpoint body passes below (the loop CFG is stable across PEA).
@@ -9106,6 +9120,8 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
   // escalation per loop), matching Graal's per-call local.
   bool TooManyIterationsSeen = false;
   while (true) {
+    SmallBitVector KnownAliveLoopEnds(LoopEnds.size(), false);
+
     // Each outer attempt starts at the current forward-edge state A. The
     // pointer-PHI aliases are initialized from that edge exactly once, then
     // every inner traversal consumes B directly. A nested processLoop owns an
@@ -9156,7 +9172,39 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
       // Overflow (a STOP_NEW materialization of an outer-scope VO) may have
       // been latched by this pass or a deeper recursion. Stop iterating: the
       // state is half-consistent and is rolled back below.
-      if (OverflowFlag)
+      if (OverflowFlag || InvalidLoopMonotonicity)
+        break;
+
+      // A completed Graal traversal returns one state for every structural
+      // loop end. Snapshot Jeandle's corresponding fresh edge contributions
+      // before the post-body header merge mutates any edge-local view.
+      SmallVector<EdgeContributionKind, 4> LoopEndKinds;
+      {
+        ScopedEdgeExitViews EdgeViews(*this);
+        for (BasicBlock *LoopEnd : LoopEnds) {
+          EdgeContribution Contribution = contributionFor(LoopEnd, Header);
+          if (Contribution.isUnseen()) {
+            InvalidLoopMonotonicity = true;
+            LLVM_DEBUG({
+              dbgs() << "PEA: loop traversal incomplete at ";
+              Header->printAsOperand(dbgs(), false);
+              dbgs() << ": backedge ";
+              LoopEnd->printAsOperand(dbgs(), false);
+              dbgs() << " did not publish an exit state\n";
+            });
+            break;
+          }
+          LLVM_DEBUG({
+            dbgs() << "PEA: loop @ " << Header->getName() << " iteration "
+                   << (Iter + 1) << " backedge ";
+            LoopEnd->printAsOperand(dbgs(), false);
+            dbgs() << " is " << (Contribution.isLive() ? "live" : "dead")
+                   << "\n";
+          });
+          LoopEndKinds.push_back(Contribution.Kind);
+        }
+      }
+      if (InvalidLoopMonotonicity)
         break;
 
       // Post-body merge (Graal doMergeWithoutDead): compute the true
@@ -9203,7 +9251,40 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
                           << " iters (B-based, post-body)\n");
         break;
       }
+
+      // Graal reads and updates knownAliveLoopEnds only after a completed
+      // non-converged pass. A live end may stay live, and a previously dead
+      // end may become live as B grows less precise, but live must not become
+      // dead.
+      for (unsigned I = 0; I != LoopEndKinds.size(); ++I) {
+        const bool IsLive = LoopEndKinds[I] == EdgeContributionKind::Live;
+        if (KnownAliveLoopEnds[I] &&
+            LoopEndKinds[I] == EdgeContributionKind::Dead) {
+          InvalidLoopMonotonicity = true;
+          LLVM_DEBUG({
+            dbgs() << "PEA: loop-end liveness monotonicity violation at ";
+            Header->printAsOperand(dbgs(), false);
+            dbgs() << ": backedge ";
+            LoopEnds[I]->printAsOperand(dbgs(), false);
+            dbgs() << " changed from live to dead\n";
+          });
+          break;
+        }
+        KnownAliveLoopEnds[I] = KnownAliveLoopEnds[I] || IsLive;
+      }
+      if (InvalidLoopMonotonicity)
+        break;
+
+      LLVM_DEBUG(dbgs() << "PEA: loop @ " << Header->getName()
+                        << " retry after " << (Iter + 1)
+                        << " iters (B != B')\n");
       LastMergedState = NewMergedState; // B := B'   (Graal EffectsClosure)
+    }
+
+    if (InvalidLoopMonotonicity) {
+      if (L->getLoopDepth() == 1)
+        CurrentMode = SavedModeForNest;
+      return;
     }
 
     if (Converged) {
@@ -9355,9 +9436,14 @@ jeandle::PEAResult Analyzer::run() {
     // block inside the loop appears before its header), still dispatch on
     // the top-level loop and mark all its blocks Done.
     processLoop(Top, FunctionRPO);
+    if (InvalidLoopMonotonicity)
+      return jeandle::PEAResult();
     for (BasicBlock *SB : Top->blocks())
       Done.insert(SB);
   }
+
+  if (InvalidLoopMonotonicity)
+    return jeandle::PEAResult();
 
   // Safety net — drain preheader virtuals ONLY for loops the RPO
   // walk never reached (unreachable top-level loops, or sub-loops whose
