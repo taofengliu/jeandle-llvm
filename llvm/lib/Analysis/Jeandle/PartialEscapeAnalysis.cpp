@@ -994,15 +994,11 @@ private:
   // The cache returns a STABLE PHINode* across fixpoint iterations so the
   // convergence check on BlockExitInfo.FieldStates can compare FieldValues
   // by Value pointer (otherwise every iteration would synthesize a fresh
-  // PHI and the fixpoint would never close), AND so that the preserved
-  // BlockExits[BB] (restoreLoopSnapshot does not roll back loop-block
-  // BlockExits) never references a PHI that rollback deletes. Every entry is
-  // a real per-field PHI keyed by its byte offset. The cached PHI
-  // lives in Result.OwnedLoopFieldPhis, which is preserved across rollback
-  // (unlike OwnedPhis, which is truncated). The CreatePHI Effect referencing
-  // the cached PHI is re-emitted in BlockEffects[BB] on every iteration —
-  // BlockEffects[BB] is wiped on rollback, but the PHI itself is not. The
-  // `Header` field is the merge block BB passed to getOrCreateLoopFieldPhi.
+  // PHI and the fixpoint would never close). The current B seed and fresh
+  // body exits may both reference these PHIs, so the shells live in
+  // Result.OwnedLoopFieldPhis and survive rollback while their CreatePHI
+  // effects are re-emitted for the current traversal. The `Header` field is
+  // the merge block BB passed to getOrCreateLoopFieldPhi.
   struct LoopPhiKey {
     BasicBlock *Header;
     jeandle::ObjectID ID;
@@ -1100,15 +1096,20 @@ private:
   // Returns a stable PHI for the given (in-loop merge block, ID, offset)
   // tuple, creating one (and registering it in OwnedLoopFieldPhis) on first
   // use. Falls back to createUnparentedPhi when BB is not inside any loop
-  // (LI.getLoopFor(BB) == nullptr). Inside a
-  // loop — including non-header in-loop merge blocks — the PHI must be cached
-  // so its Value* survives restoreLoopSnapshot (which preserves BlockExits[BB]
-  // for loop blocks but truncates OwnedPhis).
+  // (LI.getLoopFor(BB) == nullptr). Inside a loop — including non-header
+  // in-loop merge blocks — the PHI must be cached so any B seed or fresh body
+  // exit that names it stays valid while restoreLoopSnapshot truncates
+  // OwnedPhis.
   PHINode *getOrCreateLoopFieldPhi(BasicBlock *BB, jeandle::ObjectID ID,
                                    int64_t Offset, Type *Ty, unsigned N,
                                    const Twine &Name);
 
   void processBlock(BasicBlock *BB);
+  void processBlockBodyAndPublish(BasicBlock *BB);
+  void processSeededLoopHeader(BasicBlock *Header,
+                               const BlockExitData &HeaderSeed);
+  void initializeLoopHeaderPhiAliases(BasicBlock *Header,
+                                      BasicBlock *Preheader);
   // Drain a block's deferred merge-PHI effects (PendingMergePhis[BB]) into
   // Result.BlockEffects[BB], assigning each a fresh SeqNo at drain time so
   // the transform's SeqNo order is per-pred Materialize, CreatePHI, then
@@ -1293,7 +1294,10 @@ private:
   SmallVector<BasicBlock *, 32>
   loopBlocksInRPO(Loop *L, ArrayRef<BasicBlock *> FunctionRPO);
   void processLoopBodyOnePass(Loop *L, ArrayRef<BasicBlock *> LoopRPO,
-                              ArrayRef<BasicBlock *> FunctionRPO);
+                              ArrayRef<BasicBlock *> FunctionRPO,
+                              const BlockExitData *HeaderSeed = nullptr);
+
+  enum class LoopRestoreMode : uint8_t { Iteration, Full };
 
   // The per-iteration snapshot. All members are independently restorable.
   //
@@ -1333,13 +1337,9 @@ private:
     bool NeedsCFGCleanup = false;
 
     // For each block in L, the prior BlockEffects[BB] (if any) and
-    // MaterializedAtPred[BB] (if any), captured *before* the loop iteration
-    // began. BlockExits[BB] is NOT snapshotted here: the next iteration's
-    // mergeStates(Header) reads each back-edge pred's BlockExits[BB] to learn
-    // the loop-internal contribution, so loop-block BlockExits are deliberately
-    // preserved across iterations (see restoreLoopSnapshot's note). This keeps
-    // per-iteration Value* pointers in FieldStates stable for the convergence
-    // check.
+    // MaterializedAtPred[BB] (if any), captured before the loop traversal.
+    // BlockExits are traversal-local payloads: processLoop erases the current
+    // loop nest before every pass and supplies the header state explicitly.
     DenseMap<BasicBlock *, jeandle::EffectList> SavedBlockEffects;
     DenseMap<BasicBlock *, DenseMap<BasicBlock *, DenseSet<jeandle::ObjectID>>>
         SavedMaterializedAtPred;
@@ -1352,14 +1352,13 @@ private:
                         LoopSnapshot &S);
   void
   restoreLoopSnapshot(const llvm::SmallPtrSetImpl<BasicBlock *> &LoopBlocks,
-                      const LoopSnapshot &S);
+                      const LoopSnapshot &S, LoopRestoreMode Mode);
 
   // Active loop-body-pass context (processLoopBodyOnePass): the loop being
   // re-processed and the blocks already processed in this pass. Consulted by
-  // processBlockPhis to distinguish a loop-header PHI's not-yet-processed
-  // back-edge predecessor (unknown — its aliases were rolled back and will
-  // be re-registered later in this pass) from a genuinely non-virtual
-  // incoming (divergence). Saved and restored around nested processLoop
+  // processBlockPhis during an ordinary (unseeded) traversal to distinguish a
+  // loop-header PHI's not-yet-processed back-edge predecessor from a genuinely
+  // non-virtual incoming. Saved and restored around nested processLoop
   // recursion; null when no body pass is active.
   Loop *ActiveBodyPassLoop = nullptr;
   llvm::SmallPtrSet<BasicBlock *, 16> BodyPassProcessed;
@@ -1783,6 +1782,63 @@ void Analyzer::processBlock(BasicBlock *BB) {
     mergeStates(BB);
   }
 
+  processBlockBodyAndPublish(BB);
+}
+
+void Analyzer::processSeededLoopHeader(BasicBlock *Header,
+                                       const BlockExitData &HeaderSeed) {
+  ScopedEdgeExitViews EdgeViews(*this);
+  resetPerBlockState();
+  inheritFromExit(HeaderSeed);
+  processBlockBodyAndPublish(Header);
+}
+
+void Analyzer::initializeLoopHeaderPhiAliases(BasicBlock *Header,
+                                              BasicBlock *Preheader) {
+  ScopedEdgeExitViews EdgeViews(*this);
+  EdgeContribution Forward = contributionFor(Preheader, Header);
+
+  jeandle::PEABlockState ForwardState;
+  if (Forward.isLive())
+    for (jeandle::ObjectID ID : Forward.Data->Virtuals)
+      if (Eligible.lookup(ID))
+        ForwardState.addObject(ID, jeandle::ObjectState());
+
+  for (PHINode &Phi : Header->phis()) {
+    Type *Ty = Phi.getType();
+    if (!Ty->isPointerTy() || cast<PointerType>(Ty)->getAddressSpace() !=
+                                  jeandle::AddrSpace::JavaHeapAddrSpace)
+      continue;
+
+    Aliases.resetAlias(&Phi);
+    if (!Forward.isLive())
+      continue;
+
+    int PreheaderIndex = -1;
+    for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I) {
+      if (Phi.getIncomingBlock(I) != Preheader)
+        continue;
+      if (PreheaderIndex != -1) {
+        PreheaderIndex = -1;
+        break;
+      }
+      PreheaderIndex = static_cast<int>(I);
+    }
+    if (PreheaderIndex == -1)
+      continue;
+
+    auto Identity = jeandle::pea::resolveVirtualIdentity(
+        Phi.getIncomingValue(static_cast<unsigned>(PreheaderIndex)),
+        ForwardState, Aliases, DL,
+        jeandle::pea::VirtualIdentityMode::WholeObject);
+    if (Identity.isDefined() && Eligible.lookup(Identity.getObjectID()))
+      Aliases.addVirtualAlias(&Phi, Identity.getObjectID(),
+                              /*IsWholeObject=*/true);
+  }
+}
+
+void Analyzer::processBlockBodyAndPublish(BasicBlock *BB) {
+
   // Merge effects precede effects produced while walking the block body, as
   // in Graal's EffectsClosure.merge.
   drainPendingMergePhis(BB);
@@ -2111,14 +2167,9 @@ PHINode *Analyzer::getOrCreateLoopFieldPhi(BasicBlock *BB, jeandle::ObjectID ID,
   // Outside any loop (LI.getLoopFor(BB) == nullptr), fall back to the
   // single-shot OwnedPhis path. Inside a loop — including NON-HEADER in-loop
   // merge blocks — the PHI is cached so its Value* stays stable across
-  // fixpoint iterations: restoreLoopSnapshot preserves BlockExits[BB] for
-  // every loop block (so the next iteration's in-pass mergeStates(Header)
-  // can read the back-edge pred's exit state), and any Value* reachable from
-  // a preserved BlockExits[BB] must therefore survive rollback. Cached PHIs
-  // live in OwnedLoopFieldPhis, which restoreLoopSnapshot does NOT pop
-  // (unlike OwnedPhis); were a non-header in-loop merge to bypass the cache,
-  // its PHI would land in OwnedPhis and be deleted on rollback while the
-  // preserved BlockExits[BB] still references it → dangling Value*.
+  // fixpoint iterations. B and B' compare FieldValues by Value* and the next
+  // explicit B seed may carry a prior merge result, so cached PHIs live in
+  // OwnedLoopFieldPhis, which restoreLoopSnapshot does not pop.
   if (!LI.getLoopFor(BB))
     return createUnparentedPhi(Ty, N, Name);
 
@@ -3146,10 +3197,9 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
       } else {
         // Loop-carried self-reference: the incoming value peels (through
         // offset-0 casts / zero-index GEPs / freeze) back to this PHI
-        // itself. The virtual alias that would resolve it was registered
-        // inside the loop body and is rolled back between loop-fixpoint
-        // passes, so at a later pass's header merge the alias map has no
-        // entry. A self-carry denotes this PHI itself, so it agrees with
+        // itself. The virtual alias that would resolve it may not have been
+        // registered yet in the current traversal. A self-carry denotes this
+        // PHI itself, so it agrees with
         // whatever object the remaining incomings resolve to (verified
         // against the consensus below). A NON-ZERO / non-constant offset on
         // the carry changes the value per iteration — that is a derived
@@ -3164,35 +3214,15 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
             AnyDerived = true;
         }
       }
-      // During a loop body pass, an incoming of the loop-header PHI whose
-      // predecessor is inside the loop but has not yet been processed in
-      // THIS pass cannot be trusted as a divergence: the virtual alias that
-      // would resolve it was registered inside the loop during the previous
-      // pass and rolled back by restoreLoopSnapshot, while the pred's
-      // BlockExits is deliberately preserved (so !PredED does not fire
-      // here). First try to re-resolve the incoming through the phi-keyed
-      // Case-C cache: a previous pass's post-body merge recorded which
-      // source VO occupied this incoming slot, and the stale pred exit
-      // still tracks that VO. Re-resolving lets the header Case C fire
-      // again with the SAME synthetic (Graal: the body traversal sees the
-      // last merged state, where the header phi already aliases the cached
-      // merged VO) — the loop body's field effects are then built on the
-      // merged identity, which is required for semantic correctness (a body
-      // load/store through the header phi must read/write the MERGED field
-      // state, not one source's). If the memo does not cover this slot, the
-      // incoming is UNKNOWN (the same abstain as the !PredED path above —
-      // Graal processPhi returns false without materializing when a
-      // predecessor's ObjectState is missing); the post-body merge
-      // re-derives the decision with complete latch data after the body
-      // pass. Treating it as a resolved non-virtual instead would send the
-      // PHI to the Case-A fallback and materialize the remaining virtual
-      // incomings at their preds — at the preheader that materialization is
-      // outside the loop and never rolled back, so one pass's incomplete
-      // information would permanently defeat the header Case C. Restricted
-      // to the loop header: non-header blocks get no post-body re-merge, so
-      // an optimistic decision there could never be corrected. SelfCarry
-      // keeps precedence: a carry that strips back to this PHI itself is
-      // structural and needs no alias.
+      // During an ordinary loop body pass, an incoming of the loop-header PHI
+      // whose predecessor is inside the loop but has not yet been processed in
+      // this pass cannot be trusted as a divergence. First try to re-resolve
+      // the incoming through the phi-keyed Case-C cache. If the memo does not
+      // cover this slot, the incoming is unknown and the post-body merge
+      // re-derives the decision with complete latch data. Restricted to the
+      // loop header: non-header blocks get no post-body re-merge, so an
+      // optimistic decision there could never be corrected. SelfCarry keeps
+      // precedence because it is structural and needs no alias.
       if (!Found && !PoisonWildcard.test(I) && !SelfCarry.test(I) &&
           ActiveBodyPassLoop && BB == ActiveBodyPassLoop->getHeader() &&
           ActiveBodyPassLoop->contains(Pred) &&
@@ -4189,11 +4219,10 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
     }
     // Route through the LoopFieldPhiCache so the per-(BB, NewID, Off) PHI
     // shell is REUSED across loop-fixpoint iterations. Same Value* across
-    // iters keeps FieldStates structurally equivalent for the convergence
-    // check, and — for non-header in-loop merge BBs — keeps the PHI alive
-    // (OwnedLoopFieldPhis) so the preserved BlockExits[BB] does not reference
-    // a PHI that rollback deletes. For BBs outside any loop the cache is
-    // bypassed (getOrCreateLoopFieldPhi falls back to createUnparentedPhi).
+    // iters keeps FieldStates structurally equivalent for convergence and
+    // keeps a PHI named by B alive across rollback. For BBs outside any loop
+    // the cache is bypassed (getOrCreateLoopFieldPhi falls back to
+    // createUnparentedPhi).
     PHINode *NewPhi = getOrCreateLoopFieldPhi(BB, NewID, P.Off, P.PhiType,
                                               OriginalN, "pea.casec.field.phi");
     PhiHome[NewPhi] = BB;
@@ -4297,6 +4326,12 @@ void Analyzer::processInstruction(Instruction *I) {
   // back to materialized.
   if (isa<PHINode>(I))
     return;
+
+  // Aliases are analyzer-global so a loop retry can carry the preceding
+  // header merge's PHI result into the next traversal. A revisited ordinary
+  // instruction nevertheless derives its output from the current block state
+  // and must discard its own earlier result before dispatch.
+  Aliases.resetAlias(I);
 
   // Allocation: Jeandle allocation site.
   if (auto *CB = dyn_cast<CallBase>(I)) {
@@ -8581,11 +8616,10 @@ void Analyzer::materializeAtPredFromExitInfo(jeandle::ObjectID ID,
 // MaxLoopFixpointIters = 10 body passes). The fixpoint state B starts as the
 // preheader state A. After each body pass, mergeStates(Header) computes
 // B' = merge(A, fresh latch states), and convergence compares B' with B.
-// BlockExits for loop blocks are retained across iteration rollback so the
-// next in-pass header merge can see the previous latch contribution; they are
-// not themselves the convergence variable. Field PHIs inside the loop MUST be
-// stable across passes (same Value*) for B/B' structural equivalence — that is
-// the purpose of LoopFieldPhiCache / OwnedLoopFieldPhis.
+// Every pass receives B explicitly at the header and rebuilds loop BlockExits
+// from scratch. Field PHIs inside the loop remain stable across passes (same
+// Value*) for B/B' structural equivalence through LoopFieldPhiCache /
+// OwnedLoopFieldPhis.
 //
 // On non-convergence OR overflow (OverflowFlag, latched in ensureMaterialized
 // under Mode::StopNewInLoopNest), escalate to Mode::MaterializeAll ONCE and
@@ -8697,11 +8731,6 @@ void Analyzer::takeLoopSnapshot(
   S.HadBlockEffects.clear();
   S.HadMaterializedAtPred.clear();
   for (BasicBlock *BB : LoopBlocks) {
-    // BlockExits[BB] is INTENTIONALLY NOT snapshotted: the next iteration's
-    // mergeStates(Header) reads each back-edge pred's BlockExits[BB] to
-    // learn the loop-internal contribution, so loop-block BlockExits are
-    // preserved across iterations. Restoring them would wipe the very state
-    // the next merge needs.
     auto FIt = Result.BlockEffects.find(BB);
     if (FIt != Result.BlockEffects.end()) {
       S.HadBlockEffects.insert(BB);
@@ -8717,9 +8746,13 @@ void Analyzer::takeLoopSnapshot(
 
 void Analyzer::restoreLoopSnapshot(
     const llvm::SmallPtrSetImpl<BasicBlock *> &LoopBlocks,
-    const LoopSnapshot &S) {
+    const LoopSnapshot &S, LoopRestoreMode Mode) {
   CurrentState = S.CurrentState;
-  Aliases.restore(S.Aliases);
+  // Graal keeps its closure-global aliases across ordinary fixpoint retries:
+  // the preceding header merge's PHI alias is the next B traversal's input.
+  // Full recovery returns to the pre-loop attempt and restores the whole map.
+  if (Mode == LoopRestoreMode::Full)
+    Aliases.restore(S.Aliases);
   FieldStates = S.FieldStates;
   FieldDefinitions = S.FieldDefinitions;
   ObservedFieldStores = S.ObservedFieldStores;
@@ -8744,42 +8777,6 @@ void Analyzer::restoreLoopSnapshot(
     Eligible[Result.VirtualObjects[I]->getID()] = true;
   }
 
-  // Defensive invariant: no PRESERVED BlockExits[BB] (BB ∈ LoopBlocks) may
-  // reference an unparented PHI we are about to delete below. BlockExits for
-  // loop blocks is deliberately preserved across rollback (see the rationale
-  // at the bottom of this function), so every Value* reachable from a
-  // preserved entry must outlive rollback. In-loop merge-block field PHIs
-  // stay alive because getOrCreateLoopFieldPhi caches them (gated on
-  // LI.getLoopFor(BB)) in OwnedLoopFieldPhis, which this cleanup does NOT
-  // pop. Were a non-header in-loop merge to bypass that cache (landing its
-  // PHI in OwnedPhis), the next iteration's mergeStates(Header) would read a
-  // dangling Value* through the preserved BlockExits[BB] — use-after-free.
-  // This check makes that regression deterministic.
-  assert((([&] {
-           SmallPtrSet<Value *, 16> ToDelete;
-           for (size_t I = S.OwnedPhisSize; I < Result.OwnedPhis.size(); ++I)
-             if (Value *V = Result.OwnedPhis[I])
-               ToDelete.insert(V);
-           for (BasicBlock *BB : LoopBlocks) {
-             auto It = BlockExits.find(BB);
-             if (It == BlockExits.end())
-               continue;
-             for (const auto &FS : It->second.FieldStates)
-               for (const auto &FV : FS.second) {
-                 if (FV.second.isScalar() &&
-                     ToDelete.count(FV.second.getScalar()))
-                   return false;
-                 if (FV.second.isMaterializedRef() &&
-                     ToDelete.count(FV.second.getMaterialized()))
-                   return false;
-               }
-           }
-           return true;
-         })()) &&
-         "BlockExits[loop-block] references an unparented PHI that "
-         "restoreLoopSnapshot is about to delete; the in-loop merge PHI "
-         "must be cached via getOrCreateLoopFieldPhi, not OwnedPhis");
-
   // Pop and delete unparented PHIs / insts created during the rolled-back
   // iteration. OwnedLoopFieldPhis are NOT touched — they're the per-loop
   // PHI cache, and the whole point of the cache is to keep them alive
@@ -8792,27 +8789,12 @@ void Analyzer::restoreLoopSnapshot(
   for (const CFGDeadnessProof &Proof : CFGDeadnessProofs)
     RecordedCFGProofs.insert(Proof.Killer);
 
-  // Roll back per-loop-block ledgers.
-  //
-  // BlockExits for loop blocks is deliberately NOT rolled back: the next
-  // iteration's mergeStates(Header) reads each back-edge pred's BlockExits to
-  // learn the loop-internal contribution (the back-edge pred is later in RPO
-  // than the header, so wiping it would leave mergeStates seeing only the
-  // preheader). snapshotExitState() at the end of each processBlock
-  // overwrites the stale entry with the iteration's fresh result. Convergence
-  // compares the post-body NewMergedState (B') with LastMergedState (B); the
-  // preserved BlockExits only supply the next in-pass latch contribution.
-  //
-  // BlockEffects and MaterializedAtPred MUST be rolled back (they accumulate
-  // emitted-effect side-data; leaving them would duplicate effects across
-  // iterations). LoopFieldPhiCache / OwnedLoopFieldPhis cover the stable
-  // PHI Value* need for iter-spanning structural equivalence AND for the
-  // BlockExits-preservation invariant above: getOrCreateLoopFieldPhi gates
-  // the cache on LI.getLoopFor(BB), so EVERY in-loop merge-block PHI (header
-  // or not) is cached and survives this rollback. Were a non-header in-loop
-  // merge to bypass the cache, its PHI would land in OwnedPhis and be deleted
-  // by the cleanup above while the preserved BlockExits[BB] still references
-  // it — the debug assert earlier in this function guards exactly this.
+  // Roll back failed traversal effects and block-local ledgers. The preheader
+  // is outside LoopBlocks, so forward-edge materialization and its
+  // (Preheader, Header, ID) ledger survive an ordinary retry together with B.
+  // Pending queues contain traversal-local effect objects and never survive a
+  // restore; stable PHI and synthetic-VO shells live in their dedicated
+  // analyzer caches.
   for (BasicBlock *BB : LoopBlocks) {
     auto SF = S.SavedBlockEffects.find(BB);
     if (S.HadBlockEffects.count(BB))
@@ -8825,6 +8807,9 @@ void Analyzer::restoreLoopSnapshot(
       MaterializedAtPred[BB] = SM->second;
     else
       MaterializedAtPred.erase(BB);
+
+    PendingMergePhis.erase(BB);
+    PendingMaterializeAllVOs.erase(BB);
   }
   // Restoring the per-block EffectLists changes the effect set.
   ++Result.EffectEpoch;
@@ -8842,7 +8827,8 @@ Analyzer::loopBlocksInRPO(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
 }
 
 void Analyzer::processLoopBodyOnePass(Loop *L, ArrayRef<BasicBlock *> LoopRPO,
-                                      ArrayRef<BasicBlock *> FunctionRPO) {
+                                      ArrayRef<BasicBlock *> FunctionRPO,
+                                      const BlockExitData *HeaderSeed) {
   // Process loop blocks in function-RPO order. Sub-loop headers dispatch
   // recursively to processLoop, and the sub-loop's blocks are marked Done so
   // we don't re-process them in this pass. FunctionRPO is computed once by
@@ -8882,7 +8868,10 @@ void Analyzer::processLoopBodyOnePass(Loop *L, ArrayRef<BasicBlock *> LoopRPO,
         BodyPassProcessed.insert(SB);
       continue;
     }
-    processBlock(BB);
+    if (BB == L->getHeader() && HeaderSeed)
+      processSeededLoopHeader(BB, *HeaderSeed);
+    else
+      processBlock(BB);
     // Defensive: processBlock does not currently latch OverflowFlag (it does
     // not mutate STOP_NEW), but poll anyway so a future change cannot silently
     // keep walking an overflowed nest.
@@ -9046,19 +9035,34 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
   // once and retry the whole fixpoint; a second failure hard-bails.
   // TooManyIterationsSeen is LOCAL to each processLoop (one independent
   // escalation per loop), matching Graal's per-call local.
-  // Single-state B fixpoint context (Graal lastMergedState) as
-  // LOCALS — each processLoop call is its own C++ stack frame, so nesting is
-  // isolated without a shared member (the outer's locals are untouched while a
-  // recursive processLoop(inner) runs). B := A (Graal EffectsClosure): Jeandle
-  // has no PEA-level killed-location strip (PEReadEliminationClosure
-  // machinery), so the entry state is just the preheader's exit data, populated
-  // by the outer RPO walk before processLoop is dispatched.
-  BlockExitData LastMergedState =
-      static_cast<const BlockExitData &>(BlockExits[Preheader]);
-  BlockExitData NewMergedState; // B' each pass (post-body header merge result)
-
   bool TooManyIterationsSeen = false;
   while (true) {
+    // Each outer attempt starts at the current forward-edge state A. The
+    // pointer-PHI aliases are initialized from that edge exactly once, then
+    // every inner traversal consumes B directly. A nested processLoop owns an
+    // independent pair of stack-local B/B' states.
+    std::optional<BlockExitData> ForwardState;
+    {
+      ScopedEdgeExitViews EdgeViews(*this);
+      EdgeContribution Forward = contributionFor(Preheader, Header);
+      if (Forward.isLive())
+        ForwardState = *Forward.Data;
+    }
+    if (!ForwardState) {
+      // B is a live abstract state. A dead or not-yet-published forward edge
+      // must use the ordinary structural entry gate instead of being promoted
+      // into a seeded live traversal.
+      for (BasicBlock *BB : LoopBlocks)
+        BlockExits.erase(BB);
+      processLoopBodyOnePass(L, LoopRPO, FunctionRPO);
+      if (L->getLoopDepth() == 1)
+        CurrentMode = SavedModeForNest;
+      return;
+    }
+    BlockExitData LastMergedState = std::move(*ForwardState);
+    BlockExitData NewMergedState;
+    initializeLoopHeaderPhiAliases(Header, Preheader);
+
     // ---- inner fixpoint: up to MaxLoopFixpointIters body passes ----
     // Single-state B convergence (Graal's loop fixpoint). B is
     // the header's merged state (seeded := A, the preheader exit). Each pass
@@ -9069,10 +9073,15 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
     bool Converged = false;
     for (unsigned Iter = 0; Iter < MaxLoopFixpointIters; ++Iter) {
       if (Iter > 0)
-        restoreLoopSnapshot(LoopBlocks, Pre);
+        restoreLoopSnapshot(LoopBlocks, Pre, LoopRestoreMode::Iteration);
+      // ReentrantBlockIterator creates a fresh end-state map for every Graal
+      // traversal. B is the only cross-pass header input; old loop/nested-loop
+      // edge payloads must not participate, including on iteration zero.
+      for (BasicBlock *BB : LoopBlocks)
+        BlockExits.erase(BB);
       ++AttemptStats.LoopFixpointRetries;
 
-      processLoopBodyOnePass(L, LoopRPO, FunctionRPO);
+      processLoopBodyOnePass(L, LoopRPO, FunctionRPO, &LastMergedState);
 
       // Overflow (a STOP_NEW materialization of an outer-scope VO) may have
       // been latched by this pass or a deeper recursion. Stop iterating: the
@@ -9080,21 +9089,17 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
       if (OverflowFlag)
         break;
 
-      // Post-body merge (Graal doMergeWithoutDead): compute the
-      // TRUE B' = merge(A, fresh latch end-states) AFTER the body pass. On
-      // iteration 0 the in-pass header merge is just A — the latch BlockExits
-      // is not yet populated when the header is processed — so only a post-body
-      // merge sees this pass's latch exits, letting iteration 0 compare
-      // meaningfully and the loop converge in a single body pass
-      // (matching Graal's structure).
+      // Post-body merge (Graal doMergeWithoutDead): compute the true
+      // B' = merge(A, fresh latch end-states) after the body pass. The seeded
+      // header deliberately skips predecessor/PHI merging, so this is the one
+      // structural header merge for the traversal and iteration zero can
+      // already compare a complete B' with B.
       //
-      // This merge runs AFTER the body (Graal runs the LoopBegin merge after
-      // the body too, Graal EffectsClosure), so it is the ONLY place
+      // This merge runs after the body (Graal runs the LoopBegin merge after
+      // the body too, Graal EffectsClosure), so it is the only place
       // that can resolve an object allocated INSIDE the loop body and carried
-      // across the back-edge via a header pointer-phi: the in-pass header merge
-      // (header first in RPO) runs before that alloc is virtualized, so its
-      // alias is not registered and the back-edge slot resolves to nullopt.
-      // Here the latch BlockExits is populated and the alias is known, so
+      // across the back-edge via a header pointer-phi. Here the latch
+      // BlockExits is populated and the allocation alias is known, so
       // processBlockPhis Case A fires and materializes the carried object at
       // the back-edge pred's terminator (Graal ensureMaterialized at
       // predecessor.getEndNode(), Graal PartialEscapeClosure).
@@ -9108,19 +9113,9 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
       // snapshotted+restored via LoopSnapshot, and under reuse-OrigAlloc the
       // materialized value is OrigAlloc on every edge), so B' is stable and
       // the fixpoint converges rather than escalating to MATERIALIZE_ALL.
-      // PendingMergePhis[Header] is drained to BlockEffects[Header] so that
-      // Case-C CreatePHI effects from the post-body merge (e.g. a synthetic
-      // merge VO for a loop-carried conditional replacement) survive to
-      // transform. When the in-pass header merge also took Case C (the
-      // phi-keyed memo lets it hit the same synthetic), BlockEffects[Header]
-      // already holds that merge's CreatePHI effects for the SAME PHI
-      // shells, so this drain adds a second effect object per shell. That is
-      // benign: both merges compute identical incoming-value lists (the
-      // LoopFieldPhiCache shells and the phi-keyed Case-C cache make the
-      // in-pass and post-body field states agree), and CreatePHIEffect::
-      // apply is idempotent on an already-inserted PHI, so the in-pass
-      // effect (earlier SeqNo) wins and the duplicate no-ops. Case A records
-      // its materialize in BlockEffects[latch], not PendingMergePhis.
+      // PendingMergePhis[Header] is drained so the converged post-body Case C
+      // or field merge reaches the transform. Failed-pass effect objects are
+      // removed by Iteration restore; their cached PHI shells remain stable.
       {
         resetPerBlockState();
         mergeStates(Header);
@@ -9170,12 +9165,7 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
       TooManyIterationsSeen = true;
       if (CurrentMode != Mode::MaterializeAll)
         ++AttemptStats.ModeEscalations;
-      restoreLoopSnapshot(LoopBlocks, Pre);
-      // Wipe loop-block BlockExits so the retry starts from a true pre-loop
-      // view. (restoreLoopSnapshot intentionally preserves loop-block
-      // BlockExits across iters for the Regular fixpoint's back-edge
-      // contribution; the MATERIALIZE_ALL retry must not inherit the stale
-      // virtuals it is trying to forget.)
+      restoreLoopSnapshot(LoopBlocks, Pre, LoopRestoreMode::Full);
       for (BasicBlock *BB : LoopBlocks)
         BlockExits.erase(BB);
       // Consume the overflow signal and leave STOP_NEW before draining.
@@ -9188,12 +9178,8 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
       // starts with no live virtuals on entry — Graal's
       // processStateBeforeLoopOnOverflow (Graal PartialEscapeClosure).
       processStateBeforeLoopOnOverflow(L);
-      // Re-seed B := A: processStateBeforeLoopOnOverflow materializes pre-loop
-      // virtuals at the loop's forward end, so BlockExits[Preheader] changed.
-      // The MATERIALIZE_ALL redo must compare against the POST-overflow entry
-      // state, not the stale pre-overflow LastMergedState.
-      LastMergedState =
-          static_cast<const BlockExitData &>(BlockExits[Preheader]);
+      // The next outer attempt recomputes A/B after the preheader drain and
+      // reinitializes the header pointer-PHI aliases from that forward edge.
       continue;
     }
 
