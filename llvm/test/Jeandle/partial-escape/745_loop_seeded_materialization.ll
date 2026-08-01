@@ -61,17 +61,13 @@ late:
 ; The seeded field is replayed once on the outer forward edge.
 ; CHECK-LABEL: define ptr addrspace(1) @loop_seeded_materialization(
 ; CHECK: entry:
-; CHECK: store atomic i8 0, ptr addrspace(1) [[OBJECT:%.*]] unordered, align 1
-; CHECK: br label %outer.header
-; CHECK-NOT: inner.first.header.pea.replay:
-; CHECK: inner.first.header:
-; CHECK-NOT: inner.second.header.pea.replay:
-; CHECK: inner.second.header:
-; CHECK-NOT: pea.replay:
+; CHECK: [[OBJECT:%.*]] = call hotspotcc ptr addrspace(1) @jeandle.new_instance
+; CHECK-NEXT: store atomic i8 0, ptr addrspace(1) [[OBJECT]] unordered, align 1
+; CHECK-NOT: .pea.replay:
+; CHECK: }
 
-; TRACE: PEA: EliminateAllocation function=@loop_seeded_materialization [VO=0]
+; TRACE-LABEL: PEA: EliminateAllocation function=@loop_seeded_materialization [VO=0]{{.*}}ptr nonnull
 ; TRACE: PEA: Materialize function=@loop_seeded_materialization [VO=0] block=%entry
-; TRACE-NOT: block=%inner.first.header.pea.replay
-; TRACE-NOT: block=%inner.second.header.pea.replay
+; TRACE-NOT: PEA: Materialize function=@loop_seeded_materialization [VO=0]
 
 !java-method-compilation = !{}
