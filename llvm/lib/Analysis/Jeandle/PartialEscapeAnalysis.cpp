@@ -75,6 +75,7 @@
 #include "llvm/Support/CheckedArithmetic.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
 
 #include <limits>
 #include <unordered_map>
@@ -156,13 +157,22 @@ static llvm::cl::opt<bool> JeandlePEAForceMaterializeAll(
                    "Mode::MaterializeAll on entry. Testing aid for "
                    "virtualize-then-materialise coverage."));
 
+// Inner B/B' body-pass cap. The default preserves the production policy;
+// tests can lower it to exercise whole-attempt recovery without constructing
+// a pathological non-converging abstract state.
+static llvm::cl::opt<unsigned> JeandlePEALoopFixpointMaxIters(
+    "jeandle-pea-loop-fixpoint-max-iters", llvm::cl::init(10), llvm::cl::Hidden,
+    llvm::cl::desc("PEA: maximum loop body traversals in one inner B/B' "
+                   "fixpoint attempt. Must be at least 1. Default 10."));
+
 // Loop nesting DEPTH threshold. When a top-level processLoop encounters a
 // nest whose maximum depth exceeds this value, the analyzer transiently
 // enters Mode::StopNewInLoopNest: processAllocation refuses NEW virtual
 // allocations inside the nest, but all other operations continue. Bounds the
 // worst-case cost of a deep nest while preserving virtualisation for objects
-// allocated outside it. Default 20. Distinct from MaxLoopFixpointIters (10),
-// which caps BODY iterations within a single fixpoint.
+// allocated outside it. Default 20. Distinct from
+// JeandlePEALoopFixpointMaxIters, which caps body traversals within a single
+// fixpoint attempt.
 static llvm::cl::opt<unsigned> JeandlePEALoopCutoff(
     "jeandle-pea-loop-cutoff", llvm::cl::init(20), llvm::cl::Hidden,
     llvm::cl::desc("PEA: loop nesting depth threshold. When a nest's maximum "
@@ -660,9 +670,6 @@ public:
   ArrayRef<CallBase *> getUnsafeFinalUseAllocationSites() const {
     return UnsafeFinalUseAllocationSites;
   }
-
-  // Cap on iterations for the loop-fixpoint.
-  static constexpr unsigned MaxLoopFixpointIters = 10;
 
   // Loop-nest execution mode. Mirrors Graal's EffectsClosureMode
   // (Graal EffectsClosure), a single closure-global field:
@@ -1312,6 +1319,7 @@ private:
   // local to that iteration and only persist if the converged exit state
   // requires them.
   struct LoopSnapshot {
+    BasicBlock *Preheader = nullptr;
     jeandle::PEABlockState CurrentState;
     jeandle::AliasMap Aliases;
     DenseMap<jeandle::ObjectID, DenseMap<int64_t, jeandle::FieldValue>>
@@ -1336,10 +1344,12 @@ private:
     size_t CFGDeadnessProofCount = 0;
     bool NeedsCFGCleanup = false;
 
-    // For each block in L, the prior BlockEffects[BB] (if any) and
-    // MaterializedAtPred[BB] (if any), captured before the loop traversal.
-    // BlockExits are traversal-local payloads: processLoop erases the current
-    // loop nest before every pass and supplies the header state explicitly.
+    // For each block in L and for L's canonical preheader, the prior
+    // BlockEffects[BB] (if any) and MaterializedAtPred[BB] (if any), captured
+    // before the loop attempt. Iteration restore consumes only the loop-block
+    // entries; Full restore also consumes the preheader entry. BlockExits are
+    // traversal-local payloads: processLoop erases the current loop nest
+    // before every pass and supplies the header state explicitly.
     DenseMap<BasicBlock *, jeandle::EffectList> SavedBlockEffects;
     DenseMap<BasicBlock *, DenseMap<BasicBlock *, DenseSet<jeandle::ObjectID>>>
         SavedMaterializedAtPred;
@@ -1352,7 +1362,12 @@ private:
                         LoopSnapshot &S);
   void
   restoreLoopSnapshot(const llvm::SmallPtrSetImpl<BasicBlock *> &LoopBlocks,
-                      const LoopSnapshot &S, LoopRestoreMode Mode);
+                      const LoopSnapshot &S, LoopRestoreMode Mode,
+                      const BlockExitData *PreservedSeed = nullptr);
+#ifndef NDEBUG
+  void assertPreservedLoopSeedDoesNotReferenceTruncatedOwnedValues(
+      const BlockExitData &Seed, const LoopSnapshot &S) const;
+#endif
 
   // Active loop-body-pass context (processLoopBodyOnePass): the loop being
   // re-processed and the blocks already processed in this pass. Consulted by
@@ -8707,6 +8722,7 @@ bool Analyzer::exitDataEquivalent(const BlockExitData &A,
 void Analyzer::takeLoopSnapshot(
     Loop *L, const llvm::SmallPtrSetImpl<BasicBlock *> &LoopBlocks,
     LoopSnapshot &S) {
+  S.Preheader = L->getLoopPreheader();
   S.CurrentState = CurrentState;
   S.Aliases = Aliases.snapshot();
   S.FieldStates = FieldStates;
@@ -8730,7 +8746,7 @@ void Analyzer::takeLoopSnapshot(
   S.SavedMaterializedAtPred.clear();
   S.HadBlockEffects.clear();
   S.HadMaterializedAtPred.clear();
-  for (BasicBlock *BB : LoopBlocks) {
+  auto SaveBlockLedgers = [&](BasicBlock *BB) {
     auto FIt = Result.BlockEffects.find(BB);
     if (FIt != Result.BlockEffects.end()) {
       S.HadBlockEffects.insert(BB);
@@ -8741,12 +8757,46 @@ void Analyzer::takeLoopSnapshot(
       S.HadMaterializedAtPred.insert(BB);
       S.SavedMaterializedAtPred[BB] = MIt->second;
     }
+  };
+  for (BasicBlock *BB : LoopBlocks)
+    SaveBlockLedgers(BB);
+  if (S.Preheader) {
+    assert(!LoopBlocks.count(S.Preheader) &&
+           "a loop cannot contain its canonical preheader");
+    SaveBlockLedgers(S.Preheader);
   }
 }
 
+#ifndef NDEBUG
+void Analyzer::assertPreservedLoopSeedDoesNotReferenceTruncatedOwnedValues(
+    const BlockExitData &Seed, const LoopSnapshot &S) const {
+  SmallPtrSet<Value *, 16> ToDelete;
+  for (size_t I = S.OwnedPhisSize; I < Result.OwnedPhis.size(); ++I)
+    if (Value *V = Result.OwnedPhis[I])
+      ToDelete.insert(V);
+  for (size_t I = S.OwnedInstsSize; I < Result.OwnedInsts.size(); ++I)
+    if (Value *V = Result.OwnedInsts[I])
+      ToDelete.insert(V);
+
+  for (const auto &ObjectFields : Seed.FieldStates)
+    for (const auto &Field : ObjectFields.second) {
+      const jeandle::FieldValue &Value = Field.second;
+      if (Value.isScalar())
+        assert(!ToDelete.count(Value.getScalar()) &&
+               "preserved loop seed references an OwnedPhi/OwnedInst that "
+               "iteration restore will delete");
+      if (Value.isMaterializedRef())
+        assert(!ToDelete.count(Value.getMaterialized()) &&
+               "preserved loop seed references an OwnedPhi/OwnedInst that "
+               "iteration restore will delete");
+    }
+}
+#endif
+
 void Analyzer::restoreLoopSnapshot(
     const llvm::SmallPtrSetImpl<BasicBlock *> &LoopBlocks,
-    const LoopSnapshot &S, LoopRestoreMode Mode) {
+    const LoopSnapshot &S, LoopRestoreMode Mode,
+    const BlockExitData *PreservedSeed) {
   CurrentState = S.CurrentState;
   // Graal keeps its closure-global aliases across ordinary fixpoint retries:
   // the preceding header merge's PHI alias is the next B traversal's input.
@@ -8777,6 +8827,18 @@ void Analyzer::restoreLoopSnapshot(
     Eligible[Result.VirtualObjects[I]->getID()] = true;
   }
 
+#ifndef NDEBUG
+  if (Mode == LoopRestoreMode::Iteration) {
+    assert(PreservedSeed && "iteration restore requires its preserved B seed");
+    assertPreservedLoopSeedDoesNotReferenceTruncatedOwnedValues(*PreservedSeed,
+                                                                S);
+  } else {
+    assert(!PreservedSeed && "Full restore abandons rather than preserves B");
+  }
+#else
+  (void)PreservedSeed;
+#endif
+
   // Pop and delete unparented PHIs / insts created during the rolled-back
   // iteration. OwnedLoopFieldPhis are NOT touched — they're the per-loop
   // PHI cache, and the whole point of the cache is to keep them alive
@@ -8789,13 +8851,14 @@ void Analyzer::restoreLoopSnapshot(
   for (const CFGDeadnessProof &Proof : CFGDeadnessProofs)
     RecordedCFGProofs.insert(Proof.Killer);
 
-  // Roll back failed traversal effects and block-local ledgers. The preheader
-  // is outside LoopBlocks, so forward-edge materialization and its
-  // (Preheader, Header, ID) ledger survive an ordinary retry together with B.
-  // Pending queues contain traversal-local effect objects and never survive a
-  // restore; stable PHI and synthetic-VO shells live in their dedicated
-  // analyzer caches.
-  for (BasicBlock *BB : LoopBlocks) {
+  // Roll back failed traversal effects and block-local ledgers. An ordinary
+  // retry restores only LoopBlocks, preserving the preheader's edge-local
+  // materialization together with B. Full recovery also restores the exact
+  // pre-attempt preheader effects and ledger before its block-end drain.
+  // Pending queues contain traversal-local effect objects and never survive
+  // a loop-block restore; stable PHI and synthetic-VO shells live in their
+  // dedicated analyzer caches.
+  auto RestoreBlockLedgers = [&](BasicBlock *BB, bool ClearTraversalQueues) {
     auto SF = S.SavedBlockEffects.find(BB);
     if (S.HadBlockEffects.count(BB))
       Result.BlockEffects[BB] = SF->second.clone();
@@ -8808,9 +8871,15 @@ void Analyzer::restoreLoopSnapshot(
     else
       MaterializedAtPred.erase(BB);
 
-    PendingMergePhis.erase(BB);
-    PendingMaterializeAllVOs.erase(BB);
-  }
+    if (ClearTraversalQueues) {
+      PendingMergePhis.erase(BB);
+      PendingMaterializeAllVOs.erase(BB);
+    }
+  };
+  for (BasicBlock *BB : LoopBlocks)
+    RestoreBlockLedgers(BB, /*ClearTraversalQueues=*/true);
+  if (Mode == LoopRestoreMode::Full && S.Preheader)
+    RestoreBlockLedgers(S.Preheader, /*ClearTraversalQueues=*/false);
   // Restoring the per-block EffectLists changes the effect set.
   ++Result.EffectEpoch;
 }
@@ -9071,9 +9140,10 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
     // post-body merge sees iteration 0's latch exits, the loop can converge in
     // a single body pass — matching Graal's structure exactly.
     bool Converged = false;
-    for (unsigned Iter = 0; Iter < MaxLoopFixpointIters; ++Iter) {
+    for (unsigned Iter = 0; Iter < JeandlePEALoopFixpointMaxIters; ++Iter) {
       if (Iter > 0)
-        restoreLoopSnapshot(LoopBlocks, Pre, LoopRestoreMode::Iteration);
+        restoreLoopSnapshot(LoopBlocks, Pre, LoopRestoreMode::Iteration,
+                            &LastMergedState);
       // ReentrantBlockIterator creates a fresh end-state map for every Graal
       // traversal. B is the only cross-pass header input; old loop/nested-loop
       // edge payloads must not participate, including on iteration zero.
@@ -9210,6 +9280,10 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
 }
 
 jeandle::PEAResult Analyzer::run() {
+  if (JeandlePEALoopFixpointMaxIters == 0)
+    report_fatal_error("-jeandle-pea-loop-fixpoint-max-iters must be at least "
+                       "1");
+
   // Apply the legacy substring gate and the repeatable exact-name gate
   // independently. Empty filters preserve the existing all-functions
   // behavior.
