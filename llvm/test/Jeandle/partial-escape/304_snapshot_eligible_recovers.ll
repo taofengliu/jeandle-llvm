@@ -1,15 +1,10 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Eligible MUST be rolled back across loop-fixpoint iterations.
-;
 ; A loop-local object is allocated inside the body and consumed in-iter
-; via a store/load of a primitive field. The fixpoint iterates twice
-; over the body. Iteration 0 creates the VO and marks Eligible[ID]=true;
-; if iter 0's processing transiently sets Eligible[ID]=false (e.g. by
-; some bail path that gets re-examined on iter 1), the snapshot/restore
-; protocol must give iter 1 a clean Eligible state so the body-local
-; alloc can re-virtualise. The post-snapshot re-mark of fresh VOs in
-; restoreLoopSnapshot ensures the alloc is eliminated.
+; via a store/load of a primitive field. The allocation-site cache reuses
+; the same ObjectID on later loop-fixpoint traversals. Ordinary B/B' retries
+; must preserve its virtual state when no keep-real condition was observed,
+; so the allocation remains eliminable after convergence.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)

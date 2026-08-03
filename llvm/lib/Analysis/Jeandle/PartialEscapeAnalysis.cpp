@@ -594,6 +594,20 @@ static void markObjectMaterializedInExitData(BlockExitData &Data,
   rewriteVirtualRefsToMaterialized(ID, MaterializedValue, Data.FieldStates);
 }
 
+#ifndef NDEBUG
+static void assertVirtualReferenceClosure(const BlockExitData &Data) {
+  for (const auto &Holder : Data.FieldStates)
+    for (const auto &Field : Holder.second) {
+      if (!Field.second.isVirtualRef())
+        continue;
+      jeandle::ObjectID Target = Field.second.getVirtualRef();
+      assert(Data.Virtuals.count(Target) &&
+             "a VirtualRef target must have a virtual state in the same "
+             "block state");
+    }
+}
+#endif
+
 // Resolve the effective "strict lock order" value for one analyzer run.
 // Precedence:
 //   1. If the JeandleAssumeStrictLockOrder cl::opt was explicitly set on the
@@ -667,8 +681,8 @@ public:
   ArrayRef<CallBase *> getInvalidDeoptAllocationSites() const {
     return InvalidDeoptAllocationSites;
   }
-  ArrayRef<CallBase *> getUnsafeFinalUseAllocationSites() const {
-    return UnsafeFinalUseAllocationSites;
+  ArrayRef<CallBase *> getRetryVirtualizationAllocationSites() const {
+    return RetryVirtualizationAllocationSites;
   }
 
   // Loop-nest execution mode. Mirrors Graal's EffectsClosureMode
@@ -721,7 +735,7 @@ private:
   SmallVector<Instruction *, 8> InvalidCFGProofKillers;
   bool InvalidDeoptObligation = false;
   SmallVector<CallBase *, 4> InvalidDeoptAllocationSites;
-  SmallVector<CallBase *, 4> UnsafeFinalUseAllocationSites;
+  SmallVector<CallBase *, 4> RetryVirtualizationAllocationSites;
   DenseSet<CallBase *> LateInvalidDeoptPools;
 
   // Attempt-local ledger of every non-literal CFG deadness proof actually
@@ -808,15 +822,12 @@ private:
   // this only for observed definitions, avoiding historical append-only edges.
   DenseMap<StoreInst *, jeandle::ObjectID> VirtualRefStoreTargets;
 
-  // Per-object eligibility flag. Function-wide: starts true at allocation;
-  // flipped to false ONLY where keeping the original IR is semantically
-  // required — merge/loop hazards (retry cap, synthetic-VO mixed merge,
-  // lock replay infeasibility), lock/value-based semantics, commit-time
-  // cascades, and the materialize-time value-availability fallback. Use points
-  // (untrackable accesses, opaque consumers) MATERIALIZE instead (Graal
-  // processNodeInputs): markIneligible is function-wide and retroactive
-  // (commit() drops every recorded effect for the object), while
-  // materialize preserves every fold recorded so far.
+  // Per-object eligibility flag. It is function-wide within one traversal:
+  // markIneligible retroactively drops every recorded effect for the object,
+  // while ordinary use points materialize and preserve earlier folds. A loop
+  // retry restores decisions made from an incomplete backedge state. A stable
+  // failure abandons the attempt and suppresses its allocation sites in a
+  // fresh analysis instead of mutating historical loop states in place.
   DenseMap<jeandle::ObjectID, bool> Eligible;
 
   // Exact CallBase operand numbers owned by the current safepoint's complete
@@ -1135,6 +1146,7 @@ private:
   void inheritFromExit(const BlockExitData &Exit);
   void mergeStates(BasicBlock *BB);
   void snapshotExitState(BasicBlock *BB);
+  void normalizeIneligibleVirtualRefs(BlockExitData &Data);
   // Mirror of snapshotExitState that writes the per-object snapshot into
   // an arbitrary BlockExitData (rather than into BlockExits[BB]). Used by
   // processBlock to capture the pre-invoke state for the unwind variant.
@@ -1326,18 +1338,10 @@ private:
 
   enum class LoopRestoreMode : uint8_t { Iteration, Full };
 
-  // The per-iteration snapshot. All members are independently restorable.
-  //
-  // Eligible MUST be rolled back across loop-fixpoint iterations.
-  // Numerous in-body paths (mergeStates' incompatible-merge bail, store
-  // overlap, atomic / cmpxchg / memcpy fallbacks, etc.) mutate
-  // Eligible[ID] = false unconditionally. Without snapshotting, a transient
-  // escape pattern in iter N (e.g. an as-yet-unpopulated empty back-edge
-  // exit) would permanently wedge the VO ineligible for iter N+1, even
-  // though iter N+1's fully-populated back-edge would otherwise allow
-  // re-virtualisation. Each iteration's per-VO ineligibility flips are
-  // local to that iteration and only persist if the converged exit state
-  // requires them.
+  // The pre-loop snapshot. Ordinary B/B' retries restore traversal-local
+  // state and effects before reprocessing from the complete B seed. A Full
+  // retry restores the same members before abandoning B' and reprocessing the
+  // whole loop nest in MATERIALIZE_ALL mode.
   struct LoopSnapshot {
     BasicBlock *Preheader = nullptr;
     jeandle::PEABlockState CurrentState;
@@ -1351,13 +1355,9 @@ private:
     DenseMap<jeandle::ObjectID, SmallVector<LockEnter, 4>> LiveLockEnters;
     DenseSet<jeandle::ObjectID> Materialized;
     DenseMap<jeandle::ObjectID, bool> EligibleSnapshot;
-    // Number of VOs that existed BEFORE this iteration. IDs greater
-    // than or equal to this index were created within the rolled-back iter;
-    // restoreLoopSnapshot re-marks them Eligible[ID]=true so the next iter's
-    // AllocSiteToVO cache-hit path (which bails on !Eligible.lookup) sees a
-    // re-eligible VO and proceeds. Without this, body-local allocations
-    // created inside the loop would be wedged ineligible across every
-    // iteration after the first.
+    // Number of VOs that existed before the loop. Restoring the old
+    // eligibility map drops entries for allocation-site cache records created
+    // by the abandoned traversal, so those records must be re-primed.
     size_t PreIterVOCount = 0;
     size_t OwnedPhisSize = 0;
     size_t OwnedInstsSize = 0;
@@ -1636,8 +1636,11 @@ private:
   // downstream resolveVirtualRef stops folding through it. Safe on
   // non-synthetic VOs (degenerates to Eligible[ID] = false). Single source of
   // truth for the conservative synthetic cascade used when identity-DAG
-  // preparation fails preflight.
-  void markIneligible(jeandle::ObjectID ID);
+  // preparation fails preflight. FreshRetry=true rejects every ordinary
+  // allocation leaf in a fresh Analyzer attempt, matching Graal's retryable
+  // bailout for a virtualization plan that cannot be completed soundly.
+  void markIneligible(jeandle::ObjectID ID, bool FreshRetry = false);
+  void collectRetryVirtualizationSites(jeandle::ObjectID ID);
 
   // The real SSA identity of a VO: OrigAlloc for an ordinary object, or the
   // Case-C merge PHI for a synthetic.  The latter applies both to conservative
@@ -1693,14 +1696,33 @@ void Analyzer::observeAllFieldDefinitions(
   }
 }
 
-void Analyzer::markIneligible(jeandle::ObjectID ID) {
-  // Fast marking only: clear Eligible and cascade through synthetic sources
-  // (a synthetic VO's real-allocation sources must also be kept real, else the
-  // merge PHI of a dropped synthetic would be left with all-OrigAlloc
-  // incomings — poison). The VirtualRef (outer-real -> inner-real) cascade is
-  // NOT walked here by design: it is commit()-time, where commit() seeds from
-  // every Eligible[ID]==false and walks dependencies derived from observed
-  // reaching store definitions.
+void Analyzer::collectRetryVirtualizationSites(jeandle::ObjectID ID) {
+  SmallVector<jeandle::ObjectID, 8> Worklist(1, ID);
+  DenseSet<jeandle::ObjectID> Visited;
+  while (!Worklist.empty()) {
+    jeandle::ObjectID Cur = Worklist.pop_back_val();
+    if (!Visited.insert(Cur).second || Cur == jeandle::InvalidObjectID ||
+        Cur >= Result.VirtualObjects.size())
+      continue;
+    const jeandle::VirtualObject &VObj = *Result.VirtualObjects[Cur];
+    if (VObj.IsSynthetic) {
+      Worklist.append(VObj.SyntheticSourceIDs.begin(),
+                      VObj.SyntheticSourceIDs.end());
+      continue;
+    }
+    auto *Site = dyn_cast_or_null<CallBase>((Value *)VObj.AllocationCall);
+    if (Site && !llvm::is_contained(RetryVirtualizationAllocationSites, Site))
+      RetryVirtualizationAllocationSites.push_back(Site);
+  }
+}
+
+void Analyzer::markIneligible(jeandle::ObjectID ID, bool FreshRetry) {
+  if (FreshRetry)
+    collectRetryVirtualizationSites(ID);
+  // Synthetic sources are kept real as a unit. A synthetic without a usable
+  // backing allocation cannot survive while its sources are eliminated. The
+  // worklist is finite: synthetic sources precede their synthetic owner, and
+  // Visited is a defensive cycle guard.
   SmallVector<jeandle::ObjectID, 8> Worklist;
   DenseSet<jeandle::ObjectID> Visited;
   Worklist.push_back(ID);
@@ -1817,6 +1839,8 @@ void Analyzer::processBlock(BasicBlock *BB) {
     mergeStates(BB);
   }
 
+  if (!RetryVirtualizationAllocationSites.empty())
+    return;
   processBlockBodyAndPublish(BB);
 }
 
@@ -1915,11 +1939,17 @@ void Analyzer::processBlockBodyAndPublish(BasicBlock *BB) {
   for (Instruction &I : *BB) {
     if (&I == BB->getTerminator())
       drainMaterializeAll();
+    if (!RetryVirtualizationAllocationSites.empty())
+      return;
     if (MaybeSplit && &I == TermII) {
       PreInvokeSnapshot.emplace();
       snapshotExitStateInto(*PreInvokeSnapshot);
+      if (!RetryVirtualizationAllocationSites.empty())
+        return;
     }
     processInstruction(&I);
+    if (!RetryVirtualizationAllocationSites.empty())
+      return;
   }
   // Defensive: empty blocks or blocks whose terminator was never enqueued
   // through the loop above still need a drain (the foreach loop above does
@@ -1928,6 +1958,8 @@ void Analyzer::processBlockBodyAndPublish(BasicBlock *BB) {
   drainMaterializeAll();
 
   snapshotExitState(BB);
+  if (!RetryVirtualizationAllocationSites.empty())
+    return;
 
   if (TermII) {
     BlockExitInfo &Info = BlockExits[BB];
@@ -1981,6 +2013,12 @@ void Analyzer::processBlockBodyAndPublish(BasicBlock *BB) {
               *PreInvokeSnapshot, ME->getMutationOwner(),
               realIdentityOf(ME->getMutationOwner()));
         }
+      normalizeIneligibleVirtualRefs(*PreInvokeSnapshot);
+#ifndef NDEBUG
+      assertVirtualReferenceClosure(*PreInvokeSnapshot);
+#endif
+      if (!RetryVirtualizationAllocationSites.empty())
+        return;
     }
 
     // Only stash the pre-invoke snapshot if (a) we actually took one
@@ -3115,6 +3153,52 @@ bool Analyzer::MergeProcessor::mergeFieldStates(jeandle::ObjectID ID) {
   return Changed;
 }
 
+void Analyzer::normalizeIneligibleVirtualRefs(BlockExitData &Data) {
+  SmallVector<jeandle::ObjectID, 4> HoldersToKeepReal;
+  do {
+    HoldersToKeepReal.clear();
+    for (auto &Holder : Data.FieldStates)
+      for (auto &Field : Holder.second) {
+        if (!Field.second.isVirtualRef())
+          continue;
+        jeandle::ObjectID Target = Field.second.getVirtualRef();
+        if (Data.Virtuals.count(Target))
+          continue;
+        Value *RealIdentity = realIdentityOf(Target);
+        if (Data.Materialized.count(Target) && RealIdentity) {
+          Field.second = jeandle::FieldValue::materializedRef(RealIdentity);
+          continue;
+        }
+        // A VirtualRef without a virtual target is not a closed block state.
+        // Reject its allocation leaves in a fresh attempt so aliases, stores,
+        // merge states, and deopt plans are rebuilt from the original IR with
+        // the target real from the start. Keep this transient snapshot closed
+        // as well; the current attempt is discarded before it can be applied.
+        observeFieldDefinitions(Target, Data.FieldDefinitions);
+        markIneligible(Target, /*FreshRetry=*/true);
+        if (RealIdentity) {
+          Field.second = jeandle::FieldValue::materializedRef(RealIdentity);
+          continue;
+        }
+        HoldersToKeepReal.push_back(Holder.first);
+      }
+
+    llvm::sort(HoldersToKeepReal);
+    HoldersToKeepReal.erase(
+        std::unique(HoldersToKeepReal.begin(), HoldersToKeepReal.end()),
+        HoldersToKeepReal.end());
+    for (jeandle::ObjectID Holder : HoldersToKeepReal) {
+      observeFieldDefinitions(Holder, Data.FieldDefinitions);
+      markIneligible(Holder, /*FreshRetry=*/true);
+      Data.Virtuals.erase(Holder);
+      Data.Materialized.erase(Holder);
+      Data.FieldStates.erase(Holder);
+      Data.LockCounts.erase(Holder);
+      Data.LiveLockEnters.erase(Holder);
+    }
+  } while (!HoldersToKeepReal.empty());
+}
+
 void Analyzer::snapshotExitStateInto(BlockExitData &Data) {
   for (auto &VObjUP : Result.VirtualObjects) {
     jeandle::ObjectID ID = VObjUP->getID();
@@ -3144,13 +3228,18 @@ void Analyzer::snapshotExitStateInto(BlockExitData &Data) {
     }
   }
 
-  // Eligibility is function-wide, but store liveness remains point-sensitive.
-  // Preserve ghost reaching definitions after a bail so later blocks and
-  // reconvergent merges can still identify which provisional store
-  // eliminations a real consumer observes.
+  // Eligibility is function-wide within this traversal, but store liveness
+  // remains point-sensitive. Preserve ghost reaching definitions after a bail
+  // so later blocks and reconvergent merges can still identify which
+  // provisional store eliminations a real consumer observes.
   for (const auto &Kv : FieldDefinitions)
     if (!Eligible.lookup(Kv.first) && !Kv.second.empty())
       Data.FieldDefinitions[Kv.first] = Kv.second;
+
+  normalizeIneligibleVirtualRefs(Data);
+#ifndef NDEBUG
+  assertVirtualReferenceClosure(Data);
+#endif
 }
 
 void Analyzer::snapshotExitState(BasicBlock *BB) {
@@ -4145,11 +4234,11 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
   }
   if (UnsupportedVirtualRefEdge) {
     for (jeandle::ObjectID ID : PerPredIDs)
-      markIneligible(ID);
+      markIneligible(ID, /*FreshRetry=*/true);
     for (const OffsetPlan &P : Plans)
       for (const jeandle::FieldValue &FV : P.PerPredFVs)
         if (FV.isVirtualRef())
-          markIneligible(FV.getVirtualRef());
+          markIneligible(FV.getVirtualRef(), /*FreshRetry=*/true);
     return false;
   }
 
@@ -4613,11 +4702,12 @@ void Analyzer::processAllocation(CallBase *CB) {
   if (UnsafeCyclicBlocks.contains(CB->getParent()))
     return;
 
-  // A failed final deopt obligation retries analysis from untouched IR with
-  // every offending original allocation site in this monotonic suppression
-  // set. Keeping the allocation real is the conservative fixpoint: all of its
-  // original uses and stores remain valid, and the same site cannot trigger
-  // another virtualization-dependent obligation.
+  // A structural/materialization failure or failed final obligation retries
+  // analysis from untouched IR with every offending original allocation site
+  // in this monotonic suppression set. Keeping the allocation real is the
+  // conservative fixpoint: all original aliases, uses, and stores are rebuilt
+  // consistently, and the same site cannot trigger another
+  // virtualization-dependent failure.
   if (SuppressedVirtualizations.count(CB))
     return;
 
@@ -7056,7 +7146,7 @@ bool Analyzer::prepareSyntheticDAG(jeandle::ObjectID ID) {
   if (!canPrepareSyntheticDAG(ID, Visiting, Planned, Leaves)) {
     DenseSet<jeandle::ObjectID> Observed;
     observeSyntheticSourceDefinitions(ID, Observed);
-    markIneligible(ID);
+    markIneligible(ID, /*FreshRetry=*/true);
     return false;
   }
   // The read-only preflight above covers the complete DAG. Commit the backing
@@ -7100,7 +7190,7 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
         // including edge-local field definitions.
         observeFieldDefinitions(ID, C.FieldDefinitions);
         MaterializationPlanMembers[ActiveMaterializationPlanID].insert(ID);
-        markIneligible(ID);
+        markIneligible(ID, /*FreshRetry=*/true);
         return;
       }
     }
@@ -7220,7 +7310,9 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
   Value *ReplayReceiver = realIdentityOf(ID);
   if (!isValueAvailableAt(ReplayReceiver, SafeIP, C.ReplaySource,
                           C.ReplayTarget)) {
-    markIneligible(ID);
+    LLVM_DEBUG(dbgs() << "PEA: keep-real receiver unavailable VO=" << ID
+                      << " at " << *SafeIP << "\n");
+    markIneligible(ID, /*FreshRetry=*/true);
     return;
   }
 
@@ -7242,7 +7334,9 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
       if (!V)
         continue;
       if (!isValueAvailableAt(V, SafeIP, C.ReplaySource, C.ReplayTarget)) {
-        markIneligible(ID);
+        LLVM_DEBUG(dbgs() << "PEA: keep-real field unavailable VO=" << ID
+                          << " value=" << *V << " at " << *SafeIP << "\n");
+        markIneligible(ID, /*FreshRetry=*/true);
         return;
       }
     }
@@ -7269,7 +7363,7 @@ void Analyzer::ensureMaterialized(jeandle::ObjectID ID, MaterializeContext &C) {
     if (const auto &Stack = C.LiveLockEnters.lookup(ID); !Stack.empty())
       for (const LockEnter &LE : Stack)
         if (!LE.Call || !LE.Call->getCalledFunction()) {
-          markIneligible(ID);
+          markIneligible(ID, /*FreshRetry=*/true);
           return;
         }
 
@@ -7801,10 +7895,7 @@ void Analyzer::commit() {
               return false;
             });
         if (HasSurvivingUse) {
-          markIneligible(ID);
-          auto *Site = dyn_cast_or_null<CallBase>(Allocation);
-          if (Site && !llvm::is_contained(UnsafeFinalUseAllocationSites, Site))
-            UnsafeFinalUseAllocationSites.push_back(Site);
+          markIneligible(ID, /*FreshRetry=*/true);
           AnyChange = true;
         }
       }
@@ -8556,8 +8647,11 @@ void Analyzer::materializeAtPredFromExitInfo(jeandle::ObjectID ID,
   // keep the object real before emitting any cascade, field, or lock effect.
   if (EdgeLocal && TargetMerge) {
     if (!isReplayEdgeSupported(PH, TargetMerge)) {
+      LLVM_DEBUG(dbgs() << "PEA: keep-real unsupported replay edge VO=" << ID
+                        << " from " << PH->getName() << " to "
+                        << TargetMerge->getName() << "\n");
       observeFieldDefinitions(ID, ExitInfo.FieldDefinitions);
-      markIneligible(ID);
+      markIneligible(ID, /*FreshRetry=*/true);
       return;
     }
   }
@@ -8767,11 +8861,7 @@ void Analyzer::takeLoopSnapshot(
   S.LockCounts = LockCounts;
   S.LiveLockEnters = LiveLockEnters;
   S.Materialized = Materialized;
-  // Snapshot per-VO eligibility so a transient bail in this iter does
-  // not wedge the VO ineligible for iter N+1.
   S.EligibleSnapshot = Eligible;
-  // Also snapshot the VO count, so on restore we can re-mark every
-  // VO created inside this iter as eligible for the next iter's retry.
   S.PreIterVOCount = Result.VirtualObjects.size();
   S.OwnedPhisSize = Result.OwnedPhis.size();
   S.OwnedInstsSize = Result.OwnedInsts.size();
@@ -8845,16 +8935,11 @@ void Analyzer::restoreLoopSnapshot(
   LockCounts = S.LockCounts;
   LiveLockEnters = S.LiveLockEnters;
   Materialized = S.Materialized;
-  // Restore Eligible map in full so transient per-iter bails do not
-  // outlive the iteration they occurred in. Then re-mark every VO created
-  // AFTER the snapshot was taken (i.e. allocs inside this iter's body) as
-  // eligible — they survive in IR (we never erase invokes during analysis)
-  // and the next iter's processAllocation hits AllocSiteToVO and would bail
-  // early on `!Eligible.lookup(ID)` if we didn't re-prime it. Without
-  // these post-snapshot re-marks, body-local allocations would be wedged
-  // ineligible across the entire fixpoint after iter 0 — observable as
-  // failure to virtualise a loop-local "new" with no escape.
   Eligible = S.EligibleSnapshot;
+
+  // Allocation-site cache entries outlive traversal rollback. Restore their
+  // default eligibility so the same static site can represent a new dynamic
+  // object on the next traversal.
   for (size_t I = S.PreIterVOCount, E = Result.VirtualObjects.size(); I < E;
        ++I) {
     if (!Result.VirtualObjects[I])
@@ -8964,7 +9049,8 @@ void Analyzer::processLoopBodyOnePass(Loop *L, ArrayRef<BasicBlock *> LoopRPO,
       // A nested loop failure stops this traversal immediately. Overflow is
       // recovered by the outermost loop; loop-end invariant failures discard
       // the complete analysis attempt.
-      if (OverflowFlag || InvalidLoopMonotonicity)
+      if (OverflowFlag || InvalidLoopMonotonicity ||
+          !RetryVirtualizationAllocationSites.empty())
         return;
       for (BasicBlock *SB : Inner->blocks())
         BodyPassProcessed.insert(SB);
@@ -8976,7 +9062,8 @@ void Analyzer::processLoopBodyOnePass(Loop *L, ArrayRef<BasicBlock *> LoopRPO,
       processBlock(BB);
     // Defensive polling keeps future block handlers from extending a
     // half-built traversal after either attempt-local failure mode.
-    if (OverflowFlag || InvalidLoopMonotonicity)
+    if (OverflowFlag || InvalidLoopMonotonicity ||
+        !RetryVirtualizationAllocationSites.empty())
       return;
     BodyPassProcessed.insert(BB);
   }
@@ -8993,7 +9080,7 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
     // Defensive: a loop with no header would be malformed LoopInfo state.
     return;
   }
-  if (InvalidLoopMonotonicity)
+  if (InvalidLoopMonotonicity || !RetryVirtualizationAllocationSites.empty())
     return;
   if (!Preheader) {
     // Loop without a unique preheader. Jeandle schedules LoopSimplifyPass
@@ -9038,15 +9125,17 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
       BlockExitInfo &PExit = It->second;
       for (jeandle::ObjectID ID : PExit.Virtuals) {
         observeFieldDefinitions(ID, PExit.FieldDefinitions);
-        markIneligible(ID);
+        markIneligible(ID, /*FreshRetry=*/true);
       }
     }
+    if (!RetryVirtualizationAllocationSites.empty())
+      return;
 
     // Body walk in REGULAR mode (single pass — no fixpoint, since there is
     // no way to verify convergence at a non-existent preheader). Loop-local
     // allocs that don't outlive a single iteration are still virtualised.
     processLoopBodyOnePass(L, loopBlocksInRPO(L, FunctionRPO), FunctionRPO);
-    if (InvalidLoopMonotonicity)
+    if (InvalidLoopMonotonicity || !RetryVirtualizationAllocationSites.empty())
       return;
 
     // Post-body merge (Graal doMergeWithoutDead run AFTER the body,
@@ -9064,6 +9153,8 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
     // its effects simply persist to commit().
     resetPerBlockState();
     mergeStates(Header);
+    if (!RetryVirtualizationAllocationSites.empty())
+      return;
     // Drain the merge's deferred CreatePHI effects the same way the fixpoint
     // path's post-body merge does: a one-shot post-body Case C (or a field
     // merge) needs them to reach transform; clearing them here would leave
@@ -9198,6 +9289,12 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
 
       processLoopBodyOnePass(L, LoopRPO, FunctionRPO, &LastMergedState);
 
+      if (!RetryVirtualizationAllocationSites.empty()) {
+        if (L->getLoopDepth() == 1)
+          CurrentMode = SavedModeForNest;
+        return;
+      }
+
       // Overflow (a STOP_NEW materialization of an outer-scope VO) may have
       // been latched by this pass or a deeper recursion. Stop iterating: the
       // state is half-consistent and is rolled back below.
@@ -9269,6 +9366,11 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
         NewMergedState = BlockExitData();
         snapshotExitStateInto(NewMergedState); // B'
         drainPendingMergePhis(Header);
+      }
+      if (!RetryVirtualizationAllocationSites.empty()) {
+        if (L->getLoopDepth() == 1)
+          CurrentMode = SavedModeForNest;
+        return;
       }
       // B' vs B (Graal's loop fixpoint equivalentTo). No iteration gate: with
       // the post-body merge, iteration 0 already has a true B' to compare
@@ -9358,6 +9460,11 @@ void Analyzer::processLoop(Loop *L, ArrayRef<BasicBlock *> FunctionRPO) {
       // starts with no live virtuals on entry — Graal's
       // processStateBeforeLoopOnOverflow (Graal PartialEscapeClosure).
       processStateBeforeLoopOnOverflow(L);
+      if (!RetryVirtualizationAllocationSites.empty()) {
+        if (L->getLoopDepth() == 1)
+          CurrentMode = SavedModeForNest;
+        return;
+      }
       // The next outer attempt recomputes A/B after the preheader drain and
       // reinitializes the header pointer-PHI aliases from that forward edge.
       continue;
@@ -9453,6 +9560,8 @@ jeandle::PEAResult Analyzer::run() {
     if (!L) {
       bailUnvisitedBackEdgeVOs(BB);
       processBlock(BB);
+      if (!RetryVirtualizationAllocationSites.empty())
+        return jeandle::PEAResult();
       Done.insert(BB);
       continue;
     }
@@ -9465,7 +9574,7 @@ jeandle::PEAResult Analyzer::run() {
     // block inside the loop appears before its header), still dispatch on
     // the top-level loop and mark all its blocks Done.
     processLoop(Top, FunctionRPO);
-    if (InvalidLoopMonotonicity)
+    if (InvalidLoopMonotonicity || !RetryVirtualizationAllocationSites.empty())
       return jeandle::PEAResult();
     for (BasicBlock *SB : Top->blocks())
       Done.insert(SB);
@@ -9480,8 +9589,10 @@ jeandle::PEAResult Analyzer::run() {
   // handled by processLoop directly. Loops with no preheader are a no-op
   // either way (the function cannot pick a drain IP without a PH).
   materializePreheaderVirtualsForUnvisitedLoops();
+  if (!RetryVirtualizationAllocationSites.empty())
+    return jeandle::PEAResult();
   commit();
-  if (!UnsafeFinalUseAllocationSites.empty())
+  if (!RetryVirtualizationAllocationSites.empty())
     return jeandle::PEAResult();
   validateFinalDeoptObligations();
   if (InvalidDeoptObligation)
@@ -9531,13 +9642,22 @@ PartialEscapeAnalysis::run(Function &F, FunctionAnalysisManager &FAM) {
     Analyzer A(F, DT, LI, StrictLockOrder, SuppressedCFGProofs,
                SuppressedVirtualizations);
     jeandle::PEAResult Attempt = A.run();
-    if (!A.getUnsafeFinalUseAllocationSites().empty()) {
+    if (!A.getRetryVirtualizationAllocationSites().empty()) {
       bool AddedSuppression = false;
-      for (CallBase *Site : A.getUnsafeFinalUseAllocationSites())
-        AddedSuppression |= SuppressedVirtualizations.insert(Site).second;
-      // The winner keeps each unsafe allocation real before assigning an
+      for (CallBase *Site : A.getRetryVirtualizationAllocationSites()) {
+        if (!SuppressedVirtualizations.insert(Site).second)
+          continue;
+        AddedSuppression = true;
+        LLVM_DEBUG({
+          dbgs() << "PEA: fresh retry suppressing allocation ";
+          Site->printAsOperand(dbgs(), false);
+          dbgs() << " in @" << F.getName() << "\n";
+        });
+      }
+      // The winner keeps each rejected allocation real before assigning an
       // ObjectID or recording effects. Every retry must add at least one new
-      // stable site, so this general final-use suppression is finite.
+      // stable site, so structural/materialization and final-use suppression
+      // share one finite fresh-analysis fixpoint.
       if (!AddedSuppression)
         return jeandle::PEAResult();
       continue;
