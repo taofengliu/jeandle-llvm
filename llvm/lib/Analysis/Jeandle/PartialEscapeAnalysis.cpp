@@ -1232,6 +1232,20 @@ private:
   // calling, so this routine only handles same-slot type reinterprets.
   Value *coerceToType(Value *V, Type *LoadTy, Instruction *InsertContext);
 
+  // Widen a sub-int scalar (i1/i8/i16) bound for a deopt descriptor field to
+  // i32. The field's wire encoding is T_INT (see LLVM2JavaComputational: Java
+  // boolean/byte/char/short fields all occupy int slots), and the HotSpot
+  // stackmap parser resolves every T_INT location as a 4-byte slot. A sub-int
+  // LLVM value would land in a sub-int stackmap location whose bytes the
+  // parser cannot read as a T_INT slot (Location::new_stk_loc truncates the
+  // byte offset to a 4-byte slot boundary), silently reconstructing the field
+  // from unrelated bytes. Widen the value in the IR instead: the stackmap
+  // then records an int-width location the parser reads correctly. Constants
+  // are already full-width in the stackmap constant pool and need no zext.
+  // The zext is registered unparented with Result.OwnedInsts; the transform
+  // splices it in immediately before the safepoint.
+  Value *widenDeoptScalar(Value *V, Instruction *InsertContext);
+
   // Why a materialization was emitted. Used to bump the per-reason Statistic
   // counter at the emission site. ALL six reasons (Unhandled, Merge,
   // LoopExit, Phi, Cascade, Nested) have standalone counters; Cascade and
@@ -2314,6 +2328,19 @@ Value *Analyzer::coerceToType(Value *V, Type *LoadTy,
   // mismatch. The caller marks the VO ineligible so the original
   // alloc/store/load survive in IR.
   return nullptr;
+}
+
+Value *Analyzer::widenDeoptScalar(Value *V, Instruction *InsertContext) {
+  Type *Ty = V->getType();
+  if (!Ty->isIntegerTy() || Ty->getIntegerBitWidth() >= 32 || isa<Constant>(V))
+    return V;
+  Instruction *ZExt = CastInst::Create(Instruction::ZExt, V,
+                                       Type::getInt32Ty(V->getContext()),
+                                       "pea.deopt.widen", /*InsertBefore=*/nullptr);
+  if (InsertContext)
+    ZExt->setDebugLoc(InsertContext->getDebugLoc());
+  Result.OwnedInsts.emplace_back(ZExt);
+  return ZExt;
 }
 
 Analyzer::MergeProcessor::MergeProcessor(Analyzer &A, BasicBlock *BB)
@@ -6361,6 +6388,8 @@ void Analyzer::recordDeoptBundleMappings(CallBase *CB) {
           Node.Describable = false;
           return;
         }
+        if (BasicType == jeandle::T_INT)
+          V = widenDeoptScalar(V, CB);
         Node.Fields.push_back(DeoptPoolFieldInput::scalar(
             InvalidDeoptPoolSemanticCellID, Offset, BasicType, BindScalar(V)));
       };
