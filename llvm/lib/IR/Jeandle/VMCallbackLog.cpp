@@ -90,6 +90,13 @@ VMCallbackLogRecorder::~VMCallbackLogRecorder() { ActiveRecorder = nullptr; }
 void VMCallbackLogRecorder::recordIfNew(unsigned Kind,
                                         ArrayRef<CallbackValue> Args,
                                         CallbackValue Result) {
+  // GetNewStatepointID is an id-allocation callback, not a pure query: the VM
+  // owns global statepoint-id allocation and returns a fresh id on every call,
+  // so the same template id legitimately maps to different results across
+  // calls. It cannot be recorded for replay (replay allocates synthetic ids
+  // instead), and it must not be purity-checked.
+  if (Kind == CK_GetNewStatepointID)
+    return;
   CallbackKey Key{Kind,
                   SmallVector<CallbackValue, 4>(Args.begin(), Args.end())};
   auto [It, Inserted] = Entries.try_emplace(Key, Result);
@@ -308,6 +315,16 @@ static void handleReplaySideEffects(unsigned Kind, ArrayRef<CallbackValue> Args,
 template <typename T>
 static T fetchReplayedResult(unsigned Kind, ArrayRef<CallbackValue> Args,
                              const char *Name) {
+  // GetNewStatepointID is an id-allocation callback (impure by design), so it
+  // is never recorded in the log. Replay allocates synthetic fresh ids; they
+  // only need to be unique within the replayed compilation, since replay has
+  // no JVM-side CallSiteInfo consumer.
+  if constexpr (std::is_same_v<T, int64_t>) {
+    if (Kind == CK_GetNewStatepointID) {
+      static int64_t NextReplayStatepointID = 1;
+      return NextReplayStatepointID++;
+    }
+  }
   const CallbackValue &RawResult = lookupValue(Kind, Args, Name);
   handleReplaySideEffects(Kind, Args, RawResult);
   return decodeVMCallbackValue<T>(RawResult);
