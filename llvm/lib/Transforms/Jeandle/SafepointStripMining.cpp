@@ -1,0 +1,1307 @@
+//===- SafepointStripMining.cpp - Jeandle safepoint strip mining ---------===//
+//
+// Copyright (c) 2026, the Jeandle-LLVM Authors. All Rights Reserved.
+//
+// Part of the Jeandle-LLVM project, under the Apache License v2.0 with LLVM
+// Exceptions. See https://llvm.org/LICENSE.txt for license information.
+// SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+//
+//===----------------------------------------------------------------------===//
+
+#include "llvm/Transforms/Jeandle/SafepointStripMining.h"
+#include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/PostOrderIterator.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
+#include "llvm/ADT/SmallVector.h"
+#include "llvm/Analysis/CFG.h"
+#include "llvm/Analysis/IVDescriptors.h"
+#include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/MemorySSA.h"
+#include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/CFG.h"
+#include "llvm/IR/Constants.h"
+#include "llvm/IR/Dominators.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/IRBuilder.h"
+#include "llvm/IR/Instructions.h"
+#include "llvm/IR/Intrinsics.h"
+#include "llvm/IR/Jeandle/Attributes.h"
+#include "llvm/IR/Jeandle/JeandleUtils.h"
+#include "llvm/IR/Jeandle/Metadata.h"
+#include "llvm/IR/ValueMap.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Transforms/Jeandle/SafepointUtils.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/Cloning.h"
+#include "llvm/Transforms/Utils/LoopUtils.h"
+
+using namespace llvm;
+
+#define DEBUG_TYPE "safepoint-strip-mining"
+
+namespace {
+
+using jeandle::canProveExclusiveNoWrap;
+using jeandle::canProveInclusiveNoWrap;
+using jeandle::getConstantAddStep;
+using jeandle::isSafepointPoll;
+using jeandle::StripMineStrideOverflowWidenBits;
+
+constexpr StringRef InclusiveSlowPathMD = jeandle::Metadata::InclusiveSlowPath;
+
+[[maybe_unused]] StringRef modeName(SafepointStripMiningMode Mode) {
+  switch (Mode) {
+  case SafepointStripMiningMode::StripMining:
+    return "strip-mining";
+  case SafepointStripMiningMode::InclusiveLoopVersioning:
+    return "inclusive-loop-versioning";
+  }
+  llvm_unreachable("unknown SafepointStripMiningMode");
+}
+
+// ===--------------------------------------------------------------------===//
+// Strip mining for unbounded / large counted loops.
+//
+// A loop whose trip count is not provably within the chunk budget can't have
+// its back-edge poll deleted without leaving the loop naked. Following C2's
+// OuterStripMinedLoopNode, wrap the loop in an outer loop that iterates the
+// original IV space in batches of N: the inner loop runs poll-free (so it can
+// vectorize / LICM / widen its IV) and a single poll on the outer back-edge
+// keeps time-to-safepoint bounded to N inner iterations.
+//
+// The poll is relocated, never synthesized: the inner back-edge poll is
+// cloned onto the outer latch with its deopt bundle carried over and the
+// loop-carried operands remapped to the outer recurrences. A poll whose deopt
+// state can't be remapped — it references a value that is neither the IV, a
+// header recurrence, nor loop-invariant — makes the loop ineligible; we keep
+// it as-is rather than emit a safepoint with wrong deopt state.
+// ===--------------------------------------------------------------------===//
+
+struct IVInfo {
+  PHINode *Phi;
+  Value *ComparedValue;
+  APInt Step;
+  const SCEVAddRecExpr *AR;
+};
+
+// The integer induction phi whose latch-carried next value ExitCmp compares
+// directly against a loop-invariant limit, with a compile-time non-zero
+// constant step. LoopRotate delivers this latch-exit (post-increment) shape;
+// the cmp's limit rewrite stays a single operand swap, and the IV is tied to
+// the exit test, so a loop with several affine recurrences strip-mines on the
+// one the exit drives.
+std::optional<IVInfo> findIntInduction(Loop *L, ICmpInst *ExitCmp,
+                                       ScalarEvolution &SE) {
+  PHINode *Phi = L->getInductionVariable(SE);
+  if (!Phi)
+    return std::nullopt;
+  InductionDescriptor IndDesc;
+  if (!L->getInductionDescriptor(SE, IndDesc))
+    return std::nullopt;
+  ConstantInt *Step = IndDesc.getConstIntStepValue();
+  if (!Step || Step->isZero())
+    return std::nullopt;
+
+  Value *LatchValue = Phi->getIncomingValueForBlock(L->getLoopLatch());
+  Value *Op0 = ExitCmp->getOperand(0);
+  Value *Op1 = ExitCmp->getOperand(1);
+  Value *Limit = nullptr;
+  Value *ComparedValue = nullptr;
+  if (Op0 == LatchValue) {
+    Limit = Op1;
+    ComparedValue = Op0;
+  } else if (Op1 == LatchValue) {
+    Limit = Op0;
+    ComparedValue = Op1;
+  } else {
+    return std::nullopt;
+  }
+  if (!SE.isLoopInvariant(SE.getSCEV(Limit), L))
+    return std::nullopt;
+  const auto *AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(Phi));
+  if (!AR || AR->getLoop() != L || !AR->isAffine())
+    return std::nullopt;
+  return IVInfo{Phi, ComparedValue, Step->getValue(), AR};
+}
+
+// Relational predicates are handled directly. eq/ne loops are accepted here so
+// checkStripMineShape can support the `i != limit` counted-loop subset when the
+// continue predicate normalizes to NE and the step is exactly +/-1.
+bool isAcceptablePredicate(ICmpInst::Predicate P) {
+  return ICmpInst::isRelational(P) || P == ICmpInst::ICMP_EQ ||
+         P == ICmpInst::ICMP_NE;
+}
+
+struct StripMineShape {
+  BasicBlock *Preheader, *Header, *Latch, *ExitingBB, *ExitBB;
+  BranchInst *ExitingBr;
+  Value *ResumeIV;
+  unsigned ExitSuccessorIdx;
+  unsigned LimitOperandIdx;
+  bool Increasing;
+  bool Inclusive; // ContinuePredicate is *LE / *GE (runs one extra iteration)
+  ICmpInst::Predicate ContinuePredicate;
+};
+
+// Narrow preconditions kept simple so the CFG surgery is auditable:
+// LoopSimplify form, a single primary counted exit whose conditional branch is
+// ExitCmp (ordinary side exits are permitted alongside it), a relational
+// predicate whose direction matches the step sign, and the IV phi compared
+// directly against a loop-invariant limit.
+std::optional<StripMineShape> checkStripMineShape(Loop *L, const IVInfo &IV,
+                                                  ICmpInst *ExitCmp,
+                                                  ScalarEvolution &SE,
+                                                  bool AllowRuntimeVersioning) {
+  // LoopSimplify form is defined as having a preheader, a single latch, and
+  // dedicated exits, so getLoopPreheader()/getLoopLatch() are non-null here.
+  if (!L->isLoopSimplifyForm())
+    return std::nullopt;
+  BasicBlock *Preheader = L->getLoopPreheader();
+  BasicBlock *Header = L->getHeader();
+  BasicBlock *Latch = L->getLoopLatch();
+
+  // The surgery reroutes the preheader's branch into the new outer preheader.
+  // LoopSimplify gives the preheader a single successor but not necessarily a
+  // plain BranchInst terminator (a callbr could reach the header), so require
+  // one here — before any mutation — rather than cast blindly mid-surgery.
+  if (!isa<BranchInst>(Preheader->getTerminator()))
+    return std::nullopt;
+
+  // The surgery rewires the primary counted exit only. Any other exit edge
+  // already leaves the current loop and, after wrapping, the strip-mined nest,
+  // so it is not part of the long-running back-edge path that needs bounded
+  // TTSP coverage; keep it and its exit state untouched. This mirrors C2
+  // CountedLoop's "1 trip-counter exit path and maybe other exit paths"
+  // contract.
+  BasicBlock *ExitingBB = ExitCmp->getParent();
+  SmallVector<BasicBlock *, 4> ExitingBBs;
+  L->getExitingBlocks(ExitingBBs);
+  if (!llvm::is_contained(ExitingBBs, ExitingBB))
+    return std::nullopt;
+
+  // LoopRotate delivers a latch-exit (post-increment) loop: the counted test
+  // lives in the latch and compares the latch-carried next value against a
+  // loop-invariant limit. A loop that did not rotate into this shape has no
+  // latch compare (buildStripMinePlan's getLatchCmpInst returned null) and
+  // never reaches here, so only the latch-carried next-value compare is
+  // handled.
+  Value *LatchIV = IV.Phi->getIncomingValueForBlock(Latch);
+  if (ExitingBB != Latch)
+    return std::nullopt;
+  auto LatchStep = getConstantAddStep(LatchIV, IV.Phi);
+  if (!LatchStep || *LatchStep != IV.Step)
+    return std::nullopt;
+  auto *LatchNextInst = dyn_cast<Instruction>(LatchIV);
+  if (!LatchNextInst || !L->contains(LatchNextInst))
+    return std::nullopt;
+
+  auto *Br = dyn_cast<BranchInst>(ExitingBB->getTerminator());
+  if (!Br || !Br->isConditional() || Br->getCondition() != ExitCmp)
+    return std::nullopt;
+
+  // The surgery rewrites ExitCmp's limit operand in place to the clamped
+  // per-batch limit. If ExitCmp feeds anything other than this branch (a
+  // select, another branch, a side-exit poll's deopt bundle), that user would
+  // silently start reading the clamped limit instead of the real one. Only
+  // rewrite a compare used solely by the exit branch. (EarlyCSE, now in the
+  // strip-mining pipeline, can merge equal compares into a shared multi-use
+  // value, so this is not hypothetical.)
+  if (!ExitCmp->hasOneUse())
+    return std::nullopt;
+
+  unsigned ExitSuccIdx = 0;
+  BasicBlock *ExitBB = nullptr;
+  for (unsigned I = 0; I < Br->getNumSuccessors(); ++I) {
+    if (!L->contains(Br->getSuccessor(I))) {
+      if (ExitBB)
+        return std::nullopt; // more than one exit edge from this branch
+      ExitBB = Br->getSuccessor(I);
+      ExitSuccIdx = I;
+    }
+  }
+  if (!ExitBB)
+    return std::nullopt;
+
+  // Normalise branch polarity: reason in terms of the predicate that is true
+  // when we should *continue* the inner batch, so exit-on-true and
+  // exit-on-false shapes are handled on equal footing.
+  bool ExitOnTrue = (ExitSuccIdx == 0);
+  ICmpInst::Predicate ContinuePred =
+      ExitOnTrue ? ICmpInst::getInversePredicate(ExitCmp->getPredicate())
+                 : ExitCmp->getPredicate();
+
+  unsigned LimitIdx;
+  bool ComparedOnRHS = false;
+  if (ExitCmp->getOperand(0) == IV.ComparedValue)
+    LimitIdx = 1;
+  else if (ExitCmp->getOperand(1) == IV.ComparedValue) {
+    LimitIdx = 0;
+    ComparedOnRHS = true;
+  } else {
+    return std::nullopt;
+  }
+  if (ComparedOnRHS)
+    ContinuePred = ICmpInst::getSwappedPredicate(ContinuePred);
+
+  bool CanonicalizedNE = ContinuePred == ICmpInst::ICMP_NE;
+  if (CanonicalizedNE) {
+    if (!IV.Step.abs().isOne())
+      return std::nullopt;
+    ContinuePred =
+        IV.Step.isStrictlyPositive() ? ICmpInst::ICMP_SLT : ICmpInst::ICMP_SGT;
+  }
+
+  bool Increasing, Inclusive;
+  switch (ContinuePred) {
+  case ICmpInst::ICMP_SLT:
+  case ICmpInst::ICMP_ULT:
+    Increasing = true;
+    Inclusive = false;
+    break;
+  case ICmpInst::ICMP_SLE:
+  case ICmpInst::ICMP_ULE:
+    Increasing = true;
+    Inclusive = true;
+    break;
+  case ICmpInst::ICMP_SGT:
+  case ICmpInst::ICMP_UGT:
+    Increasing = false;
+    Inclusive = false;
+    break;
+  case ICmpInst::ICMP_SGE:
+  case ICmpInst::ICMP_UGE:
+    Increasing = false;
+    Inclusive = true;
+    break;
+  default:
+    return std::nullopt;
+  }
+  if (Increasing != IV.Step.isStrictlyPositive())
+    return std::nullopt; // step direction conflicts with predicate direction
+
+  // The limit's loop-invariance is already established by findIntInduction
+  // (SE.isLoopInvariant(SE.getSCEV(Limit), L)); no need to re-check here.
+
+  const SCEV *Start = IV.AR->getStart();
+  const SCEV *Limit = SE.getSCEV(ExitCmp->getOperand(LimitIdx));
+  // No-wrap legality, including the supported runtime-versioned case, is
+  // checked after this structural normalization.
+  bool CanAddStableEntryGuard =
+      AllowRuntimeVersioning && Inclusive && ICmpInst::isSigned(ContinuePred) &&
+      !IV.Step.isMinSignedValue() && IV.Phi->getType()->isIntegerTy(32);
+  if (!SE.isLoopEntryGuardedByCond(L, ContinuePred, Start, Limit) &&
+      !CanAddStableEntryGuard)
+    return std::nullopt;
+
+  return StripMineShape{Preheader, Header,     Latch,     ExitingBB,
+                        ExitBB,    Br,         LatchIV,   ExitSuccIdx,
+                        LimitIdx,  Increasing, Inclusive, ContinuePred};
+}
+
+// Back-edge polls owned by L (not a sub-loop) whose block dominates the latch:
+// these fire on every iteration that reaches the back-edge, so they are the
+// relocation candidates for strip mining. (The back-edge poll may sit in a
+// header/body block that dominates the latch, not only in the latch itself.)
+// Dominance proves coverage only; relocation's separate memory and deopt-state
+// gates below do the real work; the loop-tree poll-deletion pass owns polls
+// that are not on the back-edge path (early-return, conditional).
+SmallVector<CallInst *, 4> collectBackEdgePolls(Loop *L, LoopInfo &LI,
+                                                DominatorTree &DT) {
+  BasicBlock *Latch = L->getLoopLatch();
+  SmallVector<CallInst *, 4> Out;
+  for (BasicBlock *BB : L->blocks()) {
+    if (LI.getLoopFor(BB) != L)
+      continue;
+    if (!DT.dominates(BB, Latch))
+      continue;
+    for (Instruction &I : *BB)
+      if (isSafepointPoll(I))
+        Out.push_back(cast<CallInst>(&I));
+  }
+  return Out;
+}
+
+CallInst *findRelocationCandidate(Loop *L, LoopInfo &LI, DominatorTree &DT) {
+  BasicBlock *Latch = L->getLoopLatch();
+  for (BasicBlock *BB = Latch; BB && L->contains(BB);) {
+    if (LI.getLoopFor(BB) == L)
+      for (Instruction &I : llvm::reverse(*BB))
+        if (isSafepointPoll(I))
+          return cast<CallInst>(&I);
+
+    DomTreeNode *Node = DT.getNode(BB);
+    DomTreeNode *IDom = Node ? Node->getIDom() : nullptr;
+    BB = IDom ? IDom->getBlock() : nullptr;
+  }
+  return nullptr;
+}
+
+// The value a header phi carries from the latch edge — the loop-carried "next"
+// value (e.g. i.next, s.next). The frontend's back-edge deopt bundle captures
+// these, not the phis themselves (the state is "resume at the next iteration").
+PHINode *getHeaderPhiForLatchValue(Value *V, BasicBlock *Header,
+                                   BasicBlock *Latch) {
+  for (PHINode &Phi : Header->phis())
+    if (Phi.getIncomingValueForBlock(Latch) == V)
+      return &Phi;
+  return nullptr;
+}
+
+bool isHeaderPhiLatchValue(Value *V, BasicBlock *Header, BasicBlock *Latch) {
+  return getHeaderPhiForLatchValue(V, Header, Latch) != nullptr;
+}
+
+// Frontends may keep an unchanged local (notably `this`) live across a loop as
+// a syntactic self recurrence. It is semantically invariant and can be lifted
+// to the outer recurrence without changing the state observed at a batch
+// boundary.
+bool isLoopInvariantSelfRecurrence(PHINode *Phi, Loop *L, BasicBlock *Header,
+                                   BasicBlock *Latch) {
+  if (Phi->getParent() != Header || Phi->getIncomingValueForBlock(Latch) != Phi)
+    return false;
+  BasicBlock *Preheader = L->getLoopPreheader();
+  Value *Initial =
+      Preheader ? Phi->getIncomingValueForBlock(Preheader) : nullptr;
+  return Initial && L->isLoopInvariant(Initial);
+}
+
+// The relocated poll represents the next iteration at a batch boundary. A raw
+// header phi is normally current-iteration state, even when it also happens to
+// be the latch input of another copy/swap recurrence. The one safe exception is
+// an invariant self recurrence; reject every other header phi before testing
+// latch-value matching.
+bool deoptOperandsDescribeBatchBoundary(CallInst *P, Loop *L,
+                                        BasicBlock *Header, BasicBlock *Latch) {
+  auto OB = P->getOperandBundle(LLVMContext::OB_deopt);
+  if (!OB)
+    return true;
+  for (const Use &U : OB->Inputs) {
+    Value *V = U.get();
+    if (L->isLoopInvariant(V))
+      continue;
+    if (auto *Phi = dyn_cast<PHINode>(V); Phi && Phi->getParent() == Header) {
+      if (isLoopInvariantSelfRecurrence(Phi, L, Header, Latch))
+        continue;
+      return false;
+    }
+    if (isHeaderPhiLatchValue(V, Header, Latch))
+      continue;
+    return false;
+  }
+  return true;
+}
+
+bool memoryStateMatchesBackedge(CallInst *Poll, Loop *L, BasicBlock *Header,
+                                BasicBlock *Latch, MemorySSA &MSSA) {
+  MemoryAccess *PollAccess = MSSA.getMemoryAccess(Poll);
+  if (!PollAccess)
+    return false;
+
+  MemoryAccess *BoundaryState = nullptr;
+  if (isa<MemoryDef>(PollAccess))
+    BoundaryState = PollAccess;
+  else if (auto *Use = dyn_cast<MemoryUse>(PollAccess))
+    BoundaryState = Use->getDefiningAccess();
+  if (!BoundaryState)
+    return false;
+
+  MemoryPhi *HeaderMemory = MSSA.getMemoryAccess(Header);
+  if (HeaderMemory) {
+    if (HeaderMemory->getBasicBlockIndex(Latch) < 0)
+      return false;
+    return HeaderMemory->getIncomingValueForBlock(Latch) == BoundaryState;
+  }
+
+  // With no loop-header MemoryPhi, only a MemoryUse can be loop-invariant.
+  // Its defining state must originate outside the loop (or be live-on-entry),
+  // so executing it at the outer boundary observes the same memory state.
+  if (!isa<MemoryUse>(PollAccess))
+    return false;
+  return MSSA.isLiveOnEntryDef(BoundaryState) ||
+         !L->contains(BoundaryState->getBlock());
+}
+
+bool isUnmodeledRelocationHazard(const Instruction &I, MemorySSA &MSSA) {
+  if (I.isDebugOrPseudoInst() || I.isLifetimeStartOrEnd())
+    return false;
+  return I.mayHaveSideEffects() && !MSSA.getMemoryAccess(&I);
+}
+
+// Walk backward from the latch and stop at the poll block. Since the poll block
+// dominates the latch, this visits exactly the current-iteration paths that can
+// still reach the backedge and ignores side-exit-only paths.
+bool hasNoUnmodeledRelocationHazardAfterPoll(CallInst *Poll, Loop *L,
+                                             BasicBlock *Latch,
+                                             MemorySSA &MSSA) {
+  BasicBlock *PollBB = Poll->getParent();
+  SmallVector<BasicBlock *, 8> Worklist{Latch};
+  SmallPtrSet<BasicBlock *, 16> Visited;
+  bool ReachedPoll = false;
+
+  while (!Worklist.empty()) {
+    BasicBlock *BB = Worklist.pop_back_val();
+    if (!Visited.insert(BB).second)
+      continue;
+    if (!L->contains(BB))
+      return false;
+
+    if (BB == PollBB) {
+      ReachedPoll = true;
+      for (auto It = std::next(Poll->getIterator()), End = BB->end(); It != End;
+           ++It)
+        if (isUnmodeledRelocationHazard(*It, MSSA))
+          return false;
+      continue;
+    }
+
+    for (Instruction &I : *BB)
+      if (isUnmodeledRelocationHazard(I, MSSA))
+        return false;
+
+    bool HasLoopPredecessor = false;
+    for (BasicBlock *Pred : predecessors(BB)) {
+      if (!L->contains(Pred))
+        return false;
+      HasLoopPredecessor = true;
+      Worklist.push_back(Pred);
+    }
+    if (!HasLoopPredecessor)
+      return false;
+  }
+  return ReachedPoll;
+}
+
+struct HeaderPhiState {
+  PHINode *Phi;
+  Value *PreheaderValue;
+  Value *LatchValue;
+};
+
+struct InclusiveExitPhiIncoming {
+  PHINode *Phi;
+  BasicBlock *ExitingBB;
+  Value *IncomingValue;
+};
+
+struct InclusiveRuntimeGuard {
+  ICmpInst::Predicate Predicate;
+  ICmpInst::Predicate FirstIterationPredicate;
+  APInt Bound;
+  SmallVector<InclusiveExitPhiIncoming, 8> ExitPhiIncomings;
+};
+
+struct StripMinePlan {
+  Loop *L;
+  StripMineShape Shape;
+  PHINode *IVPhi;
+  ICmpInst *ExitCmp;
+  CallInst *PollToMove;
+  SmallVector<CallInst *, 4> AllPolls;
+  SmallVector<PHINode *, 4> LiftedHeaderPhis;
+  SmallVector<HeaderPhiState, 4> HeaderPhis;
+  std::optional<InclusiveRuntimeGuard> RuntimeGuard;
+  APInt AbsStepN;
+  bool IsSigned;
+  uint64_t ChunkIters;
+  Value *InitVal;
+  Value *Limit;
+
+  /// Pre-condition re-check queued before applying: this plan still matches the
+  /// IR (loop/header/latch/exiting/exit identity, exit-branch wiring, poll
+  /// parents, the IV-phi/limit/exit-cmp the relocation gates on, and the
+  /// runtime-guard exit-phi incomings). Sibling-plan application can invalidate
+  /// a queued plan; each plan validates itself before it applies (C2's two-
+  /// phase analyze-then-mutate pattern, guarded here against interference).
+  bool stillStructurallyValid(LoopInfo &LI, DominatorTree &DT) const;
+};
+
+bool isSafeToVersionInclusiveLoop(Loop *L) {
+  if (!L->isSafeToClone())
+    return false;
+
+  SmallVector<BasicBlock *, 4> ExitBlocks;
+  L->getUniqueExitBlocks(ExitBlocks);
+  for (BasicBlock *ExitBB : ExitBlocks) {
+    auto It = ExitBB->getFirstNonPHIIt();
+    if (It != ExitBB->end() && It->isEHPad())
+      return false;
+  }
+
+  for (BasicBlock *BB : L->blocks()) {
+    for (Instruction &I : *BB) {
+      if (I.getType()->isTokenTy() && I.isUsedOutsideOfBlock(BB))
+        return false;
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB)
+        continue;
+      if (isa<InvokeInst>(CB) || CB->isConvergent() ||
+          CB->getAttributes()
+              .getFnAttr(jeandle::Attribute::StatepointID)
+              .isValid())
+        return false;
+    }
+  }
+  return true;
+}
+
+std::optional<StripMinePlan>
+buildStripMinePlanWithIV(Loop *L, const IVInfo &IV, ICmpInst *ExitCmp,
+                         CallInst *PollToMove, ArrayRef<CallInst *> AllPolls,
+                         MemorySSA &MSSA, DominatorTree &DT,
+                         ScalarEvolution &SE, bool AllowRuntimeVersioning) {
+  auto MaybeShape =
+      checkStripMineShape(L, IV, ExitCmp, SE, AllowRuntimeVersioning);
+  if (!MaybeShape) {
+    LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
+                      << ": unsupported loop shape\n");
+    return std::nullopt;
+  }
+  StripMineShape Shape = *MaybeShape;
+
+  if (!memoryStateMatchesBackedge(PollToMove, L, Shape.Header, Shape.Latch,
+                                  MSSA)) {
+    LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
+                      << ": poll is not the backedge memory state\n");
+    return std::nullopt;
+  }
+  if (!hasNoUnmodeledRelocationHazardAfterPoll(PollToMove, L, Shape.Latch,
+                                               MSSA)) {
+    LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
+                      << ": unmodeled relocation hazard after poll\n");
+    return std::nullopt;
+  }
+  if (!deoptOperandsDescribeBatchBoundary(PollToMove, L, Shape.Header,
+                                          Shape.Latch)) {
+    LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
+                      << ": deopt state is not a batch boundary\n");
+    return std::nullopt;
+  }
+
+  uint64_t N = jeandle::getLoopStripMiningIter();
+  if (N < 2) {
+    LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
+                      << ": chunk budget below 2\n");
+    return std::nullopt;
+  }
+
+  Type *Ty = IV.Phi->getType();
+  Value *InitVal = IV.Phi->getIncomingValueForBlock(Shape.Preheader);
+  Value *Limit = ExitCmp->getOperand(Shape.LimitOperandIdx);
+
+  // Per-batch stride = |step| * Steps, where an inclusive predicate runs one
+  // extra iteration so it advances Steps = N-1 (strict advances N). Compute it
+  // in a wide value and bail unless it fits the IV type as a positive bound:
+  // a narrow IV (or a chunk budget too large for the type) would otherwise
+  // overflow the clamp arithmetic — truncating to a smaller or zero stride and,
+  // at stride zero, spinning the outer loop forever. Bailing keeps such loops
+  // un-mined (they retain their poll) rather than miscompiled.
+  unsigned BitWidth = Ty->getIntegerBitWidth();
+  uint64_t Steps = Shape.Inclusive ? N - 1 : N;
+  bool IsSigned = ICmpInst::isSigned(Shape.ContinuePredicate);
+  APInt WideStride =
+      IV.Step.abs().zext(BitWidth + StripMineStrideOverflowWidenBits) *
+      APInt(BitWidth + StripMineStrideOverflowWidenBits, Steps,
+            /*isSigned=*/false);
+  if (WideStride.isZero() ||
+      WideStride.getActiveBits() + (IsSigned ? 1 : 0) > BitWidth) {
+    LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
+                      << ": batch stride overflows IV type\n");
+    return std::nullopt;
+  }
+  APInt AbsStepN = WideStride.trunc(BitWidth);
+
+  // The IV must not wrap inside a poll-free batch. The transform and verifier
+  // prove the same real-limit range at loop entry, so an entry guard such as
+  // `n < 1000` is usable but a body-only IV guard is not.
+  const SCEV *LimitS = SE.getSCEV(Limit);
+  const Instruction *LoopEntryCtx = Shape.Header->getTerminator();
+  std::optional<InclusiveRuntimeGuard> RuntimeGuard;
+  if (!Shape.Inclusive) {
+    bool HasStableInit = isGuaranteedNotToBeUndefOrPoison(InitVal);
+    bool HasStableLimit = isGuaranteedNotToBeUndefOrPoison(Limit);
+    bool HasValueIndependentNoWrap =
+        IV.Step.abs().isOne() ||
+        (IsSigned ? IV.AR->hasNoSignedWrap() : IV.AR->hasNoUnsignedWrap());
+    // An entry guard over an undef-dependent value does not constrain a later
+    // freeze of that value. Only accept unstable operands when no-wrap follows
+    // from the step/recurrence itself; applyStripMinePlan then freezes each
+    // operand once before duplicating it across the outer and inner tests.
+    if ((!HasStableInit || !HasStableLimit) && !HasValueIndependentNoWrap) {
+      LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
+                        << ": cannot prove exclusive no-wrap\n");
+      return std::nullopt;
+    }
+    if (!canProveExclusiveNoWrap(IV.AR, IV.Step, LimitS, LoopEntryCtx, IsSigned,
+                                 Shape.Increasing, SE)) {
+      LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
+                        << ": cannot prove exclusive no-wrap\n");
+      return std::nullopt;
+    }
+  } else {
+    // The clamp and loop test use these operands separately. A SCEV range does
+    // not make transitive uses of an undef-dependent SSA value agree.
+    bool HasStableInit = isGuaranteedNotToBeUndefOrPoison(InitVal);
+    if (!HasStableInit ||
+        !canProveInclusiveNoWrap(IV.AR, IV.Step, Limit, LimitS, LoopEntryCtx,
+                                 IsSigned, Shape.Increasing, SE)) {
+      SmallVector<InclusiveExitPhiIncoming, 8> ExitPhiIncomings;
+      SmallVector<BasicBlock *, 4> ExitBlocks;
+      L->getUniqueExitBlocks(ExitBlocks);
+      bool HasVersionableExits = L->hasDedicatedExits();
+      for (BasicBlock *ExitBB : ExitBlocks) {
+        for (PHINode &Phi : ExitBB->phis()) {
+          for (unsigned I = 0; I < Phi.getNumIncomingValues(); ++I) {
+            BasicBlock *ExitingBB = Phi.getIncomingBlock(I);
+            if (!L->contains(ExitingBB)) {
+              HasVersionableExits = false;
+              break;
+            }
+            ExitPhiIncomings.push_back(
+                {&Phi, ExitingBB, Phi.getIncomingValue(I)});
+          }
+          if (!HasVersionableExits)
+            break;
+        }
+        if (!HasVersionableExits)
+          break;
+      }
+      bool IsSupportedRuntimeShape =
+          AllowRuntimeVersioning && HasVersionableExits &&
+          isSafeToVersionInclusiveLoop(L) && IsSigned &&
+          !IV.Step.isMinSignedValue() && IV.Phi->getType()->isIntegerTy(32) &&
+          !Shape.Latch->getTerminator()->getMetadata(InclusiveSlowPathMD);
+      if (!IsSupportedRuntimeShape) {
+        LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
+                          << ": inclusive loop not versionable\n");
+        return std::nullopt;
+      }
+
+      APInt GuardBound = Shape.Increasing
+                             ? APInt::getSignedMaxValue(/*numBits=*/32)
+                             : APInt::getSignedMinValue(/*numBits=*/32);
+      if (Shape.Increasing) {
+        GuardBound -= IV.Step;
+        GuardBound += 1;
+      } else {
+        GuardBound += IV.Step.abs();
+        GuardBound -= 1;
+      }
+      RuntimeGuard = InclusiveRuntimeGuard{
+          Shape.Increasing ? ICmpInst::ICMP_SLT : ICmpInst::ICMP_SGT,
+          Shape.Increasing ? ICmpInst::ICMP_SLE : ICmpInst::ICMP_SGE,
+          GuardBound, std::move(ExitPhiIncomings)};
+    }
+  }
+
+  // Every non-IV header phi is a recurrence that must continue across batches,
+  // so all of them are threaded through the outer loop — not only those that
+  // leak out via an exit phi.
+  SmallVector<PHINode *, 4> LiftedHeaderPhis;
+  for (PHINode &Phi : Shape.Header->phis())
+    if (&Phi != IV.Phi)
+      LiftedHeaderPhis.push_back(&Phi);
+
+  // Pre-mutation validation: every value leaking out through an exit LCSSA phi
+  // must be representable at the final outer-header exit. Header exits leak the
+  // current header phis; latch exits leak the latch-carried next values.
+  // Anything else is out of scope — bail before mutation.
+  for (PHINode &Phi : Shape.ExitBB->phis()) {
+    int Idx = Phi.getBasicBlockIndex(Shape.ExitingBB);
+    if (Idx < 0)
+      continue;
+    Value *V = Phi.getIncomingValue(Idx);
+    if (L->isLoopInvariant(V))
+      continue;
+    if (V == Shape.ResumeIV)
+      continue;
+    PHINode *HPhi = getHeaderPhiForLatchValue(V, Shape.Header, Shape.Latch);
+    if (!HPhi || HPhi == IV.Phi) {
+      LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
+                        << ": unsupported exit phi\n");
+      return std::nullopt;
+    }
+  }
+
+  SmallVector<HeaderPhiState, 4> HeaderPhis;
+  for (PHINode &Phi : Shape.Header->phis())
+    HeaderPhis.push_back({&Phi, Phi.getIncomingValueForBlock(Shape.Preheader),
+                          Phi.getIncomingValueForBlock(Shape.Latch)});
+
+  return StripMinePlan{L,
+                       Shape,
+                       IV.Phi,
+                       ExitCmp,
+                       PollToMove,
+                       SmallVector<CallInst *, 4>(AllPolls),
+                       std::move(LiftedHeaderPhis),
+                       std::move(HeaderPhis),
+                       std::move(RuntimeGuard),
+                       AbsStepN,
+                       IsSigned,
+                       N,
+                       InitVal,
+                       Limit};
+}
+
+std::optional<StripMinePlan>
+buildStripMinePlan(Loop *L, LoopInfo &LI, DominatorTree &DT,
+                   ScalarEvolution &SE, MemorySSA &MSSA,
+                   bool AllowRuntimeVersioning = false) {
+  if (!L->isInnermost()) {
+    LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
+                      << ": not innermost\n");
+    return std::nullopt;
+  }
+  jeandle::LoopSafepointFacts Facts = jeandle::LoopSafepointFacts::get(*L, SE);
+  // A loop whose symbolic maximum backedge count is below the shared budget
+  // already meets the short-loop policy and needs no outer loop.
+  if (Facts.IsWithinBudget) {
+    LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
+                      << ": within budget (short loop)\n");
+    return std::nullopt;
+  }
+  if (!L->isLCSSAForm(DT) || !L->getLoopLatch() ||
+      L->getLoopLatch()->getTerminator()->getMetadata(InclusiveSlowPathMD)) {
+    LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
+                      << ": not in LCSSA/simplify form or slow-path clone\n");
+    return std::nullopt;
+  }
+
+  // A loop that reaches a guaranteed-safepoint call on every iteration needs
+  // no outer loop: C2 declines to strip-mine loops with calls
+  // (is_counted_loop's !loop->_has_call) and just drops the back-edge poll.
+  // Skip the wrap here and let the following deletion pass erase the poll as
+  // call-covered.
+  if (jeandle::hasGuaranteedCallCoverage(*L, DT)) {
+    LLVM_DEBUG(
+        dbgs() << "  reject " << L->getHeader()->getName()
+               << ": loop already reaches a guaranteed-safepoint call\n");
+    return std::nullopt;
+  }
+
+  SmallVector<CallInst *, 4> Polls = collectBackEdgePolls(L, LI, DT);
+  if (Polls.empty()) {
+    LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
+                      << ": no backedge poll\n");
+    return std::nullopt;
+  }
+  jeandle::AncestorPollRequirements AncestorRequirements =
+      jeandle::computeAncestorPollRequirements(*L, LI, DT, SE);
+  for (CallInst *P : Polls)
+    if (AncestorRequirements.isRequired(*P, DT)) {
+      LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
+                        << ": backedge poll required by an ancestor loop\n");
+      return std::nullopt;
+    }
+
+  // Select the poll closest to the latch on the dominator chain, and the last
+  // poll in that block. This is independent of Loop::blocks() traversal order
+  // and matches the keep-one policy used by poll elimination.
+  CallInst *PollToMove = findRelocationCandidate(L, LI, DT);
+  if (!PollToMove) {
+    LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
+                      << ": no relocation candidate poll\n");
+    return std::nullopt;
+  }
+
+  ICmpInst *Cmp = L->getLatchCmpInst();
+  if (!Cmp || !isAcceptablePredicate(Cmp->getPredicate())) {
+    LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
+                      << ": no supported latch compare\n");
+    return std::nullopt;
+  }
+  auto IV = findIntInduction(L, Cmp, SE);
+  if (!IV) {
+    LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
+                      << ": no canonical integer induction\n");
+    return std::nullopt;
+  }
+  auto Plan = buildStripMinePlanWithIV(L, *IV, Cmp, PollToMove, Polls, MSSA, DT,
+                                       SE, AllowRuntimeVersioning);
+  if (Plan && AllowRuntimeVersioning && !Plan->RuntimeGuard) {
+    LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
+                      << ": versioning declined (provably no-wrap)\n");
+    return std::nullopt;
+  }
+  return Plan;
+}
+
+bool StripMinePlan::stillStructurallyValid(LoopInfo &LI,
+                                           DominatorTree &DT) const {
+  if (!L->isInnermost() || L->getHeader() != Shape.Header ||
+      L->getLoopPreheader() != Shape.Preheader ||
+      L->getLoopLatch() != Shape.Latch || LI.getLoopFor(Shape.Header) != L ||
+      !L->contains(Shape.ExitingBB) || !L->isLCSSAForm(DT))
+    return false;
+  // The surgery reroutes the preheader's plain branch to the header; it must
+  // still be one (the shape check required it at plan time).
+  auto *PreheaderBr = dyn_cast<BranchInst>(Shape.Preheader->getTerminator());
+  if (!PreheaderBr || PreheaderBr->getNumSuccessors() != 1 ||
+      PreheaderBr->getSuccessor(0) != Shape.Header)
+    return false;
+  if (!jeandle::isSafepointPoll(*PollToMove) || !PollToMove->getParent() ||
+      LI.getLoopFor(PollToMove->getParent()) != L ||
+      !DT.dominates(PollToMove->getParent(), Shape.Latch))
+    return false;
+  if (ExitCmp->getParent() != Shape.ExitingBB || !ExitCmp->hasOneUse() ||
+      ExitCmp->getOperand(Shape.LimitOperandIdx) != Limit ||
+      ExitCmp->getOperand(1 - Shape.LimitOperandIdx) != Shape.ResumeIV ||
+      Shape.ExitingBr->getParent() != Shape.ExitingBB ||
+      Shape.ExitingBr->getCondition() != ExitCmp ||
+      Shape.ExitingBr->getSuccessor(Shape.ExitSuccessorIdx) != Shape.ExitBB)
+    return false;
+  for (CallInst *P : AllPolls)
+    if (!jeandle::isSafepointPoll(*P) || !P->getParent() ||
+        LI.getLoopFor(P->getParent()) != L)
+      return false;
+  for (const HeaderPhiState &State : HeaderPhis) {
+    int PreheaderIdx = State.Phi->getBasicBlockIndex(Shape.Preheader);
+    int LatchIdx = State.Phi->getBasicBlockIndex(Shape.Latch);
+    if (PreheaderIdx < 0 || LatchIdx < 0 ||
+        State.Phi->getIncomingValue(PreheaderIdx) != State.PreheaderValue ||
+        State.Phi->getIncomingValue(LatchIdx) != State.LatchValue)
+      return false;
+  }
+  if (RuntimeGuard) {
+    if (!isSafeToVersionInclusiveLoop(L) || !L->hasDedicatedExits())
+      return false;
+    for (const InclusiveExitPhiIncoming &Incoming :
+         RuntimeGuard->ExitPhiIncomings) {
+      int Idx = Incoming.Phi->getBasicBlockIndex(Incoming.ExitingBB);
+      if (Idx < 0 ||
+          Incoming.Phi->getIncomingValue(Idx) != Incoming.IncomingValue)
+        return false;
+    }
+  }
+  return true;
+}
+
+void replaceLoopUses(Loop *L, Value *From, Value *To) {
+  if (From == To)
+    return;
+  if (isa<Constant>(From)) {
+    // Constants have no use list to filter: rewrite in-loop uses directly.
+    // Freezing undef/poison unifies every use to one frozen value — a valid
+    // refinement that keeps all duplicated uses in agreement.
+    for (BasicBlock *BB : L->blocks())
+      for (Instruction &I : *BB)
+        I.replaceUsesOfWith(From, To);
+    return;
+  }
+  From->replaceUsesWithIf(To, [L](Use &U) {
+    auto *I = dyn_cast<Instruction>(U.getUser());
+    return I && L->contains(I);
+  });
+}
+
+void applyInclusiveLoopVersioningPlan(StripMinePlan &Plan, LoopInfo &LI,
+                                      DominatorTree &DT) {
+  assert(Plan.RuntimeGuard && "versioning plan must carry a runtime guard");
+  Loop *FastLoop = Plan.L;
+  StripMineShape &Shape = Plan.Shape;
+  Function *F = Shape.Header->getParent();
+
+  BasicBlock *CheckBB = Shape.Preheader;
+  BasicBlock *FastPreheader =
+      SplitBlock(CheckBB, CheckBB->getTerminator(), &DT, &LI, nullptr,
+                 Shape.Header->getName() + ".inclusive.fast.ph");
+
+  IRBuilder<> CheckBuilder(CheckBB->getTerminator());
+  // Freeze only operands that may be undef/poison; stable operands (constants,
+  // noundef values) are read directly by the guard and the duplicated tests.
+  Value *StableLimit =
+      isGuaranteedNotToBeUndefOrPoison(Plan.Limit)
+          ? Plan.Limit
+          : CheckBuilder.CreateFreeze(Plan.Limit, "inclusive.limit.fr");
+  Value *StableInit = Plan.InitVal == Plan.Limit
+                          ? StableLimit
+                          : (isGuaranteedNotToBeUndefOrPoison(Plan.InitVal)
+                                 ? Plan.InitVal
+                                 : CheckBuilder.CreateFreeze(
+                                       Plan.InitVal, "inclusive.start.fr"));
+  if (StableLimit != Plan.Limit)
+    replaceLoopUses(FastLoop, Plan.Limit, StableLimit);
+  if (StableInit != Plan.InitVal)
+    replaceLoopUses(FastLoop, Plan.InitVal, StableInit);
+
+  ValueToValueMapTy VMap;
+  SmallVector<BasicBlock *, 8> SlowBlocks;
+  Loop *SlowLoop =
+      cloneLoopWithPreheader(FastPreheader, CheckBB, FastLoop, VMap,
+                             ".inclusive.slow", &LI, &DT, SlowBlocks);
+  remapInstructionsInBlocks(SlowBlocks, VMap);
+
+  auto *SlowPreheader = cast<BasicBlock>(VMap[FastPreheader]);
+  for (const InclusiveExitPhiIncoming &Incoming :
+       Plan.RuntimeGuard->ExitPhiIncomings) {
+    auto *SlowExitingBB = cast<BasicBlock>(VMap[Incoming.ExitingBB]);
+    Value *SlowValue = Incoming.IncomingValue;
+    if (auto It = VMap.find(SlowValue); It != VMap.end())
+      SlowValue = It->second;
+    Incoming.Phi->addIncoming(SlowValue, SlowExitingBB);
+  }
+
+  Instruction *OldTerm = CheckBB->getTerminator();
+  BasicBlock *NoWrapCheckBB = BasicBlock::Create(
+      F->getContext(), Shape.Header->getName() + ".inclusive.no_wrap.check", F,
+      SlowPreheader);
+  if (Loop *ParentL = FastLoop->getParentLoop())
+    ParentL->addBasicBlockToLoop(NoWrapCheckBB, LI);
+  IRBuilder<> B(NoWrapCheckBB);
+  const InclusiveRuntimeGuard &Guard = *Plan.RuntimeGuard;
+  Value *NoWrap =
+      B.CreateICmp(Guard.Predicate, StableLimit,
+                   ConstantInt::get(StableLimit->getType(), Guard.Bound),
+                   "inclusive.no_wrap");
+  B.CreateCondBr(NoWrap, FastPreheader, SlowPreheader);
+
+  IRBuilder<> EntryBuilder(OldTerm);
+  Value *FirstIteration =
+      EntryBuilder.CreateICmp(Guard.FirstIterationPredicate, StableInit,
+                              StableLimit, "inclusive.first_iteration");
+  EntryBuilder.CreateCondBr(FirstIteration, NoWrapCheckBB, SlowPreheader);
+  OldTerm->eraseFromParent();
+
+  SlowLoop->getLoopLatch()->getTerminator()->setMetadata(
+      InclusiveSlowPathMD, MDNode::get(F->getContext(), {}));
+
+  // Both versions initially retain their original polls. Re-form dedicated
+  // exits before the next pass recomputes MemorySSA and strip-mines only the
+  // guarded version.
+  DT.recalculate(*F);
+  formDedicatedExitBlocks(SlowLoop, &DT, &LI, nullptr, true);
+  formDedicatedExitBlocks(FastLoop, &DT, &LI, nullptr, true);
+  DT.recalculate(*F);
+
+  LLVM_DEBUG(dbgs() << "  inclusive-versioning: versioned "
+                    << Shape.Header->getName()
+                    << " (cloned slow path behind no-wrap guard)\n");
+}
+
+void applyStripMinePlan(StripMinePlan &Plan, LoopInfo &LI, DominatorTree &DT,
+                        ScalarEvolution &SE) {
+  Loop *L = Plan.L;
+  StripMineShape &Shape = Plan.Shape;
+  PHINode *IVPhi = Plan.IVPhi;
+  ICmpInst *ExitCmp = Plan.ExitCmp;
+  CallInst *PollToMove = Plan.PollToMove;
+  ArrayRef<PHINode *> LiftedHeaderPhis = Plan.LiftedHeaderPhis;
+  const APInt &AbsStepN = Plan.AbsStepN;
+  bool IsSigned = Plan.IsSigned;
+  uint64_t N = Plan.ChunkIters;
+  Value *InitVal = Plan.InitVal;
+  Value *Limit = Plan.Limit;
+
+  Function *F = Shape.Header->getParent();
+  LLVMContext &Ctx = F->getContext();
+  Type *Ty = IVPhi->getType();
+
+  if (!Shape.Inclusive && (!isGuaranteedNotToBeUndefOrPoison(InitVal) ||
+                           !isGuaranteedNotToBeUndefOrPoison(Limit))) {
+    IRBuilder<> StableBuilder(Shape.Preheader->getTerminator());
+    Value *StableLimit =
+        isGuaranteedNotToBeUndefOrPoison(Limit)
+            ? Limit
+            : StableBuilder.CreateFreeze(Limit, "exclusive.limit.fr");
+    Value *StableInit =
+        InitVal == Limit
+            ? StableLimit
+            : (isGuaranteedNotToBeUndefOrPoison(InitVal)
+                   ? InitVal
+                   : StableBuilder.CreateFreeze(InitVal, "exclusive.start.fr"));
+    replaceLoopUses(L, Limit, StableLimit);
+    replaceLoopUses(L, InitVal, StableInit);
+    Limit = StableLimit;
+    InitVal = StableInit;
+  }
+
+  BasicBlock *OuterPH =
+      BasicBlock::Create(Ctx, Shape.Header->getName() + ".outer.ph", F);
+  BasicBlock *OuterHeader =
+      BasicBlock::Create(Ctx, Shape.Header->getName() + ".outer", F);
+  BasicBlock *InnerEntry = BasicBlock::Create(
+      Ctx, Shape.Header->getName() + ".outer.inner.entry", F);
+  BasicBlock *OuterLatch =
+      BasicBlock::Create(Ctx, Shape.Header->getName() + ".outer.latch", F);
+
+  auto *PHBr = cast<BranchInst>(Shape.Preheader->getTerminator());
+  for (unsigned I = 0; I < PHBr->getNumSuccessors(); ++I)
+    if (PHBr->getSuccessor(I) == Shape.Header)
+      PHBr->setSuccessor(I, OuterPH);
+
+  IRBuilder<> B(OuterPH);
+  B.CreateBr(OuterHeader);
+
+  B.SetInsertPoint(OuterHeader);
+  PHINode *OuterIV = B.CreatePHI(Ty, 2, "outer.iv");
+  OuterIV->addIncoming(InitVal, OuterPH);
+  SmallVector<PHINode *, 4> OuterReducPhis;
+  for (PHINode *HPhi : LiftedHeaderPhis) {
+    PHINode *OP = B.CreatePHI(HPhi->getType(), 2, HPhi->getName() + ".outer");
+    OP->addIncoming(HPhi->getIncomingValueForBlock(Shape.Preheader), OuterPH);
+    OuterReducPhis.push_back(OP);
+  }
+  // OuterCond is "continue the inner batch" so the br targets are fixed
+  // regardless of the original branch polarity (ContinuePredicate encodes it).
+  Value *OuterCond =
+      B.CreateICmp(Shape.ContinuePredicate, OuterIV, Limit, "outer.cond");
+  B.CreateCondBr(OuterCond, InnerEntry, Shape.ExitBB);
+
+  // InnerEntry clamps the per-batch inner limit to min(batch end, real limit).
+  // Saturating arithmetic handles IV-type extremes: an overflow saturates and
+  // the cap compare then pins the inner limit to the real limit.
+  B.SetInsertPoint(InnerEntry);
+  Value *StepN = ConstantInt::get(Ty, AbsStepN);
+  Intrinsic::ID SatID =
+      Shape.Increasing ? (IsSigned ? Intrinsic::sadd_sat : Intrinsic::uadd_sat)
+                       : (IsSigned ? Intrinsic::ssub_sat : Intrinsic::usub_sat);
+  Value *BatchEnd =
+      B.CreateBinaryIntrinsic(SatID, OuterIV, StepN,
+                              /*FMFSource=*/nullptr, "outer.batch.end");
+  Value *KeepEnd =
+      B.CreateICmp(Shape.ContinuePredicate, BatchEnd, Limit, "outer.cap.cond");
+  Value *InnerLimit =
+      B.CreateSelect(KeepEnd, BatchEnd, Limit, "outer.inner.limit");
+  B.CreateBr(Shape.Header);
+
+  // Each batch resumes the recurrences from the outer progress.
+  int PHIdx = IVPhi->getBasicBlockIndex(Shape.Preheader);
+  IVPhi->setIncomingBlock(PHIdx, InnerEntry);
+  IVPhi->setIncomingValue(PHIdx, OuterIV);
+  for (size_t I = 0; I < LiftedHeaderPhis.size(); ++I) {
+    int Ix = LiftedHeaderPhis[I]->getBasicBlockIndex(Shape.Preheader);
+    LiftedHeaderPhis[I]->setIncomingBlock(Ix, InnerEntry);
+    LiftedHeaderPhis[I]->setIncomingValue(Ix, OuterReducPhis[I]);
+  }
+
+  ExitCmp->setOperand(Shape.LimitOperandIdx, InnerLimit);
+  Shape.ExitingBr->setSuccessor(Shape.ExitSuccessorIdx, OuterLatch);
+
+  // OuterLatch captures the batch-boundary recurrences and carries the poll.
+  B.SetInsertPoint(OuterLatch);
+  PHINode *OuterIVNext = B.CreatePHI(Ty, 1, "outer.iv.next");
+  OuterIVNext->addIncoming(Shape.ResumeIV, Shape.ExitingBB);
+  SmallVector<PHINode *, 4> OuterReducNext;
+  for (PHINode *HPhi : LiftedHeaderPhis) {
+    PHINode *NP =
+        B.CreatePHI(HPhi->getType(), 1, HPhi->getName() + ".outer.next");
+    NP->addIncoming(HPhi->getIncomingValueForBlock(Shape.Latch),
+                    Shape.ExitingBB);
+    OuterReducNext.push_back(NP);
+  }
+  BranchInst *OuterBr = B.CreateBr(OuterHeader);
+  OuterIV->addIncoming(OuterIVNext, OuterLatch);
+  for (size_t I = 0; I < OuterReducPhis.size(); ++I)
+    OuterReducPhis[I]->addIncoming(OuterReducNext[I], OuterLatch);
+
+  // Relocate the poll after the planning phase proved memory, control, and
+  // deopt-state compatibility. Only latch-carried next values are remapped.
+  // Skip a latch value that is loop-invariant (e.g. a phi whose latch operand
+  // is a constant): it needs no remap, and keying Remap on it would spuriously
+  // rewrite an unrelated but equal constant elsewhere in the deopt bundle.
+  DenseMap<Value *, Value *> Remap;
+  auto addRemap = [&](Value *LatchVal, Value *Outer) {
+    if (!L->isLoopInvariant(LatchVal))
+      Remap[LatchVal] = Outer;
+  };
+  addRemap(IVPhi->getIncomingValueForBlock(Shape.Latch), OuterIVNext);
+  for (size_t I = 0; I < LiftedHeaderPhis.size(); ++I)
+    addRemap(LiftedHeaderPhis[I]->getIncomingValueForBlock(Shape.Latch),
+             OuterReducNext[I]);
+  SmallVector<OperandBundleDef, 1> Bundles;
+  if (auto OB = PollToMove->getOperandBundle(LLVMContext::OB_deopt)) {
+    SmallVector<Value *, 8> Args;
+    for (const Use &U : OB->Inputs) {
+      Value *V = U.get();
+      auto It = Remap.find(V);
+      Args.push_back(It != Remap.end() ? It->second : V);
+    }
+    Bundles.emplace_back("deopt", Args);
+  }
+  // Relocate the back-edge poll to the outer back-edge: clone it with the
+  // deopt operands remapped to the outer recurrence (the bci/frame layout in
+  // the deopt bundle is preserved verbatim — no LLVM pass may synthesize a
+  // poll, only relocate one). Mark the relocated poll with the strip-mined
+  // poll attribute: the inner loop now runs poll-free, bounded to <= N
+  // iterations by the clamped limit, and SCEV can't see that bound through the
+  // select/saturating-add. The attribute identifies this nest to the passes
+  // that immediately follow (after-strip-mining deletion and the coverage
+  // verifier); marking the poll itself means the marker cannot outlive the
+  // coverage it certifies.
+  auto *RelocatedPoll =
+      CallBase::Create(PollToMove, Bundles, OuterBr->getIterator());
+  RelocatedPoll->addFnAttr(
+      Attribute::get(Ctx, jeandle::Attribute::StripMinedPoll));
+
+  // Fix up the exit LCSSA phis: predecessor is now OuterHeader; a leaked IV
+  // resolves to OuterIV, a leaked recurrence to its outer phi, an invariant
+  // stays put. Resolve by the phi's incoming value (unique header phi -> outer
+  // phi), so one header recurrence feeding several exit phis fixes up each of
+  // them correctly.
+  DenseMap<Value *, Value *> HeaderToOuter;
+  DenseMap<Value *, Value *> LatchValueToOuter;
+  for (size_t I = 0; I < LiftedHeaderPhis.size(); ++I)
+    HeaderToOuter[LiftedHeaderPhis[I]] = OuterReducPhis[I];
+  for (size_t I = 0; I < LiftedHeaderPhis.size(); ++I) {
+    Value *LatchValue =
+        LiftedHeaderPhis[I]->getIncomingValueForBlock(Shape.Latch);
+    if (!L->isLoopInvariant(LatchValue))
+      LatchValueToOuter[LatchValue] = OuterReducPhis[I];
+  }
+  for (PHINode &Phi : Shape.ExitBB->phis()) {
+    int Idx = Phi.getBasicBlockIndex(Shape.ExitingBB);
+    if (Idx < 0)
+      continue;
+    Value *V = Phi.getIncomingValue(Idx);
+    Phi.setIncomingBlock(Idx, OuterHeader);
+    if (L->isLoopInvariant(V))
+      continue;
+    if (V == IVPhi || V == Shape.ResumeIV)
+      Phi.setIncomingValue(Idx, OuterIV);
+    else if (auto It = HeaderToOuter.find(V); It != HeaderToOuter.end())
+      Phi.setIncomingValue(Idx, It->second);
+    else if (auto It = LatchValueToOuter.find(V); It != LatchValueToOuter.end())
+      Phi.setIncomingValue(Idx, It->second);
+  }
+
+  // Drop the selected back-edge poll after cloning it to the outer backedge.
+  // The subsequent poll-elimination stage removes any other inner-loop polls
+  // only after validating the complete strip-mined structure.
+  PollToMove->eraseFromParent();
+
+  // Maintain analyses by hand (no LPMUpdater): reparent the nest so it becomes
+  // OuterL -> L, add the new blocks, then rebuild DT and drop stale SCEV. The
+  // outer loop is not in this run's loop snapshot, so it is not revisited; its
+  // poll carries the coverage marker against later passes.
+  Loop *OuterL = LI.AllocateLoop();
+  if (Loop *ParentL = L->getParentLoop()) {
+    auto It = llvm::find(*ParentL, L);
+    assert(It != ParentL->end() && "L not a child of its parent");
+    ParentL->removeChildLoop(It);
+    ParentL->addChildLoop(OuterL);
+    ParentL->addBasicBlockToLoop(OuterPH, LI);
+  } else {
+    auto It = llvm::find(LI, L);
+    assert(It != LI.end() && "L not a top-level loop");
+    LI.removeLoop(It);
+    LI.addTopLevelLoop(OuterL);
+  }
+  OuterL->addChildLoop(L);
+  OuterL->addBasicBlockToLoop(OuterHeader, LI);
+  OuterL->addBasicBlockToLoop(InnerEntry, LI);
+  OuterL->addBasicBlockToLoop(OuterLatch, LI);
+  for (BasicBlock *BB : L->blocks())
+    OuterL->addBlockEntry(BB);
+
+  DT.recalculate(*F);
+  SE.forgetLoop(L);
+  SE.forgetTopmostLoop(L);
+  SE.forgetBlockAndLoopDispositions();
+
+  // MemorySSA is deliberately NOT updated: plans validate their memory state
+  // against the pre-mutation MSSA at build time, no MSSA query happens after a
+  // mutation inside this pass, and PreservedAnalyses::none() forces a rebuild
+  // for the next consumer. (The erased poll leaves a dangling MemoryAccess in
+  // the stale MSSA; nothing may query it.)
+  LLVM_DEBUG(dbgs() << "  strip-mine: wrapped loop " << Shape.Header->getName()
+                    << " (N=" << N << ", inclusive=" << Shape.Inclusive
+                    << ", batch-stride=" << AbsStepN.getLimitedValue()
+                    << ", relocated poll to outer back-edge)\n");
+}
+
+} // namespace
+
+void SafepointStripMining::printPipeline(
+    raw_ostream &OS, function_ref<StringRef(StringRef)> MapClassName2PassName) {
+  static_cast<PassInfoMixin<SafepointStripMining> *>(this)->printPipeline(
+      OS, MapClassName2PassName);
+  OS << '<';
+  switch (Mode) {
+  case SafepointStripMiningMode::InclusiveLoopVersioning:
+    OS << "inclusive-loop-versioning";
+    break;
+  case SafepointStripMiningMode::StripMining:
+    OS << "strip-mining";
+    break;
+  }
+  if (DeferEmptyLoopDeletion)
+    OS << ";defer-empty-loop-deletion";
+  OS << '>';
+}
+
+PreservedAnalyses SafepointStripMining::run(Function &F,
+                                            FunctionAnalysisManager &AM) {
+  if (!jeandle::isSafepointEliminationEnabled() ||
+      !jeandle::isRootJavaMethodFunction(F) || !jeandle::isStripMiningEnabled())
+    return PreservedAnalyses::all();
+
+  if (Mode == SafepointStripMiningMode::InclusiveLoopVersioning &&
+      !jeandle::isInclusiveLoopVersioningEnabled())
+    return PreservedAnalyses::all();
+
+  LLVM_DEBUG(dbgs() << "strip-mining<" << modeName(Mode) << "> running on "
+                    << F.getName() << "\n");
+
+  auto &LI = AM.getResult<LoopAnalysis>(F);
+  ReversePostOrderTraversal<const Function *> RPOT(&F);
+  if (containsIrreducibleCFG<const BasicBlock *>(RPOT, LI)) {
+    LLVM_DEBUG(dbgs() << "strip-mining<" << modeName(Mode)
+                      << ">: irreducible CFG in " << F.getName()
+                      << ", all polls preserved\n");
+    return PreservedAnalyses::all();
+  }
+
+  auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
+  auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
+  auto &MSSA = AM.getResult<MemorySSAAnalysis>(F).getMSSA();
+  SmallVector<Loop *, 8> Loops(LI.getLoopsInPreorder());
+  SmallVector<StripMinePlan, 4> Plans;
+  SmallPtrSet<BasicBlock *, 32> PlannedBlocks;
+
+  bool Versioning = Mode == SafepointStripMiningMode::InclusiveLoopVersioning;
+  SmallPtrSet<Loop *, 8> DeferredEmptyLoops;
+  if (DeferEmptyLoopDeletion) {
+    for (Loop *L : Loops) {
+      if (DeferredEmptyLoops.contains(L))
+        continue;
+      if (!jeandle::isEmptyLoopPollDeletionCandidate(*L, LI, DT, SE))
+        continue;
+      for (Loop *Nested : L->getLoopsInPreorder())
+        DeferredEmptyLoops.insert(Nested);
+    }
+  }
+  for (Loop *L : llvm::reverse(Loops)) {
+    if (DeferredEmptyLoops.contains(L)) {
+      LLVM_DEBUG(dbgs() << "  strip-mining: skip " << L->getHeader()->getName()
+                        << ": empty-loop deletion candidate\n");
+      continue;
+    }
+    auto Plan = buildStripMinePlan(L, LI, DT, SE, MSSA, Versioning);
+    if (!Plan)
+      continue;
+    bool Overlaps = llvm::any_of(L->blocks(), [&](BasicBlock *BB) {
+      return PlannedBlocks.contains(BB);
+    });
+    if (Overlaps)
+      continue;
+    for (BasicBlock *BB : L->blocks())
+      PlannedBlocks.insert(BB);
+    Plans.push_back(std::move(*Plan));
+  }
+
+  bool Changed = false;
+  for (StripMinePlan &Plan : Plans) {
+    if (!Plan.stillStructurallyValid(LI, DT))
+      continue;
+    if (Versioning)
+      applyInclusiveLoopVersioningPlan(Plan, LI, DT);
+    else
+      applyStripMinePlan(Plan, LI, DT, SE);
+    Changed = true;
+  }
+  return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
+}

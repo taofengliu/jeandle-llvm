@@ -1,4 +1,4 @@
-; RUN: opt -passes='safepoint-elimination<early>,safepoint-elimination<strip-mining>' -jeandle-enable-strip-mining -S < %s | FileCheck %s
+; RUN: opt -passes='safepoint-poll-elimination<early>,safepoint-strip-mining<strip-mining>,safepoint-poll-elimination<after-strip-mining>' -S < %s | FileCheck %s
 
 ; Latch-exit support is limited to guarded post-increment exits. An unguarded
 ; do-while shape would lose its first iteration if wrapped by a pre-tested outer
@@ -6,7 +6,7 @@
 
 declare hotspotcc void @jeandle.safepoint_poll()
 
-define void @unguarded_latch_next(i64 %n) {
+define void @unguarded_latch_next(i64 %n) "java-method" {
 entry:
   br label %header
 
@@ -27,10 +27,10 @@ exit:
 ; CHECK-LABEL: @unguarded_latch_next(
 ; CHECK-NOT:   .outer
 ; CHECK:       call hotspotcc void @jeandle.safepoint_poll()
-; CHECK-NOT:   !strip-mined
+; CHECK-NOT:   jeandle.strip-mined-poll
 
 
-define void @latch_old_iv(i64 %n) {
+define void @latch_old_iv(i64 %n) "java-method" {
 entry:
   %entry.guard = icmp slt i64 0, %n
   br i1 %entry.guard, label %loop.preheader, label %return
@@ -58,9 +58,9 @@ return:
 ; CHECK-LABEL: @latch_old_iv(
 ; CHECK-NOT:   .outer
 ; CHECK:       call hotspotcc void @jeandle.safepoint_poll()
-; CHECK-NOT:   !strip-mined
+; CHECK-NOT:   jeandle.strip-mined-poll
 
-define void @latch_next_sub_form(i64 %n) {
+define void @latch_next_sub_form(i64 %n) "java-method" {
 entry:
   %entry.guard = icmp slt i64 0, %n
   br i1 %entry.guard, label %loop.preheader, label %return
@@ -88,6 +88,6 @@ return:
 ; CHECK-LABEL: @latch_next_sub_form(
 ; CHECK-NOT:   .outer
 ; CHECK:       call hotspotcc void @jeandle.safepoint_poll()
-; CHECK-NOT:   !strip-mined
+; CHECK-NOT:   jeandle.strip-mined-poll
 
 !java-method-compilation = !{}

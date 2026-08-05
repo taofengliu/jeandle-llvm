@@ -3,9 +3,9 @@
 ; CHECK: java-operation-lower<phase=0>
 ; CHECK-SAME: jeandle-inline-driver
 ; CHECK-SAME: constant-field-folding
-; CHECK-SAME: safepoint-elimination
+; CHECK-SAME: safepoint-poll-elimination
 ; CHECK-SAME: insert-gc-barriers
-; CHECK-SAME: safepoint-elimination
+; CHECK-SAME: safepoint-poll-elimination
 ; CHECK-SAME: java-operation-lower<phase=1>
 ; CHECK-SAME: expand-narrow-oop-cast
 ; CHECK-SAME: rewrite-statepoints-for-gc
