@@ -1251,11 +1251,12 @@ void applyStripMinePlan(StripMinePlan &Plan, LoopInfo &LI, DominatorTree &DT,
   RelocatedPoll->addFnAttr(
       Attribute::get(Ctx, jeandle::Attribute::StripMinedPoll));
 
-  // Fix up the exit LCSSA phis: predecessor is now OuterHeader; a leaked IV
-  // resolves to OuterIV, a leaked recurrence to its outer phi, an invariant
-  // stays put. Resolve by the phi's incoming value (unique header phi -> outer
-  // phi), so one header recurrence feeding several exit phis fixes up each of
-  // them correctly.
+  // Fix up the exit LCSSA phis: predecessor is now OuterHeader; the
+  // post-increment resume IV resolves to OuterIV, while header recurrences and
+  // their latch-carried values resolve to their outer phis. This preserves the
+  // current-IV phase through a lag recurrence whose latch value is that IV.
+  // Resolve by each exit phi's incoming value so one recurrence feeding
+  // several exit phis fixes up each of them correctly.
   DenseMap<Value *, Value *> HeaderToOuter;
   DenseMap<Value *, Value *> LatchValueToOuter;
   for (size_t I = 0; I < LiftedHeaderPhis.size(); ++I)
@@ -1274,7 +1275,7 @@ void applyStripMinePlan(StripMinePlan &Plan, LoopInfo &LI, DominatorTree &DT,
     Phi.setIncomingBlock(Idx, OuterHeader);
     if (L->isLoopInvariant(V))
       continue;
-    if (V == IVPhi || V == Shape.ResumeIV)
+    if (V == Shape.ResumeIV)
       Phi.setIncomingValue(Idx, OuterIV);
     else if (auto It = HeaderToOuter.find(V); It != HeaderToOuter.end())
       Phi.setIncomingValue(Idx, It->second);
