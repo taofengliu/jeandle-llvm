@@ -1,0 +1,2 @@
+RequiresStrictLockOrder = 1
+HasFinalizer 9998 = true

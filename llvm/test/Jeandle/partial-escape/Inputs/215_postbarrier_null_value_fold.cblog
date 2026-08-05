@@ -1,0 +1,3 @@
+# 215: Object[] (klass 8888), Object element kind. No instance allocation.
+RequiresStrictLockOrder = 1
+ElementBasicTypeOfArrayKlass 8888 = 8

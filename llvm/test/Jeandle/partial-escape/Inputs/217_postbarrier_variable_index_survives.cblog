@@ -1,0 +1,6 @@
+# 217: Object[] (klass 8888), Object element kind. No instance allocation.
+# The variable index GEP never matches matchArrayElementGEP, but
+# processAllocation still queries ElementBasicTypeOfArrayKlass to populate
+# per-element metadata, so it must be logged.
+RequiresStrictLockOrder = 1
+ElementBasicTypeOfArrayKlass 8888 = 8

@@ -1,0 +1,5 @@
+# Mechanism test for VMConstants::fromModule: override
+# ElementBasicTypeOfArrayKlass(54321) -> Int (4) so processAllocation populates
+# ArrayBaseOffset/ArrayIndexScale from the module's runtime-defined globals.
+RequiresStrictLockOrder = 1
+ElementBasicTypeOfArrayKlass 54321 = 4

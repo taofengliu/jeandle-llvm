@@ -25,6 +25,8 @@ set(ANALYSIS_TEST_SOURCES
   ConstraintSystemTest.cpp
   CtxProfAnalysisTest.cpp
   DDGTest.cpp
+  DeoptPoolBundleLoweringTest.cpp
+  DeoptPoolPlannerTest.cpp
   DomTreeUpdaterTest.cpp
   DXILResourceTest.cpp
   EphemeralValuesCacheTest.cpp
@@ -44,6 +46,7 @@ set(ANALYSIS_TEST_SOURCES
   MemoryProfileInfoTest.cpp
   MemorySSATest.cpp
   MLModelRunnerTest.cpp
+  PartialEscapeUtilsTest.cpp
   PhiValuesTest.cpp
   PluginInlineAdvisorAnalysisTest.cpp
   PluginInlineOrderAnalysisTest.cpp

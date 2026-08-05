@@ -48,6 +48,7 @@
 #include "llvm/Analysis/IVUsers.h"
 #include "llvm/Analysis/InlineAdvisor.h"
 #include "llvm/Analysis/InstCount.h"
+#include "llvm/Analysis/Jeandle/PartialEscapeAnalysis.h"
 #include "llvm/Analysis/KernelInfo.h"
 #include "llvm/Analysis/LastRunTrackingAnalysis.h"
 #include "llvm/Analysis/LazyCallGraph.h"
@@ -270,10 +271,13 @@
 #include "llvm/Transforms/Jeandle/ConstantFieldFolding.h"
 #include "llvm/Transforms/Jeandle/ExpandNarrowOopCast.h"
 #include "llvm/Transforms/Jeandle/InsertGCBarriers.h"
+#include "llvm/Transforms/Jeandle/JavaOpLengthFolding.h"
 #include "llvm/Transforms/Jeandle/JavaOperationDeletion.h"
 #include "llvm/Transforms/Jeandle/JavaOperationLower.h"
 #include "llvm/Transforms/Jeandle/JeandleInliner.h"
 #include "llvm/Transforms/Jeandle/JeandleNarrowOopMarker.h"
+#include "llvm/Transforms/Jeandle/PartialEscapeIterative.h"
+#include "llvm/Transforms/Jeandle/PartialEscapeTransform.h"
 #include "llvm/Transforms/Jeandle/RecoverTypeInfo.h"
 #include "llvm/Transforms/Jeandle/RepeatedConstantFolding.h"
 #include "llvm/Transforms/Jeandle/TLSPointerRewrite.h"
@@ -1744,6 +1748,50 @@ Expected<FatLTOOptions> parseFatLTOOptions(StringRef Params) {
   if (!HaveOptLevel)
     return make_error<StringError>(
         "missing optimization level for fatlto-pre-link pipeline",
+        inconvertibleErrorCode());
+  return Result;
+}
+
+struct JeandlePipelineParams {
+  OptimizationLevel Level;
+  jeandle::PipelineMode Mode = jeandle::PipelineMode::MethodCompilation;
+};
+
+Expected<JeandlePipelineParams> parseJeandlePipelineParams(StringRef Params) {
+  JeandlePipelineParams Result;
+  bool HaveOptLevel = false;
+  bool HaveMode = false;
+  while (!Params.empty()) {
+    StringRef ParamName;
+    std::tie(ParamName, Params) = Params.split(';');
+
+    if (ParamName == "stub" || ParamName == "method") {
+      if (HaveMode)
+        return make_error<StringError>(
+            formatv("duplicate pipeline mode parameter '{}'", ParamName).str(),
+            inconvertibleErrorCode());
+      HaveMode = true;
+      Result.Mode = ParamName == "stub"
+                        ? jeandle::PipelineMode::StubCompilation
+                        : jeandle::PipelineMode::MethodCompilation;
+    } else if (std::optional<OptimizationLevel> OptLevel =
+                   parseOptLevel(ParamName)) {
+      if (HaveOptLevel)
+        return make_error<StringError>(
+            formatv("duplicate optimization level parameter '{}'", ParamName)
+                .str(),
+            inconvertibleErrorCode());
+      HaveOptLevel = true;
+      Result.Level = *OptLevel;
+    } else {
+      return make_error<StringError>(
+          formatv("invalid jeandle pipeline parameter '{}'", ParamName).str(),
+          inconvertibleErrorCode());
+    }
+  }
+  if (!HaveOptLevel)
+    return make_error<StringError>(
+        "missing optimization level for jeandle pipeline",
         inconvertibleErrorCode());
   return Result;
 }
