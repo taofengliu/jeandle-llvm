@@ -62,19 +62,27 @@ namespace jeandle {
 // BasicType IDs mirroring HotSpot's enum BasicType in oops/typeArrayKlass.hpp.
 // Used as index into per-element-type tables below.
 enum class JBasicType : uint8_t {
-  Boolean = 0, Byte = 1, Char = 2, Short = 3,
-  Int = 4,     Long = 5, Float = 6, Double = 7,
-  Object = 8,  Count = 9
+  Boolean = 0,
+  Byte = 1,
+  Char = 2,
+  Short = 3,
+  Int = 4,
+  Long = 5,
+  Float = 6,
+  Double = 7,
+  Object = 8,
+  Count = 9
 };
 
 struct VMConstants {
   // oopDesc layout (in bytes).
   int64_t MarkWordOffset = 0;
-  int64_t KlassOffset = 8;            // 8 with compressed klass; HotSpot may override.
-  int64_t DefaultMarkWord = 1;        // markWord::prototype() — biased lock bit cleared.
+  int64_t KlassOffset = 8; // 8 with compressed klass; HotSpot may override.
+  int64_t DefaultMarkWord =
+      1; // markWord::prototype() — biased lock bit cleared.
 
   // arrayOopDesc layout.
-  int64_t ArrayLengthOffset = 12;     // 12 with compressed klass; 16 without.
+  int64_t ArrayLengthOffset = 12; // 12 with compressed klass; 16 without.
 
   // instanceOopDesc layout.  The opt-only lit tests do not link the runtime
   // VMConstants globals, so keep the fallback permissive; JVM compilations
@@ -83,16 +91,16 @@ struct VMConstants {
 
   // Per-element-type base offsets. Indexed by JBasicType.
   int64_t ArrayBaseOffset[(unsigned)JBasicType::Count] = {
-      /*Boolean*/16, /*Byte*/16, /*Char*/16, /*Short*/16,
-      /*Int*/16,     /*Long*/16, /*Float*/16, /*Double*/16,
-      /*Object*/16,
+      /*Boolean*/ 16, /*Byte*/ 16, /*Char*/ 16,  /*Short*/ 16,
+      /*Int*/ 16,     /*Long*/ 16, /*Float*/ 16, /*Double*/ 16,
+      /*Object*/ 16,
   };
 
   // Per-element size in bytes. Indexed by JBasicType.
   uint64_t ElementSize[(unsigned)JBasicType::Count] = {
-      /*Boolean*/1, /*Byte*/1, /*Char*/2, /*Short*/2,
-      /*Int*/4,     /*Long*/8, /*Float*/4, /*Double*/8,
-      /*Object*/4,                          // compressed oop default
+      /*Boolean*/ 1, /*Byte*/ 1, /*Char*/ 2,  /*Short*/ 2,
+      /*Int*/ 4,     /*Long*/ 8, /*Float*/ 4, /*Double*/ 8,
+      /*Object*/ 4, // compressed oop default
   };
 
   bool UseCompressedClassPointers = true;

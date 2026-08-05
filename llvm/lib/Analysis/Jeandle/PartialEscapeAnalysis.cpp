@@ -2381,9 +2381,9 @@ Value *Analyzer::widenDeoptScalar(Value *V, Instruction *InsertContext) {
   Type *Ty = V->getType();
   if (!Ty->isIntegerTy() || Ty->getIntegerBitWidth() >= 32 || isa<Constant>(V))
     return V;
-  Instruction *ZExt = CastInst::Create(Instruction::ZExt, V,
-                                       Type::getInt32Ty(V->getContext()),
-                                       "pea.deopt.widen", /*InsertBefore=*/nullptr);
+  Instruction *ZExt =
+      CastInst::Create(Instruction::ZExt, V, Type::getInt32Ty(V->getContext()),
+                       "pea.deopt.widen", /*InsertBefore=*/nullptr);
   if (InsertContext)
     ZExt->setDebugLoc(InsertContext->getDebugLoc());
   Result.OwnedInsts.emplace_back(ZExt);
