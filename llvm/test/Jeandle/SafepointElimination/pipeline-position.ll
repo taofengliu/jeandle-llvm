@@ -36,7 +36,7 @@
 
 ; CHECK-NOT:  function(loop-simplify)
 ; CHECK-NOT:  function(lcssa)
-; CHECK:      loop-mssa(loop-rotate<header-duplication;no-prepare-for-lto>,licm<allowspeculation>,indvars)
+; CHECK:      loop-mssa(licm<no-allowspeculation>,loop-rotate<header-duplication;no-prepare-for-lto>,licm<allowspeculation>,indvars)
 ; CHECK-SAME: safepoint-poll-elimination<early;defer-empty-loop-deletion>
 ; CHECK-SAME: safepoint-strip-mining<inclusive-loop-versioning;defer-empty-loop-deletion>
 ; CHECK-SAME: safepoint-strip-mining<strip-mining;defer-empty-loop-deletion>
@@ -53,7 +53,7 @@
 ; CHECK-SAME: tls-pointer-rewrite
 ; VERIFY-NOT:  function(loop-simplify)
 ; VERIFY-NOT:  function(lcssa)
-; VERIFY:      loop-mssa(loop-rotate<header-duplication;no-prepare-for-lto>,licm<allowspeculation>,indvars)
+; VERIFY:      loop-mssa(licm<no-allowspeculation>,loop-rotate<header-duplication;no-prepare-for-lto>,licm<allowspeculation>,indvars)
 ; VERIFY-SAME: safepoint-poll-elimination<early;defer-empty-loop-deletion>
 ; VERIFY-SAME: verify<jeandle-safepoint-coverage>
 ; VERIFY-SAME: safepoint-strip-mining<inclusive-loop-versioning;defer-empty-loop-deletion>
@@ -72,7 +72,7 @@
 ; VERIFY-SAME: tls-pointer-rewrite
 ; NO-INCLUSIVE-NOT:  function(loop-simplify)
 ; NO-INCLUSIVE-NOT:  function(lcssa)
-; NO-INCLUSIVE:      loop-mssa(loop-rotate<header-duplication;no-prepare-for-lto>,licm<allowspeculation>,indvars)
+; NO-INCLUSIVE:      loop-mssa(licm<no-allowspeculation>,loop-rotate<header-duplication;no-prepare-for-lto>,licm<allowspeculation>,indvars)
 ; NO-INCLUSIVE-SAME: safepoint-poll-elimination<early;defer-empty-loop-deletion>
 ; NO-INCLUSIVE-NOT:  safepoint-strip-mining<inclusive-loop-versioning>
 ; NO-INCLUSIVE-SAME: safepoint-strip-mining<strip-mining;defer-empty-loop-deletion>

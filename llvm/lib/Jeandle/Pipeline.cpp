@@ -64,14 +64,19 @@ static void addCoverageVerifier(ModulePassManager &PM) {
     PM.addPass(createModuleToFunctionPassAdaptor(SafepointCoverageVerifier()));
 }
 
-// Canonicalization strip mining needs: expose mandatory array-length exits
-// (SimplifyCFG), then rotate the loop and hoist invariants so SCEV can see each
-// loop's trip count. FunctionToLoopPassAdaptor establishes LoopSimplify and
-// LCSSA form before running the loop pipeline. Runs before Early so Early
-// analyzes the most canonical loop form.
-static void addCanonicalizationForStripMining(ModulePassManager &PM) {
+// Prepare strip-mining candidates by exposing array-length exits and scalar
+// comparisons, then hoisting guaranteed invariant header work before rotation
+// applies its duplication budget. The second, speculative LICM cleans up the
+// rotated loop. FunctionToLoopPassAdaptor establishes LoopSimplify and LCSSA
+// form before running the loop pipeline.
+static void addPreparationForStripMining(ModulePassManager &PM) {
+  PM.addPass(createModuleToFunctionPassAdaptor(EarlyCSEPass()));
+  PM.addPass(createModuleToFunctionPassAdaptor(InstCombinePass()));
   PM.addPass(createModuleToFunctionPassAdaptor(SimplifyCFGPass()));
   LoopPassManager LPM;
+  LICMOptions PreRotateLICMOptions;
+  PreRotateLICMOptions.AllowSpeculation = false;
+  LPM.addPass(LICMPass(PreRotateLICMOptions));
   LPM.addPass(LoopRotatePass(true, false));
   LPM.addPass(LICMPass(LICMOptions()));
   // IndVarSimplify canonicalizes the IV and strengthens SCEV no-wrap flags (via
@@ -138,13 +143,7 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   PM.addPass(createModuleToFunctionPassAdaptor(RepeatedConstantFolding()));
   PM.addPass(createModuleToFunctionPassAdaptor(TypeCheckElimination()));
 
-  // Strip mining needs SCEV to see each loop's trip count, which means hoisting
-  // jeandle.arraylength out of the loop (EarlyCSE) and collapsing the
-  // frontend's lcmp/iflt chain into a single icmp (InstCombine).
-  if (isStripMiningEnabled()) {
-    PM.addPass(createModuleToFunctionPassAdaptor(EarlyCSEPass()));
-    PM.addPass(createModuleToFunctionPassAdaptor(InstCombinePass()));
-  }
+  const bool StripMiningEnabled = isStripMiningEnabled();
 
   // The loop adaptor establishes LoopSimplify + LCSSA form before
   // IndVarSimplify or the strip-mining canonicalization pipeline. On the
@@ -152,15 +151,14 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   // on the frontend's bare (flagless) IV increments, so Early can prove that a
   // loop's maximum backedge count is strictly below INT_MAX
   // (IsIntCountedEquivalent) and drop all of its polls.
-  if (!isStripMiningEnabled()) {
+  if (StripMiningEnabled) {
+    addPreparationForStripMining(PM);
+  } else {
     LoopPassManager LPM;
     LPM.addPass(IndVarSimplifyPass());
     PM.addPass(createModuleToFunctionPassAdaptor(
         createFunctionToLoopPassAdaptor(std::move(LPM))));
   }
-
-  if (isStripMiningEnabled())
-    addCanonicalizationForStripMining(PM);
 
   // With strip mining enabled, Early handles only non-loop blocks. Loop polls
   // remain available to strip mining, then AfterStripMining performs the full
@@ -170,7 +168,7 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
       SafepointPollEliminationMode::Early, level == OptimizationLevel::O3)));
   addCoverageVerifier(PM);
 
-  if (isStripMiningEnabled())
+  if (StripMiningEnabled)
     addStripMiningPasses(PM, level == OptimizationLevel::O3);
 
   // TODO: InsertGCBarriers currently inserts high-level barrier calls before

@@ -144,6 +144,7 @@ struct StripMineShape {
   unsigned LimitOperandIdx;
   bool Increasing;
   bool Inclusive; // ContinuePredicate is *LE / *GE (runs one extra iteration)
+  bool FirstIterationGuaranteed;
   ICmpInst::Predicate ContinuePredicate;
 };
 
@@ -154,8 +155,7 @@ struct StripMineShape {
 // directly against a loop-invariant limit.
 std::optional<StripMineShape> checkStripMineShape(Loop *L, const IVInfo &IV,
                                                   ICmpInst *ExitCmp,
-                                                  ScalarEvolution &SE,
-                                                  bool AllowRuntimeVersioning) {
+                                                  ScalarEvolution &SE) {
   // LoopSimplify form is defined as having a preheader, a single latch, and
   // dedicated exits, so getLoopPreheader()/getLoopLatch() are non-null here.
   if (!L->isLoopSimplifyForm())
@@ -288,18 +288,20 @@ std::optional<StripMineShape> checkStripMineShape(Loop *L, const IVInfo &IV,
 
   const SCEV *Start = IV.AR->getStart();
   const SCEV *Limit = SE.getSCEV(ExitCmp->getOperand(LimitIdx));
-  // No-wrap legality, including the supported runtime-versioned case, is
-  // checked after this structural normalization.
-  bool CanAddStableEntryGuard =
-      AllowRuntimeVersioning && Inclusive && ICmpInst::isSigned(ContinuePred) &&
-      !IV.Step.isMinSignedValue() && IV.Phi->getType()->isIntegerTy(32);
-  if (!SE.isLoopEntryGuardedByCond(L, ContinuePred, Start, Limit) &&
-      !CanAddStableEntryGuard)
+  bool FirstIterationGuaranteed =
+      SE.isLoopEntryGuardedByCond(L, ContinuePred, Start, Limit);
+  // NE is equivalent to the normalized relational predicate only when the
+  // entry order and unit step prove that the IV reaches the limit without
+  // passing it. A post-tested skeleton preserves the mandatory first
+  // iteration, but it cannot supply that reachability proof.
+  if (CanonicalizedNE && !FirstIterationGuaranteed)
     return std::nullopt;
 
-  return StripMineShape{Preheader, Header,     Latch,     ExitingBB,
-                        ExitBB,    Br,         LatchIV,   ExitSuccIdx,
-                        LimitIdx,  Increasing, Inclusive, ContinuePred};
+  return StripMineShape{Preheader,   Header,      Latch,
+                        ExitingBB,   ExitBB,      Br,
+                        LatchIV,     ExitSuccIdx, LimitIdx,
+                        Increasing,  Inclusive,   FirstIterationGuaranteed,
+                        ContinuePred};
 }
 
 // Back-edge polls owned by L (not a sub-loop) whose block dominates the latch:
@@ -598,8 +600,7 @@ buildStripMinePlanWithIV(Loop *L, const IVInfo &IV, ICmpInst *ExitCmp,
                          CallInst *PollToMove, ArrayRef<CallInst *> AllPolls,
                          MemorySSA &MSSA, DominatorTree &DT,
                          ScalarEvolution &SE, bool AllowRuntimeVersioning) {
-  auto MaybeShape =
-      checkStripMineShape(L, IV, ExitCmp, SE, AllowRuntimeVersioning);
+  auto MaybeShape = checkStripMineShape(L, IV, ExitCmp, SE);
   if (!MaybeShape) {
     LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
                       << ": unsupported loop shape\n");
@@ -660,18 +661,20 @@ buildStripMinePlanWithIV(Loop *L, const IVInfo &IV, ICmpInst *ExitCmp,
   }
   APInt AbsStepN = WideStride.trunc(BitWidth);
 
-  // The IV must not wrap inside a poll-free batch. The transform and verifier
-  // prove the same real-limit range at loop entry, so an entry guard such as
-  // `n < 1000` is usable but a body-only IV guard is not.
+  // The IV must not wrap inside a poll-free batch. A pre-tested outer may use
+  // facts established at loop entry; a post-tested outer executes its first
+  // batch unconditionally and therefore requires recurrence-level no-wrap.
   const SCEV *LimitS = SE.getSCEV(Limit);
   const Instruction *LoopEntryCtx = Shape.Header->getTerminator();
+  bool HasRecurrenceNoWrap =
+      IsSigned ? IV.AR->hasNoSignedWrap() : IV.AR->hasNoUnsignedWrap();
   std::optional<InclusiveRuntimeGuard> RuntimeGuard;
   if (!Shape.Inclusive) {
     bool HasStableInit = isGuaranteedNotToBeUndefOrPoison(InitVal);
     bool HasStableLimit = isGuaranteedNotToBeUndefOrPoison(Limit);
     bool HasValueIndependentNoWrap =
-        IV.Step.abs().isOne() ||
-        (IsSigned ? IV.AR->hasNoSignedWrap() : IV.AR->hasNoUnsignedWrap());
+        HasRecurrenceNoWrap ||
+        (Shape.FirstIterationGuaranteed && IV.Step.abs().isOne());
     // An entry guard over an undef-dependent value does not constrain a later
     // freeze of that value. Only accept unstable operands when no-wrap follows
     // from the step/recurrence itself; applyStripMinePlan then freezes each
@@ -681,8 +684,12 @@ buildStripMinePlanWithIV(Loop *L, const IVInfo &IV, ICmpInst *ExitCmp,
                         << ": cannot prove exclusive no-wrap\n");
       return std::nullopt;
     }
-    if (!canProveExclusiveNoWrap(IV.AR, IV.Step, LimitS, LoopEntryCtx, IsSigned,
-                                 Shape.Increasing, SE)) {
+    bool CanProveNoWrap =
+        Shape.FirstIterationGuaranteed
+            ? canProveExclusiveNoWrap(IV.AR, IV.Step, LimitS, LoopEntryCtx,
+                                      IsSigned, Shape.Increasing, SE)
+            : HasRecurrenceNoWrap;
+    if (!CanProveNoWrap) {
       LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
                         << ": cannot prove exclusive no-wrap\n");
       return std::nullopt;
@@ -691,9 +698,13 @@ buildStripMinePlanWithIV(Loop *L, const IVInfo &IV, ICmpInst *ExitCmp,
     // The clamp and loop test use these operands separately. A SCEV range does
     // not make transitive uses of an undef-dependent SSA value agree.
     bool HasStableInit = isGuaranteedNotToBeUndefOrPoison(InitVal);
-    if (!HasStableInit ||
-        !canProveInclusiveNoWrap(IV.AR, IV.Step, Limit, LimitS, LoopEntryCtx,
-                                 IsSigned, Shape.Increasing, SE)) {
+    bool HasStableLimit = isGuaranteedNotToBeUndefOrPoison(Limit);
+    bool CanProveNoWrap = Shape.FirstIterationGuaranteed
+                              ? canProveInclusiveNoWrap(
+                                    IV.AR, IV.Step, Limit, LimitS, LoopEntryCtx,
+                                    IsSigned, Shape.Increasing, SE)
+                              : HasStableLimit && HasRecurrenceNoWrap;
+    if (!HasStableInit || !CanProveNoWrap) {
       SmallVector<InclusiveExitPhiIncoming, 8> ExitPhiIncomings;
       SmallVector<BasicBlock *, 4> ExitBlocks;
       L->getUniqueExitBlocks(ExitBlocks);
@@ -1135,11 +1146,18 @@ void applyStripMinePlan(StripMinePlan &Plan, LoopInfo &LI, DominatorTree &DT,
     OP->addIncoming(HPhi->getIncomingValueForBlock(Shape.Preheader), OuterPH);
     OuterReducPhis.push_back(OP);
   }
-  // OuterCond is "continue the inner batch" so the br targets are fixed
-  // regardless of the original branch polarity (ContinuePredicate encodes it).
-  Value *OuterCond =
-      B.CreateICmp(Shape.ContinuePredicate, OuterIV, Limit, "outer.cond");
-  B.CreateCondBr(OuterCond, InnerEntry, Shape.ExitBB);
+  if (Shape.FirstIterationGuaranteed) {
+    // OuterCond is "continue the inner batch" so the br targets are fixed
+    // regardless of the original branch polarity.
+    Value *OuterCond =
+        B.CreateICmp(Shape.ContinuePredicate, OuterIV, Limit, "outer.cond");
+    B.CreateCondBr(OuterCond, InnerEntry, Shape.ExitBB);
+  } else {
+    // A latch-tested source loop executes once even when its continue
+    // predicate is initially false. Preserve that behavior by entering the
+    // first inner batch unconditionally and testing only at the outer latch.
+    B.CreateBr(InnerEntry);
+  }
 
   // InnerEntry clamps the per-batch inner limit to min(batch end, real limit).
   // Saturating arithmetic handles IV-type extremes: an overflow saturates and
@@ -1183,7 +1201,14 @@ void applyStripMinePlan(StripMinePlan &Plan, LoopInfo &LI, DominatorTree &DT,
                     Shape.ExitingBB);
     OuterReducNext.push_back(NP);
   }
-  BranchInst *OuterBr = B.CreateBr(OuterHeader);
+  BranchInst *OuterBr;
+  if (Shape.FirstIterationGuaranteed) {
+    OuterBr = B.CreateBr(OuterHeader);
+  } else {
+    Value *OuterCond =
+        B.CreateICmp(Shape.ContinuePredicate, OuterIVNext, Limit, "outer.cond");
+    OuterBr = B.CreateCondBr(OuterCond, OuterHeader, Shape.ExitBB);
+  }
   OuterIV->addIncoming(OuterIVNext, OuterLatch);
   for (size_t I = 0; I < OuterReducPhis.size(); ++I)
     OuterReducPhis[I]->addIncoming(OuterReducNext[I], OuterLatch);
@@ -1251,32 +1276,36 @@ void applyStripMinePlan(StripMinePlan &Plan, LoopInfo &LI, DominatorTree &DT,
   RelocatedPoll->addFnAttr(
       Attribute::get(Ctx, jeandle::Attribute::StripMinedPoll));
 
-  // Fix up the exit LCSSA phis: predecessor is now OuterHeader; the
-  // post-increment resume IV resolves to OuterIV, while header recurrences and
-  // their latch-carried values resolve to their outer phis. This preserves the
-  // current-IV phase through a lag recurrence whose latch value is that IV.
-  // Resolve by each exit phi's incoming value so one recurrence feeding
-  // several exit phis fixes up each of them correctly.
+  // Fix up the primary exit LCSSA phis at the boundary where the selected outer
+  // skeleton exits. A pre-tested outer loop exposes its current recurrences at
+  // OuterHeader; a post-tested outer loop exposes the just-completed batch at
+  // OuterLatch. Resolve by each exit phi's incoming value so one recurrence
+  // feeding several exit phis fixes up each of them correctly.
   DenseMap<Value *, Value *> HeaderToOuter;
   DenseMap<Value *, Value *> LatchValueToOuter;
-  for (size_t I = 0; I < LiftedHeaderPhis.size(); ++I)
-    HeaderToOuter[LiftedHeaderPhis[I]] = OuterReducPhis[I];
+  if (Shape.FirstIterationGuaranteed)
+    for (size_t I = 0; I < LiftedHeaderPhis.size(); ++I)
+      HeaderToOuter[LiftedHeaderPhis[I]] = OuterReducPhis[I];
   for (size_t I = 0; I < LiftedHeaderPhis.size(); ++I) {
     Value *LatchValue =
         LiftedHeaderPhis[I]->getIncomingValueForBlock(Shape.Latch);
     if (!L->isLoopInvariant(LatchValue))
-      LatchValueToOuter[LatchValue] = OuterReducPhis[I];
+      LatchValueToOuter[LatchValue] = Shape.FirstIterationGuaranteed
+                                          ? OuterReducPhis[I]
+                                          : OuterReducNext[I];
   }
   for (PHINode &Phi : Shape.ExitBB->phis()) {
     int Idx = Phi.getBasicBlockIndex(Shape.ExitingBB);
     if (Idx < 0)
       continue;
     Value *V = Phi.getIncomingValue(Idx);
-    Phi.setIncomingBlock(Idx, OuterHeader);
+    Phi.setIncomingBlock(Idx, Shape.FirstIterationGuaranteed ? OuterHeader
+                                                             : OuterLatch);
     if (L->isLoopInvariant(V))
       continue;
     if (V == Shape.ResumeIV)
-      Phi.setIncomingValue(Idx, OuterIV);
+      Phi.setIncomingValue(Idx, Shape.FirstIterationGuaranteed ? OuterIV
+                                                               : OuterIVNext);
     else if (auto It = HeaderToOuter.find(V); It != HeaderToOuter.end())
       Phi.setIncomingValue(Idx, It->second);
     else if (auto It = LatchValueToOuter.find(V); It != LatchValueToOuter.end())
