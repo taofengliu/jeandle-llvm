@@ -356,43 +356,87 @@ bool isHeaderPhiLatchValue(Value *V, BasicBlock *Header, BasicBlock *Latch) {
 }
 
 // Frontends may keep an unchanged local (notably `this`) live across a loop as
-// a syntactic self recurrence. It is semantically invariant and can be lifted
-// to the outer recurrence without changing the state observed at a batch
-// boundary.
-bool isLoopInvariantSelfRecurrence(PHINode *Phi, Loop *L, BasicBlock *Header,
-                                   BasicBlock *Latch) {
+// a syntactic self recurrence. It is semantically invariant, so its preheader
+// value is the value observed at every batch boundary.
+Value *getLoopInvariantSelfRecurrenceInitial(PHINode *Phi, Loop *L,
+                                             BasicBlock *Header,
+                                             BasicBlock *Latch) {
   if (Phi->getParent() != Header || Phi->getIncomingValueForBlock(Latch) != Phi)
-    return false;
+    return nullptr;
   BasicBlock *Preheader = L->getLoopPreheader();
   Value *Initial =
       Preheader ? Phi->getIncomingValueForBlock(Preheader) : nullptr;
-  return Initial && L->isLoopInvariant(Initial);
+  return Initial && L->isLoopInvariant(Initial) ? Initial : nullptr;
 }
+
+struct DeoptBoundaryValue {
+  Value *Original;
+  // The value reached by walking Casts from Original. Null means Original is
+  // defined outside the loop and can be reused directly.
+  Value *OriginalRoot;
+  // The value from which the outer-boundary expression is rebuilt. This is the
+  // root itself for an invariant/latch-carried root, or the preheader value for
+  // an invariant self recurrence.
+  Value *BoundaryBase;
+  Value *LatchValue;
+  // Outermost-to-innermost casts from Original down to OriginalRoot. Applying
+  // the plan walks this list in reverse and memoizes each rebuilt cast.
+  SmallVector<CastInst *, 2> Casts;
+};
 
 // The relocated poll represents the next iteration at a batch boundary. A raw
 // header phi is normally current-iteration state, even when it also happens to
 // be the latch input of another copy/swap recurrence. The one safe exception is
-// an invariant self recurrence; reject every other header phi before testing
-// latch-value matching.
-bool deoptOperandsDescribeBatchBoundary(CallInst *P, Loop *L,
-                                        BasicBlock *Header, BasicBlock *Latch) {
+// an invariant self recurrence. Other operands must either be loop-invariant,
+// a latch-carried next value, or a pure cast chain rooted at such a next value.
+// The returned plans are consumed verbatim during relocation, keeping the
+// eligibility proof and materialization behavior in sync.
+std::optional<SmallVector<DeoptBoundaryValue, 8>>
+analyzeDeoptBoundaryValues(CallInst *P, Loop *L, BasicBlock *Header,
+                           BasicBlock *Latch) {
+  SmallVector<DeoptBoundaryValue, 8> Plans;
   auto OB = P->getOperandBundle(LLVMContext::OB_deopt);
   if (!OB)
-    return true;
+    return Plans;
   for (const Use &U : OB->Inputs) {
     Value *V = U.get();
-    if (L->isLoopInvariant(V))
+    if (L->isLoopInvariant(V)) {
+      Plans.push_back({V, nullptr, nullptr, nullptr, {}});
       continue;
-    if (auto *Phi = dyn_cast<PHINode>(V); Phi && Phi->getParent() == Header) {
-      if (isLoopInvariantSelfRecurrence(Phi, L, Header, Latch))
-        continue;
-      return false;
     }
-    if (isHeaderPhiLatchValue(V, Header, Latch))
+    if (auto *Phi = dyn_cast<PHINode>(V); Phi && Phi->getParent() == Header) {
+      if (Value *Initial =
+              getLoopInvariantSelfRecurrenceInitial(Phi, L, Header, Latch)) {
+        Plans.push_back({V, V, Initial, nullptr, {}});
+        continue;
+      }
+      return std::nullopt;
+    }
+
+    SmallVector<CastInst *, 2> Casts;
+    Value *Root = V;
+    while (auto *Cast = dyn_cast<CastInst>(Root)) {
+      Casts.push_back(Cast);
+      Root = Cast->getOperand(0);
+    }
+    if (L->isLoopInvariant(Root)) {
+      Plans.push_back({V, Root, Root, nullptr, std::move(Casts)});
       continue;
-    return false;
+    }
+    if (auto *Phi = dyn_cast<PHINode>(Root);
+        Phi && Phi->getParent() == Header) {
+      if (Value *Initial =
+              getLoopInvariantSelfRecurrenceInitial(Phi, L, Header, Latch)) {
+        Plans.push_back({V, Root, Initial, nullptr, std::move(Casts)});
+        continue;
+      }
+      return std::nullopt;
+    }
+    if (!isHeaderPhiLatchValue(Root, Header, Latch))
+      return std::nullopt;
+    Plans.push_back({V, Root, Root, Root, std::move(Casts)});
   }
-  return true;
+  return Plans;
 }
 
 bool memoryStateMatchesBackedge(CallInst *Poll, Loop *L, BasicBlock *Header,
@@ -503,6 +547,7 @@ struct StripMinePlan {
   SmallVector<CallInst *, 4> AllPolls;
   SmallVector<PHINode *, 4> LiftedHeaderPhis;
   SmallVector<HeaderPhiState, 4> HeaderPhis;
+  SmallVector<DeoptBoundaryValue, 8> DeoptBoundaryValues;
   std::optional<InclusiveRuntimeGuard> RuntimeGuard;
   APInt AbsStepN;
   bool IsSigned;
@@ -574,8 +619,9 @@ buildStripMinePlanWithIV(Loop *L, const IVInfo &IV, ICmpInst *ExitCmp,
                       << ": unmodeled relocation hazard after poll\n");
     return std::nullopt;
   }
-  if (!deoptOperandsDescribeBatchBoundary(PollToMove, L, Shape.Header,
-                                          Shape.Latch)) {
+  auto DeoptBoundaryValues =
+      analyzeDeoptBoundaryValues(PollToMove, L, Shape.Header, Shape.Latch);
+  if (!DeoptBoundaryValues) {
     LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
                       << ": deopt state is not a batch boundary\n");
     return std::nullopt;
@@ -739,6 +785,7 @@ buildStripMinePlanWithIV(Loop *L, const IVInfo &IV, ICmpInst *ExitCmp,
                        SmallVector<CallInst *, 4>(AllPolls),
                        std::move(LiftedHeaderPhis),
                        std::move(HeaderPhis),
+                       std::move(*DeoptBoundaryValues),
                        std::move(RuntimeGuard),
                        AbsStepN,
                        IsSigned,
@@ -865,6 +912,49 @@ bool StripMinePlan::stillStructurallyValid(LoopInfo &LI,
         State.Phi->getIncomingValue(PreheaderIdx) != State.PreheaderValue ||
         State.Phi->getIncomingValue(LatchIdx) != State.LatchValue)
       return false;
+  }
+  auto OB = PollToMove->getOperandBundle(LLVMContext::OB_deopt);
+  if (OB) {
+    if (OB->Inputs.size() != DeoptBoundaryValues.size())
+      return false;
+    for (size_t I = 0; I < DeoptBoundaryValues.size(); ++I) {
+      if (OB->Inputs[I].get() != DeoptBoundaryValues[I].Original)
+        return false;
+      const DeoptBoundaryValue &Boundary = DeoptBoundaryValues[I];
+      if (!Boundary.OriginalRoot) {
+        if (Boundary.BoundaryBase || Boundary.LatchValue ||
+            !Boundary.Casts.empty())
+          return false;
+        continue;
+      }
+      Value *Root = Boundary.Original;
+      for (CastInst *Cast : Boundary.Casts) {
+        if (Root != Cast)
+          return false;
+        Root = Cast->getOperand(0);
+      }
+      if (Root != Boundary.OriginalRoot)
+        return false;
+      if (Boundary.LatchValue) {
+        if (Boundary.BoundaryBase != Boundary.LatchValue ||
+            Root != Boundary.LatchValue ||
+            !isHeaderPhiLatchValue(Root, Shape.Header, Shape.Latch))
+          return false;
+        continue;
+      }
+      if (Root == Boundary.BoundaryBase) {
+        if (!L->isLoopInvariant(Root))
+          return false;
+        continue;
+      }
+      auto *Phi = dyn_cast<PHINode>(Root);
+      if (!Phi || getLoopInvariantSelfRecurrenceInitial(Phi, L, Shape.Header,
+                                                        Shape.Latch) !=
+                      Boundary.BoundaryBase)
+        return false;
+    }
+  } else if (!DeoptBoundaryValues.empty()) {
+    return false;
   }
   if (RuntimeGuard) {
     if (!isSafeToVersionInclusiveLoop(L) || !L->hasDedicatedExits())
@@ -1099,7 +1189,8 @@ void applyStripMinePlan(StripMinePlan &Plan, LoopInfo &LI, DominatorTree &DT,
     OuterReducPhis[I]->addIncoming(OuterReducNext[I], OuterLatch);
 
   // Relocate the poll after the planning phase proved memory, control, and
-  // deopt-state compatibility. Only latch-carried next values are remapped.
+  // deopt-state compatibility. Latch-carried next values are remapped, and
+  // optimizer-introduced cast chains are rebuilt from those outer values.
   // Skip a latch value that is loop-invariant (e.g. a phi whose latch operand
   // is a constant): it needs no remap, and keying Remap on it would spuriously
   // rewrite an unrelated but equal constant elsewhere in the deopt bundle.
@@ -1114,11 +1205,34 @@ void applyStripMinePlan(StripMinePlan &Plan, LoopInfo &LI, DominatorTree &DT,
              OuterReducNext[I]);
   SmallVector<OperandBundleDef, 1> Bundles;
   if (auto OB = PollToMove->getOperandBundle(LLVMContext::OB_deopt)) {
+    assert(OB->Inputs.size() == Plan.DeoptBoundaryValues.size() &&
+           "deopt boundary plan no longer matches the poll bundle");
     SmallVector<Value *, 8> Args;
-    for (const Use &U : OB->Inputs) {
-      Value *V = U.get();
-      auto It = Remap.find(V);
-      Args.push_back(It != Remap.end() ? It->second : V);
+    for (const DeoptBoundaryValue &Boundary : Plan.DeoptBoundaryValues) {
+      if (!Boundary.OriginalRoot) {
+        Args.push_back(Boundary.Original);
+        continue;
+      }
+
+      Value *Remapped = Boundary.BoundaryBase;
+      if (auto It = Remap.find(Boundary.BoundaryBase); It != Remap.end())
+        Remapped = It->second;
+      else
+        assert(L->isLoopInvariant(Boundary.BoundaryBase) &&
+               "planned boundary base has no outer value");
+      for (CastInst *Cast : llvm::reverse(Boundary.Casts)) {
+        if (auto Cached = Remap.find(Cast); Cached != Remap.end()) {
+          Remapped = Cached->second;
+          continue;
+        }
+        auto *OuterCast = cast<CastInst>(Cast->clone());
+        OuterCast->setOperand(0, Remapped);
+        OuterCast->setName(Cast->getName() + ".outer");
+        OuterCast->insertBefore(OuterBr->getIterator());
+        Remapped = OuterCast;
+        Remap[Cast] = OuterCast;
+      }
+      Args.push_back(Remapped);
     }
     Bundles.emplace_back("deopt", Args);
   }
