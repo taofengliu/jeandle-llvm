@@ -44,5 +44,7 @@ exit:
 ; The exit drives %j: the outer condition and clamp are on %j's recurrence
 ; (step 2 -> batch advance of 2000).
 ; CHECK:         %outer.cond = icmp slt i64 %outer.iv, %n
-; CHECK:         %outer.batch.end = call i64 @llvm.sadd.sat.i64(i64 %outer.iv, i64 2000)
+; CHECK:         %outer.batch.dist = sub nsw i128
+; CHECK:         call i128 @llvm.smin.i128
+; CHECK:         %outer.inner.limit = add nsw i64 %outer.iv, %outer.batch.chunk
 ; CHECK:         call hotspotcc void @jeandle.safepoint_poll()

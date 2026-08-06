@@ -1133,6 +1133,50 @@ void applyInclusiveLoopVersioningPlan(StripMinePlan &Plan, LoopInfo &LI,
                     << " (cloned slow path behind no-wrap guard)\n");
 }
 
+// Per-batch inner limit for a SIGNED counted loop, built as a C2-style
+// residual-distance chunk in a 2*BW wide type:
+//   Diff  = (Increasing ? Limit : OuterIV) - (Increasing ? OuterIV : Limit)
+//   Chunk = trunc(smin(smax(Diff, 0), zext(StepN)))
+//   Limit = OuterIV + Chunk (increasing) / OuterIV - Chunk (decreasing)
+//
+// This replaces sadd_sat/ssub_sat: ScalarEvolution does not model the signed
+// saturating intrinsics (createSCEV falls through to getUnknown for them), so
+// the old clamp left the inner loop's backedge-taken count as
+// SCEVCouldNotCompute — defeating the unroll/vectorize that strip mining exists
+// to enable. Every operation used here (sext, nsw sub, smax, smin, zext, trunc,
+// nsw add/sub) is modeled by ScalarEvolution, so the inner trip count stays
+// analyzable downstream.
+//
+// Widening the subtraction to 2*BW makes it overflow-free for any IV range:
+// the difference of two BW-bit signed values always fits in 2*BW bits. That
+// preserves the saturating-add behavior of never degenerating strip mining on
+// extreme IV ranges (no perf cliff). chunk <= max(0, Diff) then bounds the
+// IV-type add/sub to [OuterIV, Limit], so it is non-overflowing and safely
+// carries nsw. NUW is intentionally not set: signed IV values may be negative.
+static Value *emitSignedInnerLimit(IRBuilder<> &B, Value *OuterIV, Value *Limit,
+                                   const APInt &AbsStepN, bool Increasing) {
+  Type *IVTy = OuterIV->getType();
+  unsigned BW = IVTy->getIntegerBitWidth();
+  IntegerType *WideTy = IntegerType::get(B.getContext(), 2 * BW);
+
+  Value *StepN = ConstantInt::get(IVTy, AbsStepN);
+  Value *WideIV = B.CreateSExt(OuterIV, WideTy, "outer.iv.wide");
+  Value *WideLim = B.CreateSExt(Limit, WideTy, "outer.limit.wide");
+  Value *Diff = Increasing ? B.CreateNSWSub(WideLim, WideIV, "outer.batch.dist")
+                           : B.CreateNSWSub(WideIV, WideLim, "outer.batch.dist");
+  Value *ZeroW = ConstantInt::get(WideTy, 0);
+  Value *Rem = B.CreateBinaryIntrinsic(Intrinsic::smax, Diff, ZeroW,
+                                       /*FMFSource=*/nullptr, "outer.batch.rem");
+  Value *StepNW =
+      B.CreateZExt(StepN, WideTy, "outer.batch.stepn.wide");
+  Value *ChunkW = B.CreateBinaryIntrinsic(Intrinsic::smin, Rem, StepNW,
+                                          /*FMFSource=*/nullptr,
+                                          "outer.batch.chunk.wide");
+  Value *Chunk = B.CreateTrunc(ChunkW, IVTy, "outer.batch.chunk");
+  return Increasing ? B.CreateNSWAdd(OuterIV, Chunk, "outer.inner.limit")
+                    : B.CreateNSWSub(OuterIV, Chunk, "outer.inner.limit");
+}
+
 void applyStripMinePlan(StripMinePlan &Plan, LoopInfo &LI, DominatorTree &DT,
                         ScalarEvolution &SE) {
   Loop *L = Plan.L;
@@ -1209,21 +1253,30 @@ void applyStripMinePlan(StripMinePlan &Plan, LoopInfo &LI, DominatorTree &DT,
     B.CreateBr(InnerEntry);
   }
 
-  // InnerEntry clamps the per-batch inner limit to min(batch end, real limit).
-  // Saturating arithmetic handles IV-type extremes: an overflow saturates and
-  // the cap compare then pins the inner limit to the real limit.
+  // InnerEntry clamps the per-batch inner limit so a batch never exceeds N
+  // iterations while still respecting the real loop limit. The signed and
+  // unsigned paths differ only here:
+  //  - Unsigned loops keep the SCEV-modeled uadd_sat/usub_sat + select clamp.
+  //  - Signed loops use a residual-distance chunk (emitSignedInnerLimit):
+  //    sadd_sat/ssub_sat are NOT modeled by ScalarEvolution, so the old clamp
+  //    left the inner backedge-taken count as SCEVCouldNotCompute and defeated
+  //    the unroll/vectorize that strip mining exists to enable.
   B.SetInsertPoint(InnerEntry);
   Value *StepN = ConstantInt::get(Ty, AbsStepN);
-  Intrinsic::ID SatID =
-      Shape.Increasing ? (IsSigned ? Intrinsic::sadd_sat : Intrinsic::uadd_sat)
-                       : (IsSigned ? Intrinsic::ssub_sat : Intrinsic::usub_sat);
-  Value *BatchEnd =
-      B.CreateBinaryIntrinsic(SatID, OuterIV, StepN,
-                              /*FMFSource=*/nullptr, "outer.batch.end");
-  Value *KeepEnd =
-      B.CreateICmp(Shape.ContinuePredicate, BatchEnd, Limit, "outer.cap.cond");
-  Value *InnerLimit =
-      B.CreateSelect(KeepEnd, BatchEnd, Limit, "outer.inner.limit");
+  Value *InnerLimit;
+  if (!IsSigned) {
+    Intrinsic::ID SatID =
+        Shape.Increasing ? Intrinsic::uadd_sat : Intrinsic::usub_sat;
+    Value *BatchEnd =
+        B.CreateBinaryIntrinsic(SatID, OuterIV, StepN,
+                                /*FMFSource=*/nullptr, "outer.batch.end");
+    Value *KeepEnd =
+        B.CreateICmp(Shape.ContinuePredicate, BatchEnd, Limit, "outer.cap.cond");
+    InnerLimit = B.CreateSelect(KeepEnd, BatchEnd, Limit, "outer.inner.limit");
+  } else {
+    InnerLimit =
+        emitSignedInnerLimit(B, OuterIV, Limit, AbsStepN, Shape.Increasing);
+  }
   B.CreateBr(Shape.Header);
 
   // Each batch resumes the recurrences from the outer progress.
@@ -1316,11 +1369,10 @@ void applyStripMinePlan(StripMinePlan &Plan, LoopInfo &LI, DominatorTree &DT,
   // the deopt bundle is preserved verbatim — no LLVM pass may synthesize a
   // poll, only relocate one). Mark the relocated poll with the strip-mined
   // poll attribute: the inner loop now runs poll-free, bounded to <= N
-  // iterations by the clamped limit, and SCEV can't see that bound through the
-  // select/saturating-add. The attribute identifies this nest to the passes
-  // that immediately follow (after-strip-mining deletion and the coverage
-  // verifier); marking the poll itself means the marker cannot outlive the
-  // coverage it certifies.
+  // iterations by the clamped limit. The attribute is the contract the coverage
+  // verifier trusts without re-deriving that bound, and the marker the
+  // after-strip-mining poll elimination keys on; marking the poll itself means
+  // the marker cannot outlive the coverage it certifies.
   auto *RelocatedPoll =
       CallBase::Create(PollToMove, Bundles, OuterBr->getIterator());
   RelocatedPoll->addFnAttr(

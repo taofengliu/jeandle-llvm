@@ -75,7 +75,9 @@ exit:
 ; CHECK:       header.outer:
 ; CHECK-NOT:     outer.cond
 ; CHECK:         br label %header.outer.inner.entry
-; CHECK:         call i64 @llvm.ssub.sat.i64
+; CHECK:         %outer.batch.dist = sub nsw i128
+; CHECK:         call i128 @llvm.smin.i128
+; CHECK:         %outer.inner.limit = sub nsw i64 %outer.iv, %outer.batch.chunk
 ; CHECK:       header.outer.latch:
 ; CHECK:         %outer.cond = icmp sgt i64 %outer.iv.next, %n
 ; CHECK:         call hotspotcc void @jeandle.safepoint_poll()
@@ -107,7 +109,9 @@ exit:
 ; CHECK:       header.outer:
 ; CHECK-NOT:     outer.cond
 ; CHECK:         br label %header.outer.inner.entry
-; CHECK:         call i32 @llvm.sadd.sat.i32(i32 %outer.iv, i32 3)
+; CHECK:         %outer.batch.dist = sub nsw i64
+; CHECK:         call i64 @llvm.smin.i64
+; CHECK:         %outer.inner.limit = add nsw i32 %outer.iv, %outer.batch.chunk
 ; CHECK:       header.outer.latch:
 ; CHECK:         %outer.cond = icmp sle i32 %outer.iv.next, %n
 ; CHECK:         call hotspotcc void @jeandle.safepoint_poll()
@@ -138,7 +142,9 @@ exit:
 ; CHECK:       header.outer:
 ; CHECK-NOT:     outer.cond
 ; CHECK:         br label %header.outer.inner.entry
-; CHECK:         call i32 @llvm.ssub.sat.i32(i32 %outer.iv, i32 3)
+; CHECK:         %outer.batch.dist = sub nsw i64
+; CHECK:         call i64 @llvm.smin.i64
+; CHECK:         %outer.inner.limit = sub nsw i32 %outer.iv, %outer.batch.chunk
 ; CHECK:       header.outer.latch:
 ; CHECK:         %outer.cond = icmp sge i32 %outer.iv.next, %n
 ; CHECK:         call hotspotcc void @jeandle.safepoint_poll()

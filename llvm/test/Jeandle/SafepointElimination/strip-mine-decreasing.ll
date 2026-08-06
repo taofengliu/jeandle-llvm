@@ -33,5 +33,7 @@ exit:
 
 ; CHECK-LABEL: @countdown(
 ; CHECK:         %outer.cond = icmp sgt i64 %outer.iv, 0
-; CHECK:         %outer.batch.end = call i64 @llvm.ssub.sat.i64(i64 %outer.iv, i64 1000)
+; CHECK:         %outer.batch.dist = sub nsw i128
+; CHECK:         call i128 @llvm.smin.i128
+; CHECK:         %outer.inner.limit = sub nsw i64 %outer.iv, %outer.batch.chunk
 ; CHECK:         call hotspotcc void @jeandle.safepoint_poll()

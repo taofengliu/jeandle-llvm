@@ -321,7 +321,9 @@ exit:
 
 ; CHECK-LABEL: @runtime_inclusive_inc_step2(
 ; CHECK:       %inclusive.no_wrap = icmp slt i32 %inclusive.limit.fr, 2147483646
-; CHECK-DAG:   %outer.batch.end = call i32 @llvm.sadd.sat.i32(i32 %outer.iv, i32 14)
+; CHECK-DAG:   %outer.batch.dist = sub nsw i64
+; CHECK-DAG:   call i64 @llvm.smin.i64
+; CHECK-DAG:   %outer.inner.limit = add nsw i32 %outer.iv, %outer.batch.chunk
 ; CHECK-DAG:   loop.outer.latch:
 ; CHECK-DAG:   call hotspotcc void @jeandle.safepoint_poll() #{{[0-9]+}} [ "deopt"({{.*}}%outer.iv.next) ]
 ; CHECK-DAG:   loop.inclusive.slow:
@@ -336,19 +338,25 @@ exit:
 
 ; CHECK-LABEL: @runtime_inclusive_inc_step3_header(
 ; CHECK:       %inclusive.no_wrap = icmp slt i32 %inclusive.limit.fr, 2147483645
-; CHECK-DAG:   %outer.batch.end = call i32 @llvm.sadd.sat.i32(i32 %outer.iv, i32 21)
+; CHECK-DAG:   %outer.batch.dist = sub nsw i64
+; CHECK-DAG:   call i64 @llvm.smin.i64
+; CHECK-DAG:   %outer.inner.limit = add nsw i32 %outer.iv, %outer.batch.chunk
 ; CHECK-DAG:   body.outer.latch:
 ; CHECK-DAG:   body.inclusive.slow:
 
 ; CHECK-LABEL: @runtime_inclusive_dec_step2(
 ; CHECK:       %inclusive.no_wrap = icmp sgt i32 %inclusive.limit.fr, -2147483647
-; CHECK-DAG:   %outer.batch.end = call i32 @llvm.ssub.sat.i32(i32 %outer.iv, i32 14)
+; CHECK-DAG:   %outer.batch.dist = sub nsw i64
+; CHECK-DAG:   call i64 @llvm.smin.i64
+; CHECK-DAG:   %outer.inner.limit = sub nsw i32 %outer.iv, %outer.batch.chunk
 ; CHECK-DAG:   loop.outer.latch:
 ; CHECK-DAG:   loop.inclusive.slow:
 
 ; CHECK-LABEL: @runtime_inclusive_dec_step3_header(
 ; CHECK:       %inclusive.no_wrap = icmp sgt i32 %inclusive.limit.fr, -2147483646
-; CHECK-DAG:   %outer.batch.end = call i32 @llvm.ssub.sat.i32(i32 %outer.iv, i32 21)
+; CHECK-DAG:   %outer.batch.dist = sub nsw i64
+; CHECK-DAG:   call i64 @llvm.smin.i64
+; CHECK-DAG:   %outer.inner.limit = sub nsw i32 %outer.iv, %outer.batch.chunk
 ; CHECK-DAG:   body.outer.latch:
 ; CHECK-DAG:   body.inclusive.slow:
 

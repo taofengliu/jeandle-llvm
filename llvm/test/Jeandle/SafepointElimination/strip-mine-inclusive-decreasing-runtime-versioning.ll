@@ -152,7 +152,9 @@ exit:
 ; CHECK-DAG:   loop.inclusive.slow:
 ; CHECK-DAG:   call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i64 %sum.next.inclusive.slow, i32 %iv.next.inclusive.slow) ]
 ; CHECK-DAG:   loop.outer:
-; CHECK-DAG:   %outer.batch.end = call i32 @llvm.ssub.sat.i32(i32 %outer.iv, i32 999)
+; CHECK-DAG:   %outer.batch.dist = sub nsw i64
+; CHECK-DAG:   call i64 @llvm.smin.i64
+; CHECK-DAG:   %outer.inner.limit = sub nsw i32 %outer.iv, %outer.batch.chunk
 ; CHECK-DAG:   loop.outer.latch:
 ; CHECK-DAG:   call hotspotcc void @jeandle.safepoint_poll()
 

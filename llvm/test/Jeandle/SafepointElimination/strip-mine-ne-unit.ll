@@ -144,7 +144,9 @@ return:
 ; CHECK:         %cond = icmp ne i64 %iv.next, %outer.inner.limit
 ; CHECK:       body.outer:
 ; CHECK:         %outer.cond = icmp sgt i64 %outer.iv, %n
-; CHECK:         %outer.batch.end = call i64 @llvm.ssub.sat.i64(i64 %outer.iv, i64 1000)
+; CHECK:         %outer.batch.dist = sub nsw i128
+; CHECK:         call i128 @llvm.smin.i128
+; CHECK:         %outer.inner.limit = sub nsw i64 %outer.iv, %outer.batch.chunk
 
 define void @header_ne_swapped(i64 noundef %n) "java-method" {
 entry:
@@ -212,5 +214,7 @@ return:
 ; CHECK:         br i1 %cond, label %header, label %header.outer.latch
 ; CHECK:       header.outer:
 ; CHECK:         %outer.cond = icmp sgt i64 %outer.iv, %n
-; CHECK:         %outer.batch.end = call i64 @llvm.ssub.sat.i64(i64 %outer.iv, i64 1000)
+; CHECK:         %outer.batch.dist = sub nsw i128
+; CHECK:         call i128 @llvm.smin.i128
+; CHECK:         %outer.inner.limit = sub nsw i64 %outer.iv, %outer.batch.chunk
 !java-method-compilation = !{}

@@ -35,7 +35,9 @@ x:
 ; The strip-mine structure is present (so this isn't a "didn't strip" false pass)
 ; CHECK-LABEL: @idem(
 ; CHECK:       b.outer.inner.entry:
-; CHECK:         call i64 @llvm.sadd.sat.i64
+; CHECK:         %outer.batch.dist = sub nsw i128
+; CHECK:         call i128 @llvm.smin.i128
+; CHECK:         %outer.inner.limit = add nsw i64 %outer.iv, %outer.batch.chunk
 
 ; ...and exactly one coverage poll survives two runs — no second wrap.
 ; CHECK-COUNT-1: call hotspotcc void @jeandle.safepoint_poll()
