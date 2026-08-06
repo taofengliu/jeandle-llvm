@@ -123,9 +123,7 @@ PreservedAnalyses SafepointCoverageVerifier::run(Function &F,
   // The verifier is a backstop for normal Java-method compilations. A module
   // carrying the skip-safepoint-coverage-verifier named metadata opts out — this
   // is set only for compilation paths with different safepoint semantics (e.g.
-  // intrinsic lowering / runtime stubs), not for every Java method. Checking
-  // JavaMethodCompilation here would silently disable the verifier for all of
-  // them, since that metadata marks every Java-method module.
+  // intrinsic lowering / runtime stubs), not for every Java method.
   if (F.getParent()->getNamedMetadata(
           jeandle::Metadata::SkipSafepointCoverageVerifier))
     return PreservedAnalyses::all();

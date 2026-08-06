@@ -1049,6 +1049,36 @@ void replaceLoopUses(Loop *L, Value *From, Value *To) {
   });
 }
 
+struct FrozenOperands {
+  Value *StableInit = nullptr;
+  Value *StableLimit = nullptr;
+};
+
+// Freeze InitVal/Limit when either may be undef/poison so the duplicated tests
+// in the outer-loop (strip mining) or the cloned slow path (inclusive versioning)
+// agree on a single stable value. Operands already known non-undef are returned
+// unchanged. `B` must be positioned where the freeze should materialize (the
+// preheader terminator for strip mining, the versioning check block for inclusive
+// versioning); `Prefix` selects the freeze value names ("exclusive.*" /
+// "inclusive.*"). In-loop uses of a frozen operand are rewritten to the frozen
+// value. Shared by applyStripMinePlan and applyInclusiveLoopVersioningPlan.
+static FrozenOperands freezeLoopOperands(Loop *L, Value *InitVal, Value *Limit,
+                                         IRBuilder<> &B, StringRef Prefix) {
+  Value *StableLimit =
+      isGuaranteedNotToBeUndefOrPoison(Limit)
+          ? Limit
+          : B.CreateFreeze(Limit, Prefix + ".limit.fr");
+  Value *StableInit =
+      InitVal == Limit
+          ? StableLimit
+          : (isGuaranteedNotToBeUndefOrPoison(InitVal)
+                 ? InitVal
+                 : B.CreateFreeze(InitVal, Prefix + ".start.fr"));
+  replaceLoopUses(L, Limit, StableLimit);
+  replaceLoopUses(L, InitVal, StableInit);
+  return {StableInit, StableLimit};
+}
+
 void applyInclusiveLoopVersioningPlan(StripMinePlan &Plan, LoopInfo &LI,
                                       DominatorTree &DT) {
   assert(Plan.RuntimeGuard && "versioning plan must carry a runtime guard");
@@ -1064,20 +1094,8 @@ void applyInclusiveLoopVersioningPlan(StripMinePlan &Plan, LoopInfo &LI,
   IRBuilder<> CheckBuilder(CheckBB->getTerminator());
   // Freeze only operands that may be undef/poison; stable operands (constants,
   // noundef values) are read directly by the guard and the duplicated tests.
-  Value *StableLimit =
-      isGuaranteedNotToBeUndefOrPoison(Plan.Limit)
-          ? Plan.Limit
-          : CheckBuilder.CreateFreeze(Plan.Limit, "inclusive.limit.fr");
-  Value *StableInit = Plan.InitVal == Plan.Limit
-                          ? StableLimit
-                          : (isGuaranteedNotToBeUndefOrPoison(Plan.InitVal)
-                                 ? Plan.InitVal
-                                 : CheckBuilder.CreateFreeze(
-                                       Plan.InitVal, "inclusive.start.fr"));
-  if (StableLimit != Plan.Limit)
-    replaceLoopUses(FastLoop, Plan.Limit, StableLimit);
-  if (StableInit != Plan.InitVal)
-    replaceLoopUses(FastLoop, Plan.InitVal, StableInit);
+  auto [StableInit, StableLimit] = freezeLoopOperands(
+      FastLoop, Plan.InitVal, Plan.Limit, CheckBuilder, "inclusive");
 
   ValueToValueMapTy VMap;
   SmallVector<BasicBlock *, 8> SlowBlocks;
@@ -1122,11 +1140,13 @@ void applyInclusiveLoopVersioningPlan(StripMinePlan &Plan, LoopInfo &LI,
 
   // Both versions initially retain their original polls. Re-form dedicated
   // exits before the next pass recomputes MemorySSA and strip-mines only the
-  // guarded version.
+  // guarded version. The NoWrapCheckBB / entry-guard construction above bypasses
+  // DominatorTree maintenance, so re-baseline DT once before forming the exits;
+  // formDedicatedExitBlocks then keeps DT current incrementally (it splits
+  // predecessors through DT), so no second recalculate is needed.
   DT.recalculate(*F);
   formDedicatedExitBlocks(SlowLoop, &DT, &LI, nullptr, true);
   formDedicatedExitBlocks(FastLoop, &DT, &LI, nullptr, true);
-  DT.recalculate(*F);
 
   LLVM_DEBUG(dbgs() << "  inclusive-versioning: versioned "
                     << Shape.Header->getName()
@@ -1177,157 +1197,80 @@ static Value *emitSignedInnerLimit(IRBuilder<> &B, Value *OuterIV, Value *Limit,
                     : B.CreateNSWSub(OuterIV, Chunk, "outer.inner.limit");
 }
 
-void applyStripMinePlan(StripMinePlan &Plan, LoopInfo &LI, DominatorTree &DT,
-                        ScalarEvolution &SE) {
+// Wrap `L` in a freshly-allocated outer loop so the nest becomes OuterL -> L,
+// and register the new outer-loop blocks (OuterHeader, InnerEntry, OuterLatch)
+// under OuterL along with L's existing blocks. OuterPH is the new outer loop's
+// preheader: it is attached to L's original parent (or left at top level) and
+// deliberately kept OUT of OuterL. No upstream utility builds this "wrap a loop
+// in an outer loop" shape, so the reparenting is done by hand exactly as
+// LoopInterchange and SimpleLoopUnswitch do; the assertions below pin the
+// LoopInfo nest invariants the rest of the pass relies on. The caller
+// recalculates the DominatorTree afterwards, so these structural checks do not
+// require it.
+static Loop *reparentAsOuterLoop(Loop *L, BasicBlock *OuterPH,
+                                 BasicBlock *OuterHeader, BasicBlock *InnerEntry,
+                                 BasicBlock *OuterLatch, LoopInfo &LI) {
+  Loop *OuterL = LI.AllocateLoop();
+  if (Loop *ParentL = L->getParentLoop()) {
+    auto It = llvm::find(*ParentL, L);
+    assert(It != ParentL->end() && "L not a child of its parent");
+    ParentL->removeChildLoop(It);
+    ParentL->addChildLoop(OuterL);
+    ParentL->addBasicBlockToLoop(OuterPH, LI);
+  } else {
+    auto It = llvm::find(LI, L);
+    assert(It != LI.end() && "L not a top-level loop");
+    LI.removeLoop(It);
+    LI.addTopLevelLoop(OuterL);
+  }
+  OuterL->addChildLoop(L);
+  OuterL->addBasicBlockToLoop(OuterHeader, LI);
+  OuterL->addBasicBlockToLoop(InnerEntry, LI);
+  OuterL->addBasicBlockToLoop(OuterLatch, LI);
+  for (BasicBlock *BB : L->blocks())
+    OuterL->addBlockEntry(BB);
+
+  assert(OuterL->contains(L) && "outer loop must contain the inner loop");
+  assert(L->getParentLoop() == OuterL && "inner's parent must be the outer loop");
+  assert(LI.getLoopFor(OuterHeader) == OuterL &&
+         LI.getLoopFor(InnerEntry) == OuterL &&
+         LI.getLoopFor(OuterLatch) == OuterL &&
+         "outer body blocks must belong to the outer loop");
+  assert(LI.getLoopFor(OuterPH) != OuterL &&
+         "the outer preheader must stay outside the outer loop");
+  assert(llvm::all_of(L->blocks(),
+                      [&](BasicBlock *BB) { return OuterL->contains(BB); }) &&
+         "every inner-loop block must be in the outer loop");
+  return OuterL;
+}
+
+// Relocate the planned back-edge poll onto the outer back-edge, immediately
+// before OuterBr: clone it with the deopt operands remapped to the outer
+// recurrences, and tag the clone as the strip-mined poll. Latch-carried next
+// values are remapped to the outer PHIs; optimizer-introduced cast chains are
+// rebuilt from those outer values and cached in Remap. A loop-invariant latch
+// value (e.g. a phi whose latch operand is a constant) is skipped: it needs no
+// remap, and keying Remap on it would spuriously rewrite an unrelated but equal
+// constant elsewhere in the deopt bundle. The bci/frame layout in the deopt
+// bundle is carried over verbatim — no LLVM pass may synthesize a poll, only
+// relocate one. The strip-mined-poll attribute is the contract the coverage
+// verifier trusts without re-deriving the bound, and the marker the
+// after-strip-mining poll elimination keys on; marking the poll itself means
+// the marker cannot outlive the coverage it certifies.
+static void relocatePollToOuterLatch(StripMinePlan &Plan, Value *OuterIVNext,
+                                     ArrayRef<PHINode *> OuterReducNext,
+                                     BranchInst *OuterBr) {
   Loop *L = Plan.L;
-  StripMineShape &Shape = Plan.Shape;
-  PHINode *IVPhi = Plan.IVPhi;
-  ICmpInst *ExitCmp = Plan.ExitCmp;
+  const StripMineShape &Shape = Plan.Shape;
   CallInst *PollToMove = Plan.PollToMove;
   ArrayRef<PHINode *> LiftedHeaderPhis = Plan.LiftedHeaderPhis;
-  const APInt &AbsStepN = Plan.AbsStepN;
-  bool IsSigned = Plan.IsSigned;
-  uint64_t N = Plan.ChunkIters;
-  Value *InitVal = Plan.InitVal;
-  Value *Limit = Plan.Limit;
 
-  Function *F = Shape.Header->getParent();
-  LLVMContext &Ctx = F->getContext();
-  Type *Ty = IVPhi->getType();
-
-  if (!Shape.Inclusive && (!isGuaranteedNotToBeUndefOrPoison(InitVal) ||
-                           !isGuaranteedNotToBeUndefOrPoison(Limit))) {
-    IRBuilder<> StableBuilder(Shape.Preheader->getTerminator());
-    Value *StableLimit =
-        isGuaranteedNotToBeUndefOrPoison(Limit)
-            ? Limit
-            : StableBuilder.CreateFreeze(Limit, "exclusive.limit.fr");
-    Value *StableInit =
-        InitVal == Limit
-            ? StableLimit
-            : (isGuaranteedNotToBeUndefOrPoison(InitVal)
-                   ? InitVal
-                   : StableBuilder.CreateFreeze(InitVal, "exclusive.start.fr"));
-    replaceLoopUses(L, Limit, StableLimit);
-    replaceLoopUses(L, InitVal, StableInit);
-    Limit = StableLimit;
-    InitVal = StableInit;
-  }
-
-  BasicBlock *OuterPH =
-      BasicBlock::Create(Ctx, Shape.Header->getName() + ".outer.ph", F);
-  BasicBlock *OuterHeader =
-      BasicBlock::Create(Ctx, Shape.Header->getName() + ".outer", F);
-  BasicBlock *InnerEntry = BasicBlock::Create(
-      Ctx, Shape.Header->getName() + ".outer.inner.entry", F);
-  BasicBlock *OuterLatch =
-      BasicBlock::Create(Ctx, Shape.Header->getName() + ".outer.latch", F);
-
-  auto *PHBr = cast<BranchInst>(Shape.Preheader->getTerminator());
-  for (unsigned I = 0; I < PHBr->getNumSuccessors(); ++I)
-    if (PHBr->getSuccessor(I) == Shape.Header)
-      PHBr->setSuccessor(I, OuterPH);
-
-  IRBuilder<> B(OuterPH);
-  B.CreateBr(OuterHeader);
-
-  B.SetInsertPoint(OuterHeader);
-  PHINode *OuterIV = B.CreatePHI(Ty, 2, "outer.iv");
-  OuterIV->addIncoming(InitVal, OuterPH);
-  SmallVector<PHINode *, 4> OuterReducPhis;
-  for (PHINode *HPhi : LiftedHeaderPhis) {
-    PHINode *OP = B.CreatePHI(HPhi->getType(), 2, HPhi->getName() + ".outer");
-    OP->addIncoming(HPhi->getIncomingValueForBlock(Shape.Preheader), OuterPH);
-    OuterReducPhis.push_back(OP);
-  }
-  if (Shape.FirstIterationGuaranteed) {
-    // OuterCond is "continue the inner batch" so the br targets are fixed
-    // regardless of the original branch polarity.
-    Value *OuterCond =
-        B.CreateICmp(Shape.ContinuePredicate, OuterIV, Limit, "outer.cond");
-    B.CreateCondBr(OuterCond, InnerEntry, Shape.ExitBB);
-  } else {
-    // A latch-tested source loop executes once even when its continue
-    // predicate is initially false. Preserve that behavior by entering the
-    // first inner batch unconditionally and testing only at the outer latch.
-    B.CreateBr(InnerEntry);
-  }
-
-  // InnerEntry clamps the per-batch inner limit so a batch never exceeds N
-  // iterations while still respecting the real loop limit. The signed and
-  // unsigned paths differ only here:
-  //  - Unsigned loops keep the SCEV-modeled uadd_sat/usub_sat + select clamp.
-  //  - Signed loops use a residual-distance chunk (emitSignedInnerLimit):
-  //    sadd_sat/ssub_sat are NOT modeled by ScalarEvolution, so the old clamp
-  //    left the inner backedge-taken count as SCEVCouldNotCompute and defeated
-  //    the unroll/vectorize that strip mining exists to enable.
-  B.SetInsertPoint(InnerEntry);
-  Value *StepN = ConstantInt::get(Ty, AbsStepN);
-  Value *InnerLimit;
-  if (!IsSigned) {
-    Intrinsic::ID SatID =
-        Shape.Increasing ? Intrinsic::uadd_sat : Intrinsic::usub_sat;
-    Value *BatchEnd =
-        B.CreateBinaryIntrinsic(SatID, OuterIV, StepN,
-                                /*FMFSource=*/nullptr, "outer.batch.end");
-    Value *KeepEnd =
-        B.CreateICmp(Shape.ContinuePredicate, BatchEnd, Limit, "outer.cap.cond");
-    InnerLimit = B.CreateSelect(KeepEnd, BatchEnd, Limit, "outer.inner.limit");
-  } else {
-    InnerLimit =
-        emitSignedInnerLimit(B, OuterIV, Limit, AbsStepN, Shape.Increasing);
-  }
-  B.CreateBr(Shape.Header);
-
-  // Each batch resumes the recurrences from the outer progress.
-  int PHIdx = IVPhi->getBasicBlockIndex(Shape.Preheader);
-  IVPhi->setIncomingBlock(PHIdx, InnerEntry);
-  IVPhi->setIncomingValue(PHIdx, OuterIV);
-  for (size_t I = 0; I < LiftedHeaderPhis.size(); ++I) {
-    int Ix = LiftedHeaderPhis[I]->getBasicBlockIndex(Shape.Preheader);
-    LiftedHeaderPhis[I]->setIncomingBlock(Ix, InnerEntry);
-    LiftedHeaderPhis[I]->setIncomingValue(Ix, OuterReducPhis[I]);
-  }
-
-  ExitCmp->setOperand(Shape.LimitOperandIdx, InnerLimit);
-  Shape.ExitingBr->setSuccessor(Shape.ExitSuccessorIdx, OuterLatch);
-
-  // OuterLatch captures the batch-boundary recurrences and carries the poll.
-  B.SetInsertPoint(OuterLatch);
-  PHINode *OuterIVNext = B.CreatePHI(Ty, 1, "outer.iv.next");
-  OuterIVNext->addIncoming(Shape.ResumeIV, Shape.ExitingBB);
-  SmallVector<PHINode *, 4> OuterReducNext;
-  for (PHINode *HPhi : LiftedHeaderPhis) {
-    PHINode *NP =
-        B.CreatePHI(HPhi->getType(), 1, HPhi->getName() + ".outer.next");
-    NP->addIncoming(HPhi->getIncomingValueForBlock(Shape.Latch),
-                    Shape.ExitingBB);
-    OuterReducNext.push_back(NP);
-  }
-  BranchInst *OuterBr;
-  if (Shape.FirstIterationGuaranteed) {
-    OuterBr = B.CreateBr(OuterHeader);
-  } else {
-    Value *OuterCond =
-        B.CreateICmp(Shape.ContinuePredicate, OuterIVNext, Limit, "outer.cond");
-    OuterBr = B.CreateCondBr(OuterCond, OuterHeader, Shape.ExitBB);
-  }
-  OuterIV->addIncoming(OuterIVNext, OuterLatch);
-  for (size_t I = 0; I < OuterReducPhis.size(); ++I)
-    OuterReducPhis[I]->addIncoming(OuterReducNext[I], OuterLatch);
-
-  // Relocate the poll after the planning phase proved memory, control, and
-  // deopt-state compatibility. Latch-carried next values are remapped, and
-  // optimizer-introduced cast chains are rebuilt from those outer values.
-  // Skip a latch value that is loop-invariant (e.g. a phi whose latch operand
-  // is a constant): it needs no remap, and keying Remap on it would spuriously
-  // rewrite an unrelated but equal constant elsewhere in the deopt bundle.
   DenseMap<Value *, Value *> Remap;
   auto addRemap = [&](Value *LatchVal, Value *Outer) {
     if (!L->isLoopInvariant(LatchVal))
       Remap[LatchVal] = Outer;
   };
-  addRemap(IVPhi->getIncomingValueForBlock(Shape.Latch), OuterIVNext);
+  addRemap(Plan.IVPhi->getIncomingValueForBlock(Shape.Latch), OuterIVNext);
   for (size_t I = 0; I < LiftedHeaderPhis.size(); ++I)
     addRemap(LiftedHeaderPhis[I]->getIncomingValueForBlock(Shape.Latch),
              OuterReducNext[I]);
@@ -1364,26 +1307,25 @@ void applyStripMinePlan(StripMinePlan &Plan, LoopInfo &LI, DominatorTree &DT,
     }
     Bundles.emplace_back("deopt", Args);
   }
-  // Relocate the back-edge poll to the outer back-edge: clone it with the
-  // deopt operands remapped to the outer recurrence (the bci/frame layout in
-  // the deopt bundle is preserved verbatim — no LLVM pass may synthesize a
-  // poll, only relocate one). Mark the relocated poll with the strip-mined
-  // poll attribute: the inner loop now runs poll-free, bounded to <= N
-  // iterations by the clamped limit. The attribute is the contract the coverage
-  // verifier trusts without re-deriving that bound, and the marker the
-  // after-strip-mining poll elimination keys on; marking the poll itself means
-  // the marker cannot outlive the coverage it certifies.
   auto *RelocatedPoll =
       CallBase::Create(PollToMove, Bundles, OuterBr->getIterator());
-  RelocatedPoll->addFnAttr(
-      Attribute::get(Ctx, jeandle::Attribute::StripMinedPoll));
+  RelocatedPoll->addFnAttr(Attribute::get(OuterBr->getContext(),
+                                          jeandle::Attribute::StripMinedPoll));
+}
 
-  // Fix up the primary exit LCSSA phis at the boundary where the selected outer
-  // skeleton exits. A pre-tested outer loop exposes its current recurrences at
-  // OuterHeader; a post-tested outer loop exposes the just-completed batch at
-  // OuterLatch. Use the recurrence role recorded by the plan: in a cyclic
-  // recurrence, the same SSA value can be both one header phi and another
-  // phi's latch value, but only the latter describes its value on this exit.
+// Rewrite the primary-exit LCSSA PHI incomings at the boundary where the
+// selected outer skeleton exits. A pre-tested outer loop exposes its current
+// recurrences at OuterHeader; a post-tested outer loop exposes the
+// just-completed batch at OuterLatch. Use the recurrence role recorded by the
+// plan: in a cyclic recurrence, the same SSA value can be both one header phi
+// and another phi's latch value, but only the latter describes its value on
+// this exit.
+static void fixupPrimaryExitPhis(StripMinePlan &Plan, BasicBlock *OuterHeader,
+                                 BasicBlock *OuterLatch, PHINode *OuterIV,
+                                 PHINode *OuterIVNext,
+                                 ArrayRef<PHINode *> OuterReducPhis,
+                                 ArrayRef<PHINode *> OuterReducNext) {
+  const StripMineShape &Shape = Plan.Shape;
   for (const PrimaryExitPhiState &State : Plan.PrimaryExitPhis) {
     PHINode *Phi = State.Phi;
     int Idx = Phi->getBasicBlockIndex(Shape.ExitingBB);
@@ -1407,6 +1349,200 @@ void applyStripMinePlan(StripMinePlan &Plan, LoopInfo &LI, DominatorTree &DT,
       break;
     }
   }
+}
+
+// The blocks and recurrence PHIs of the outer wrapper loop built around the
+// inner loop being strip-mined. The skeleton is created up front and filled in
+// in phases (outer header, inner-entry clamp, outer latch), so the values are
+// threaded through this frame rather than scattered as locals in the caller.
+struct OuterLoopFrame {
+  BasicBlock *OuterPH = nullptr;
+  BasicBlock *OuterHeader = nullptr;
+  BasicBlock *InnerEntry = nullptr;
+  BasicBlock *OuterLatch = nullptr; // created empty, filled by buildOuterLatch
+  PHINode *OuterIV = nullptr;
+  PHINode *OuterIVNext = nullptr;
+  SmallVector<PHINode *, 4> OuterReducPhis;
+  SmallVector<PHINode *, 4> OuterReducNext;
+  BranchInst *OuterBr = nullptr;
+  Value *InnerLimit = nullptr;
+};
+
+// Create the four outer-loop blocks, reroute the inner preheader into the new
+// outer preheader, and build the outer header: the outer IV phi, the lifted
+// reduction phis (one per non-IV header phi), and the pre/post-tested entry
+// branch. OuterLatch is created empty here so it lands in the right position in
+// the function; buildOuterLatch fills it.
+static void createOuterSkeleton(StripMinePlan &Plan, Function *F, Type *Ty,
+                                Value *InitVal, Value *Limit,
+                                OuterLoopFrame &Frame) {
+  const StripMineShape &Shape = Plan.Shape;
+  LLVMContext &Ctx = F->getContext();
+
+  Frame.OuterPH =
+      BasicBlock::Create(Ctx, Shape.Header->getName() + ".outer.ph", F);
+  Frame.OuterHeader =
+      BasicBlock::Create(Ctx, Shape.Header->getName() + ".outer", F);
+  Frame.InnerEntry = BasicBlock::Create(
+      Ctx, Shape.Header->getName() + ".outer.inner.entry", F);
+  Frame.OuterLatch =
+      BasicBlock::Create(Ctx, Shape.Header->getName() + ".outer.latch", F);
+
+  auto *PHBr = cast<BranchInst>(Shape.Preheader->getTerminator());
+  for (unsigned I = 0; I < PHBr->getNumSuccessors(); ++I)
+    if (PHBr->getSuccessor(I) == Shape.Header)
+      PHBr->setSuccessor(I, Frame.OuterPH);
+
+  IRBuilder<> B(Frame.OuterPH);
+  B.CreateBr(Frame.OuterHeader);
+
+  B.SetInsertPoint(Frame.OuterHeader);
+  Frame.OuterIV = B.CreatePHI(Ty, 2, "outer.iv");
+  Frame.OuterIV->addIncoming(InitVal, Frame.OuterPH);
+  for (PHINode *HPhi : Plan.LiftedHeaderPhis) {
+    PHINode *OP = B.CreatePHI(HPhi->getType(), 2, HPhi->getName() + ".outer");
+    OP->addIncoming(HPhi->getIncomingValueForBlock(Shape.Preheader), Frame.OuterPH);
+    Frame.OuterReducPhis.push_back(OP);
+  }
+  if (Shape.FirstIterationGuaranteed) {
+    // OuterCond is "continue the inner batch" so the br targets are fixed
+    // regardless of the original branch polarity.
+    Value *OuterCond =
+        B.CreateICmp(Shape.ContinuePredicate, Frame.OuterIV, Limit, "outer.cond");
+    B.CreateCondBr(OuterCond, Frame.InnerEntry, Shape.ExitBB);
+  } else {
+    // A latch-tested source loop executes once even when its continue
+    // predicate is initially false. Preserve that behavior by entering the
+    // first inner batch unconditionally and testing only at the outer latch.
+    B.CreateBr(Frame.InnerEntry);
+  }
+}
+
+// Fill InnerEntry with the per-batch limit clamp so a batch never exceeds N
+// iterations while still respecting the real loop limit. The signed and
+// unsigned paths differ only here:
+//  - Unsigned loops keep the SCEV-modeled uadd_sat/usub_sat + select clamp.
+//  - Signed loops use a residual-distance chunk (emitSignedInnerLimit):
+//    sadd_sat/ssub_sat are NOT modeled by ScalarEvolution, so the old clamp
+//    left the inner backedge-taken count as SCEVCouldNotCompute and defeated
+//    the unroll/vectorize that strip mining exists to enable.
+static void clampInnerLimit(StripMinePlan &Plan, Type *Ty, Value *Limit,
+                            OuterLoopFrame &Frame) {
+  const StripMineShape &Shape = Plan.Shape;
+  IRBuilder<> B(Frame.InnerEntry);
+  Value *StepN = ConstantInt::get(Ty, Plan.AbsStepN);
+  Value *InnerLimit;
+  if (!Plan.IsSigned) {
+    Intrinsic::ID SatID =
+        Shape.Increasing ? Intrinsic::uadd_sat : Intrinsic::usub_sat;
+    Value *BatchEnd =
+        B.CreateBinaryIntrinsic(SatID, Frame.OuterIV, StepN,
+                                /*FMFSource=*/nullptr, "outer.batch.end");
+    Value *KeepEnd =
+        B.CreateICmp(Shape.ContinuePredicate, BatchEnd, Limit, "outer.cap.cond");
+    InnerLimit = B.CreateSelect(KeepEnd, BatchEnd, Limit, "outer.inner.limit");
+  } else {
+    InnerLimit = emitSignedInnerLimit(B, Frame.OuterIV, Limit, Plan.AbsStepN,
+                                      Shape.Increasing);
+  }
+  B.CreateBr(Shape.Header);
+  Frame.InnerLimit = InnerLimit;
+}
+
+// Rewire the inner loop to run as one batch: repoint each header phi's
+// preheader incoming at InnerEntry (fed by the outer recurrence), set the latch
+// exit compare to the clamped per-batch limit, and redirect the exiting branch's
+// exit edge to the outer latch so a completed batch feeds the next outer
+// iteration instead of leaving the loop.
+static void rewireInnerHeaderForBatch(StripMinePlan &Plan, OuterLoopFrame &Frame) {
+  const StripMineShape &Shape = Plan.Shape;
+  ArrayRef<PHINode *> LiftedHeaderPhis = Plan.LiftedHeaderPhis;
+
+  int PHIdx = Plan.IVPhi->getBasicBlockIndex(Shape.Preheader);
+  Plan.IVPhi->setIncomingBlock(PHIdx, Frame.InnerEntry);
+  Plan.IVPhi->setIncomingValue(PHIdx, Frame.OuterIV);
+  for (size_t I = 0; I < LiftedHeaderPhis.size(); ++I) {
+    int Ix = LiftedHeaderPhis[I]->getBasicBlockIndex(Shape.Preheader);
+    LiftedHeaderPhis[I]->setIncomingBlock(Ix, Frame.InnerEntry);
+    LiftedHeaderPhis[I]->setIncomingValue(Ix, Frame.OuterReducPhis[I]);
+  }
+
+  Plan.ExitCmp->setOperand(Shape.LimitOperandIdx, Frame.InnerLimit);
+  Shape.ExitingBr->setSuccessor(Shape.ExitSuccessorIdx, Frame.OuterLatch);
+}
+
+// Build the outer latch: the batch-boundary recurrence next-values (one input
+// each, fed from the inner exiting block), the back-edge branch (a pre-tested
+// outer loop returns unconditionally to the outer header; a post-tested one
+// re-tests the continue predicate here), and the second incomings of the outer
+// header phis that close the outer recurrence cycle.
+static void buildOuterLatch(StripMinePlan &Plan, Type *Ty, Value *Limit,
+                            OuterLoopFrame &Frame) {
+  const StripMineShape &Shape = Plan.Shape;
+  ArrayRef<PHINode *> LiftedHeaderPhis = Plan.LiftedHeaderPhis;
+
+  IRBuilder<> B(Frame.OuterLatch);
+  Frame.OuterIVNext = B.CreatePHI(Ty, 1, "outer.iv.next");
+  Frame.OuterIVNext->addIncoming(Shape.ResumeIV, Shape.ExitingBB);
+  for (PHINode *HPhi : LiftedHeaderPhis) {
+    PHINode *NP =
+        B.CreatePHI(HPhi->getType(), 1, HPhi->getName() + ".outer.next");
+    NP->addIncoming(HPhi->getIncomingValueForBlock(Shape.Latch),
+                    Shape.ExitingBB);
+    Frame.OuterReducNext.push_back(NP);
+  }
+  if (Shape.FirstIterationGuaranteed) {
+    Frame.OuterBr = B.CreateBr(Frame.OuterHeader);
+  } else {
+    Value *OuterCond =
+        B.CreateICmp(Shape.ContinuePredicate, Frame.OuterIVNext, Limit, "outer.cond");
+    Frame.OuterBr = B.CreateCondBr(OuterCond, Frame.OuterHeader, Shape.ExitBB);
+  }
+  Frame.OuterIV->addIncoming(Frame.OuterIVNext, Frame.OuterLatch);
+  for (size_t I = 0; I < Frame.OuterReducPhis.size(); ++I)
+    Frame.OuterReducPhis[I]->addIncoming(Frame.OuterReducNext[I],
+                                         Frame.OuterLatch);
+}
+
+void applyStripMinePlan(StripMinePlan &Plan, LoopInfo &LI, DominatorTree &DT,
+                        ScalarEvolution &SE) {
+  Loop *L = Plan.L;
+  StripMineShape &Shape = Plan.Shape;
+  CallInst *PollToMove = Plan.PollToMove;
+  const APInt &AbsStepN = Plan.AbsStepN;
+  uint64_t N = Plan.ChunkIters;
+  Value *InitVal = Plan.InitVal;
+  Value *Limit = Plan.Limit;
+
+  Function *F = Shape.Header->getParent();
+  Type *Ty = Plan.IVPhi->getType();
+
+  if (!Shape.Inclusive && (!isGuaranteedNotToBeUndefOrPoison(InitVal) ||
+                           !isGuaranteedNotToBeUndefOrPoison(Limit))) {
+    IRBuilder<> StableBuilder(Shape.Preheader->getTerminator());
+    auto [StableInit, StableLimit] =
+        freezeLoopOperands(L, InitVal, Limit, StableBuilder, "exclusive");
+    Limit = StableLimit;
+    InitVal = StableInit;
+  }
+
+  OuterLoopFrame Frame;
+  createOuterSkeleton(Plan, F, Ty, InitVal, Limit, Frame);
+  clampInnerLimit(Plan, Ty, Limit, Frame);
+  rewireInnerHeaderForBatch(Plan, Frame);
+  buildOuterLatch(Plan, Ty, Limit, Frame);
+
+  // Relocate the back-edge poll onto the outer back-edge (cloned, with its
+  // deopt state remapped to the outer recurrences and tagged as the
+  // strip-mined poll that certifies the inner loop's bounded coverage).
+  relocatePollToOuterLatch(Plan, Frame.OuterIVNext, Frame.OuterReducNext,
+                           Frame.OuterBr);
+
+  // Rewrite the primary-exit LCSSA PHI incomings to the outer skeleton's exit
+  // boundary, using the recurrence role recorded by the plan.
+  fixupPrimaryExitPhis(Plan, Frame.OuterHeader, Frame.OuterLatch, Frame.OuterIV,
+                       Frame.OuterIVNext, Frame.OuterReducPhis,
+                       Frame.OuterReducNext);
 
   // Drop the selected back-edge poll after cloning it to the outer backedge.
   // The subsequent poll-elimination stage removes any other inner-loop polls
@@ -1417,25 +1553,8 @@ void applyStripMinePlan(StripMinePlan &Plan, LoopInfo &LI, DominatorTree &DT,
   // OuterL -> L, add the new blocks, then rebuild DT and drop stale SCEV. The
   // outer loop is not in this run's loop snapshot, so it is not revisited; its
   // poll carries the coverage marker against later passes.
-  Loop *OuterL = LI.AllocateLoop();
-  if (Loop *ParentL = L->getParentLoop()) {
-    auto It = llvm::find(*ParentL, L);
-    assert(It != ParentL->end() && "L not a child of its parent");
-    ParentL->removeChildLoop(It);
-    ParentL->addChildLoop(OuterL);
-    ParentL->addBasicBlockToLoop(OuterPH, LI);
-  } else {
-    auto It = llvm::find(LI, L);
-    assert(It != LI.end() && "L not a top-level loop");
-    LI.removeLoop(It);
-    LI.addTopLevelLoop(OuterL);
-  }
-  OuterL->addChildLoop(L);
-  OuterL->addBasicBlockToLoop(OuterHeader, LI);
-  OuterL->addBasicBlockToLoop(InnerEntry, LI);
-  OuterL->addBasicBlockToLoop(OuterLatch, LI);
-  for (BasicBlock *BB : L->blocks())
-    OuterL->addBlockEntry(BB);
+  Loop *OuterL = reparentAsOuterLoop(L, Frame.OuterPH, Frame.OuterHeader,
+                                     Frame.InnerEntry, Frame.OuterLatch, LI);
 
   DT.recalculate(*F);
   SE.forgetLoop(L);
