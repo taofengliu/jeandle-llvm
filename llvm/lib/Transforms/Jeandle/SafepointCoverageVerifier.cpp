@@ -120,6 +120,9 @@ SafepointCoverageCheck llvm::jeandle::getSafepointCoverageCheck() {
 
 PreservedAnalyses SafepointCoverageVerifier::run(Function &F,
                                                  FunctionAnalysisManager &AM) {
+  if (F.getParent()->getNamedMetadata(jeandle::Metadata::JavaMethodCompilation))
+    return PreservedAnalyses::all();
+
   if (CoverageCheck == SafepointCoverageCheck::Off ||
       !jeandle::isRootJavaMethodFunction(F))
     return PreservedAnalyses::all();
