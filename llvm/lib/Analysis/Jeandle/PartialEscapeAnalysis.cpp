@@ -8371,6 +8371,33 @@ void Analyzer::validateFinalDeoptObligations() {
     for (const Use &Input : Deopt->Inputs)
       AuditValue(Input.get());
   }
+
+  // A surviving Materialize / CreatePHI effect replays its recorded field
+  // values at apply time, so each replay value carries the same closure
+  // obligation as a deopt root: it must not resolve to a NeverEscapes VO's
+  // identity, whose OrigAlloc the cfg-kill phase RAUWs to poison — a replayed
+  // reference would become a poison store that canonicalization then deletes,
+  // silently dropping the field write. Graal has no analog: its
+  // materializeWithCommit recursively commits nested virtual objects into the
+  // same commit, so a referenced object is always materialized alongside its
+  // holder. Jeandle's analysis/transform split plus un-virtualize decisions and
+  // loop-fixpoint eligibility rollback can strand such a reference, so audit
+  // it here and rebuild with the referenced allocation kept real.
+  for (const auto &KV : Result.BlockEffects) {
+    for (const jeandle::Effect &E : KV.second) {
+      if (const auto *ME = dyn_cast<jeandle::MaterializeEffect>(&E)) {
+        for (const auto &FE : ME->FieldEntries) {
+          if (FE.Value.isScalar())
+            AuditValue(FE.Value.getScalar());
+          else if (FE.Value.isMaterializedRef())
+            AuditValue(FE.Value.getMaterialized());
+        }
+      } else if (const auto *PE = dyn_cast<jeandle::CreatePHIEffect>(&E)) {
+        for (const WeakTrackingVH &In : PE->PHIIncomingValues)
+          AuditValue(In);
+      }
+    }
+  }
 }
 
 SmallVector<Instruction *, 8> Analyzer::validateCFGDeadnessProofs() const {
