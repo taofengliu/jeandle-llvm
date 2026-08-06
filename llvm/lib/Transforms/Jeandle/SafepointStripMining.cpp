@@ -527,6 +527,19 @@ struct HeaderPhiState {
   Value *LatchValue;
 };
 
+enum class PrimaryExitValueKind {
+  LoopInvariant,
+  ResumeIV,
+  LiftedRecurrence,
+};
+
+struct PrimaryExitPhiState {
+  PHINode *Phi;
+  Value *IncomingValue;
+  PrimaryExitValueKind Kind;
+  unsigned RecurrenceIndex;
+};
+
 struct InclusiveExitPhiIncoming {
   PHINode *Phi;
   BasicBlock *ExitingBB;
@@ -549,6 +562,7 @@ struct StripMinePlan {
   SmallVector<CallInst *, 4> AllPolls;
   SmallVector<PHINode *, 4> LiftedHeaderPhis;
   SmallVector<HeaderPhiState, 4> HeaderPhis;
+  SmallVector<PrimaryExitPhiState, 4> PrimaryExitPhis;
   SmallVector<DeoptBoundaryValue, 8> DeoptBoundaryValues;
   std::optional<InclusiveRuntimeGuard> RuntimeGuard;
   APInt AbsStepN;
@@ -560,9 +574,10 @@ struct StripMinePlan {
   /// Pre-condition re-check queued before applying: this plan still matches the
   /// IR (loop/header/latch/exiting/exit identity, exit-branch wiring, poll
   /// parents, the IV-phi/limit/exit-cmp the relocation gates on, and the
-  /// runtime-guard exit-phi incomings). Sibling-plan application can invalidate
-  /// a queued plan; each plan validates itself before it applies (C2's two-
-  /// phase analyze-then-mutate pattern, guarded here against interference).
+  /// primary/runtime-guard exit-phi incomings). Sibling-plan application can
+  /// invalidate a queued plan; each plan validates itself before it applies
+  /// (C2's two-phase analyze-then-mutate pattern, guarded here against
+  /// interference).
   bool stillStructurallyValid(LoopInfo &LI, DominatorTree &DT) const;
 };
 
@@ -763,24 +778,37 @@ buildStripMinePlanWithIV(Loop *L, const IVInfo &IV, ICmpInst *ExitCmp,
       LiftedHeaderPhis.push_back(&Phi);
 
   // Pre-mutation validation: every value leaking out through an exit LCSSA phi
-  // must be representable at the final outer-header exit. Header exits leak the
-  // current header phis; latch exits leak the latch-carried next values.
-  // Anything else is out of scope — bail before mutation.
+  // must be representable at the selected outer-loop exit. Record the exact
+  // recurrence whose latch value supplies each non-invariant incoming; a value
+  // can also be a different header phi in cyclic recurrences, so its SSA
+  // identity alone does not preserve that role.
+  SmallVector<PrimaryExitPhiState, 4> PrimaryExitPhis;
   for (PHINode &Phi : Shape.ExitBB->phis()) {
     int Idx = Phi.getBasicBlockIndex(Shape.ExitingBB);
     if (Idx < 0)
       continue;
     Value *V = Phi.getIncomingValue(Idx);
-    if (L->isLoopInvariant(V))
+    if (L->isLoopInvariant(V)) {
+      PrimaryExitPhis.push_back(
+          {&Phi, V, PrimaryExitValueKind::LoopInvariant, 0});
       continue;
-    if (V == Shape.ResumeIV)
+    }
+    if (V == Shape.ResumeIV) {
+      PrimaryExitPhis.push_back({&Phi, V, PrimaryExitValueKind::ResumeIV, 0});
       continue;
+    }
     PHINode *HPhi = getHeaderPhiForLatchValue(V, Shape.Header, Shape.Latch);
     if (!HPhi || HPhi == IV.Phi) {
       LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
                         << ": unsupported exit phi\n");
       return std::nullopt;
     }
+    auto It = llvm::find(LiftedHeaderPhis, HPhi);
+    assert(It != LiftedHeaderPhis.end() &&
+           "validated recurrence must be lifted");
+    PrimaryExitPhis.push_back(
+        {&Phi, V, PrimaryExitValueKind::LiftedRecurrence,
+         static_cast<unsigned>(It - LiftedHeaderPhis.begin())});
   }
 
   SmallVector<HeaderPhiState, 4> HeaderPhis;
@@ -796,6 +824,7 @@ buildStripMinePlanWithIV(Loop *L, const IVInfo &IV, ICmpInst *ExitCmp,
                        SmallVector<CallInst *, 4>(AllPolls),
                        std::move(LiftedHeaderPhis),
                        std::move(HeaderPhis),
+                       std::move(PrimaryExitPhis),
                        std::move(*DeoptBoundaryValues),
                        std::move(RuntimeGuard),
                        AbsStepN,
@@ -923,6 +952,27 @@ bool StripMinePlan::stillStructurallyValid(LoopInfo &LI,
         State.Phi->getIncomingValue(PreheaderIdx) != State.PreheaderValue ||
         State.Phi->getIncomingValue(LatchIdx) != State.LatchValue)
       return false;
+  }
+  for (const PrimaryExitPhiState &State : PrimaryExitPhis) {
+    int Idx = State.Phi->getBasicBlockIndex(Shape.ExitingBB);
+    if (Idx < 0 || State.Phi->getIncomingValue(Idx) != State.IncomingValue)
+      return false;
+    switch (State.Kind) {
+    case PrimaryExitValueKind::LoopInvariant:
+      if (!L->isLoopInvariant(State.IncomingValue))
+        return false;
+      break;
+    case PrimaryExitValueKind::ResumeIV:
+      if (State.IncomingValue != Shape.ResumeIV)
+        return false;
+      break;
+    case PrimaryExitValueKind::LiftedRecurrence:
+      if (State.RecurrenceIndex >= LiftedHeaderPhis.size() ||
+          LiftedHeaderPhis[State.RecurrenceIndex]->getIncomingValueForBlock(
+              Shape.Latch) != State.IncomingValue)
+        return false;
+      break;
+    }
   }
   auto OB = PollToMove->getOperandBundle(LLVMContext::OB_deopt);
   if (OB) {
@@ -1279,37 +1329,31 @@ void applyStripMinePlan(StripMinePlan &Plan, LoopInfo &LI, DominatorTree &DT,
   // Fix up the primary exit LCSSA phis at the boundary where the selected outer
   // skeleton exits. A pre-tested outer loop exposes its current recurrences at
   // OuterHeader; a post-tested outer loop exposes the just-completed batch at
-  // OuterLatch. Resolve by each exit phi's incoming value so one recurrence
-  // feeding several exit phis fixes up each of them correctly.
-  DenseMap<Value *, Value *> HeaderToOuter;
-  DenseMap<Value *, Value *> LatchValueToOuter;
-  if (Shape.FirstIterationGuaranteed)
-    for (size_t I = 0; I < LiftedHeaderPhis.size(); ++I)
-      HeaderToOuter[LiftedHeaderPhis[I]] = OuterReducPhis[I];
-  for (size_t I = 0; I < LiftedHeaderPhis.size(); ++I) {
-    Value *LatchValue =
-        LiftedHeaderPhis[I]->getIncomingValueForBlock(Shape.Latch);
-    if (!L->isLoopInvariant(LatchValue))
-      LatchValueToOuter[LatchValue] = Shape.FirstIterationGuaranteed
-                                          ? OuterReducPhis[I]
-                                          : OuterReducNext[I];
-  }
-  for (PHINode &Phi : Shape.ExitBB->phis()) {
-    int Idx = Phi.getBasicBlockIndex(Shape.ExitingBB);
-    if (Idx < 0)
-      continue;
-    Value *V = Phi.getIncomingValue(Idx);
-    Phi.setIncomingBlock(Idx, Shape.FirstIterationGuaranteed ? OuterHeader
-                                                             : OuterLatch);
-    if (L->isLoopInvariant(V))
-      continue;
-    if (V == Shape.ResumeIV)
-      Phi.setIncomingValue(Idx, Shape.FirstIterationGuaranteed ? OuterIV
-                                                               : OuterIVNext);
-    else if (auto It = HeaderToOuter.find(V); It != HeaderToOuter.end())
-      Phi.setIncomingValue(Idx, It->second);
-    else if (auto It = LatchValueToOuter.find(V); It != LatchValueToOuter.end())
-      Phi.setIncomingValue(Idx, It->second);
+  // OuterLatch. Use the recurrence role recorded by the plan: in a cyclic
+  // recurrence, the same SSA value can be both one header phi and another
+  // phi's latch value, but only the latter describes its value on this exit.
+  for (const PrimaryExitPhiState &State : Plan.PrimaryExitPhis) {
+    PHINode *Phi = State.Phi;
+    int Idx = Phi->getBasicBlockIndex(Shape.ExitingBB);
+    assert(Idx >= 0 && Phi->getIncomingValue(Idx) == State.IncomingValue &&
+           "primary exit phi no longer matches its plan");
+    Phi->setIncomingBlock(Idx, Shape.FirstIterationGuaranteed ? OuterHeader
+                                                              : OuterLatch);
+    switch (State.Kind) {
+    case PrimaryExitValueKind::LoopInvariant:
+      break;
+    case PrimaryExitValueKind::ResumeIV:
+      Phi->setIncomingValue(Idx, Shape.FirstIterationGuaranteed ? OuterIV
+                                                                : OuterIVNext);
+      break;
+    case PrimaryExitValueKind::LiftedRecurrence:
+      assert(State.RecurrenceIndex < OuterReducPhis.size() &&
+             "planned recurrence index out of range");
+      Phi->setIncomingValue(Idx, Shape.FirstIterationGuaranteed
+                                     ? OuterReducPhis[State.RecurrenceIndex]
+                                     : OuterReducNext[State.RecurrenceIndex]);
+      break;
+    }
   }
 
   // Drop the selected back-edge poll after cloning it to the outer backedge.
