@@ -65,6 +65,8 @@ public:
 
   static constexpr const char *DeclaredHolder = "declared-holder";
 
+  static constexpr const char *MhIntrinsicName = "mh-intrinsic-name";
+
   static constexpr const char *MonomorphicTarget = "monomorphic-target";
 };
 

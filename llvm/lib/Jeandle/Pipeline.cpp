@@ -12,7 +12,6 @@
 #include "llvm/IR/PassManager.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Jeandle/CHADevirtualization.h"
-#include "llvm/Transforms/Jeandle/ConstantFieldFolding.h"
 #include "llvm/Transforms/Jeandle/ExpandNarrowOopCast.h"
 #include "llvm/Transforms/Jeandle/InsertGCBarriers.h"
 #include "llvm/Transforms/Jeandle/JavaOperationDeletion.h"
@@ -39,7 +38,7 @@
 
 namespace llvm::jeandle {
 
-Pipeline::Pipeline(OptimizationLevel level, LLVMContext &Ctx,
+Pipeline::Pipeline(OptimizationLevel Level, LLVMContext &Ctx,
                    PipelineOptions Options)
     : SI(Ctx, /*DebugLogging=*/false) {
   SI.registerCallbacks(PIC, &MAM);
@@ -53,7 +52,7 @@ Pipeline::Pipeline(OptimizationLevel level, LLVMContext &Ctx,
   PB.registerLoopAnalyses(LAM);
   PB.crossRegisterProxies(LAM, FAM, CGAM, MAM);
 
-  PM = buildJeandlePipeline(PB, level, Options);
+  PM = buildJeandlePipeline(PB, Level, Options);
 }
 
 // TODO: The pass selection/ordering is not optimal. We need to improve it.
@@ -105,7 +104,7 @@ static void addStripMiningPasses(ModulePassManager &PM,
 }
 
 ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
-                                                 OptimizationLevel level,
+                                                 OptimizationLevel Level,
                                                  PipelineOptions Options) {
   ModulePassManager PM;
   PM.addPass(JavaOperationLower(0));
@@ -165,11 +164,11 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   // loop-tree deletion. Without strip mining, Early also performs that loop
   // deletion directly.
   PM.addPass(createModuleToFunctionPassAdaptor(SafepointPollElimination(
-      SafepointPollEliminationMode::Early, level == OptimizationLevel::O3)));
+      SafepointPollEliminationMode::Early, Level == OptimizationLevel::O3)));
   addCoverageVerifier(PM);
 
   if (StripMiningEnabled)
-    addStripMiningPasses(PM, level == OptimizationLevel::O3);
+    addStripMiningPasses(PM, Level == OptimizationLevel::O3);
 
   // TODO: InsertGCBarriers currently inserts high-level barrier calls before
   // O3 because it cannot handle O3 generated memory intrinsics and vector
@@ -177,7 +176,7 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   // optimizations.
   PM.addPass(createModuleToFunctionPassAdaptor(InsertGCBarriers()));
 
-  if (level == OptimizationLevel::O3) {
+  if (Level == OptimizationLevel::O3) {
     // Re-form LCSSA independently of strip mining, then atomically delete
     // finite empty loops and the polls that prevent their deletion.
     PM.addPass(createModuleToFunctionPassAdaptor(LCSSAPass()));
@@ -186,7 +185,7 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   }
 
   PM.addPass(JavaOperationLower(1));
-  PM.addPass(std::move(PB.buildPerModuleDefaultPipeline(level)));
+  PM.addPass(std::move(PB.buildPerModuleDefaultPipeline(Level)));
   PM.addPass(ExpandNarrowOopCast());
   PM.addPass(RewriteStatepointsForGC());
   PM.addPass(createModuleToFunctionPassAdaptor(JeandleNarrowOopMarker()));
