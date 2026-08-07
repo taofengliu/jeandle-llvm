@@ -76,12 +76,12 @@ enum class DeoptSemanticCellRole : uint8_t {
   ShouldReexecute, // i64 should_reexecute slot preceding the BCI pair.
   BCI,             // One operand of the duplicated equal-i32 BCI pair.
   // VO descriptor pool records (root scope only).
-  DescriptorHeader,       // Descriptor header encoding (index = wire ID).
-  DescriptorKlass,        // i64 klass pointer of a descriptor.
-  DescriptorFieldCount,   // i32 field count of a descriptor.
+  DescriptorHeader,        // Descriptor header encoding (index = wire ID).
+  DescriptorKlass,         // i64 klass pointer of a descriptor.
+  DescriptorFieldCount,    // i32 field count of a descriptor.
   DescriptorFieldEncoding, // Encoding operand of one descriptor field.
-  DescriptorFieldValue,   // Value operand of one descriptor field (scalar,
-                          // or wire ID for a VORef field).
+  DescriptorFieldValue,    // Value operand of one descriptor field (scalar,
+                           // or wire ID for a VORef field).
   // Scope-value records (locals and expression stack).
   ScopeValueEncoding, // Encoding operand of a local/stack slot.
   ScopeValue,         // Value operand of a local/stack slot (scalar, or

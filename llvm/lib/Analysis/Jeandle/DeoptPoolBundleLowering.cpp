@@ -48,8 +48,7 @@ namespace llvm::jeandle::pea {
 
 // A tracked token snapshots the value's type at plan time; serialization
 // later re-checks liveness and this exact type against the live IR.
-FinalDeoptPoolBundleToken
-FinalDeoptPoolBundleToken::tracked(Value *V) {
+FinalDeoptPoolBundleToken FinalDeoptPoolBundleToken::tracked(Value *V) {
   FinalDeoptPoolBundleToken Token;
   Token.Kind = FinalDeoptPoolBundleTokenKind::TrackedValue;
   Token.Tracked = V;
@@ -782,17 +781,16 @@ private:
       const ParsedDeoptField *ParsedField =
           Parsed ? &Parsed->Fields[FieldIndex] : nullptr;
       unsigned EncodingIndex =
-          appendToken(FinalDeoptPoolBundleToken::immediateI64(
-              encodeDeoptValue(
-                  static_cast<uint32_t>(Field.Offset),
-                  Field.isReference() ? DeoptValueEncoding::VORefLocalType
-                                      : DeoptValueEncoding::LocalType,
-                  Field.isReference() ? T_OBJECT : Field.BasicType)));
+          appendToken(FinalDeoptPoolBundleToken::immediateI64(encodeDeoptValue(
+              static_cast<uint32_t>(Field.Offset),
+              Field.isReference() ? DeoptValueEncoding::VORefLocalType
+                                  : DeoptValueEncoding::LocalType,
+              Field.isReference() ? T_OBJECT : Field.BasicType)));
 
       unsigned ValueIndex;
       if (Field.isReference()) {
-        ValueIndex = appendToken(FinalDeoptPoolBundleToken::immediateI32(
-            Field.TargetWireID));
+        ValueIndex = appendToken(
+            FinalDeoptPoolBundleToken::immediateI32(Field.TargetWireID));
         // A reference to a current node needs occurrence bookkeeping: exact
         // for an overlaid legacy field, generated for a current-node field.
         if (auto Current = currentIDForWire(Field.TargetWireID)) {
@@ -808,8 +806,7 @@ private:
         Value *Scalar = lookupScalar(Field.ScalarToken, Field.BasicType);
         if (!Scalar)
           return false;
-        ValueIndex = appendToken(
-            FinalDeoptPoolBundleToken::tracked(Scalar));
+        ValueIndex = appendToken(FinalDeoptPoolBundleToken::tracked(Scalar));
       }
     }
     return true;
@@ -848,8 +845,8 @@ private:
     unsigned EncodingIndex =
         appendToken(FinalDeoptPoolBundleToken::immediateI64(
             encodeDeoptValue(WireID, RefType, T_OBJECT)));
-    unsigned ValueIndex = appendToken(
-        FinalDeoptPoolBundleToken::immediateI32(WireID));
+    unsigned ValueIndex =
+        appendToken(FinalDeoptPoolBundleToken::immediateI32(WireID));
     if (currentIDForWire(WireID))
       setExactOccurrenceOutput(Value.ValueCell.OperandIndex, EncodingIndex,
                                ValueIndex);
@@ -872,11 +869,10 @@ private:
 
     uint32_t WireID = Root->second->TargetWireID;
     unsigned EncodingIndex =
-        appendToken(FinalDeoptPoolBundleToken::immediateI64(
-            encodeDeoptValue(/*Index=*/1, DeoptValueEncoding::MonitorType,
-                             T_OBJECT)));
-    unsigned ValueIndex = appendToken(
-        FinalDeoptPoolBundleToken::immediateI32(WireID));
+        appendToken(FinalDeoptPoolBundleToken::immediateI64(encodeDeoptValue(
+            /*Index=*/1, DeoptValueEncoding::MonitorType, T_OBJECT)));
+    unsigned ValueIndex =
+        appendToken(FinalDeoptPoolBundleToken::immediateI32(WireID));
     appendSource(Monitor.LockCell);
     if (currentIDForWire(WireID))
       setExactOccurrenceOutput(Monitor.OwnerCell.OperandIndex, EncodingIndex,

@@ -7996,12 +7996,13 @@ void Analyzer::materializeAt(jeandle::ObjectID ID, Instruction *InsertBefore,
   });
 
   // Escape-point (live-state) path. Delegates the shared cascade, lock-capture,
-  // recursive-prereq, dominance, emit, and flip algorithm to ensureMaterialized.
-  // This wrapper supplies the live analyzer maps, the function-wide Materialized
-  // idempotency set, recursion back into materializeAt, and the live-path
-  // specifics: SafeIP is the escape-point instruction, there are no
-  // per-predecessor flags, the deopt bundle is sourced from the escape-point
-  // call, and the state flip is applied to the live CurrentState.
+  // recursive-prereq, dominance, emit, and flip algorithm to
+  // ensureMaterialized. This wrapper supplies the live analyzer maps, the
+  // function-wide Materialized idempotency set, recursion back into
+  // materializeAt, and the live-path specifics: SafeIP is the escape-point
+  // instruction, there are no per-predecessor flags, the deopt bundle is
+  // sourced from the escape-point call, and the state flip is applied to the
+  // live CurrentState.
   auto ClearLockState = [&](jeandle::ObjectID Oid) {
     LockCounts[Oid] = 0;
     LiveLockEnters.erase(Oid);
