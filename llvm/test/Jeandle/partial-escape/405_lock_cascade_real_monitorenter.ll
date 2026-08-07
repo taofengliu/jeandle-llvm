@@ -1,7 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; materializeVirtualLocksBefore on a NOT-DELETED monitorenter
-; (Graal PartialEscapeClosure.java:263-264, 641-652).
+; materializeVirtualLocksBefore on a NOT-DELETED monitorenter.
 ;
 ; A virtual object %obj holds an elided lock at bytecode depth 0. A REAL
 ; monitorenter on a non-virtual receiver %otherObj (a parameter) runs at

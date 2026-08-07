@@ -42,7 +42,7 @@ u:
 
 ; CHECK-LABEL: define void @escape_via_call_arg
 ; The original allocation invoke is RETAINED (the object escapes via @sink, so
-; it is PartiallyEscapes and OrigAlloc is kept; no fresh materialization invoke).
+; it is PartiallyEscapes and OrigAlloc is kept; no new invoke is introduced).
 ; CHECK: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
 ; CHECK-NOT: pea.mat = invoke
 ; Tracked field stores are replayed onto OrigAlloc before the escape.

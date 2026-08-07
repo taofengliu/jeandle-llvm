@@ -2,8 +2,8 @@
 
 ; Recursive nested-virtual materialization: an outer object whose tracked
 ; field references an inner virtual object. Returning the outer is an escape;
-; PEA must materialize BOTH inner and outer (inner first, with lower SeqNo)
-; and replay a store of the *new* inner pointer into the new outer's field.
+; PEA retains BOTH original allocations (inner first, with lower SeqNo) and
+; replays a store of the inner pointer into the outer's field.
 ;
 ; Each allocation invoke gets its own unwind landingpad to keep the multi-
 ; predecessor merge from marking later-allocated objects ineligible at a
@@ -34,13 +34,13 @@ u2:
 }
 
 ; CHECK-LABEL: define ptr addrspace(1) @test_nested_escape
-; A new inner-allocation invoke (klass 12345) appears.
+; The inner allocation invoke (klass 12345) is retained.
 ; CHECK: %[[INNER:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
 ; CHECK-NEXT: to label %{{.*}} unwind label %{{.*}}
-; A new outer-allocation invoke (klass 67890) appears.
+; The outer allocation invoke (klass 67890) is retained.
 ; CHECK: %[[OUTER:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 67890 to ptr), i32 16)
 ; CHECK-NEXT: to label %{{.*}} unwind label %{{.*}}
-; The outer's MatCont stores the new inner pointer at offset 8 of the new outer.
+; A replayed store writes the inner OrigAlloc at offset 8 of the outer.
 ; A reference field is replayed with natural 8-byte (heap pointer width) alignment.
 ; CHECK: %[[SLOT:[A-Za-z0-9._]+]] = getelementptr inbounds i8, ptr addrspace(1) %[[OUTER]], i64 8
 ; CHECK: store atomic ptr addrspace(1) %[[INNER]], ptr addrspace(1) %[[SLOT]] unordered, align 8

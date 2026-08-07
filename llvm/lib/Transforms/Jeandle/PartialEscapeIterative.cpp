@@ -48,11 +48,11 @@
 
 using namespace llvm;
 
-// Default 2 rounds, matching Graal. A nested virtual-reference merge can use
-// both productive rounds: the first materializes predecessor effects and the
-// second re-analyzes the resulting explicit Phi for Case C. A later idle round
-// is only a convergence probe; it is not required to complete that rewrite.
-// The hard cap is HardIterationCap (16).
+// Default 2 rounds. A nested virtual-reference merge can use both productive
+// rounds: the first materializes predecessor effects and the second
+// re-analyzes the resulting explicit Phi for Case C. A later idle round is
+// only a convergence probe; it is not required to complete that rewrite. The
+// hard cap is HardIterationCap (16).
 static cl::opt<unsigned> JeandlePEAIterations(
     "jeandle-pea-iterations", cl::init(2), cl::Hidden,
     cl::desc("PEA: maximum number of analyze+transform+canonicalize rounds "
@@ -81,6 +81,7 @@ static cl::list<std::string> JeandleDumpPEAIRFunctions(
              "default) preserves substring-filter behavior."),
     cl::value_desc("function"));
 
+// True when no exact-name dump allowlist is set or FunctionName is on it.
 static bool matchesExactDumpFunction(StringRef FunctionName) {
   if (JeandleDumpPEAIRFunctions.empty())
     return true;
@@ -97,6 +98,8 @@ bool llvm::jeandle::isPEAEnabled() {
   return JeandlePEA && JeandlePEAIterations != 0;
 }
 
+// The function's exact printed IR. Compared across the canonicalization
+// sequence to detect changes that PreservedAnalyses cannot prove absent.
 static std::string printFunctionIR(const Function &F) {
   std::string IR;
   raw_string_ostream OS(IR);
@@ -140,6 +143,10 @@ PreservedAnalyses PartialEscapeIterative::run(Function &F,
   unsigned ExecutedRounds = 0;
   bool ReachedFixpoint = false;
 
+  // Round loop. Each round runs the transform over a fresh PEAResult followed
+  // by the full canonicalization sequence, and stops early only at a true
+  // fixpoint: the transform was idle AND canonicalization left the printed IR
+  // bit-identical (see the file header).
   for (unsigned Iter = 0; Iter < IterCap; ++Iter) {
     if (DumpThisFunc) {
       errs() << ";; PEA-DUMP before iter=" << Iter << " function "

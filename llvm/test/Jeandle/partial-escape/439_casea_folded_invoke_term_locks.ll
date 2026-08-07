@@ -49,7 +49,7 @@ u:
 ; CHECK-NOT: @jeandle.arraylength
 ; The ORIGINAL allocation invoke (OrigAlloc %o) is RETAINED.
 ; CHECK: %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 7, i32 44, i32 16, i32 1048576)
-; No pea.mat materialization invoke is emitted.
+; No additional allocation invoke is emitted.
 ; CHECK-NOT: pea.mat = invoke
 ; Both normal paths replay the enter because both execute merge's real exit.
 ; The else replay is isolated on its incoming edge.

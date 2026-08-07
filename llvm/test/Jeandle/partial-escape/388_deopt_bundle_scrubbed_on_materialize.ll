@@ -2,14 +2,13 @@
 
 ; A VO that is BOTH a real call argument AND a deopt-bundle operand of the
 ; same call is MATERIALIZED at the call — never described as virtual there.
-; Graal's processNodeInputs (materialize the call's real
-; virtual inputs) runs BEFORE processNodeWithState (record the frame-state
-; virtual mappings); Jeandle's materializeVirtualCallArgs now runs before
-; recordDeoptBundleMappings in the same order. At a DURING-CALL deopt this
-; preserves one Java identity: the caller's frame and the callee's frame
-; both reference the real OrigAlloc object, so the callee's field writes are
-; visible to the caller. The pre-fix order (record before materialize)
-; emitted OrigAlloc-kept + field replay AND a VO descriptor at the same
+; Jeandle materializes the call's real virtual inputs
+; (materializeVirtualCallArgs) BEFORE recording the frame-state virtual
+; mappings (recordDeoptBundleMappings). At a DURING-CALL deopt this preserves
+; one Java identity: the caller's frame and the callee's frame both reference
+; the real OrigAlloc object, so the callee's field writes are visible to the
+; caller. Recording the bundle before materializing the call args would
+; instead keep OrigAlloc + replay fields AND emit a VO descriptor at the same
 ; call — deopt would reallocate a NEW object for the caller while the callee
 ; continued with the real one (identity split).
 ;
@@ -45,7 +44,8 @@ u:
 }
 
 ; CHECK-LABEL: define void @partial_escape_descriptor_at_safepoint
-; OrigAlloc is RETAINED (PartiallyEscapes — it escapes via @sink). No pea.mat.
+; OrigAlloc is RETAINED (PartiallyEscapes — it escapes via @sink) and is the
+; only allocation invoke.
 ; CHECK: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
 ; CHECK-NOT: pea.mat = invoke
 ; Tracked field stores are replayed onto OrigAlloc before the escape.

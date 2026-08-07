@@ -16,12 +16,13 @@
 ; Cyclic field graph (A.f = B, B.g = A) combined with a live monitor on A,
 ; under the reuse-OrigAlloc model. A lock-internal sink escapes the
 ; whole cascade; both objects stay PARTIALLY-ESCAPING. The ORIGINAL allocations
-; (OrigAlloc %a and OrigAlloc %b) are both KEPT (no fresh pea.mat invokes).
+; (OrigAlloc %a and OrigAlloc %b) are both KEPT (no new allocation invoke is
+; created).
 ; The virtually-tracked field stores are replayed onto the OrigAllocs at the
 ; single escape point (the return), and the surviving monitorenter stays in
 ; materialized receiver, after which the monitor is released before return.
-; The replayed enter uses OrigAlloc %a — semantically equivalent
-; to Graal's CommitAllocationNode lowering (field writes, then MonitorEnters).
+; The replayed enter uses OrigAlloc %a — semantically equivalent to the
+; materialize-commit lowering (field writes, then MonitorEnters).
 ; The back edge B.g = A resolves to OrigAlloc %a (no poison).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
@@ -55,10 +56,10 @@ u:
 
 ; CHECK-LABEL: define ptr addrspace(1) @cyclic_with_locks_cascade
 ; CHECK: %[[LOCK:[A-Za-z0-9._]+]] = alloca i64, align 8
-; Both ORIGINAL allocation invokes are RETAINED (no fresh materialization).
+; Both ORIGINAL allocation invokes are RETAINED.
 ; CHECK: %[[A:[A-Za-z0-9._]+]] = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
 ; CHECK: %[[B:[A-Za-z0-9._]+]] = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
-; No pea.mat materialization invoke is emitted.
+; Materialization emits no new allocation invoke.
 ; CHECK-NOT: pea.mat = invoke
 ; Both cyclic field stores are replayed onto OrigAllocs at the escape point,
 ; with each back edge resolving to the correct OrigAlloc (no poison).

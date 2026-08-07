@@ -37,9 +37,9 @@ u:
   resume i64 %lp
 }
 
-; The original entry alloc %X is RETAINED (no pea.mat invoke); the per-arm GEPs
-; of %X are kept and feed the merge PHI %p. The load stays a real load over the
-; offset-8 derived PHI (NOT folded to 0).
+; The original entry alloc %X is RETAINED; the per-arm GEPs of %X are kept
+; and feed the merge PHI %p. The load stays a real load over the offset-8
+; derived PHI (NOT folded to 0).
 ; CHECK-LABEL: define void @test_156_derived_phi_offset
 ; CHECK: %X = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
 ; CHECK-NOT: pea.mat = invoke

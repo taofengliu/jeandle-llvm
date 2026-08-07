@@ -4,8 +4,8 @@
 ; array (a function parameter) and the oop operand is a virtual instance.
 ; foldPostBarrier resolves arg 0 (the address) via resolveVirtualRef; an
 ; Argument does not bottom out on a virtual object, so it returns nullopt and
-; foldPostBarrier returns false — the processJavaOp contract (Graal
-; processNodeInputs on a non-deleted node) drops to the generic escape path:
+; foldPostBarrier returns false — the processJavaOp contract (a non-deleted
+; node materializes its virtual operands) drops to the generic escape path:
 ; materializeAllVirtualOperands materializes the virtual VALUE operand (the
 ; oop) so the surviving barrier observes a real pointer (never poison), and
 ; the barrier itself survives guarding the real store. This mirrors

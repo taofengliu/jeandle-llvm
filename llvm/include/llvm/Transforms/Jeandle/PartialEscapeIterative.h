@@ -1,5 +1,4 @@
-//===- PartialEscapeIterative.h - PEA outer fixpoint -------------*- C++
-//-*-===//
+//===- PartialEscapeIterative.h - PEA outer fixpoint ------------*- C++ -*-===//
 //
 // Copyright (c) 2026, the Jeandle-LLVM Authors. All Rights Reserved.
 //
@@ -23,6 +22,8 @@
 
 namespace llvm {
 
+// Drives the PEA outer fixpoint (see PartialEscapeIterative.cpp's file
+// header for the convergence condition).
 class PartialEscapeIterative : public PassInfoMixin<PartialEscapeIterative> {
 public:
   PartialEscapeIterative() = default;

@@ -3,11 +3,11 @@
 ; propagatePointerAlias select case: both arms resolve to the SAME virtual
 ; object but one arm is a derived GEP — not whole-object, so no
 ; alias-forward. The select is handed to the generic escape path, which
-; materializes the object AT the select (Graal processNodeInputs):
+; materializes the object AT the select:
 ; reuse-OrigAlloc keeps the allocation and replays the tracked store before
-; the select; the select's operands stay valid real pointers. Before the fix
-; the derived arm forced a bail of the object (markIneligible), so the
-; tracked store stayed in place (no pea.matslot replay).
+; the select; the select's operands stay valid real pointers. Regression
+; guard: the derived arm must not force a bail of the object
+; (markIneligible), which would leave the tracked store in place.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -32,7 +32,7 @@ u:
 
 ; CHECK-LABEL: define void @test_select_mixed_arms
 ; CHECK: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
-; The tracked store is replayed before the select (old bail kept it in place).
+; The tracked store is replayed before the select.
 ; CHECK: %pea.matslot = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
 ; CHECK: store atomic i32 55, ptr addrspace(1) %pea.matslot unordered, align 4
 ; The select survives as a real select over real pointers.

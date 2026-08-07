@@ -4,8 +4,8 @@
 ; EscapeClassification population + -jeandle-dump-pea-stats.
 ;
 ; Three functions cover the NeverEscapes / PartiallyEscapes classifications
-; (AlwaysEscapes is no longer reachable from these patterns: processStore's
-; unresolved-offset path now materializes at the store instead of marking the
+; (AlwaysEscapes is not reachable from these patterns: processStore's
+; unresolved-offset path materializes at the store rather than marking the
 ; object ineligible):
 ;
 ;  * @t_never:  one VO with a load/store pair, used only locally and never

@@ -2,9 +2,9 @@
 ;
 ; Multi-latch loop: the header has TWO back-edge predecessors (latch1, latch2).
 ; A loop-LOCAL object %X allocated in the body is carried across BOTH back-edges
-; by the header PHI %px and escapes at the exit. Graal materializes at each
-; back-edge pred's end node (PartialEscapeClosure.java:996/1504, per-pred loop);
-; Jeandle's post-body merge Case A must materialize at BOTH latches.
+; by the header PHI %px and escapes at the exit. Jeandle materializes at each
+; back-edge pred's end (per-pred loop): the post-body merge Case A must
+; materialize at BOTH latches.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))

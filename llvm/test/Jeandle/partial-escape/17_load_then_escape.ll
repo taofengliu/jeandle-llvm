@@ -5,8 +5,7 @@
 ; %v becomes the constant 99 (so use_int gets a constant, consumed before the
 ; escape). The ORIGINAL allocation (OrigAlloc) is kept alive; PEA replays the
 ; tracked field store onto OrigAlloc immediately before the escape point (the
-; @sink call). No fresh materialization invoke is emitted; the sink consumes
-; OrigAlloc directly.
+; @sink call), and the sink consumes OrigAlloc directly.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use_int(i32)
@@ -31,8 +30,7 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_load_then_escape
-; The original allocation invoke is RETAINED — exactly one new_instance, no
-; fresh pea.mat materialization invoke.
+; The original allocation invoke is RETAINED — exactly one new_instance.
 ; CHECK: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
 ; CHECK-NOT: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
 ; The load folds to the stored constant.

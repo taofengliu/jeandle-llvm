@@ -4,7 +4,7 @@
 
 ; Same carried-replacement shape as 711, but the carried object's IDENTITY is
 ; observed: the loop compares the current object against the first allocation
-; with ==. Graal refuses Case C in this case (the two allocations must keep
+; with ==. Case C is refused in this case (the two allocations must keep
 ; their distinct identities); Jeandle must stay equally conservative and
 ; retain both allocations.
 

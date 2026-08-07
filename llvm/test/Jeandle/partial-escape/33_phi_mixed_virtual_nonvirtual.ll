@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA: an LLVM PHI of ptr addrspace(1) mixes a virtual incoming (the fresh
+; PEA: an LLVM PHI of ptr addrspace(1) mixes a virtual incoming (the
 ; allocation in branch %left) with a non-virtual incoming (a function-arg
 ; pointer in branch %right). The analyzer materializes the virtual incoming
 ; at its predecessor; the LLVM PHI itself stays in IR with the materialized

@@ -7,7 +7,7 @@
 ; RUN:     -passes="require<partial-escape-analysis>,partial-escape-transform" \
 ; RUN:     -jeandle-pea-loop-cutoff=1 %s 2>&1 | FileCheck %s --check-prefix=TRACE
 
-; A2 — STOP_NEW overflow escalation inside a NESTED loop structure.
+; STOP_NEW overflow escalation inside a NESTED loop structure.
 ;
 ; A 2-deep loop nest (hdr1 outer, hdr2 inner). A pre-loop virtual object
 ; escapes via @sink in the OUTER loop body (body1). With
@@ -23,7 +23,7 @@
 ; (Escapes inside the INNER / depth>1 body cannot be tested yet: pre-loop
 ; virtuals do not survive into nested-loop bodies in Jeandle — the loop-body
 ; partial-escape feature is deferred. So depth>1 overflow PROPAGATION, while
-; implemented per Graal, is not exercised here.)
+; implemented, is not exercised here.)
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))

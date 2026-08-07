@@ -7,7 +7,7 @@
 ; the freeze), so only a recursive whole-object check (Select arms and PHI
 ; incomings) catches this shape. The select itself is not whole-object
 ; either (both arms are derived GEPs), so the generic escape path
-; MATERIALIZES %inner at the select (Graal processNodeInputs): %inner's
+; MATERIALIZES %inner at the select: %inner's
 ; allocation survives and the derived arms stay valid. The store of %fr
 ; then tracks a live materialized value, the load folds to %fr (NOT to
 ; %inner's base — the offset-losing regression this test guards), and

@@ -3,7 +3,7 @@
 ; Coverage for an indirectbr back-edge. This CFG is reducible: %head dominates
 ; the latch, so LoopInfo can represent it as a natural loop. The test locks
 ; down the conservative output for this unusual terminator, but deliberately
-; makes no claim that Analyzer::run's missed-LoopInfo safety sweep fired.
+; makes no claim that the unsafe-cyclic-blocks safety net fired.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare i32 @__gxx_personality_v0(...)

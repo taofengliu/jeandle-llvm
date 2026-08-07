@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Graal-precision companion of 388: %x escapes as a real call
+; Companion of 388: %x escapes as a real call
 ; argument (materialized at foo), while %y — which only REFERENCES %x from a
 ; field and sits in foo's deopt bundle — stays VIRTUAL and is described with
 ; that field as a live oop (MaterializedRef -> describeMaterializedOop).

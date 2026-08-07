@@ -8,9 +8,10 @@
 ; escapes, so it is virtual at the deopt safepoint and must be described; its
 ; offset-16 field value is the live oop %inner, which RS4GC keeps relocatable.
 ;
-; Pre-fix: planFields bailed MaterializedRef fields (Cell::Bad), so %outer was
-; undescribable and got materialized too. The fix flattens a describable
-; MaterializedRef (wide oop, non-null, non-constant) to a Scalar live-oop field.
+; planFields flattens a describable MaterializedRef (wide oop, non-null,
+; non-constant) to a Scalar live-oop field. Bailing MaterializedRef fields
+; (Cell::Bad) would leave %outer undescribable and force it to materialize
+; too.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(i32)

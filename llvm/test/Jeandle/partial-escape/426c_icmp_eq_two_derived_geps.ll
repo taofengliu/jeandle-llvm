@@ -1,9 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; #2.2 variant: two derived GEPs of the same virtual at DIFFERENT offsets
-; (%g1 at 8, %g2 at 16). Both resolve to %o's ObjectID. Before the fix,
-; foldICmpEquality folded `icmp eq %g1, %g2` to true; the addresses differ,
-; so it must be false.
+; Variant: two derived GEPs of the same virtual at DIFFERENT offsets
+; (%g1 at 8, %g2 at 16). Both resolve to %o's ObjectID, but the addresses
+; differ, so `icmp eq %g1, %g2` must fold to false, not true.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i1)

@@ -2,11 +2,10 @@
 
 ; PEA Case C — ARRAY merge. Both arms allocate the same-length array of the same
 ; Klass but store DIFFERENT element byte offsets (left -> 16, right -> 24).
-; For arrays entryCount() returned ArrayLength (already compared explicitly via
-; ArrayLength), so removing the entryCount gate must leave array merges intact:
-; the ArrayLength / element-metadata checks still gate compatibility, and the
-; synthetic VO's Fields is the union of the stored element slots. Both loads
-; fold to per-entry PHIs; both array allocations are eliminated.
+; Array compatibility is gated by the explicit ArrayLength / element-metadata
+; checks, and the synthetic VO's Fields is the union of the stored element
+; slots. Both loads fold to per-entry PHIs; both array allocations are
+; eliminated.
 ;
 ; Byte-offset element access (no VM callback log needed: the typed-GEP matcher
 ; is inert without ArrayElementType, so accesses resolve via constant offsets).

@@ -7,17 +7,16 @@
 ; RUN:     -passes="require<partial-escape-analysis>,partial-escape-transform" \
 ; RUN:     -jeandle-pea-loop-cutoff=0 %s 2>&1 | FileCheck %s --check-prefix=TRACE
 
-; A1 — STOP_NEW overflow escalation (the core refactor test).
+; STOP_NEW overflow escalation.
 ;
 ; A pre-loop virtual object (allocated + field-stored before the loop) escapes
 ; via @sink inside the loop body. With -jeandle-pea-loop-cutoff=0 the loop
 ; (depth 1) enters Mode::StopNewInLoopNest. The in-body escape calls
 ; ensureMaterialized on the (necessarily outer-scope) virtual under STOP_NEW,
-; which polls OverflowFlag — the Jeandle (-fno-exceptions) equivalent of Graal's
-; EffecsClosureOverflowException (PartialEscapeClosure.java:541-562). The
-; outermost (depth==1) processLoop catches it, restores the snapshot, drains the
-; preheader (processStateBeforeLoopOnOverflow), and redoes the body in
-; MATERIALIZE_ALL (EffectsClosure.java:533-551).
+; which polls OverflowFlag — the Jeandle (-fno-exceptions) equivalent of an
+; overflow exception. The outermost (depth==1) processLoop catches it, restores
+; the snapshot, drains the preheader (processStateBeforeLoopOnOverflow), and
+; redoes the body in MATERIALIZE_ALL.
 ;
 ; The escalation statistic proves that STOP_NEW overflow recovery ran. The
 ; final effect trace pins replay to the loop preheader, while the IR check

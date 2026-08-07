@@ -2,11 +2,10 @@
 
 ; getOrCreateFieldIndex unknown-size type. For a non-pointer
 ; field type, ByteSize is derived from Type::getPrimitiveSizeInBits(), which
-; returns 0 for aggregate types (struct/array — and scalable vectors). Before
-; the fix the `assert(Bits > 0)` fired in debug builds (opt crash); in release a
-; zero-byte field was silently inserted. After the fix the function
-; conservatively returns -1, processStore materializes the operands AT the
-; store, and the object survives (no crash). Fixed vector types have a known
+; returns 0 for aggregate types (struct/array — and scalable vectors). The
+; function conservatively returns -1 for such types, processStore
+; materializes the operands AT the store, and the object survives (no assert
+; crash, no silent zero-byte field). Fixed vector types have a known
 ; primitive size and are handled normally, so the trigger here is a struct
 ; value.
 

@@ -2,7 +2,7 @@
 
 ; Nested Select-of-PHI-of-virtual. The merge PHI itself
 ; gets aliased by processBlockPhis Case B; the downstream Select then
-; resolves through resolveVirtualRefImpl's Select case (each arm is
+; resolves through resolveVirtualRef's Select case (each arm is
 ; %phi, which aliases to the virtual ID). Tests that recursion composes
 ; cleanly across both kinds of merges.
 
@@ -26,7 +26,7 @@ merge:
   ; Case B PHI: both incomings = %o.
   %phi = phi ptr addrspace(1) [ %o, %left ], [ %o, %right ]
   ; Select-of-PHI-of-virtual: both arms are %phi which aliases to %o's
-  ; ObjectID. resolveVirtualRefImpl Select case + Case B alias yield
+  ; ObjectID. resolveVirtualRef Select case + Case B alias yield
   ; the same ObjectID for the Select.
   %sel = select i1 %c2, ptr addrspace(1) %phi, ptr addrspace(1) %phi
   %eq = icmp eq ptr addrspace(1) %sel, %o

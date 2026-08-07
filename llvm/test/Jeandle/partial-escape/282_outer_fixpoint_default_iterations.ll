@@ -7,7 +7,7 @@
 ; of that contract:
 ;
 ;   DEFAULT prefix  -- no `-jeandle-pea-iterations` flag, so the cl::opt
-;                      default (now 2) applies. Same input as 280; we
+;                      default (2) applies. Same input as 280; we
 ;                      expect round 1 replay plus canonicalization to make
 ;                      the branch constant, then round 2 to re-analyze the
 ;                      retained original allocation and fold its value.

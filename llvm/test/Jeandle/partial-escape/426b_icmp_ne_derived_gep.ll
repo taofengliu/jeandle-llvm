@@ -1,8 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; #2.2 variant: `icmp ne ptr %o, ptr %g` with %g = gep %o, 8. Distinct
-; addresses -> ne is TRUE. Before the fix, foldICmpEquality folded the equal
-; ObjectID to eq=true, then negated (ne) -> false (wrong).
+; Variant: `icmp ne ptr %o, ptr %g` with %g = gep %o, 8. Distinct
+; addresses -> ne is TRUE. Folding the equal ObjectID to eq=true and then
+; negating (ne) would wrongly give false.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i1)

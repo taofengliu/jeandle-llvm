@@ -49,7 +49,7 @@ u2:
 ; CHECK-LABEL: define ptr addrspace(1) @cyclic_with_scalar_field
 ; CHECK: %[[A:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr)
 ; CHECK: %[[B:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr)
-; No fresh materialization invoke is emitted.
+; Materialization emits no new allocation invoke.
 ; CHECK-NOT: pea.mat = invoke
 ; The scalar field (A.x = 42) remains in A's exact field group, and both
 ; reference stores use OrigAlloc values (the back edge B.g = A resolves through

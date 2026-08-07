@@ -3,7 +3,7 @@
 ; VORef across a post-description materialization. At S1,
 ; %outer is described in the deopt bundle with its field as a VORef to
 ; %inner (transitive closure describes both). AFTER S1, %inner escapes via
-; a DERIVED pointer (%gep) — under Graal processNodeInputs this
+; a DERIVED pointer (%gep) — the generic escape path
 ; MATERIALIZES %inner at the call instead of marking it ineligible. A
 ; materialized VO keeps its recorded deopt descriptor (S1's frame state was
 ; recorded while %inner was still virtual; a deopt there must reconstruct

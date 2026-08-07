@@ -8,10 +8,10 @@
 ;   right (pred 1): stores i32 at offset 24  -> Fields {24}
 ;
 ; Sub-width i32 load at offset 12 = high half of the i64 slot at offset 8.
-; Sub-slot / narrowing loads are intentionally UNSUPPORTED (the lshr+trunc fold
-; was removed), so the load bails: both objects materialize and the pointer PHI
-; carries the two allocations — same conservative outcome as 394 regardless of
-; which arm holds the wide slot.
+; Sub-slot / narrowing loads are intentionally UNSUPPORTED, so the load bails:
+; both objects materialize and the pointer PHI carries the two allocations —
+; same conservative outcome as 394 regardless of which arm holds the wide
+; slot.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)

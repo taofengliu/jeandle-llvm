@@ -5,7 +5,7 @@
 ; store replays onto OrigAlloc (%o into its own field), and the sink receives
 ; OrigAlloc directly. Regression guard that the live self-referential case
 ; stays correct with OrigAlloc as both the field-replay value and the escape
-; argument (no <badref>, no pea.mat).
+; argument (no <badref>, no additional allocation).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -33,6 +33,6 @@ u:
 ; The self-referential store uses the live OrigAlloc %o (no <badref>).
 ; CHECK: %[[SLOT:[A-Za-z0-9._]+]] = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
 ; CHECK: store atomic ptr addrspace(1) %o, ptr addrspace(1) %[[SLOT]] unordered, align 8
-; The sink receives OrigAlloc directly (not a fresh pea.mat).
+; The sink receives OrigAlloc directly (no new allocation invoke).
 ; CHECK: call void @sink(ptr addrspace(1) %o)
 ; CHECK: ret void

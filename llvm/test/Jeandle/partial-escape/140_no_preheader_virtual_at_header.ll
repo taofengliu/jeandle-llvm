@@ -6,11 +6,8 @@
 ; back-edge); getLoopPreheader() returns nullptr because there is no
 ; single forward pred. The alloc-before-region (%o, created in %entry)
 ; is virtual at every forward pred's exit. processLoop's no-preheader
-; branch marks every such VO INELIGIBLE ("bail on irreducible region"),
-; so the original alloc + stores + body @sink
-; survive unmodified. The naive single-pass behaviour would skip the
-; fixpoint and emit a body-internal materialize at the @sink escape,
-; leading to a duplicate-materialize pattern.
+; branch marks every such VO INELIGIBLE, so the original alloc + stores +
+; body @sink survive unmodified.
 ;
 ; This test deliberately runs PEA directly (no `loop-simplify` in the
 ; pipeline) so we exercise the in-analyzer fallback. In the full

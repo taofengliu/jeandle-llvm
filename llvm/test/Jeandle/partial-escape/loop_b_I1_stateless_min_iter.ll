@@ -6,7 +6,7 @@
 ; every iteration; nothing carried across the back-edge). The header merged
 ; state B has no carried virtuals, so the fixpoint converges as fast as
 ; possible. With the Phase 2 post-body merge, iteration 0 already produces a
-; true B' = A and the loop converges in a SINGLE body pass (matching Graal's
+; true B' = A and the loop converges in a SINGLE body pass (matching the
 ; processLoop structure).
 ;
 ; The IR check pins the loop-local elimination; the STATS check pins the

@@ -16,8 +16,8 @@
 ; Only A escapes (returned); B and C escape transitively. Under reuse-OrigAlloc
 ; all three OrigAllocs are KEPT (each dominates the single escape point), so
 ; every field store replays directly onto its OrigAlloc and the cycle resolves
-; through the peer's OrigAlloc — no cascade coordination, no fresh pea.mat
-; invoke, no materialized-object PHI.
+; through the peer's OrigAlloc — no cascade coordination and no
+; materialized-object PHI.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare i32 @__gxx_personality_v0(...)
@@ -59,7 +59,7 @@ u3:
 ; CHECK: %[[A:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
 ; CHECK: %[[B:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
 ; CHECK: %[[C:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 33333 to ptr), i32 16)
-; No fresh materialization invoke is emitted.
+; No additional allocation invoke is emitted.
 ; CHECK-NOT: pea.mat = invoke
 ; All three field groups use OrigAlloc values — the cycle's back edge C.x = A
 ; resolves through A's OrigAlloc (kept alive), never poison.

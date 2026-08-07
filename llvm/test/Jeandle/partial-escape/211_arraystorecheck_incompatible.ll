@@ -4,8 +4,8 @@
 ; virtual instance value whose exact klass (7777) is provably incompatible
 ; with the array's element klass. evalSubtypeRelation returns false
 ; (IsSubtype false, areKlassesIncompatible true via Exact=true). The check
-; SURVIVES in IR and — per the processJavaOp contract (Graal processNodeInputs
-; on a non-deleted node) — BOTH the array and the virtual value operand
+; SURVIVES in IR and — per the processJavaOp contract (a non-deleted
+; node materializes its virtual operands) — BOTH the array and the virtual value operand
 ; materialize, so the surviving array_store_check observes real pointers.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)

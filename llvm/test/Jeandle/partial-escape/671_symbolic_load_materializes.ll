@@ -3,11 +3,11 @@
 ; processLoad with an unresolvable (symbolic-index) address on a virtual
 ; int[] that has a tracked constant-index store AND a folded load before the
 ; symbolic load. The symbolic load cannot be tracked, so the array
-; materializes AT the load (Graal processNodeInputs): the tracked store is
+; materializes AT the load: the tracked store is
 ; replayed immediately before it, the earlier folded load stays folded, and
-; the symbolic load survives as a real load. Before the fix the array was
-; marked ineligible: the fold was dropped function-wide and the tracked
-; store stayed in place.
+; the symbolic load survives as a real load. Regression guard: marking the
+; array ineligible instead would drop the fold function-wide and leave the
+; tracked store in place.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare void @use_int(i32)
@@ -34,7 +34,7 @@ u:
 
 ; CHECK-LABEL: define i32 @test_symbolic_load
 ; CHECK: invoke hotspotcc ptr addrspace(1) @jeandle.new_array
-; The constant-index load stays folded (old bail dropped it function-wide).
+; The constant-index load stays folded (a bail would drop it function-wide).
 ; CHECK: call void @use_int(i32 44)
 ; The tracked store is replayed immediately before the symbolic load.
 ; CHECK: %pea.matslot = getelementptr inbounds i8, ptr addrspace(1) %arr, i64 16

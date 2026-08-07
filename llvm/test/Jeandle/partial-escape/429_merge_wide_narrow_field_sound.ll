@@ -3,14 +3,13 @@
 ; mergeFieldStates two-slot / byte-array gap — non-regression.
 ;
 ; Two predecessors write the same field at different widths: pred1 stores an
-; i64 at offset 0, pred2 stores two i8s at offsets 0 and 1. A Graal-style
-; virtualByteCount merge would have to widen pred2's i8 to i64 WITHOUT
-; discarding the i8 at offset 1 (Graal isEntryDefaults, PartialEscapeClosure
-; :1110-1253). Jeandle does not reach that merge: processStore's
+; i64 at offset 0, pred2 stores two i8s at offsets 0 and 1. A byte-count
+; merge would have to widen pred2's i8 to i64 WITHOUT
+; discarding the i8 at offset 1. Jeandle does not reach that merge: processStore's
 ; getOrCreateFieldIndex bails on the width mismatch at offset 0, so the object
 ; escapes and the stores/load survive as real operations — sound, no
 ; mis-merge. This test pins that sound behaviour. (mergeFieldStates also
-; carries a defensive isEntryDefaults-style guard so the merge stays sound if
+; carries a defensive entry-defaults guard so the merge stays sound if
 ; the width-conflict bail is ever relaxed.)
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)

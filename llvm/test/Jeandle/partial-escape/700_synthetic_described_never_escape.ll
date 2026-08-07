@@ -4,10 +4,10 @@
 
 ; A Case-C synthetic object referenced ONLY in a safepoint's deopt bundle (no
 ; real escape) is DESCRIBED there (a VO descriptor + a VORef slot) rather than
-; materialized, and its source allocations are eliminated. This mirrors Graal,
-; which treats a synthetic VO identically to a normal VO in deopt: a virtual
-; object that escapes only via a deopt frame state is encoded as a VO descriptor
-; and reallocated by the runtime at deopt.
+; materialized, and its source allocations are eliminated. A synthetic VO is
+; treated identically to a normal VO in deopt: a virtual object that escapes
+; only via a deopt frame state is encoded as a VO descriptor and reallocated
+; by the runtime at deopt.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32) nounwind
 declare void @safepoint()

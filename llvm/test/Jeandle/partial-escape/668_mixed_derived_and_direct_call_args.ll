@@ -2,11 +2,11 @@
 
 ; materializeVirtualCallArgs: a call whose arguments mix a DERIVED pointer of
 ; one virtual object (gep(%a, 8)) and a DIRECT OrigAlloc of another (%b).
-; Graal processNodeInputs materializes each virtual input independently at
+; The generic escape path materializes each virtual input independently at
 ; the call; reuse-OrigAlloc keeps both allocations alive and replays %b's
-; tracked field store immediately before the call. Before the fix, the
-; derived argument triggered a bail-all: BOTH objects were marked ineligible,
-; so %b's tracked store stayed at its original site (no pea.matslot replay).
+; tracked field store immediately before the call. Regression guard: the
+; derived argument must not trigger a bail-all that marks BOTH objects
+; ineligible (which would leave %b's tracked store at its original site).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink2(ptr addrspace(1), ptr addrspace(1))
@@ -37,7 +37,7 @@ u:
 ; CHECK: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
 ; CHECK: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
 ; %b's tracked store is replayed onto OrigAlloc immediately before the call
-; (old bail-all left it in place at %f; the replay slot is named pea.matslot).
+; (the replay slot is named pea.matslot).
 ; CHECK: %pea.matslot = getelementptr inbounds i8, ptr addrspace(1) %b, i64 8
 ; CHECK: store atomic i32 77, ptr addrspace(1) %pea.matslot unordered, align 4
 ; The call keeps the live derived pointer and OrigAlloc.

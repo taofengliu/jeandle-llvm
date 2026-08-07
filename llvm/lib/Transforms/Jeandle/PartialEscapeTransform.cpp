@@ -24,8 +24,10 @@
 // Materialization model: a PartiallyEscapes VO materializes by replaying its
 // tracked field stores and re-emitting its surviving monitorenters onto its
 // real identity. For an ordinary VO this is its ORIGINAL allocation
-// (OrigAlloc = VObj.AllocationCall); for a prepared synthetic Case-C VO it is
-// SyntheticPhi. Both dominate their escape points. Ordinary PartiallyEscapes
+// (OrigAlloc = VObj.AllocationCall); for a prepared synthetic Case-C VO (one
+// synthetic VO merged from a pointer PHI's distinct but compatible virtual
+// incomings; see PartialEscapeAnalysis.cpp) it is SyntheticPhi. Both dominate
+// their escape points. Ordinary PartiallyEscapes
 // allocations are kept alive, so their original allocation-site deopt bundles
 // remain intact. NeverEscapes VOs are eliminated (OrigAlloc erased) and
 // described by a deopt-bundle descriptor (HotSpot reallocs at deopt). The
@@ -39,8 +41,8 @@
 // replay receiver via MaterializedReceiverOf.
 // Per-object lock emission would mis-order re-entrant interleaved lock stacks.
 //
-// After both passes: ConstantFoldTerminator, a trivial-PHI fold, a dead-code
-// sweep, and EliminateUnreachableBlocks.
+// After the three phases: ConstantFoldTerminator, a trivial-PHI fold, a
+// dead-code sweep, and EliminateUnreachableBlocks.
 //
 //===----------------------------------------------------------------------===//
 
@@ -82,12 +84,12 @@
 
 using namespace llvm;
 
-// Graal places a merge-driven materialization at the predecessor EndNode,
-// which denotes one incoming edge.  An LLVM predecessor terminator denotes
-// every outgoing edge, so a critical Source->Target edge needs a dedicated
-// block before any replay plan is constructed.  All MaterializeEffects for an
-// edge move together: field stores and monitor replay have identical control
-// dependence.
+// A merge materialization replays on exactly one incoming edge of the merge,
+// but an LLVM predecessor terminator denotes every outgoing edge. A
+// Source->Target edge whose source has multiple successors therefore needs a
+// dedicated edge block that the replay plan can target. All MaterializeEffects
+// for an edge move together: field stores and monitor replay have identical
+// control dependence.
 static bool splitReplayEdges(jeandle::PEAResult &Result) {
   struct EdgePlan {
     BasicBlock *Source;
@@ -247,6 +249,10 @@ static bool splitReplayEdges(jeandle::PEAResult &Result) {
   return Changed;
 }
 
+// One expected operation in an existing replay suffix: either a field store
+// (Receiver/StoredValue/Offset) or a re-emitted monitorenter (LockCallee with
+// LockArgs, whose first element is the receiver). Used only by
+// matchExistingReplaySuffix.
 struct ExpectedReplayOperation {
   enum class Kind : uint8_t { Store, Lock } K;
   Value *Receiver = nullptr;
@@ -256,12 +262,19 @@ struct ExpectedReplayOperation {
   SmallVector<Value *, 4> LockArgs;
 };
 
+// The replayed field stores of one materialized object, matched as one
+// contiguous unit. HasDistinctRealAllocation records that Receiver is the
+// object's own OrigAlloc (not a shared synthetic PHI), in which case the
+// group may match in permuted order against sibling groups (see
+// matchExistingReplaySuffix).
 struct ExpectedReplayFieldGroup {
   Value *Receiver = nullptr;
   bool HasDistinctRealAllocation = false;
   SmallVector<ExpectedReplayOperation, 4> Fields;
 };
 
+// The concrete value a replay store must write for a field entry, or null
+// when the entry carries no materializable value.
 static Value *
 materializedFieldValue(const jeandle::MaterializeEffect::FieldEntry &FE) {
   if (FE.Value.isScalar())
@@ -271,6 +284,8 @@ materializedFieldValue(const jeandle::MaterializeEffect::FieldEntry &FE) {
   return nullptr;
 }
 
+// The nearest non-debug instruction before I in its block, or null when I is
+// the first such instruction.
 static Instruction *previousNonDebugInstruction(Instruction *I) {
   for (I = I->getPrevNode(); I; I = I->getPrevNode())
     if (!I->isDebugOrPseudoInst())
@@ -278,6 +293,10 @@ static Instruction *previousNonDebugInstruction(Instruction *I) {
   return nullptr;
 }
 
+// True when GEP is exactly the field-address GEP the replay emitter produces
+// for Op feeding Store: an inbounds i8 GEP on the receiver with one constant
+// index equal to the field offset, a single use (Store), placed immediately
+// before Store, carrying no non-debug metadata.
 static bool isCanonicalReplayGEP(GetElementPtrInst &GEP,
                                  const ExpectedReplayOperation &Op,
                                  StoreInst &Store) {
@@ -478,6 +497,13 @@ static bool matchExistingReplaySuffix(
         return true;
       };
 
+  // Collect the non-empty field groups and decide whether whole groups may
+  // match in permuted order. Permutation is allowed only when every non-empty
+  // group replays onto its object's own distinct real allocation and no
+  // receiver repeats: those objects are still unpublished, so their store
+  // groups cannot alias or be observed between stores, and any group order in
+  // the IR is equivalent. Otherwise groups must match in strict reverse
+  // emission order.
   SmallVector<unsigned, 4> NonEmptyGroups;
   DenseMap<Value *, unsigned> GroupForReceiver;
   bool MayPermuteGroups = true;
@@ -491,6 +517,9 @@ static bool matchExistingReplaySuffix(
   }
 
   if (MayPermuteGroups && NonEmptyGroups.size() > 1) {
+    // Permuted matching: walk the IR backward from the escape point, identify
+    // the group owning the current store's receiver, and consume that whole
+    // group. Each group is consumed at most once.
     SmallVector<uint8_t, 4> Consumed(FieldGroups.size(), 0);
     for (unsigned Remaining = NonEmptyGroups.size(); Remaining; --Remaining) {
       auto *Store = dyn_cast_or_null<StoreInst>(Cursor);
@@ -513,6 +542,7 @@ static bool matchExistingReplaySuffix(
       Cursor = MatchedBefore;
     }
   } else {
+    // Strict matching: groups must appear in exact reverse emission order.
     for (unsigned I : llvm::reverse(NonEmptyGroups)) {
       SmallVector<Instruction *, 8> MatchedGroup;
       Instruction *Before = nullptr;
@@ -530,6 +560,9 @@ static bool matchExistingReplaySuffix(
   return true;
 }
 
+// Erase a NeverEscapes allocation. An invoke is rewritten to an unconditional
+// branch to its normal destination, dropping the unwind edge; a plain call is
+// erased outright. Any remaining uses are poisoned first.
 static bool eraseAllocation(Instruction *Target) {
   assert(Target && "EliminateAllocation target must be non-null");
 
@@ -581,15 +614,6 @@ static bool eraseAllocation(Instruction *Target) {
   return false;
 }
 
-// Emit the materialization sequence for a single Materialize effect: replay
-// tracked field stores and re-emit surviving monitorenters onto the real
-// receiver immediately before the escape point (see the file header). The
-// downstream GC-statepoint pipeline
-// (PEA → InsertGCBarriers → ... → RewriteStatepointsForGC) wraps ordinary
-// allocation invokes with gc.statepoint/gc.result/gc.relocate; every replay
-// receiver dominates its emitted stores.
-// See `partial-escape/310_full_pipeline_statepoint.ll`.
-
 // Eager-update hook: call this BEFORE erasing `Dying` from IR. Re-aims every
 // Materialize whose InsertBefore == Dying to `Next` (the in-block normal-flow
 // successor — for a non-terminator Target->getNextNode(); for an invoke
@@ -600,8 +624,7 @@ static bool eraseAllocation(Instruction *Target) {
 // invoke terminator that a sibling ReplaceCall erases in the same block bucket
 // (lower SeqNo). Re-aiming to the successor (same program point, same block)
 // is sound: every replayed field value that dominated the erased instruction
-// also dominates its in-block successor. Mirrors Graal's "fixed deleted ->
-// use node.next()" pattern (MATERIALIZE_ALL).
+// also dominates its in-block successor.
 // Re-indexes each dependent into Next's bucket so a future erase of Next
 // chains correctly.
 static void relocateDependentMaterializes(
@@ -674,6 +697,13 @@ static void spliceUnparentedAt(Instruction *IP, Value *V) {
       I->insertBefore(IP->getIterator());
 }
 
+// Emit the materialization sequence for a single Materialize effect: replay
+// tracked field stores and re-emit surviving monitorenters onto the real
+// receiver immediately before the escape point (see the file header). The
+// downstream GC-statepoint pipeline (PEA → InsertGCBarriers → ... →
+// RewriteStatepointsForGC) wraps ordinary allocation invokes with
+// gc.statepoint/gc.result/gc.relocate; every replay receiver dominates its
+// emitted stores. See `partial-escape/310_full_pipeline_statepoint.ll`.
 static bool applyMaterialize(Function &F, const jeandle::PEAResult &Result,
                              const jeandle::MaterializeEffect &E,
                              DenseMap<const jeandle::MaterializeEffect *,
@@ -808,15 +838,15 @@ static bool applyMaterialize(Function &F, const jeandle::PEAResult &Result,
   assert((ReplayBatch || E.Locks.empty()) &&
          "every lock-carrying materialize must belong to a replay batch");
   if (ReplayBatch && E.SeqNo == ReplayBatch->EmitterSeqNo) {
-    // Depth-ordering check (the analogue of Graal's
-    // DefaultJavaLoweringProvider `GraalError.guarantee(lastDepth <
-    // monitorId.getLockDepth())` — STRICTLY increasing).
+    // Depth-ordering check: the batch must emit locks with strictly
+    // increasing BytecodeDepth, the order in which the corresponding
+    // monitorenters were taken in the source.
     bool First = true;
     uint32_t LastDepth = 0;
     for (const jeandle::MergedLock &ML : ReplayBatch->Locks) {
       assert((First || LastDepth < ML.BytecodeDepth) &&
              "emitted lock sequence must be strictly increasing in "
-             "BytecodeDepth (Graal lastDepth < getLockDepth guarantee)");
+             "BytecodeDepth");
       First = false;
       LastDepth = ML.BytecodeDepth;
       auto NIt = MaterializedReceiverOf.find(ML.SourceEffect);
@@ -827,15 +857,11 @@ static bool applyMaterialize(Function &F, const jeandle::PEAResult &Result,
     }
   }
 
-  // MaterializedReceiverOf is consumed by the lock re-emit's receiver
-  // resolution at multi-object escape points.
   return Emitted;
 }
 
 // Bundles the Function, the analysis result, and the shared per-apply state so
-// each Effect subclass's apply() is self-contained (Jeandle's adaptation of
-// Graal's `apply(StructuredGraph graph, ArrayList<Node> obsoleteNodes)` — LLVM
-// mutates a Function, not a StructuredGraph).
+// each Effect subclass's apply() is self-contained.
 //
 // The struct carries the shared state used while effects apply; each member is
 // documented at its definition.
@@ -849,15 +875,18 @@ struct jeandle::TransformContext {
   // point to resolve each MergedLock's receiver.
   DenseMap<const jeandle::MaterializeEffect *, Value *> &MaterializedReceiverOf;
 
-  // Reverse index: live InsertBefore -> Materialize effects keyed on it.
+  // Reverse index: live InsertBefore -> Materialize effects keyed on it. A
+  // sibling erase (ReplaceLoad/ReplaceCall/EliminateStore) consults this to
+  // re-aim each dependent to the in-block successor before the erase nulls the
+  // effect's WeakTrackingVH (see relocateDependentMaterializes).
   DenseMap<Instruction *, SmallVector<jeandle::MaterializeEffect *, 4>>
       &InsertBeforeDependents;
 
   // effect -> its ORIGINAL escape-point InsertBefore (captured before the
   // ordinary phase, before any eager-update re-aim). The lock re-emit looks up
   // LockReplayBatchForSite with this — the key computeEscapePointLocks used —
-  // NOT the re-aimed E.InsertBefore, which
-  // could miss the key at a multi-object escape point.
+  // NOT the re-aimed E.InsertBefore, which could miss the key at a
+  // multi-object escape point.
   DenseMap<const jeandle::MaterializeEffect *, Instruction *> &OrigInsertBefore;
 
   // A stable replay from a preceding outer round is retained in place when it
@@ -874,6 +903,9 @@ struct jeandle::TransformContext {
       &SkippedDeoptPoolEffects;
 };
 
+// Replace the load with its analyzer-computed replacement and erase it,
+// carrying over precise value metadata (see below). An unparented
+// analyzer-built replacement is spliced into the IR first.
 void jeandle::ReplaceLoadEffect::apply(jeandle::TransformContext &Ctx) {
   if (!Target || !Replacement)
     return;
@@ -881,16 +913,17 @@ void jeandle::ReplaceLoadEffect::apply(jeandle::TransformContext &Ctx) {
   // so the instruction is still alive.
   Instruction *Target = cast<Instruction>((Value *)this->Target);
   Value *Repl = Replacement;
-  // When the replacement's stamp is wider than the original, a Pi node would
-  // normally be injected. LLVM has no per-Value stamp at this layer — the
-  // closest analogue is the load-only metadata the original load may have
-  // carried. Transfer those (only when both sides are LoadInsts and the
-  // Replacement is missing the kind) so downstream LLVM passes do not lose the
-  // narrower-than-default knowledge after RAUW. Only VALUE properties are
-  // transferable: invariant.load is intentionally excluded — it asserts a
-  // memory-LOCATION property of the original pointer, and the replacement
-  // reads a different location (possibly fully mutable), so carrying it would
-  // give downstream GVN/LICM a false invariance guarantee.
+  // The analyzer may know the replacement's value more precisely than the
+  // erased load's type conveys. LLVM has no per-Value type-refinement
+  // mechanism at this layer — the closest analogue is the load-only metadata
+  // the original load may have carried. Transfer those (only when both sides
+  // are LoadInsts and the Replacement is missing the kind) so downstream LLVM
+  // passes do not lose the narrower-than-default knowledge after RAUW. Only
+  // VALUE properties are transferable: invariant.load is intentionally
+  // excluded — it asserts a memory-LOCATION property of the original pointer,
+  // and the replacement reads a different location (possibly fully mutable),
+  // so carrying it would give downstream GVN/LICM a false invariance
+  // guarantee.
   if (auto *TargetLoad = dyn_cast<LoadInst>(Target)) {
     if (auto *ReplLoad = dyn_cast<LoadInst>(Repl)) {
       static constexpr unsigned PreservableKinds[] = {
@@ -990,7 +1023,7 @@ void jeandle::EliminateStoreEffect::apply(jeandle::TransformContext &Ctx) {
     return;
   // Eager-update (defensive): EliminateStore and Materialize-
   // at-store are mutually exclusive by the processStore dispatch, so this never
-  // fires today, but a store CAN be a Materialize IP (value-side fall-through),
+  // fires, but a store CAN be a Materialize IP (value-side fall-through),
   // so the hook is future-proof if that exclusion ever changes.
   relocateDependentMaterializes(Ctx.InsertBeforeDependents, Target,
                                 Target->getNextNode());
@@ -1025,11 +1058,10 @@ void jeandle::EliminateAllocationEffect::apply(jeandle::TransformContext &Ctx) {
 }
 
 void jeandle::MaterializeEffect::apply(jeandle::TransformContext &Ctx) {
-  // Replay field stores and re-emit locks onto the real receiver — see
-  // applyMaterialize and the file header. Gate Changed on whether
-  // applyMaterialize actually emitted anything: an all-idle round (no field
-  // stores, no surviving locks) leaves the IR untouched, and marking it
-  // Changed would needlessly prevent the iterative driver from converging.
+  // Replay field stores and re-emit locks onto the real receiver (see
+  // applyMaterialize and the file header). Changed is gated on actual emission
+  // so an all-idle round does not block outer-fixpoint convergence (see
+  // Emitted in applyMaterialize).
   if (Ctx.ReusedMaterializations.count(this)) {
     Ctx.MaterializedReceiverOf[this] = Target;
     return;
@@ -1097,8 +1129,7 @@ void jeandle::RewriteDeoptPoolEffect::apply(jeandle::TransformContext &Ctx) {
   Ctx.Changed = true;
 }
 
-// Apply one explicit effect phase in SeqNo order (Jeandle's substitute for
-// Graal's list-order — see Effect::SeqNo).
+// Apply one explicit effect phase in SeqNo order (see Effect::SeqNo).
 void jeandle::EffectList::apply(jeandle::TransformContext &Ctx,
                                 jeandle::Effect::Phase Phase) {
   SmallVector<jeandle::Effect *, 16> Order;
@@ -1115,8 +1146,14 @@ void jeandle::EffectList::apply(jeandle::TransformContext &Ctx,
 
 namespace {
 
+// Outcome of validating the whole-pool rewrites before any IR mutation (see
+// preflightDeoptPoolEffects).
 struct DeoptPoolPreflight {
+  // Safepoints guaranteed to be erased by a matching ReplaceCall or
+  // EliminateAllocation effect.
   DenseSet<CallBase *> GuaranteedDeletedSafepoints;
+  // Whole-pool rewrites whose safepoint is in GuaranteedDeletedSafepoints;
+  // applied as no-ops because rebuilding a soon-to-die call is wasted work.
   DenseSet<const jeandle::RewriteDeoptPoolEffect *> SkippedEffects;
 };
 
@@ -1135,6 +1172,9 @@ guaranteesSafepointDeletion(const jeandle::ReplaceCallEffect &Effect,
          isa_and_nonnull<Argument>(Replacement);
 }
 
+// A matching EliminateAllocation is guaranteed to erase Site when the owning
+// VO is classified NeverEscapes (a PartiallyEscapes allocation is kept
+// alive).
 static bool
 guaranteesSafepointDeletion(const jeandle::EliminateAllocationEffect &Effect,
                             const jeandle::PEAResult &Result, CallBase *Site) {
@@ -1195,6 +1235,8 @@ static bool preflightDeoptPoolEffects(const Function &F,
   return true;
 }
 
+// The index of use U within Site's "deopt" operand bundle inputs, or
+// std::nullopt when Site has no "deopt" bundle or U is not one of its inputs.
 static std::optional<unsigned> getDeoptSemanticCell(const CallBase &Site,
                                                     const Use &U) {
   std::optional<OperandBundleUse> Deopt =
@@ -1209,6 +1251,12 @@ static std::optional<unsigned> getDeoptSemanticCell(const CallBase &Site,
 
 } // namespace
 
+// Transform pass entry point. Validates the analysis result (replay-store
+// legality, unique SeqNos, whole-pool preflight) before any IR mutation,
+// normalizes per-edge materialization sites, then applies effects in RPO per
+// block in the three ordered phases (see the file header) and finishes with
+// the canonical cleanups. Returns all-preserved when neither the effects nor
+// the cleanups changed the IR.
 PreservedAnalyses PartialEscapeTransform::run(Function &F,
                                               FunctionAnalysisManager &FAM) {
   // Gate on jeandle.java_method_compilation.
@@ -1235,7 +1283,18 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
     return PreservedAnalyses::all();
 
 #ifndef NDEBUG
+  // Debug-only audit of the NeverEscapes contract: the transform repeats the
+  // analyzer's final eligibility walk (hasUnremovedSemanticUses) against the
+  // committed effect plan. Every semantic use of a NeverEscapes allocation
+  // must be provably removed by this pass — the user sits in a final dead
+  // block, the user is erased by an ordinary effect, the user is a
+  // PEA-handled non-escaping intrinsic, or the use is a "deopt" bundle input
+  // of a safepoint that is itself guaranteed deleted or whose semantic cell
+  // is rewritten away by that safepoint's whole-pool plan (directly, via a
+  // current identity representing the source object, or via an occurrence
+  // pruned from the plan).
   DenseSet<Instruction *> RemovedTargets;
+  // Targets erased by ordinary effects.
   for (const auto &KV : Result.BlockEffects)
     for (const jeandle::Effect &E : KV.second)
       if (isa<jeandle::ReplaceLoadEffect>(E) ||
@@ -1306,9 +1365,7 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
 
   bool Changed = false;
 
-  // effect -> real replay receiver (OrigAlloc or SyntheticPhi). Filled as each
-  // Materialize applies; consumed by the tail effect at a multi-object escape
-  // point to resolve each MergedLock's receiver.
+  // See TransformContext::MaterializedReceiverOf.
   DenseMap<const jeandle::MaterializeEffect *, Value *> MaterializedReceiverOf;
 
   // Normalize incoming-edge materializations before RPO and before replay
@@ -1320,28 +1377,15 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
 
   // Build the per-escape-point merged lock lists (one global depth-sort per
   // materialize point) before the ordinary phase applies effects. Re-entrant
-  // interleaved
-  // lock stacks across objects at one escape point MUST be re-emitted as ONE
-  // globally depth-sorted list (per-object emission would mis-order them on
-  // the runtime lock stack).
+  // interleaved lock stacks across objects at one escape point MUST be
+  // re-emitted as ONE globally depth-sorted list (per-object emission would
+  // mis-order them on the runtime lock stack).
   Result.computeEscapePointLocks();
 
-  // Eager-update reverse index: for each Materialize effect, record its live
-  // InsertBefore instruction -> effect list. A sibling erase
-  // (ReplaceLoad/ReplaceCall/EliminateStore) consults this to re-aim each
-  // dependent Materialize to the in-block successor before nulling the
-  // WeakTrackingVH. Required when InsertBefore is a folded JavaOp invoke
-  // terminator — see
-  // relocateDependentMaterializes.
+  // See TransformContext::InsertBeforeDependents.
   DenseMap<Instruction *, SmallVector<jeandle::MaterializeEffect *, 4>>
       InsertBeforeDependents;
-  // Each Materialize effect's edge-normalized InsertBefore, captured here
-  // before the ordinary phase and before any eager-update re-aim.
-  // computeEscapePointLocks keys LockReplayBatchForSite by this same
-  // normalized instruction, so the lock re-emit must look up with it — NOT with
-  // E.InsertBefore, which relocateDependentMaterializes may re-aim to the
-  // in-block successor for a materialize. Using the re-aimed value would
-  // miss the final physical batch.
+  // See TransformContext::OrigInsertBefore.
   DenseMap<const jeandle::MaterializeEffect *, Instruction *> OrigInsertBefore;
   DenseMap<Instruction *, SmallVector<jeandle::MaterializeEffect *, 4>>
       MaterializationsAt;
@@ -1412,13 +1456,15 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
     It->second.apply(Ctx, jeandle::Effect::Phase::CfgKill);
   }
 
-  // Erase parented Case-B alias PHIs that the analyzer flagged
-  // as redundant for NeverEscapes VOs. The cfg-kill phase above already RAUW'd
-  // every OrigAlloc incoming to poison via eraseAllocation, so the
-  // PHIs survive as `phi [poison, poison]`. Replace each with poison
-  // and erase. WeakTrackingVH auto-nulls if some other code path
-  // already deleted the PHI (e.g. an outer iteration's dead-block
-  // sweep), so the null check below is load-bearing.
+  // Erase parented Case-B alias PHIs (Case B: a pointer PHI whose incomings
+  // all resolve to the same still-virtual ObjectID, so the PHI merely aliases
+  // that VO; see PartialEscapeAnalysis.cpp) that the analyzer flagged as
+  // redundant for NeverEscapes VOs. The cfg-kill phase above already RAUW'd
+  // every OrigAlloc incoming to poison via eraseAllocation, so the PHIs
+  // survive as `phi [poison, poison]`. Replace each with poison and erase.
+  // WeakTrackingVH auto-nulls if some other code path already deleted the PHI
+  // (e.g. an outer iteration's dead-block sweep), so the null check below is
+  // load-bearing.
   for (auto &VH : Result.CaseBAliasedPhisToErase) {
     Value *V = VH;
     if (!V)
@@ -1475,8 +1521,7 @@ PreservedAnalyses PartialEscapeTransform::run(Function &F,
   // Sweep trivially-dead instructions that became unused after our rewrites
   // (e.g., GEPs derived from eliminated allocations whose only users were the
   // loads/stores we replaced in the ordinary phase). Iterate to fixpoint so
-  // cascading
-  // deaths are caught.
+  // cascading deaths are caught.
   bool LocalChanged = true;
   while (LocalChanged) {
     LocalChanged = false;

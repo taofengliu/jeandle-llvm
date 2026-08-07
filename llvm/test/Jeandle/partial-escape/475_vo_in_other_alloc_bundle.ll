@@ -1,12 +1,12 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; VO referenced ONLY by another allocation invoke's deopt bundle. Allocation
-; invokes now go through
+; invokes go through
 ; recordDeoptBundleMappings like every other safepoint: %a (still virtual at
-; %b's allocation) is described in %b's bundle, exactly as Graal describes
-; virtual objects in an allocation's frame state. Pre-fix, the allocation
-; dispatch early-returned before any bundle scan, so %a's only use was left
-; for Pass-2 poison-RAUW inside %b's surviving bundle (the end-to-end
+; %b's allocation) is described in %b's bundle, exactly as virtual objects
+; are described in an allocation's frame state. Regression guard: skipping
+; the bundle scan at an allocation would leave %a's only use to be
+; poison-RAUW'd inside %b's surviving bundle (the end-to-end
 ; fill_one_scope_value ShouldNotReachHere).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)

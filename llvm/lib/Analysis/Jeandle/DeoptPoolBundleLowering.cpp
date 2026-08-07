@@ -28,6 +28,8 @@ using namespace llvm::jeandle::pea;
 
 namespace llvm::jeandle::pea {
 
+// Factory funnel for FinalDeoptPoolBundlePlan, whose constructor is private
+// so that only the lowering builder can produce a (validated) plan.
 struct FinalDeoptPoolBundlePlanAccess {
   static FinalDeoptPoolBundlePlan
   create(ParsedDeoptBundle Source, FinalDeoptPoolGraphPlan Graph,
@@ -44,40 +46,34 @@ struct FinalDeoptPoolBundlePlanAccess {
 
 namespace llvm::jeandle::pea {
 
+// A tracked token snapshots the value's type at plan time; serialization
+// later re-checks liveness and this exact type against the live IR.
 FinalDeoptPoolBundleToken
-FinalDeoptPoolBundleToken::tracked(Value *V, DeoptSemanticCellRole Role,
-                                   std::optional<unsigned> SourceSemanticCell) {
+FinalDeoptPoolBundleToken::tracked(Value *V) {
   FinalDeoptPoolBundleToken Token;
   Token.Kind = FinalDeoptPoolBundleTokenKind::TrackedValue;
-  Token.Role = Role;
-  Token.SourceSemanticCell = SourceSemanticCell;
   Token.Tracked = V;
   Token.ExpectedTrackedType = V ? V->getType() : nullptr;
   return Token;
 }
 
-FinalDeoptPoolBundleToken FinalDeoptPoolBundleToken::immediateI32(
-    uint32_t Value, DeoptSemanticCellRole Role,
-    std::optional<unsigned> SourceSemanticCell) {
+FinalDeoptPoolBundleToken
+FinalDeoptPoolBundleToken::immediateI32(uint32_t Value) {
   FinalDeoptPoolBundleToken Token;
   Token.Kind = FinalDeoptPoolBundleTokenKind::ImmediateI32;
-  Token.Role = Role;
-  Token.SourceSemanticCell = SourceSemanticCell;
   Token.Immediate = Value;
   return Token;
 }
 
-FinalDeoptPoolBundleToken FinalDeoptPoolBundleToken::immediateI64(
-    uint64_t Value, DeoptSemanticCellRole Role,
-    std::optional<unsigned> SourceSemanticCell) {
+FinalDeoptPoolBundleToken
+FinalDeoptPoolBundleToken::immediateI64(uint64_t Value) {
   FinalDeoptPoolBundleToken Token;
   Token.Kind = FinalDeoptPoolBundleTokenKind::ImmediateI64;
-  Token.Role = Role;
-  Token.SourceSemanticCell = SourceSemanticCell;
   Token.Immediate = Value;
   return Token;
 }
 
+// Null unless the token carries a live SSA value.
 Value *FinalDeoptPoolBundleToken::trackedValue() const {
   return Kind == FinalDeoptPoolBundleTokenKind::TrackedValue
              ? static_cast<Value *>(Tracked)
@@ -96,6 +92,8 @@ FinalDeoptPoolBundlePlan::FinalDeoptPoolBundlePlan(
 
 bool FinalDeoptPoolBundlePlan::coversExactOccurrence(
     DeoptPoolSemanticCellID SemanticCell, CurrentDeoptNodeID CurrentID) const {
+  // Linear scan: occurrences are few (one per current cell binding plus the
+  // generated descriptor and field occurrences), so a map would not pay off.
   for (const FinalDeoptPoolCurrentOccurrence &Occurrence : CurrentOccurrences)
     if (Occurrence.SemanticCell == SemanticCell &&
         Occurrence.CurrentID == CurrentID)
@@ -107,9 +105,13 @@ bool FinalDeoptPoolBundlePlan::coversExactOccurrence(
 
 namespace {
 
+// The deopt value encoding stores its index as a signed i32, so wire IDs,
+// field offsets, and field counts must all fit in INT32_MAX.
 constexpr unsigned MaxSignedWireValue =
     static_cast<unsigned>(std::numeric_limits<int32_t>::max());
 
+// Pack one deopt value encoding onto the wire as an i64:
+//   [63:32] index   [31:16] value type   [15:0] basic type.
 uint64_t encodeDeoptValue(uint32_t Index,
                           DeoptValueEncoding::DeoptValueType ValueType,
                           HotspotBasicType BasicType) {
@@ -132,6 +134,10 @@ serializeError(FinalDeoptPoolBundleErrorCode Code, uint64_t Subject = 0) {
   return Result;
 }
 
+// Wire-type compatibility of a scalar payload: sub-int integers widen to
+// T_INT; a T_OBJECT value must be a Java-heap pointer, and only a null
+// constant is accepted because other constants cannot be followed through a
+// tracking handle; T_ILLEGAL cells carry a zero constant.
 bool isValidScalarValue(HotspotBasicType BasicType, Value *V) {
   if (!V)
     return false;
@@ -159,17 +165,37 @@ bool isValidScalarValue(HotspotBasicType BasicType, Value *V) {
   }
 }
 
+// Where a source root cell was parsed from: a scope value (local or stack
+// slot) or a monitor owner. Exactly one of the two pointers is set, selected
+// by Kind.
 struct SourceRootLocation {
   DeoptPoolRootKind Kind;
   const ParsedDeoptScopeValue *ScopeValue = nullptr;
   const ParsedDeoptMonitor *Monitor = nullptr;
 };
 
+// Position of one descriptor field in the parsed source bundle.
 struct SourceFieldLocation {
   unsigned DescriptorIndex;
   unsigned FieldIndex;
 };
 
+// Builds the FinalDeoptPoolBundlePlan for one safepoint. The build runs
+// during analysis and performs no IR mutation; every inconsistency is
+// reported as data through fail(), never asserted. The pipeline is:
+//   1. validateSourceTree: re-validate the parsed bundle against its
+//      structural fingerprint, account for every source operand exactly
+//      once, and record where each root/field cell was parsed from;
+//   2. collectScalarTokens + validateGraph: index the scalar-token table,
+//      then check the graph plan against the parsed source — dense wire IDs,
+//      legacy descriptors kept verbatim, current members in plan order, and
+//      every source VORef still represented;
+//   3. classifyCurrentOccurrences: map every exact current-cell binding to
+//      its disposition (rewritten to a VORef, or removed with a pruned
+//      descriptor) and prove every plan-side current reference has one;
+//   4. emitCompleteBundle + validateOccurrenceCompletion: emit the complete
+//      token list in wire order and prove every rewritten occurrence
+//      received its output operands.
 class BundlePlanBuilder {
 public:
   BundlePlanBuilder(const ParsedDeoptBundle &Source,
@@ -211,12 +237,19 @@ public:
   }
 
 private:
+  // Record the first failure and report it; later failures are dropped.
   bool fail(FinalDeoptPoolBundleErrorCode Code, uint64_t Subject = 0) {
     if (!Error)
       Error = FinalDeoptPoolBundleError{Code, Subject};
     return false;
   }
 
+  // Check one parsed cell against the fingerprint and claim its operand.
+  // The fingerprint cell must agree on role and operand index and match the
+  // live operand's type (constants' exact bits were already checked when the
+  // snapshot was copied). Each operand may be claimed only once; together
+  // with the final count check in validateSourceTree this proves the parsed
+  // tree covers the bundle exactly.
   bool validateAndAccountCell(const DeoptSemanticCell &Cell,
                               DeoptSemanticCellRole ExpectedRole) {
     unsigned Index = Cell.OperandIndex;
@@ -235,6 +268,8 @@ private:
     return true;
   }
 
+  // Record where a root value cell was parsed from; two roots sharing one
+  // cell would make the later exact-occurrence lookups ambiguous.
   bool addRootLocation(const DeoptSemanticCell &Cell,
                        SourceRootLocation Location) {
     if (!SourceRoots.try_emplace(Cell.OperandIndex, Location).second)
@@ -243,6 +278,8 @@ private:
     return true;
   }
 
+  // Validate a scope value's encoding/value cell pair and register the value
+  // cell as a root of the given kind.
   bool validateScopeValue(const ParsedDeoptScopeValue &Value,
                           DeoptPoolRootKind Kind) {
     if (!validateAndAccountCell(Value.EncodingCell,
@@ -255,6 +292,10 @@ private:
     return true;
   }
 
+  // Validate one scope's cells in wire order: optional method marker,
+  // optional should-reexecute flag, the duplicated equal-BCI pair that opens
+  // the scope, then locals, stack, monitors, and the optional orig-pc
+  // marker. Locals, stack slots, and monitor owners are the root cells.
   bool validateScope(const ParsedDeoptScope &Scope) {
     if (Scope.Method) {
       if (!validateAndAccountCell(Scope.Method->EncodingCell,
@@ -300,10 +341,16 @@ private:
     return true;
   }
 
+  // Walk the whole parsed tree, validating and claiming every operand. The
+  // closing count check rejects any operand the tree did not mention, so a
+  // stale or misparsed bundle cannot slip through with extra cells.
   bool validateSourceTree() {
     if (Source.OriginalInputs.size() != Source.Fingerprint.Cells.size())
       return fail(FinalDeoptPoolBundleErrorCode::InvalidSourceFingerprint);
 
+    // Descriptors first: they occupy the root scope's VO section, ahead of
+    // all scope values. Each field's value cell is remembered so overlay and
+    // pruning checks can find its parsed form later.
     for (unsigned DescriptorIndex = 0;
          DescriptorIndex < Source.Descriptors.size(); ++DescriptorIndex) {
       const ParsedDeoptDescriptor &Descriptor =
@@ -349,6 +396,8 @@ private:
     return true;
   }
 
+  // Index the caller-provided scalar-token table, rejecting dead values and
+  // duplicate tokens.
   bool collectScalarTokens() {
     for (const DeoptPoolScalarTokenBinding &Binding : ScalarTokenInputs) {
       Value *V = Binding.Value;
@@ -362,6 +411,8 @@ private:
     return true;
   }
 
+  // Resolve a scalar token to its live SSA value and check the value's type
+  // against the slot's basic type. Records the specific failure on miss.
   Value *lookupScalar(uint64_t Token, HotspotBasicType BasicType) {
     auto It = ScalarTokens.find(Token);
     if (It == ScalarTokens.end()) {
@@ -380,6 +431,8 @@ private:
     return V;
   }
 
+  // The analysis-local current ID behind a final wire ID, or nullopt when
+  // the wire ID names a legacy node.
   std::optional<CurrentDeoptNodeID> currentIDForWire(uint32_t WireID) const {
     auto It = CurrentByWire.find(WireID);
     if (It == CurrentByWire.end())
@@ -387,6 +440,9 @@ private:
     return It->second;
   }
 
+  // Check one final field: the offset must fit the signed wire encoding, a
+  // reference must be T_OBJECT with an in-range target, and a scalar token
+  // must resolve to a live, type-compatible value.
   bool validateGraphField(const FinalDeoptPoolField &Field) {
     if (Field.Offset < 0 ||
         static_cast<uint64_t>(Field.Offset) > MaxSignedWireValue)
@@ -403,18 +459,28 @@ private:
     return true;
   }
 
+  // Check the graph plan against the parsed source: wire IDs dense and in
+  // node order, every kept legacy descriptor identical to its parsed form,
+  // current nodes consistent with currentMembers(), every overlay-induced
+  // reference pointing at a current node, and every source VORef root still
+  // represented by a final root. Also builds the by-cell lookup maps and
+  // LegacySourceKept used by occurrence classification.
   bool validateGraph() {
     LegacySourceKept.resize(Source.Descriptors.size());
     unsigned CurrentMemberIndex = 0;
     for (unsigned NodeIndex = 0; NodeIndex < Graph.nodes().size();
          ++NodeIndex) {
       const FinalDeoptPoolNode &Node = Graph.nodes()[NodeIndex];
+      // Wire IDs are the node's own index: dense, ordered, and encodable.
       if (Node.WireID != NodeIndex || Node.WireID > MaxSignedWireValue ||
           Node.Klass == 0 || Node.Fields.size() > MaxSignedWireValue)
         return fail(FinalDeoptPoolBundleErrorCode::InvalidWireGraph,
                     Node.WireID);
 
       if (Node.Origin == DeoptPoolNodeOrigin::Legacy) {
+        // A kept legacy node must be identical to the parsed descriptor it
+        // claims to keep: same klass, shape, and field layout, with cells
+        // matching the parsed field cells one to one.
         if (Node.LegacySourceIndex >= Source.Descriptors.size() ||
             LegacySourceKept.test(Node.LegacySourceIndex))
           return fail(FinalDeoptPoolBundleErrorCode::InvalidLegacySource,
@@ -444,6 +510,9 @@ private:
             return false;
         }
       } else {
+        // A current node must appear exactly at its position in
+        // currentMembers() and its fields must be newly emitted (no source
+        // cells).
         if (Node.CurrentID == InvalidCurrentDeoptNodeID ||
             CurrentMemberIndex >= Graph.currentMembers().size() ||
             Graph.currentMembers()[CurrentMemberIndex] != Node.CurrentID ||
@@ -464,6 +533,11 @@ private:
     if (CurrentMemberIndex != Graph.currentMembers().size())
       return fail(FinalDeoptPoolBundleErrorCode::InvalidWireGraph);
 
+    // A legacy field that was scalar in the source but is a reference in the
+    // plan (i.e. overlaid) must point at a current node; re-pointing it at a
+    // legacy node would silently change the original wire semantics. The
+    // SourceFields lookup cannot miss: every final legacy field's cell was
+    // matched to a parsed field cell above.
     for (const auto &[Cell, Field] : FinalFieldsByCell) {
       const SourceFieldLocation &Location = SourceFields.find(Cell)->second;
       const ParsedDeoptField &ParsedField =
@@ -474,6 +548,8 @@ private:
         return fail(FinalDeoptPoolBundleErrorCode::InvalidWireGraph, Cell);
     }
 
+    // Roots: known source cell, matching kind, and an overlaid (formerly
+    // scalar) root must likewise target a current node.
     for (const FinalDeoptPoolRoot &Root : Graph.roots()) {
       if (Root.SemanticCell == InvalidDeoptPoolSemanticCellID ||
           Root.TargetWireID >= Graph.nodes().size() ||
@@ -508,6 +584,7 @@ private:
     return true;
   }
 
+  // Map a parsed root location to its occurrence kind.
   FinalDeoptPoolOccurrenceKind
   occurrenceKind(const SourceRootLocation &Location) const {
     switch (Location.Kind) {
@@ -521,6 +598,11 @@ private:
     llvm_unreachable("unknown root kind");
   }
 
+  // Map each exact current-cell binding to its occurrence record. Three
+  // shapes are possible: the cell is a final root (an overlaid scope value
+  // or monitor owner), the cell is a field of a kept legacy descriptor (an
+  // overlaid field), or the cell sits in a pruned descriptor and disappears
+  // with it.
   bool classifyCurrentOccurrences() {
     DenseMap<DeoptPoolSemanticCellID, CurrentDeoptNodeID> UniqueCells;
     for (const DeoptPoolCurrentCellBinding &Binding : CurrentCellInputs) {
@@ -537,6 +619,9 @@ private:
 
       auto Root = FinalRootsByCell.find(Binding.SemanticCell);
       if (Root != FinalRootsByCell.end()) {
+        // Overlaid root: the final root must target the bound current node,
+        // and the source cell must have been a scalar oop (monitor owners
+        // are object-typed by construction).
         auto TargetCurrent = currentIDForWire(Root->second->TargetWireID);
         auto SourceRoot = SourceRoots.find(Binding.SemanticCell);
         if (!TargetCurrent || *TargetCurrent != Binding.CurrentID ||
@@ -562,6 +647,9 @@ private:
       } else {
         auto Field = FinalFieldsByCell.find(Binding.SemanticCell);
         if (Field != FinalFieldsByCell.end()) {
+          // Overlaid field of a kept descriptor: the final field must be a
+          // reference to the bound current node, and the source field must
+          // have been a scalar oop (not already a VORef).
           const FinalDeoptPoolField *FinalField = Field->second;
           auto SourceField = SourceFields.find(Binding.SemanticCell);
           auto TargetCurrent = FinalField->isReference()
@@ -582,6 +670,8 @@ private:
           Occurrence.Disposition =
               FinalDeoptPoolOccurrenceDisposition::RewrittenToVORef;
         } else {
+          // The cell must be a scalar oop field of a pruned descriptor; it
+          // vanishes from the wire together with that descriptor.
           auto SourceField = SourceFields.find(Binding.SemanticCell);
           if (SourceField == SourceFields.end() ||
               LegacySourceKept.test(SourceField->second.DescriptorIndex) ||
@@ -626,11 +716,16 @@ private:
     return Index;
   }
 
+  // Copy one unchanged source operand into the token stream.
   unsigned appendSource(const DeoptSemanticCell &Cell) {
-    return appendToken(FinalDeoptPoolBundleToken::tracked(
-        SourceValues[Cell.OperandIndex], Cell.Role, Cell.OperandIndex));
+    return appendToken(
+        FinalDeoptPoolBundleToken::tracked(SourceValues[Cell.OperandIndex]));
   }
 
+  // Fill in the output token indices of an exact occurrence once its
+  // encoding and value tokens have been emitted. classifyCurrentOccurrences
+  // has already proven that every current-referencing cell has a record, so
+  // the miss path is defensive only.
   void setExactOccurrenceOutput(DeoptPoolSemanticCellID Cell,
                                 unsigned EncodingIndex, unsigned ValueIndex) {
     auto It = ExactOccurrenceByCell.find(Cell);
@@ -642,6 +737,8 @@ private:
     Occurrence.OutputValueTokenIndex = ValueIndex;
   }
 
+  // Record an occurrence with no source cell: a current node's own
+  // descriptor header, or a reference field of a current node.
   void addGeneratedOccurrence(CurrentDeoptNodeID CurrentID,
                               FinalDeoptPoolOccurrenceKind Kind,
                               std::optional<unsigned> EncodingIndex,
@@ -656,27 +753,23 @@ private:
     CurrentOccurrences.push_back(std::move(Occurrence));
   }
 
+  // Emit one VO descriptor: the header encoding (ScalarValueType with the
+  // wire ID as index), the raw klass identity, the field count, then each
+  // field's encoding/value pair. Reference fields encode as VORefLocalType
+  // with the target's wire ID as an i32 value; scalar fields carry their
+  // resolved tracked value. Legacy nodes reuse their parsed cells as
+  // provenance; current nodes register generated occurrences instead.
   bool emitDescriptor(const FinalDeoptPoolNode &Node) {
     const ParsedDeoptDescriptor *Parsed = nullptr;
     if (Node.Origin == DeoptPoolNodeOrigin::Legacy)
       Parsed = &Source.Descriptors[Node.LegacySourceIndex];
 
-    std::optional<unsigned> HeaderSource =
-        Parsed ? std::optional<unsigned>(Parsed->HeaderCell.OperandIndex)
-               : std::nullopt;
     unsigned HeaderIndex = appendToken(FinalDeoptPoolBundleToken::immediateI64(
         encodeDeoptValue(Node.WireID, DeoptValueEncoding::ScalarValueType,
-                         Node.IsArray ? T_ARRAY : T_OBJECT),
-        DeoptSemanticCellRole::DescriptorHeader, HeaderSource));
-    appendToken(FinalDeoptPoolBundleToken::immediateI64(
-        Node.Klass, DeoptSemanticCellRole::DescriptorKlass,
-        Parsed ? std::optional<unsigned>(Parsed->KlassCell.OperandIndex)
-               : std::nullopt));
+                         Node.IsArray ? T_ARRAY : T_OBJECT)));
+    appendToken(FinalDeoptPoolBundleToken::immediateI64(Node.Klass));
     appendToken(FinalDeoptPoolBundleToken::immediateI32(
-        static_cast<uint32_t>(Node.Fields.size()),
-        DeoptSemanticCellRole::DescriptorFieldCount,
-        Parsed ? std::optional<unsigned>(Parsed->FieldCountCell.OperandIndex)
-               : std::nullopt));
+        static_cast<uint32_t>(Node.Fields.size())));
 
     if (Node.Origin == DeoptPoolNodeOrigin::Current)
       addGeneratedOccurrence(Node.CurrentID,
@@ -688,28 +781,20 @@ private:
       const FinalDeoptPoolField &Field = Node.Fields[FieldIndex];
       const ParsedDeoptField *ParsedField =
           Parsed ? &Parsed->Fields[FieldIndex] : nullptr;
-      std::optional<unsigned> EncodingSource =
-          ParsedField
-              ? std::optional<unsigned>(ParsedField->EncodingCell.OperandIndex)
-              : std::nullopt;
       unsigned EncodingIndex =
           appendToken(FinalDeoptPoolBundleToken::immediateI64(
               encodeDeoptValue(
                   static_cast<uint32_t>(Field.Offset),
                   Field.isReference() ? DeoptValueEncoding::VORefLocalType
                                       : DeoptValueEncoding::LocalType,
-                  Field.isReference() ? T_OBJECT : Field.BasicType),
-              DeoptSemanticCellRole::DescriptorFieldEncoding, EncodingSource));
+                  Field.isReference() ? T_OBJECT : Field.BasicType)));
 
-      std::optional<unsigned> ValueSource =
-          ParsedField
-              ? std::optional<unsigned>(ParsedField->ValueCell.OperandIndex)
-              : std::nullopt;
       unsigned ValueIndex;
       if (Field.isReference()) {
         ValueIndex = appendToken(FinalDeoptPoolBundleToken::immediateI32(
-            Field.TargetWireID, DeoptSemanticCellRole::DescriptorFieldValue,
-            ValueSource));
+            Field.TargetWireID));
+        // A reference to a current node needs occurrence bookkeeping: exact
+        // for an overlaid legacy field, generated for a current-node field.
         if (auto Current = currentIDForWire(Field.TargetWireID)) {
           if (ParsedField)
             setExactOccurrenceOutput(Field.SemanticCell, EncodingIndex,
@@ -723,13 +808,16 @@ private:
         Value *Scalar = lookupScalar(Field.ScalarToken, Field.BasicType);
         if (!Scalar)
           return false;
-        ValueIndex = appendToken(FinalDeoptPoolBundleToken::tracked(
-            Scalar, DeoptSemanticCellRole::DescriptorFieldValue, ValueSource));
+        ValueIndex = appendToken(
+            FinalDeoptPoolBundleToken::tracked(Scalar));
       }
     }
     return true;
   }
 
+  // Copy a scope's header cells verbatim: optional method marker, optional
+  // should-reexecute flag, and the duplicated BCI pair. The rewrite never
+  // changes these.
   void emitScopeHeader(const ParsedDeoptScope &Scope) {
     if (Scope.Method) {
       appendSource(Scope.Method->EncodingCell);
@@ -741,6 +829,9 @@ private:
     appendSource(Scope.SecondBCICell);
   }
 
+  // Emit one scope value. A cell the plan leaves alone is copied verbatim; a
+  // final root is rewritten to a VORef encoding (locals and stack slots use
+  // distinct wire types) plus the target's wire ID as an i32 value.
   bool emitScopeValue(const ParsedDeoptScopeValue &Value,
                       DeoptPoolRootKind Kind) {
     auto Root = FinalRootsByCell.find(Value.ValueCell.OperandIndex);
@@ -756,18 +847,20 @@ private:
     uint32_t WireID = Root->second->TargetWireID;
     unsigned EncodingIndex =
         appendToken(FinalDeoptPoolBundleToken::immediateI64(
-            encodeDeoptValue(WireID, RefType, T_OBJECT),
-            DeoptSemanticCellRole::ScopeValueEncoding,
-            Value.EncodingCell.OperandIndex));
-    unsigned ValueIndex = appendToken(FinalDeoptPoolBundleToken::immediateI32(
-        WireID, DeoptSemanticCellRole::ScopeValue,
-        Value.ValueCell.OperandIndex));
+            encodeDeoptValue(WireID, RefType, T_OBJECT)));
+    unsigned ValueIndex = appendToken(
+        FinalDeoptPoolBundleToken::immediateI32(WireID));
     if (currentIDForWire(WireID))
       setExactOccurrenceOutput(Value.ValueCell.OperandIndex, EncodingIndex,
                                ValueIndex);
     return true;
   }
 
+  // Emit one monitor. An untouched owner is copied verbatim (encoding, owner,
+  // lock). A rewritten owner becomes an eliminated-monitor encoding — the
+  // MonitorType discriminant index 1 marks a PEA-eliminated lock on a virtual
+  // object — with the owner VO's wire ID as an i32 value; the basic-lock
+  // cell is preserved for the VM to initialize at deopt.
   bool emitMonitor(const ParsedDeoptMonitor &Monitor) {
     auto Root = FinalRootsByCell.find(Monitor.OwnerCell.OperandIndex);
     if (Root == FinalRootsByCell.end()) {
@@ -781,12 +874,9 @@ private:
     unsigned EncodingIndex =
         appendToken(FinalDeoptPoolBundleToken::immediateI64(
             encodeDeoptValue(/*Index=*/1, DeoptValueEncoding::MonitorType,
-                             T_OBJECT),
-            DeoptSemanticCellRole::MonitorEncoding,
-            Monitor.EncodingCell.OperandIndex));
-    unsigned ValueIndex = appendToken(FinalDeoptPoolBundleToken::immediateI32(
-        WireID, DeoptSemanticCellRole::MonitorOwner,
-        Monitor.OwnerCell.OperandIndex));
+                             T_OBJECT)));
+    unsigned ValueIndex = appendToken(
+        FinalDeoptPoolBundleToken::immediateI32(WireID));
     appendSource(Monitor.LockCell);
     if (currentIDForWire(WireID))
       setExactOccurrenceOutput(Monitor.OwnerCell.OperandIndex, EncodingIndex,
@@ -794,6 +884,8 @@ private:
     return true;
   }
 
+  // Emit a scope's body in wire order: locals, expression stack, monitors,
+  // and the optional orig-pc marker.
   bool emitScopeBody(const ParsedDeoptScope &Scope) {
     for (const ParsedDeoptScopeValue &Value : Scope.Locals)
       if (!emitScopeValue(Value, DeoptPoolRootKind::Local))
@@ -811,6 +903,13 @@ private:
     return true;
   }
 
+  // Emit the complete bundle in wire order: root scope header, then ALL
+  // descriptors, then the root scope body, then each inlinee scope, and
+  // finally the narrow-oop tail. Placing every descriptor between the root
+  // header and the root locals forms the deopt-point-level object pool: the
+  // HotSpot parser walks scopes outermost-first and resolves VORefs through
+  // a record-level map, so every descriptor must precede any VORef that
+  // references it, and inlinee scopes never carry descriptors of their own.
   bool emitCompleteBundle() {
     if (Source.Scopes.empty())
       return fail(FinalDeoptPoolBundleErrorCode::InvalidSourceFingerprint);
@@ -835,6 +934,10 @@ private:
     return true;
   }
 
+  // Prove emission matched classification: a pruned occurrence must have
+  // received no output tokens, and a rewritten occurrence must have received
+  // its encoding token and — except for a Descriptor occurrence, which is
+  // the header cell alone — its value token.
   bool validateOccurrenceCompletion() {
     for (const FinalDeoptPoolCurrentOccurrence &Occurrence :
          CurrentOccurrences) {
@@ -858,14 +961,21 @@ private:
     return true;
   }
 
+  // Builder inputs: the parsed bundle, the graph plan, the scalar-token
+  // table, and the exact current-cell table.
   const ParsedDeoptBundle &Source;
   const FinalDeoptPoolGraphPlan &Graph;
   ArrayRef<DeoptPoolScalarTokenBinding> ScalarTokenInputs;
   ArrayRef<DeoptPoolCurrentCellBinding> CurrentCellInputs;
 
+  // Live copies of the source operands, resolved through the source's
+  // RAUW-tracking handles at build time.
   SmallVector<Value *, 32> SourceValues;
+  // One bit per source operand: claimed by exactly one parsed cell.
   SmallBitVector AccountedSourceCells;
+  // One bit per source descriptor: kept as a legacy node in the plan.
   SmallBitVector LegacySourceKept;
+  // The first failure recorded by fail().
   std::optional<FinalDeoptPoolBundleError> Error;
 
   // Lookup maps for per-safepoint plan building. Keys can't reach DenseMap's
@@ -875,15 +985,21 @@ private:
   // and scalar tokens are a 1-based counter — all far from
   // numeric_limits<uint32_t>::max()/max()-1 and the uint64_t analogs.
   DenseMap<uint64_t, WeakTrackingVH> ScalarTokens;
+  // Where each source root/field value cell was parsed from.
   DenseMap<DeoptPoolSemanticCellID, SourceRootLocation> SourceRoots;
   DenseMap<DeoptPoolSemanticCellID, SourceFieldLocation> SourceFields;
+  // Final roots/fields of the plan, keyed by their source cell.
   DenseMap<DeoptPoolSemanticCellID, const FinalDeoptPoolRoot *>
       FinalRootsByCell;
   DenseMap<DeoptPoolSemanticCellID, const FinalDeoptPoolField *>
       FinalFieldsByCell;
+  // Current-node wire ID to analysis-local ID, for plan nodes only.
   DenseMap<uint32_t, CurrentDeoptNodeID> CurrentByWire;
+  // Exact source cell to its index in CurrentOccurrences.
   DenseMap<DeoptPoolSemanticCellID, unsigned> ExactOccurrenceByCell;
 
+  // The output being assembled: the token template in wire order and the
+  // classified current-node occurrences.
   SmallVector<FinalDeoptPoolBundleToken, 32> Tokens;
   SmallVector<FinalDeoptPoolCurrentOccurrence, 8> CurrentOccurrences;
 };
@@ -901,6 +1017,10 @@ llvm::jeandle::pea::prepareFinalDeoptPoolBundlePlan(
 SerializeFinalDeoptPoolBundleResult
 llvm::jeandle::pea::serializeFinalDeoptPoolBundlePlan(
     const FinalDeoptPoolBundlePlan &Plan, const CallBase &CurrentSite) {
+  // Post-RAUW recheck against the live IR: the plan was built during
+  // analysis, and earlier effects may have rewritten the call since. The
+  // bundle must still match the parsed snapshot — grammar constants bit-for
+  // bit, semantic values through their tracking handles.
   if (!matchesParsedDeoptBundle(Plan.source(), CurrentSite))
     return serializeError(FinalDeoptPoolBundleErrorCode::StaleSourceBundle);
 
@@ -912,6 +1032,8 @@ llvm::jeandle::pea::serializeFinalDeoptPoolBundlePlan(
     const FinalDeoptPoolBundleToken &Token = Plan.tokens()[TokenIndex];
     switch (Token.kind()) {
     case FinalDeoptPoolBundleTokenKind::TrackedValue: {
+      // A tracked operand must still be alive and keep the exact type it had
+      // at plan time.
       Value *V = Token.trackedValue();
       if (!V)
         return serializeError(FinalDeoptPoolBundleErrorCode::DeadTrackedValue,

@@ -4,8 +4,8 @@
 ; The inner is then abandoned (kept real) because a DERIVED pointer to it
 ; escapes. When the outer later escapes, its materialization must still
 ; succeed — replaying the inner's surviving OrigAlloc into the field —
-; instead of giving up on the outer too (Graal's materializeWithCommit
-; contributes the already-materialized entry's value the same way).
+; instead of giving up on the outer too (the materialize commit contributes
+; the already-materialized entry's value the same way).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @foo(ptr addrspace(1))

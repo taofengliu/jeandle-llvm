@@ -5,8 +5,7 @@
 ; whenever an ObjectID is present in one and absent in the other. Every map
 ; (Virtuals, Materialized, FieldStates, LockCounts, LiveLockEnters,
 ; MaterializedValues) is size-checked before key iteration, so a present-vs-
-; absent difference returns false (no debug/release divergence; the old
-; loopBlockExitsEquivalent / KnownAliveLoopEnds llvm_unreachable path is gone).
+; absent difference returns false (no debug/release divergence).
 ;
 ; Shape: %a is allocated BEFORE the loop (virtual on loop entry → present in the
 ; Virtuals set of B := A) and escapes UNCONDITIONALLY inside the body (→ moves

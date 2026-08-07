@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; CFG lock-depth smoke test: a single virtual whose monitorenter carries NO
-; `!jeandle.lock_depth` metadata (the frontend no longer attaches it). The
+; `!jeandle.lock_depth` metadata (the frontend does not attach it). The
 ; fold-elide path must still fire (the alloc, enter, exit and field stores all
 ; eliminate). This exercises the ordinary-entry CFG depth path on a positive
 ; case and confirms the derived depth flows through ObjectState::Locks and the

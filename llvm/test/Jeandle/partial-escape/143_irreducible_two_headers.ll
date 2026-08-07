@@ -4,8 +4,8 @@
 ; other, so the cycle has no natural-loop header (LoopInfo refuses to
 ; model it as a Loop at all). processLoop is never invoked for this
 ; region; the outer RPO walk processes each block once. The escape
-; sites inside the cycle materialize the alloc per-escape, the alloc
-; survives in IR, and there is no crash.
+; sites inside the cycle classify the alloc as escaping; the original
+; alloc survives in IR, both sinks consume it, and there is no crash.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -31,8 +31,8 @@ u:
   resume i64 %lp
 }
 
-; No crash, alloc survives (potentially materialised at the first
-; escape inside the cycle), both sink calls intact.
+; No crash, the original alloc survives and feeds both sink calls
+; directly.
 ; CHECK-LABEL: define void @test_irreducible_two_headers
 ; CHECK: invoke {{.*}}@jeandle.new_instance
 ; CHECK-DAG: call void @sink

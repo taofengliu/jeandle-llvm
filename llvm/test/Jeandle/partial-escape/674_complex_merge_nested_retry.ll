@@ -9,7 +9,7 @@ declare void @sink_ref(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
 ; An i32 and a float at the same offset cannot form one typed field PHI.
-; Graal's incompatible tail materializes the object on both predecessors and
+; An incompatible merge materializes the object on both predecessors and
 ; preserves both stores plus the real load.
 define void @merge_i32_float(i1 %c)
     gc "hotspotgc" personality ptr @__gxx_personality_v0 {

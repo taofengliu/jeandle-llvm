@@ -57,9 +57,7 @@ namespace pea {
 class FinalDeoptPoolBundlePlan;
 }
 
-// ===========================================================================
-// 1.1  ObjectID and VirtualObject
-// ===========================================================================
+//===--- ObjectID and VirtualObject --------------------------------------===//
 
 using ObjectID = unsigned;
 static constexpr ObjectID InvalidObjectID = ~0u;
@@ -85,16 +83,13 @@ struct MonitorIdRef {
 };
 
 // Self-contained description of a monitorenter to re-emit at the materialize
-// point. Graal analog: a synthetic MonitorEnterNode created at the
-// CommitAllocationNode during lowering (DefaultJavaLoweringProvider
-// finishAllocatedObjects), sorted ascending by lock depth. Jeandle captures
-// this from the original enter call at ANALYSIS time because the lock model
-// DELETES the original enter from IR — the transform cannot depend on
-// the original call's lifetime. Callee is the jeandle.monitorenter_*
-// function; NonReceiverArgs are operands 1..N (e.g. the BasicLock); the
-// receiver (operand 0) is the effect's real receiver: OrigAlloc or
-// SyntheticPhi.
-// BytecodeDepth is the ascending re-emit sort key (Graal getLockDepth).
+// point, sorted ascending by lock depth. Jeandle captures this from the
+// original enter call at ANALYSIS time because the lock model DELETES the
+// original enter from IR — the transform cannot depend on the original call's
+// lifetime. Callee is the jeandle.monitorenter_* function; NonReceiverArgs are
+// operands 1..N (e.g. the BasicLock); the receiver (operand 0) is the effect's
+// real receiver: OrigAlloc or SyntheticPhi.
+// BytecodeDepth is the ascending re-emit sort key.
 struct MaterializedLock {
   Function *Callee = nullptr;
   SmallVector<WeakTrackingVH, 2> NonReceiverArgs;
@@ -104,21 +99,23 @@ struct MaterializedLock {
 // A lock re-emitted at a materialization point, tagged with its source
 // MaterializeEffect so the transform can pick the right per-effect receiver
 // for each lock when a cascade group's locks are merged and globally
-// depth-sorted. SourceEffect is the per-effect receiver-lookup key (Jeandle's
-// analog of Graal's `allocations[commit.getObjectIndex(monitorId)]`) —
-// strictly more precise than an OrigAlloc key, which would be last-write-wins
-// across per-pred materializations of the same object. The transform resolves
-// the receiver via `MaterializedReceiverOf[SourceEffect]` (set once per effect
-// to OrigAlloc or SyntheticPhi in applyMaterialize, read by the lock-cascade
-// re-emit path). Materialization never spawns a per-pred invoke, so
-// the per-effect key disambiguates cascade members without any fallback chain.
+// depth-sorted. SourceEffect is the per-effect receiver-lookup key — strictly
+// more precise than an OrigAlloc key, which would be last-write-wins across
+// per-pred materializations of the same object. The transform resolves the
+// receiver via `MaterializedReceiverOf[SourceEffect]` (set once per effect to
+// OrigAlloc or SyntheticPhi in applyMaterialize, read by the lock-cascade
+// re-emit path). Materialization never spawns a per-pred invoke, so the
+// per-effect key disambiguates cascade members without any fallback chain.
 // See PEAResult::LockReplayBatches.
 class MaterializeEffect;
 struct MergedLock {
+  // Same field meaning as MaterializedLock: the jeandle.monitorenter_*
+  // function, operands 1..N, and the ascending re-emit sort key.
   Function *Callee = nullptr;
   SmallVector<WeakTrackingVH, 2> NonReceiverArgs;
   uint32_t BytecodeDepth = 0;
-  const MaterializeEffect *SourceEffect = nullptr; // per-effect receiver key
+  // Per-effect receiver-lookup key (see above).
+  const MaterializeEffect *SourceEffect = nullptr;
   // Logical consumers whose effects contributed this one physical replay
   // operation. The transform emits the operation once; tracing emits one
   // association row per unique consumer using the same physical ordinal.
@@ -126,20 +123,32 @@ struct MergedLock {
 };
 
 // Final physical lock-replay batch consumed by the transform. EmitSite is the
-// durable edge-normalized, pre-Pass1 insertion point (before any eager re-aim),
-// and EmitterSeqNo identifies the tail MaterializeEffect that emits the
-// complete globally depth-sorted list after every receiver has been recorded.
+// durable edge-normalized insertion point captured before the transform's
+// ordinary phase (before any eager re-aim), and EmitterSeqNo identifies the
+// tail MaterializeEffect that emits the complete globally depth-sorted list
+// after every receiver has been recorded.
 struct LockReplayBatch {
   Instruction *EmitSite = nullptr;
   uint32_t EmitterSeqNo = 0;
+  // Deterministic numeric ID of the source block (EmitSite->getParent()),
+  // assigned by computeEscapePointLocks for trace output.
   uint32_t SourceID = 0;
+  // The merged, deduplicated locks of this batch, sorted ascending by
+  // BytecodeDepth.
   SmallVector<MergedLock, 4> Locks;
 };
 
+// A tracked allocation: the analysis-time record for one
+// `jeandle.new_instance`/`jeandle.new_array` site that is (or was) eligible
+// for virtualization. Carries the object's identity (AllocationCall), type
+// and layout metadata, and the synthetic-merge state for Case C. Field VALUES
+// do not live here — they are tracked in the analyzer's FieldStates map.
 class VirtualObject {
 public:
   enum ClassKind : uint8_t { Instance, Array };
 
+  // One tracked field slot: a half-open byte range [Offset, Offset+ByteSize)
+  // with the slot's LLVM type and whether it holds a Java reference.
   struct FieldDesc {
     int64_t Offset;
     Type *LLVMType;
@@ -151,43 +160,51 @@ public:
   };
 
 private:
+  // Index into PEAResult::VirtualObjects; assigned by createVirtualObject.
   const ObjectID ID;
+  // Instance vs array allocation.
   ClassKind Kind;
 
 public:
   // The original `jeandle.new_instance`/`jeandle.new_array` invoke emitted by
-  // the JDK abstract interpreter. This is Jeandle's analog of Graal's
-  // VirtualObjectNode — the identity token that downstream IR uses reference.
-  // LLVM-CONSTRAINED DIVERGENCE from Graal: Graal REPLACES the NewInstanceNode
-  // with a VirtualObjectNode DURING analysis (tool.replaceWithVirtual) and
-  // resolves uses through the point-sensitive `aliases` map; there is no
-  // persistent "OrigAlloc". Jeandle's Analysis pass cannot mutate IR (LLVM's
-  // Analysis/Transform split), so OrigAlloc persists as a real invoke until the
-  // Transform, where an ordinary VO is either eliminated (NeverEscapes) or
-  // KEPT and reused as the materialized value itself for PartiallyEscapes. The
-  // synthetic Case-C form is documented below and uses SyntheticPhi instead.
-  // The analysis
-  // rewrites every VirtualRef to the referenced object's real identity during
-  // prerequisite materialization (see processLoad/processStore/
-  // resolveVirtualRef), so the transform only replays field stores and
-  // re-emits locks onto the selected receiver. Ordinary receivers are
-  // OrigAlloc; prepared Case-C receivers are SyntheticPhi.
-  // Behaviorally equivalent: OrigAlloc's role is a pure identity token / the
-  // single sound SSA materialized value, never a fresh allocation in the final
-  // IR.
+  // the JDK abstract interpreter ("OrigAlloc") — the identity token that
+  // downstream IR uses reference. LLVM's Analysis/Transform split forbids the
+  // analysis pass from mutating IR, so OrigAlloc persists as a real invoke
+  // until the transform, where an ordinary VO is either eliminated
+  // (NeverEscapes) or KEPT and reused as the materialized value itself for
+  // PartiallyEscapes. A synthetic Case-C VO (a merge of distinct but
+  // compatible virtual objects into one synthetic VO — see
+  // PartialEscapeAnalysis.cpp's file header) uses SyntheticPhi instead. The
+  // analysis rewrites every VirtualRef to the referenced object's real
+  // identity during prerequisite materialization (see processLoad/
+  // processStore/resolveVirtualRef), so the transform only replays field
+  // stores and re-emits locks onto the selected receiver. Ordinary receivers
+  // are OrigAlloc; prepared Case-C receivers are SyntheticPhi. OrigAlloc's
+  // role is a pure identity token / the single sound SSA materialized value,
+  // never a fresh allocation in the final IR.
   // WeakTrackingVH: an atomic deopt-pool rewrite may clone the allocation
   // invoke and RAUW the original. The handle follows to the clone so
   // transform-time uses remain valid.
   WeakTrackingVH AllocationCall;
 
+  // The JVM klass pointer taken from the allocation call's first operand
+  // (0 when unknown). Used for type-compatibility checks between virtual
+  // objects and to derive field layout.
   uintptr_t Klass = 0;
+  // Total instance size in bytes (Instance kind only).
   uint32_t SizeInBytes = 0;
 
+  // Array metadata (Array kind only): the constant element count, the
+  // per-element LLVM type, the VM's element scale (bytes per element), and
+  // the byte offset of element 0 from the object base.
   uint32_t ArrayLength = 0;
   Type *ArrayElementType = nullptr;
   uint32_t ArrayIndexScale = 0;
   uint32_t ArrayBaseOffset = 0;
 
+  // Tracked fields, kept sorted by Offset (see getOrCreateFieldIndex).
+  // Lazily populated as accesses are resolved, so its size is
+  // path-dependent and not a structural invariant of the object.
   SmallVector<FieldDesc, 8> Fields;
 
   // A "synthetic" VirtualObject is created at a multi-pred merge by the
@@ -220,6 +237,10 @@ public:
   bool isInstance() const { return Kind == Instance; }
   bool isArray() const { return Kind == Array; }
 
+  // Find or create the FieldDesc slot for (Offset, Ty), keeping Fields sorted
+  // by Offset. Returns the slot's index, or -1 when the field cannot be
+  // modeled (unsupported type, unrepresentable range, overlap conflict);
+  // callers treat -1 as "keep everything real" (conservative escape).
   int getOrCreateFieldIndex(int64_t Offset, Type *Ty, const DataLayout &DL);
 
   // Result of matching a GEP against the array's element-address pattern.
@@ -241,18 +262,23 @@ public:
   // list lives in exactly one place (avoids drift when a field is added).
   void copyStructuralFieldsFrom(const VirtualObject &O);
 
+  // Deep copy with a detached identity (InvalidObjectID, synthetic state
+  // cleared); the caller registers the clone via PEAResult::createVirtualObject
+  // to obtain a fresh ID.
   std::unique_ptr<VirtualObject> duplicate() const;
 };
 
-// ===========================================================================
-// 1.2  FieldValue
-// ===========================================================================
+//===--- FieldValue -------------------------------------------------------===//
 
+// A single tracked field slot value: unknown, a concrete scalar, a reference
+// to another virtual object (by ObjectID), or a reference to an already
+// materialized object.
 class FieldValue {
 public:
   enum Tag : uint8_t { Unknown, Scalar, VirtualRef, MaterializedRef };
 
 private:
+  // Which alternative of the union is active.
   Tag T = Unknown;
   // Valid when T is Scalar or MaterializedRef. WeakTrackingVH (NOT a raw
   // Value*): the snapshotted value may be RAUW'd during the transform — a
@@ -260,10 +286,12 @@ private:
   // atomic deopt-pool rewrite — and a raw Value* would then dangle.
   // The handle follows the RAUW so the snapshot never dangles. A value
   // DELETED without replacement nulls the handle; the transform asserts
-  // values are non-null and parented (or Constant/Argument) at use. Valid
-  // when T is VirtualRef: the vo-id.
+  // values are non-null and parented (or Constant/Argument) at use.
   WeakTrackingVH V;
+  // Valid when T is VirtualRef: the vo-id.
   ObjectID Ref = InvalidObjectID;
+  // The field's declared LLVM type; used to coerce or default-construct a
+  // replayed value of the right type at materialization.
   Type *DeclaredType = nullptr;
 
 public:
@@ -299,15 +327,17 @@ public:
   bool shallowEquals(const FieldValue &O) const;
 };
 
-// ===========================================================================
-// 1.3  ObjectState
-// ===========================================================================
+//===--- ObjectState ------------------------------------------------------===//
 
+// Per-VO virtual/materialized state for one program point: the state flag,
+// the live monitor stack, and (once materialized) the materialized pointer.
 class ObjectState {
 public:
   enum StateKind : uint8_t { Virtual, Materialized };
 
 private:
+  // Virtual while the allocation is still elided; Materialized once the
+  // object has a real SSA identity on this path.
   StateKind Kind = Virtual;
   // Per-VO live monitor stack: each element is a MonitorIdRef identifying
   // the (enter-call, bytecode-depth) pair pushed by a folded monitorenter
@@ -319,15 +349,16 @@ private:
   // per-VO truth and is kept in lockstep by foldMonitorEnter /
   // foldMonitorExit.
   SmallVector<MonitorIdRef, 2> Locks;
+  // Valid when Kind is Materialized: the real SSA value this object was
+  // materialized to on this path.
   Value *MaterializedValue = nullptr;
 
 public:
   // ObjectState carries ONLY the per-VO virtual/materialized flag, the live
   // lock stack, and (once materialized) the materialized pointer. Per-FIELD
-  // state does NOT live here. Graal's ObjectState.entries is authoritative
-  // because Graal propagates an ObjectState[] across the CFG inside
-  // PartialEscapeBlockState; Jeandle cannot (LLVM's Analysis/Transform split +
-  // SSA single-pass walk — see the STATE MODEL comment in
+  // state does NOT live here: LLVM's Analysis/Transform split plus the SSA
+  // single-pass walk prevent propagating a per-field state array across the
+  // CFG inside the block state (see the STATE MODEL comment in
   // PartialEscapeAnalysis.cpp), so field values are tracked in the
   // analyzer-wide FieldStates DenseMap keyed by (ObjectID, byte-offset), and
   // ObjectState intentionally carries no field-storage member.
@@ -345,34 +376,31 @@ public:
   }
   bool hasLocks() const { return !Locks.empty(); }
 
-  // Graal analog: ObjectState.escape(ValueNode materialized). This is the
-  // pure virtual->materialized STATE FLIP only — it does NOT emit a
+  // The pure virtual->materialized STATE FLIP only — it does NOT emit a
   // Materialize effect or build an allocation invoke (that is the caller's
-  // job, e.g. materializeAt / ensureMaterialized). Named `escape` after Graal
-  // to avoid colliding with the real-materialization method family below.
+  // job, e.g. materializeAt / ensureMaterialized). Named `escape` to stay
+  // clear of the real-materialization method family (materializeAt &
+  // friends).
   void escape(Value *Ptr) {
     assert(isVirtual());
     assert(Ptr);
     Kind = Materialized;
     MaterializedValue = Ptr;
-    // Graal ObjectState.escape retains the lock state across the
-    // virtual->materialized flip — the materialized state still reads locks
-    // for re-emit and the strict-lock cascade. We match that: escape() does
-    // NOT clear Locks. Callers that need the live lock state dropped (the
-    // live-path materializeAt, via ClearLockState -> clearLocks) do so
-    // explicitly before flipping; the analyzer-side LiveLockEnters/LockCounts
-    // maps remain the cross-block authority, so any retained on-VO locks are
-    // informational only.
+    // The lock state is retained across the virtual->materialized flip: the
+    // materialized state still reads locks for re-emit and the strict-lock
+    // cascade, so escape() does NOT clear Locks. Callers that need the live
+    // lock state dropped (the live-path materializeAt, via ClearLockState ->
+    // clearLocks) do so explicitly before flipping; the analyzer-side
+    // LiveLockEnters/LockCounts maps remain the cross-block authority, so any
+    // retained on-VO locks are informational only.
   }
 
   void addLock(MonitorIdRef M) {
     assert(isVirtual());
-    // Graal ObjectState.addLock guarantees strictly descending depth on the
-    // head: the new (innermost) lock's depth is strictly greater than the
-    // previous head. Jeandle's vector runs front=min(outermost)..back=max
-    // (innermost), so the invariant is that the pushed depth strictly exceeds
-    // the current back. Mirrors Graal's GraalError.guarantee; the lock
-    // cascade (ensureMaterialized / materializeVirtualLocksBefore) relies on
+    // Invariant: strictly increasing depth on push — the new (innermost)
+    // lock's depth strictly exceeds the current back. The vector runs
+    // front=min(outermost)..back=max(innermost); the lock cascade
+    // (ensureMaterialized / materializeVirtualLocksBefore) relies on
     // front()=min / back()=max.
     assert(Locks.empty() || M.BytecodeDepth > Locks.back().BytecodeDepth);
     Locks.push_back(M);
@@ -390,10 +418,12 @@ public:
   }
 };
 
-// ===========================================================================
-// 1.4  PEABlockState
-// ===========================================================================
+//===--- PEABlockState ----------------------------------------------------===//
 
+// Per-block virtual-object state: a vector of optional ObjectState indexed by
+// ObjectID. The vector is shared between block states via std::shared_ptr
+// with array-level copy-on-write: the loop-fixpoint snapshot shares the
+// array, and only actual mutation pays for a deep copy.
 class PEABlockState {
 private:
   // ObjectStates is shared via std::shared_ptr and is copy-on-write: a mutator
@@ -427,14 +457,30 @@ private:
   SmallVector<std::optional<ObjectState>, 8> *getArrayForModification();
 };
 
-// ===========================================================================
-// 1.5  AliasMap
-// ===========================================================================
+//===--- AliasMap ---------------------------------------------------------===//
 
+// Point-sensitive value-to-identity map maintained by the analyzer. SSA
+// values that denote a still-virtual object are mapped to that object's
+// ObjectID: the allocation call's result, a merge PHI registered as a Case-B
+// alias (Case B: all PHI incomings resolve to the same still-virtual
+// ObjectID — see PartialEscapeAnalysis.cpp's file header), a load of a
+// virtual-reference field, and so on. Values folded to a scalar are mapped to
+// their replacement. Resolution of an arbitrary Value* back to a virtual
+// identity goes through jeandle::pea::resolveVirtualRef, which consults this
+// map before structural peeling.
 class AliasMap {
+  // Value* -> ObjectID for every value known to denote a virtual object.
   DenseMap<Value *, ObjectID> VirtualAliases;
+  // Subset of VirtualAliases keys whose value denotes the WHOLE object
+  // identity (as opposed to a derived value, e.g. a field-element pointer
+  // aliased for tracking purposes). Whole-object resolution refuses
+  // non-whole-object aliases.
   DenseSet<Value *> WholeObjectVirtualAliases;
+  // Value* -> replacement Value* for values folded to a concrete scalar.
   DenseMap<Value *, Value *> ScalarAliases;
+  // Instructions that use at least one virtual-aliased value. The analyzer's
+  // instruction walk uses this to route only potentially-affected
+  // instructions through the virtual-operand handling path.
   DenseSet<Instruction *> HasVirtualInputs;
 
 public:
@@ -465,38 +511,29 @@ public:
   void restore(const AliasMap &S);
 };
 
-// ===========================================================================
-// 1.6  Effects
+//===--- Effects ----------------------------------------------------------===//
 //
-// Graal's PEA models an IR mutation as an `Effect` (EffectList.java):
-//   - abstract base `Effect` with `isVisible()`, `isCfgKill()`,
-//     `apply(graph, obsoleteNodes)`, `format()`;
-//   - concrete effects are anonymous subclasses, one per mutation kind,
-//     categorized by `isCfgKill()` (drives the two-pass apply) and
-//     `isVisible()` (logging only);
-//   - stored per-block in a `GraphEffectList` (EffectList subclass) and
-//     applied in two passes — non-cfgKill first, cfgKill second — driven
-//     entirely by `isCfgKill()`.
-//
-// Jeandle mirrors this shape with three IR-form-induced adaptations:
+// PEA records every IR mutation the analysis decides on as an `Effect`: a
+// polymorphic record classified by Kind (which mutation) and Phase (when it
+// applies). Three design points are induced by the IR form:
 //   1. LLVM's Analysis/Transform split forbids mutating IR during analysis,
-//      so Jeandle's effects are serializable DATA RECORDS (named subclasses
-//      with fields), not anonymous closures capturing graph nodes. They are
-//      produced by the analysis pass, marshalled in `PEAResult`, and consumed
-//      by a separate transform pass.
-//   2. `apply(TransformContext&)` is the Jeandle form of Graal's
-//      `apply(graph, obsoleteNodes)` — `TransformContext` bundles the
-//      Function and the shared per-apply maps (defined in
-//      PartialEscapeTransform.cpp).
+//      so effects are serializable DATA RECORDS (named subclasses with
+//      fields), not closures capturing graph nodes. They are produced by the
+//      analysis pass, marshalled in `PEAResult`, and consumed by a separate
+//      transform pass.
+//   2. `apply(TransformContext&)` performs the recorded mutation;
+//      `TransformContext` bundles the Function and the shared per-apply maps
+//      (defined in PartialEscapeTransform.cpp).
 //   3. A safepoint's complete deoptimization object pool is one atomic phase
 //      between ordinary SSA rewrites and cfg-kill effects. LLVM operand
-//      bundles have no independently mutable FrameState/ObjectState graph, so
+//      bundles have no independently mutable per-object state graph, so
 //      exposing per-object bundle edits would create observable intermediate
-//      states that do not exist in Graal.
-// ===========================================================================
+//      states; the whole-pool rewrite is a single transaction instead.
+//
+// The transform applies effects in three ordered phases — Ordinary,
+// DeoptPool, CfgKill — driven entirely by `getPhase()` (see Effect::Phase).
 
-// Jeandle adaptation of Graal's `EffectList.Effect`. Abstract base for every
-// recorded IR mutation.
+// Abstract base for every recorded IR mutation.
 class Effect {
 public:
   enum class Phase : uint8_t { Ordinary, DeoptPool, CfgKill };
@@ -520,14 +557,12 @@ public:
   // bucket; transform application order still comes from that stable bucket,
   // and the physical insertion point comes from InsertBefore.
   BasicBlock *Block = nullptr;
-  // IR-FORM DIVERGENCE from Graal: Graal applies effects in pure list-order
-  // (its per-block EffectList is append-only; loop headers use
-  // insertAll(...,0)). Jeandle marshals effects into a per-block map and
-  // re-sorts at apply time, so it needs an explicit ordering key. The
-  // deferred-CreatePHI trick (emit at SeqNo=0, reassign a fresh nextSeqNo()
-  // at drain) is load-bearing for the ordinary self-loop back-edge ordering
-  // invariant (CreatePHI sorts after merge-time per-pred Materialize in the
-  // same block).
+  // Explicit apply-time ordering key: effects are marshalled into a per-block
+  // map and re-sorted at apply time rather than applied in pure list-order,
+  // so each effect carries its own key. The deferred-CreatePHI trick (emit at
+  // SeqNo=0, reassign a fresh nextSeqNo() at drain) is load-bearing for the
+  // ordinary self-loop back-edge ordering invariant (CreatePHI sorts after
+  // merge-time per-pred Materialize in the same block).
   // TODO(list-order): adopting Graal's pure list-order would require reworking
   // merge/loop emission; SeqNo + the deferred-CreatePHI trick covers ordering
   // meanwhile.
@@ -548,10 +583,10 @@ public:
 
   virtual ~Effect() = default;
 
-  // Graal's non-cfgKill/cfgKill ordering with an LLVM-specific atomic
-  // deopt-pool phase inserted between them. This phase is not the same as
-  // "structurally rewrites the CFG": Materialize and CreatePHI run in the
-  // ordinary phase.
+  // Application ordering: ordinary value/state mutations first, the atomic
+  // deopt-pool rewrite second, cfg-kill effects last. The phase is not the
+  // same as "structurally rewrites the CFG": Materialize and CreatePHI run
+  // in the ordinary phase.
   virtual Phase getPhase() const { return Phase::Ordinary; }
 
   virtual Kind getKind() const = 0;
@@ -566,25 +601,23 @@ public:
   // scans (processBlock tail, processBlockPhis identity check, commit).
   virtual Instruction *getTarget() const { return nullptr; }
 
-  // Graal apply(graph, obsoleteNodes). Mutates Ctx.F's IR. Defined in
+  // Perform the recorded IR mutation on Ctx.F. Defined in
   // PartialEscapeTransform.cpp.
   virtual void apply(TransformContext &Ctx) = 0;
 
-  // Graal format()/toString(). Drives the -jeandle-trace-pea per-effect line.
+  // One-line description driving the -jeandle-trace-pea per-effect line.
   // Non-pure: the kind name, mutation owner, block, and target are all
   // reachable via the base API, so one shared definition suffices.
   virtual void dump(raw_ostream &OS) const;
 
   // Deep copy for the loop-fixpoint snapshot (takeLoopSnapshot/
   // restoreLoopSnapshot read the snapshot across multiple iterations, so they
-  // need a copy; EffectList is move-only). IR-form divergence: Graal
-  // backtracks by truncating its EffectList (size=0); Jeandle's per-block map
-  // snapshot needs a real deep copy.
+  // need a copy; EffectList is move-only).
   virtual std::unique_ptr<Effect> clone() const = 0;
 };
 
 // Fold a load from a virtual object's field to the tracked scalar value (or a
-// synthesized coercion / default). Non-cfgKill. Graal analog: replaceAtUsages.
+// synthesized coercion / default). Ordinary phase.
 class ReplaceLoadEffect : public Effect {
 public:
   // WeakTrackingVH follows RAUW, including a safepoint clone performed by the
@@ -606,7 +639,7 @@ public:
 };
 
 // Fold a `jeandle.*` JavaOp against a virtual receiver to a constant / delete.
-// Non-cfgKill. Graal analog: replaceAtUsages / deleteNode.
+// Ordinary phase.
 class ReplaceCallEffect : public Effect {
 public:
   // WeakTrackingVH: see ReplaceLoadEffect.
@@ -634,7 +667,7 @@ public:
 };
 
 // Remove a store into a virtual object's field (value tracked in FieldStates).
-// Non-cfgKill. Graal analog: deleteNode (FixedWithNextNode).
+// Ordinary phase.
 class EliminateStoreEffect : public Effect {
 public:
   Instruction *Target = nullptr;
@@ -652,7 +685,6 @@ public:
 
 // Rewrite the original allocation invoke into an unconditional branch (dropping
 // the unwind edge) or erase a call alloc. Applied in the cfg-kill phase.
-// Graal analog: deleteNode (WithExceptionNode) / killIfBranch.
 class EliminateAllocationEffect : public Effect {
 public:
   // WeakTrackingVH: the allocation may be cloned by the deopt-pool phase; the
@@ -680,8 +712,6 @@ public:
 // allocation invoke. The receiver is recorded in
 // `MaterializedReceiverOf[&E]`.
 // Ordinary phase.
-// Graal analog: the one `Effect("materializeBefore")` appended by
-// PartialEscapeBlockState.materializeBefore.
 class MaterializeEffect : public Effect {
 public:
   static constexpr uint32_t InvalidPlanID = ~uint32_t{0};
@@ -706,10 +736,12 @@ public:
   // Replay receiver: OrigAlloc for an ordinary VO, SyntheticPhi for a
   // synthetic Case-C VO. WeakTrackingVH follows any safepoint clone.
   WeakTrackingVH Target;
+  // The field values to replay onto the receiver: one (offset, value) pair
+  // per tracked field with a known value (Unknown slots replay nothing and
+  // are omitted), in ascending offset order at emission.
   SmallVector<FieldEntry, 8> FieldEntries;
-  // Surviving (unbalanced) monitorenters to re-emit at the materialize point
-  // (Graal: synthetic MonitorEnterNodes at the CommitAllocationNode), sorted
-  // ascending by BytecodeDepth.
+  // Surviving (unbalanced) monitorenters to re-emit at the materialize point,
+  // sorted ascending by BytecodeDepth.
   SmallVector<MaterializedLock, 2> Locks;
   // Stable provenance for the final lock-replay plan. LogicalEscape identifies
   // the merge/consumer shared by alternative predecessor plans; ReplaySource
@@ -722,15 +754,15 @@ public:
   // has another distinct successor, the transform splits Source->Target and
   // moves every replay operation to that edge before building batches. Null
   // for live-path materializations and true block-end drains.
+  // Incoming-edge replay uses the effect's real receiver: field and lock
+  // replay retain edge provenance, and per-pred receiver identity survives
+  // via MaterializedReceiverOf[SourceEffect].
   BasicBlock *ReplayTarget = nullptr;
   // Recursive field prerequisites and strict-lock cascade members share one
   // plan ID. Final eligibility treats every surviving plan as an atomic
   // component: if any member is ineligible, every member's effects are
   // discarded before transform application.
   uint32_t PlanID = InvalidPlanID;
-  // Incoming-edge replay uses the effect's real receiver. Field and lock replay
-  // retain edge provenance, and per-pred receiver identity survives via
-  // MaterializedReceiverOf[SourceEffect].
 
   Kind getKind() const override { return Kind::Materialize; }
   static bool classof(const Effect *E) {
@@ -754,20 +786,26 @@ public:
 };
 
 // Insert an analyzer-built unparented PHINode at a merge block and wire its
-// incomings. Ordinary phase. Graal analog: addFloatingNode + setPhiInput
-// (initializePhiInput).
+// incomings. Ordinary phase.
 //
 // CreatePHIEffects are field-value PHIs that merge a per-offset field value
 // across predecessors or around a loop. They are emitted by mergeFieldStates
 // and synthesizeCaseC.
 class CreatePHIEffect : public Effect {
 public:
+  // The PHI's value type (the tracked field's type at FieldOffset).
   Type *PHIType = nullptr;
+  // Byte offset of the merged field within the virtual object; the mutation
+  // owner's field slot this PHI supplies.
   int64_t FieldOffset = 0;
   // WeakTrackingVH: an incoming value may be a call result whose call is
   // cloned by the deopt-pool phase; the handle follows the RAUW.
   SmallVector<WeakTrackingVH, 4> PHIIncomingValues;
+  // Predecessor block for each entry of PHIIncomingValues, pairwise.
   SmallVector<BasicBlock *, 4> PHIIncomingBlocks;
+  // The unparented PHINode built by the analyzer (owned by
+  // PEAResult::OwnedPhis / OwnedLoopFieldPhis until the transform inserts it
+  // into Block).
   PHINode *PhiInst = nullptr;
 
   Kind getKind() const override { return Kind::CreatePHI; }
@@ -815,14 +853,20 @@ private:
   // Stable analysis-time identity. It is compared and used as a map key only,
   // never dereferenced after SafepointVH stops denoting the same value.
   CallBase *const SafepointKey;
+  // The safepoint call as it migrates through IR mutation: a sibling
+  // deopt-pool rewrite clones the call and RAUWs the original, and this
+  // handle follows the clone. getTarget() returns SafepointKey only while
+  // the handle still denotes it.
   WeakTrackingVH SafepointVH;
+  // The immutable whole-pool plan: every output token and every exact
+  // current-object source occurrence for this safepoint.
   const std::shared_ptr<const pea::FinalDeoptPoolBundlePlan> Plan;
 };
 
-// Jeandle adaptation of Graal's `EffectList` / `GraphEffectList`. Append-only
-// list of `unique_ptr<Effect>` (mirrors Graal's `Effect[]` of references).
-// Move-only: the loop-fixpoint snapshot needs a copy, taken via `clone()`.
+// Append-only list of `unique_ptr<Effect>`. Move-only: the loop-fixpoint
+// snapshot needs a copy, taken via `clone()`.
 class EffectList {
+  // Owning storage, in emission order.
   SmallVector<std::unique_ptr<Effect>, 16> Effects;
 
 public:
@@ -832,31 +876,30 @@ public:
   EffectList(const EffectList &) = delete;
   EffectList &operator=(const EffectList &) = delete;
 
-  // Graal add(): append one effect at the tail.
+  // Append one effect at the tail.
   void add(std::unique_ptr<Effect> E) { Effects.push_back(std::move(E)); }
-  // Graal addAll(): append all of Other at the tail (move-merge, clear Other).
+  // Append all of Other at the tail (move-merge, clearing Other).
   void addAll(EffectList &Other) {
     for (auto &E : Other.Effects)
       Effects.push_back(std::move(E));
     Other.Effects.clear();
   }
-  // Graal clear(): size=0, retain capacity for backtracking reuse.
+  // Drop all effects, retaining capacity for backtracking reuse.
   void clear() { Effects.clear(); }
   bool empty() const { return Effects.empty(); }
   size_t size() const { return Effects.size(); }
   Effect &operator[](size_t I) { return *Effects[I]; }
   const Effect &operator[](size_t I) const { return *Effects[I]; }
 
-  // IR-form extension: remove and return ownership of element I. Used by
-  // processBlock's post-merge PendingMergePhis drain to move synthesized
-  // Case-B PHI effects into BlockEffects in SeqNo order.
+  // Remove and return ownership of element I. Used by processBlock's
+  // post-merge PendingMergePhis drain to move synthesized Case-B PHI effects
+  // into BlockEffects in SeqNo order.
   std::unique_ptr<Effect> spliceOut(size_t I) {
     auto E = std::move(Effects[I]);
     Effects.erase(Effects.begin() + I);
     return E;
   }
-  // IR-form extension: drop every effect matching Pred
-  // (dropEffectsForIneligible).
+  // Drop every effect matching Pred (used by dropEffectsForIneligible).
   void eraseIf(function_ref<bool(const Effect &)> Pred) {
     SmallVector<std::unique_ptr<Effect>, 16> Kept;
     for (auto &E : Effects)
@@ -872,9 +915,8 @@ public:
     return C;
   }
 
-  // Apply every effect in Phase, in SeqNo order (Jeandle's substitute for
-  // Graal list-order — see Effect::SeqNo). Defined in
-  // PartialEscapeTransform.cpp.
+  // Apply every effect in Phase, in SeqNo order (see Effect::SeqNo). Defined
+  // in PartialEscapeTransform.cpp.
   void apply(TransformContext &Ctx, Effect::Phase Phase);
 
   // Range-for yielding Effect& / const Effect& (the analyzer-side scans iterate
@@ -905,12 +947,14 @@ public:
   ConstIterator end() const { return {Effects.end()}; }
 };
 
-// ===========================================================================
-// 1.7  PEAResult
-// ===========================================================================
+//===--- PEAResult --------------------------------------------------------===//
 
+// The complete analysis result consumed by the transform pass: every virtual
+// object created by the analysis, its final escape classification, and the
+// per-block effect lists to apply. Owns all VirtualObjects and Effects.
 class PEAResult {
 public:
+  // Every virtual object created during analysis, indexed by ObjectID.
   SmallVector<std::unique_ptr<VirtualObject>, 8> VirtualObjects;
 
   enum class EscapeKind : uint8_t {
@@ -918,24 +962,34 @@ public:
     PartiallyEscapes,
     AlwaysEscapes
   };
+  // Final per-object classification: NeverEscapes allocations are erased;
+  // PartiallyEscapes keep OrigAlloc as the real receiver and replay onto it
+  // (a prepared synthetic identity replays onto SyntheticPhi instead, with
+  // its source allocations kept but not replayed); AlwaysEscapes were
+  // disqualified during analysis and their recorded effects were dropped,
+  // so nothing is replayed for them. Stamped by dropEffectsForIneligible
+  // (AlwaysEscapes) and by commit() (the other two kinds).
   DenseMap<ObjectID, EscapeKind> EscapeClassification;
 
+  // Effects to apply, bucketed by their semantic insertion block. The bucket
+  // assignment is stable across edge normalization (see Effect::Block).
   DenseMap<BasicBlock *, EffectList> BlockEffects;
 
   // Final physical lock-replay batches, globally depth-sorted ascending by
-  // BytecodeDepth. Graal flattens every lock materialized at one point into a
-  // single CommitAllocationNode and lowers them globally depth-sorted with a
-  // strict-increase guarantee (DefaultJavaLoweringProvider). Jeandle's per-VO
-  // MaterializeEffect model otherwise would re-emit per-effect, which
+  // BytecodeDepth. When several objects materialize at one escape point, the
+  // runtime lock stack requires their interleaved locks to be re-emitted as
+  // ONE globally depth-sorted list with strictly increasing depths. The
+  // per-VO MaterializeEffect model would otherwise re-emit per-effect, which
   // mis-orders re-entrant interleaved cascades (e.g. [a@0,b@1,a@2,c@3]
   // re-emitting as 0,2,1,3).
   //
   // The transform's tail-effect path emits an escape point's merged list once,
   // from the highest-SeqNo MaterializeEffect among those SHARING the SAME
-  // edge-normalized, pre-Pass1 InsertBefore pointer (the locked re-emit loop
-  // in applyMaterialize, gated on E.SeqNo == Batch.EmitterSeqNo). Each lock's
-  // receiver is resolved via MaterializedReceiverOf[ML.SourceEffect], asserted
-  // non-empty — NO fallback chain.
+  // edge-normalized, pre-ordinary-phase InsertBefore pointer (the locked
+  // re-emit loop in applyMaterialize, gated on E.SeqNo == Batch.EmitterSeqNo).
+  // Each lock's receiver is resolved via
+  // MaterializedReceiverOf[ML.SourceEffect], asserted non-empty — NO fallback
+  // chain.
   //
   // GROUPING RULE: the transform first normalizes each multi-successor
   // ReplaySource->ReplayTarget edge to a dedicated edge block, re-aiming all
@@ -957,17 +1011,18 @@ public:
   // batches, each with its own source provenance. Cross-object interleaved-lock
   // ordering is therefore not combined across mutually exclusive paths.
   //
-  // OrigInsertBefore (captured by the TransformContext after edge normalization
-  // and before the ordinary phase) records InsertBefore before any
-  // eager-update re-aim by
-  // relocateDependentMaterializes; the lock key is exactly this captured
-  // normalized pointer (looked up via OrigInsertBefore.lookup(&E) — a re-aimed
-  // E.InsertBefore could otherwise miss the final physical batch).
+  // OrigInsertBefore (captured by the TransformContext after edge
+  // normalization and before the ordinary phase) records InsertBefore before
+  // any eager-update re-aim by relocateDependentMaterializes; the lock key is
+  // exactly this captured normalized pointer (looked up via
+  // OrigInsertBefore.lookup(&E) — a re-aimed E.InsertBefore could otherwise
+  // miss the final physical batch).
   //
   // Populated by computeEscapePointLocks(), called once before the ordinary
-  // phase from
-  // the TransformContext setup in run().
+  // phase from the TransformContext setup in run().
   SmallVector<LockReplayBatch, 4> LockReplayBatches;
+  // Emit-site instruction -> index into LockReplayBatches, for the
+  // transform's per-materialize batch lookup (getLockReplayBatch).
   DenseMap<Instruction *, unsigned> LockReplayBatchForSite;
   void computeEscapePointLocks();
   const LockReplayBatch *getLockReplayBatch(Instruction *EmitSite) const {
@@ -977,8 +1032,13 @@ public:
     return &LockReplayBatches[It->second];
   }
 
+  // Net statistics, mutated in lockstep: each virtualization does
+  // ++VirtualizationDelta/--AllocationDelta, each de-virtualization the
+  // opposite, so AllocationDelta == -VirtualizationDelta always.
   int VirtualizationDelta = 0;
   int AllocationDelta = 0;
+  // Source of Effect::SeqNo values; monotonically increasing over the
+  // analysis run.
   uint32_t NextSeqNo = 0;
   // Monotone epoch bumped whenever the effect set changes (an effect is added
   // via addBlockEffect, dropped via dropEffectsForIneligible, or rolled back
@@ -1029,12 +1089,12 @@ public:
   SmallVector<WeakTrackingVH, 4> OwnedLoopFieldPhis;
 
   // Parented LLVM PHIs the transform should RAUW to poison + erase after
-  // the main Pass-2 EliminateAllocation sweep. These are Case-B aliases on
-  // a virtual that ended up NeverEscapes: the PHI was registered as an
+  // the cfg-kill phase's EliminateAllocation sweep. These are Case-B aliases
+  // on a virtual that ended up NeverEscapes: the PHI was registered as an
   // alias so downstream loads/stores fold through the alias map, but the
-  // PHI itself is now dead (every incoming was the VO's OrigAlloc, which
-  // Pass-2 RAUW'd to poison). WeakTrackingVH so a parallel delete path
-  // (e.g. unreachable-block pruning) leaves a null handle the transform
+  // PHI itself is now dead (every incoming was the VO's OrigAlloc, which the
+  // cfg-kill phase RAUW'd to poison). WeakTrackingVH so a parallel delete
+  // path (e.g. unreachable-block pruning) leaves a null handle the transform
   // safely skips.
   SmallVector<WeakTrackingVH, 4> CaseBAliasedPhisToErase;
 

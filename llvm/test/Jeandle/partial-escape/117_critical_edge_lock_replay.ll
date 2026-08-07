@@ -10,7 +10,7 @@
 ; that same %o receiver. Replay placement remains edge-sensitive: a
 ; predecessor with another successor must not leak merge-only lock effects
 ; onto the cold path. The verifier and trace checks cover the normalized
-; replay plan; no fresh allocation is created at the merge.
+; replay plan; no new allocation is created at the merge.
 ;
 ; The else arm holds an external padding monitor so both incoming CFG depths
 ; are one. The virtual-object lock state still differs across the merge, and

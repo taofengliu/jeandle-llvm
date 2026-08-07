@@ -3,7 +3,7 @@
 ; RUN:   -passes="require<partial-escape-analysis>,partial-escape-transform" %s 2>&1 \
 ; RUN:   | FileCheck %s --check-prefix=TRACE
 
-; Lock-count mismatch with a post-merge escape, under the reuse-OrigAlloc model.
+; Lock-count mismatch with a post-merge escape.
 ;
 ;   then: monitorenter(o) tracked virtually — LockCount[o]=1.
 ;   else: an external padding lock — LockCount[o]=0.
@@ -11,13 +11,13 @@
 ; Both paths hold one scalar monitor at the merge; the selected owner is
 ; released after the lock-state merge and escape have been observed.
 ;
-; Under reuse-OrigAlloc the lock-count mismatch no longer drives a per-pred
-; materialization cascade. The ORIGINAL allocation (OrigAlloc %o) is kept
-; alive (it dominates the escape point), the single surviving monitorenter
-; stays in its original block with receiver OrigAlloc, and the post-merge sink
-; receives OrigAlloc directly. No fresh materialization invoke is emitted, no
-; materialized-object PHI is built at the merge. A small owner PHI selects the
-; balanced monitor exit required by the two source paths.
+; The lock-count mismatch does not drive a per-pred materialization cascade.
+; The ORIGINAL allocation (OrigAlloc %o) is kept alive (it dominates the
+; escape point), the single surviving monitorenter stays in its original
+; block with receiver OrigAlloc, and the post-merge sink receives OrigAlloc
+; directly. No additional allocation invoke is emitted and no
+; materialized-object PHI is built at the merge. A small owner PHI selects
+; the balanced monitor exit required by the two source paths.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr) nounwind
@@ -55,15 +55,15 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_lock_mismatch_then_escape
-; The original allocation invoke is RETAINED (no fresh materialization).
+; The original allocation invoke is RETAINED as the sole allocation.
 ; CHECK: %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
-; No pea.mat materialization invoke is emitted.
+; No second materialization invoke is emitted.
 ; CHECK-NOT: pea.mat = invoke
 ; The single surviving monitorenter stays in its original block, receiver
 ; OrigAlloc %o.
 ; CHECK-NOT: tail call hotspotcc void @jeandle.monitorenter_with_thin_lock
 ; CHECK: call hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1) %o, ptr %lock)
-; The sink receives OrigAlloc directly rather than a materialized-object PHI.
+; The sink receives OrigAlloc directly.
 ; CHECK: call void @sink(ptr addrspace(1) %o)
 ; The source was a tail call, so this bare call proves replay occurred.
 ; TRACE: PEA: LockReplay function=@test_lock_mismatch_then_escape

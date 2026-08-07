@@ -4,7 +4,7 @@
 ; %g1 = gep %o, %s1; %g2 = gep %o, %s2. Both offsets are non-constant, so
 ; resolveFieldOffset returns nullopt and the icmp can't be folded (the
 ; addresses can't be proven equal or distinct). The object materializes AT the
-; icmp (Graal processNodeInputs): under reuse-OrigAlloc the materialized value
+; icmp: under reuse-OrigAlloc the materialized value
 ; IS OrigAlloc, which dominates both GEPs and is kept alive (PartiallyEscapes),
 ; so both derived operands stay valid. The icmp survives as a real compare over
 ; two valid pointers.

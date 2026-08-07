@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; collectLockedVirtualObjects (Graal analog): a NEVER-escaping VO that is
+; Locked-virtual collection: a NEVER-escaping VO that is
 ; HELD IN A LOCKED MONITOR at the safepoint but is NOT referenced from any
 ; locals/stack slot — its OrigAlloc appears ONLY as a monitor entry's owner.
 ; Deopt must still describe the VO (so its lock can be reconstructed on the
@@ -10,10 +10,8 @@
 ; VORef owner and emits the descriptor (no local-slot rewrite happens — there is
 ; no local slot).
 ;
-; Mirror of Graal collectLockedVirtualObjects
-; (PartialEscapeClosure.java:529-536): "a locked virtual object that does not
-; appear in any slot" is still added to the virtual mapping so deopt restores
-; its lock stack.
+; A locked virtual object that does not appear in any slot is still added to
+; the virtual mapping so deopt restores its lock stack.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr) nounwind

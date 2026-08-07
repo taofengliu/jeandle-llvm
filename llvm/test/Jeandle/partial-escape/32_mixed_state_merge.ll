@@ -1,10 +1,10 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA mixed-state merge under the reuse-OrigAlloc model: branch %left escapes
-; the object via a sink call, the other branch keeps it virtual until the
-; merge. Because the original allocation (OrigAlloc) dominates every escape
-; point and every use, it is the single sound SSA value kept alive; no fresh
-; materialization invoke is emitted and no materializedValuePhi is needed.
+; PEA mixed-state merge: branch %left escapes the object via a sink call,
+; the other branch keeps it virtual until the merge. Because the original
+; allocation (OrigAlloc) dominates every escape point and every use, it is
+; the single sound SSA value kept alive; no additional allocation invoke is
+; emitted and no materialized-object PHI is needed.
 ; The escape arm keeps OrigAlloc (PEA replays any tracked field stores onto it
 ; before the escape); the return consumes OrigAlloc directly.
 

@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Non-regression for #1.3: a whole-object select (`select %c, %o, %o`) has
+; Non-regression: a whole-object select (`select %c, %o, %o`) has
 ; BOTH arms at offset 0, so the offset guard does NOT trip — the select still
 ; alias-forwards to %o and the object stays virtual. This preserves the
 ; legitimate same-offset case (cf. 170/171/330).

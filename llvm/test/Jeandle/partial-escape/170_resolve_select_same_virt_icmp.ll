@@ -1,10 +1,10 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; A Select between two arms both aliased to the same virtual ObjectID.
-; resolveVirtualRefImpl recurses through Select arms,
+; resolveVirtualRef recurses through Select arms,
 ; both resolve to the same ID, propagatePointerAlias aliases the Select
 ; itself to the virtual, downstream consumers fold, and the alloc is
-; eliminated. Equivalent to test 112's new behavior but exercised
+; eliminated. Same fold as test 112 but exercised
 ; without the invoke/unwind framing for a tighter check.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)

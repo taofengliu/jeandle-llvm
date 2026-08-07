@@ -16,8 +16,8 @@ declare void @sink(ptr addrspace(1))
 declare i32 @__gxx_personality_v0(...)
 
 ; The virtual successor is listed first.  LLVM RPO processes the escape
-; successor first, where recursively materializing %child used to delete every
-; alias for it before the virtual block was analyzed.
+; successor first; recursively materializing %child there must not delete
+; every alias for it before the virtual block is analyzed.
 define i32 @nested_escape_before_virtual_sibling(i1 %stay.virtual)
     gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:

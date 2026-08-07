@@ -2,15 +2,9 @@
 
 ; int[3] virtual array (ArrayBaseOffset=16, index scale 4). A byte-GEP at
 ; offset 28 = 16 + 3*4 is ONE PAST THE END (index 3, length 3) — out of
-; bounds. matchArrayElementGEP (Pattern B) correctly rejects it, but before
-; the fix the generic constant-offset resolver then ACCEPTED 28 as a phantom
-; field (it only checked the lower bound `Offset < ArrayBaseOffset`). The
-; phantom field was never replayed at materialization (the emit loop walks
-; only 0..ArrayLength-1), so a store to it was silently lost and a
-; NeverEscapes array could be eliminated while a live store targeted memory
-; past its end. The fix adds the upper-bound check `Offset >= ArrayBaseOffset
-; + ArrayLength*scale -> bail`, so the array materializes at the offending
-; store and the store survives.
+; bounds. matchArrayElementGEP (Pattern B) rejects it, and the upper-bound
+; check (Offset >= ArrayBaseOffset + ArrayLength*scale) bails, so the array
+; materializes at the offending store and the store survives.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 
@@ -39,8 +33,6 @@ u:
 ; The OOB access cannot be virtualized, so the array materializes AT the OOB
 ; store: the alloc survives, the tracked in-bounds store is replayed onto
 ; OrigAlloc (pea.matslot) immediately before it, and the OOB store survives.
-; Before the fix the OOB offset was modeled as a phantom field, the array was
-; eliminated, and the stores vanished.
 ; CHECK-LABEL: define void @test_oob_byte_gep_array_bails
 ; CHECK: jeandle.new_array
 ; CHECK: store atomic i32 10

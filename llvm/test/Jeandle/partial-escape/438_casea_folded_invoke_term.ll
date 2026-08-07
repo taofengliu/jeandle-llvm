@@ -5,16 +5,15 @@
 ;
 ; %o is allocated via @jeandle.new_array. `else`'s terminator is an invoke of
 ; @jeandle.arraylength on the virtual %o, which folds (ReplaceCall erases the
-; invoke; else's terminator becomes a plain branch). The eager-update hook
-; (relocateDependentMaterializes) re-aims any Case-A Materialize's InsertBefore
-; off the erased invoke onto the in-block successor before the WeakTrackingVH
-; is nulled, and the assert(InsertBefore) must not
-; fire.
+; invoke; else's terminator becomes a plain branch). PEA must tolerate the
+; erased terminator: any pending insertion point aimed at it has to be
+; re-aimed at the in-block successor before the erased value's handle is
+; nulled, and no dangling-insertion-point assert may fire.
 ;
-; Under reuse-OrigAlloc there is no fresh materialization invoke: the original
-; allocation %o is retained, the arraylength is folded away, and the merge
-; PHI's else-incoming is OrigAlloc %o directly. (No field replay: %o has no
-; tracked field store.) No %pea.mat, no mat.cont, no split.
+; Under reuse-OrigAlloc the original allocation %o is retained, the
+; arraylength is folded away, and the merge PHI's else-incoming is OrigAlloc
+; %o directly (no field replay: %o has no tracked field store). No
+; additional allocation invoke, no continuation block, no split.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) readonly)
@@ -35,8 +34,8 @@ else:
   %len = invoke hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) %o)
               to label %merge unwind label %handler
 merge:
-  ; PHI mixing %o virtual (else arm) and null (then arm) -> Case-A materialize
-  ; of %o at else's terminator (the erased arraylength invoke).
+  ; PHI mixing %o virtual (else arm) and null (then arm) -> Case A: the
+  ; else-incoming's real identity is OrigAlloc %o.
   %p = phi ptr addrspace(1) [ null, %then ], [ %o, %else ]
   call void @sink(ptr addrspace(1) %p)
   ret void
@@ -54,7 +53,7 @@ u:
 ; The arraylength invoke was folded away (absent from entry..merge, where it
 ; sat in `else`).
 ; CHECK-NOT: @jeandle.arraylength
-; No materialization invoke / mat.cont / split (reuse-OrigAlloc).
+; No additional allocation invoke, continuation block, or split.
 ; CHECK-NOT: pea.mat = invoke
 ; CHECK-NOT: mat.cont
 ; CHECK-NOT: pea.crit.split

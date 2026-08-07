@@ -4,8 +4,8 @@
 ; sink calls. The mergeStates "AllMaterialized" branch fires (every incoming
 ; has the object Materialized). Under the reuse-OrigAlloc model every
 ; incoming's MaterializedValue resolves to the same ORIGINAL allocation
-; (OrigAlloc), which dominates both arms and the merge, so no fresh
-; materialization invoke is emitted and no ptr addrspace(1) PHI is needed at
+; (OrigAlloc), which dominates both arms and the merge, so no additional
+; allocation invoke is emitted and no ptr addrspace(1) PHI is needed at
 ; the merge: both sinks and the return consume OrigAlloc.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)

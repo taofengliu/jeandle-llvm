@@ -2,10 +2,10 @@
 
 ; processLoad sub-slot read: a written i64 field at offset 8 is read back as
 ; an i32 at offset 12 (WithinSlotByteOff != 0). The partial-field load
-; cannot be folded, so the object materializes AT the load (Graal
-; processNodeInputs): the i64 store is replayed immediately before it and
-; the load survives as a real sub-slot load. Before the fix the object was
-; marked ineligible: the i64 store stayed in place (no replay).
+; cannot be folded, so the object materializes AT the load:
+; the i64 store is replayed immediately before it and
+; the load survives as a real sub-slot load. Regression guard: marking the
+; object ineligible instead would leave the i64 store in place (no replay).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare i32 @__gxx_personality_v0(...)

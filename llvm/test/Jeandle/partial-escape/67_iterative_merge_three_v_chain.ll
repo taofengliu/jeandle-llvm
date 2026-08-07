@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA §A5 — three-deep nested-virtual chain at a diamond merge. outer is
+; Three-deep nested-virtual chain at a diamond merge. outer is
 ; allocated in entry (virtual on both preds at the merge); on the left arm
 ; outer.field = middle and middle.field = inner (both also virtual); on the
 ; right arm outer.field = an unrelated incoming pointer. mergeStates' per-VO

@@ -9,7 +9,7 @@
 ; both CFG depths are one. `o` and `p` form a cycle: o.f = p, p.g = o. The mismatch
 ; drives per-pred replay of the field stores at BOTH preds, but under
 ; reuse-OrigAlloc neither object is re-materialized: the ORIGINAL allocations
-; (OrigAlloc %o and OrigAlloc %p) are both KEPT (no fresh pea.mat invokes) and
+; (OrigAlloc %o and OrigAlloc %p) are both KEPT (no new allocation invokes) and
 ; each replayed field store uses OrigAlloc as its value. The back edge p.g = o
 ; resolves to OrigAlloc %o (no poison). The virtual source enter is replayed
 ; as a canonical bare call, and the selected held owner is released after the
@@ -59,10 +59,10 @@ u:
 !java-method-compilation = !{}
 
 ; CHECK-LABEL: define void @per_pred_cascade_with_locks
-; Both ORIGINAL allocation invokes are RETAINED (no fresh materialization).
+; Both ORIGINAL allocation invokes are RETAINED.
 ; CHECK: %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
 ; CHECK: %p = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
-; No pea.mat materialization invoke is emitted.
+; Materialization emits no new allocation invoke.
 ; CHECK-NOT: pea.mat = invoke
 ; Per-pred replayed field stores use OrigAlloc as the stored value (the cycle
 ; back-edge p.g = o resolves to OrigAlloc %o, never poison). Two stores per

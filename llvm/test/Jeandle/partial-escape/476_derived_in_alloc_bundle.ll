@@ -3,8 +3,8 @@
 ; Derived-pointer VO reference inside an allocation invoke's deopt bundle:
 ; %g = gep(%a, 8) is a DERIVED bundle operand —
 ; undescribable, so recordDeoptBundleMappings records nothing and the
-; allocation's own deopt path materializes %a at the %b invoke (Graal
-; processNodeInputs). Under reuse-OrigAlloc OrigAlloc dominates the
+; allocation's own deopt path materializes %a at the %b invoke.
+; Under reuse-OrigAlloc OrigAlloc dominates the
 ; pre-computed GEP, so the GEP and the bundle slot stay valid; %a tracks no
 ; stores, so there is nothing to replay and the IR is unchanged. Companion
 ; of 475 (describable case).

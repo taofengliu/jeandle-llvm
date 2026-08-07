@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA §A5 — stress the iterative merge wrapper with multiple parallel outer
+; Stress the iterative merge wrapper with multiple parallel outer
 ; virtuals all carrying nested-virtual fields on one arm. The first iteration
 ; emits MANY nested materializes on pred-A in a single per-VO loop pass; the
 ; second iteration sees all of them dedup'd via MaterializedAtPred and

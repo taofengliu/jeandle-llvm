@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; A long Select chain. The depth cap in
-; resolveVirtualRefImpl is 8; this chain is exactly 8 selects deep
+; resolveVirtualRef is 8; this chain is exactly 8 selects deep
 ; (depth 9 total counting the outermost). When the Select case
 ; dispatches, processBlockPhis Case B (and selects aliased by
 ; propagatePointerAlias as the analyzer walks each Select in IR order)

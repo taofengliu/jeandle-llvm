@@ -399,8 +399,8 @@ merge:
 
 ; A deopt operand referencing a Case-C synthetic BEFORE its later ordinary
 ; escape: the synthetic is still virtual at the safepoint, so it is DESCRIBED
-; there (VO descriptor + VORef slot) rather than materialized — Graal treats a
-; synthetic VO identically to a normal VO in deopt.  The source allocations
+; there (VO descriptor + VORef slot) rather than materialized — a synthetic
+; VO is treated identically to a normal VO in deopt.  The source allocations
 ; remain at their original sites because the synthetic later escapes at @sink;
 ; the complete then-current state is replayed onto %p once, at that escape
 ; point (not before the safepoint).

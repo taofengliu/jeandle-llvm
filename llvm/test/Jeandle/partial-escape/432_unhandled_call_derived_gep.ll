@@ -4,7 +4,7 @@
 ; model: an UNHANDLED call consuming a derived-GEP operand of a virtual object.
 ;
 ; t_derived_off16 / t_derived_off0: the call MATERIALIZES the object at the
-; call (Graal processNodeInputs — unconditional, per operand; there is no
+; call (unconditional, per operand; there is no
 ; derived-operand special case, so an offset-0 derived GEP is materialized
 ; exactly like a non-zero one). Under reuse-OrigAlloc the materialized value
 ; IS OrigAlloc, which dominates the pre-computed GEP, so the derived
@@ -16,8 +16,7 @@
 ;
 ; t_whole_object: a whole-object call argument is OrigAlloc directly. Under
 ; reuse-OrigAlloc the object escapes via @external(%o): the original %o is
-; retained and consumed directly (no fresh materialization invoke is needed,
-; so no %pea.mat).
+; retained and consumed directly; materialization introduces no new invoke.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @external(ptr addrspace(1))
@@ -67,12 +66,11 @@ u:
 
 ; Derived-operand calls: the object materializes at the call (PartiallyEscapes)
 ; and the GEP keeps a real base. CHECK-NOT poison right after each LABEL so
-; its scope spans the body where a pre-reuse-OrigAlloc poison GEP would sit.
+; its scope spans the body where a poison-GEP regression would appear.
 ; CHECK-LABEL: define void @t_derived_off16
 ; CHECK-NOT: getelementptr{{.*}}poison
 ; CHECK: invoke{{.*}}@jeandle.new_instance
-; The tracked store is replayed onto OrigAlloc immediately before the call
-; (the old bail-all kept it in place at %g).
+; The tracked store is replayed onto OrigAlloc immediately before the call.
 ; CHECK: %pea.matslot = getelementptr inbounds i8, ptr addrspace(1) %o, i64 16
 ; CHECK: store atomic i32 42, ptr addrspace(1) %pea.matslot unordered, align 4
 ; CHECK: call void @external(ptr addrspace(1) %g)
@@ -82,8 +80,8 @@ u:
 ; CHECK: invoke{{.*}}@jeandle.new_instance
 ; CHECK: call void @external(ptr addrspace(1) %g)
 
-; Whole-object call: OrigAlloc %o retained and consumed directly (no fresh
-; materialization invoke; reuse-OrigAlloc needs none).
+; Whole-object call: OrigAlloc %o retained and consumed directly; no new
+; invoke is introduced.
 ; CHECK-LABEL: define void @t_whole_object
 ; CHECK: invoke{{.*}}@jeandle.new_instance
 ; CHECK: call void @external(ptr addrspace(1) %o)

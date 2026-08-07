@@ -1,8 +1,9 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA: verify that materialization at an escape point emits an
-; InvokeInst (not a CallInst), splits the containing block so the new invoke
-; is a terminator, and reuses the original allocation's unwind destination.
+; PEA: an allocation made by invoke escapes via an opaque sink call in the
+; normal-dest block. Materialization retains the original new_instance
+; invoke (keeping its unwind edge) and the sink receives it directly; no
+; new allocation is emitted at the escape point.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))

@@ -7,9 +7,7 @@
 ; (430_loop_exit_cleanup_reads_vo.ll), PEA propagates %o's virtual state
 ; (field = 42) to the cleanuppad via the unwind-edge pre-invoke snapshot, so
 ; the cleanup's load FOLDS to the stored constant. %o stays NeverEscapes and is
-; eliminated; the cleanup calls @use(42). (Previously processLoopExit
-; force-materialized %o at any EH-pad exit — landingpad/catchpad/cleanuppad;
-; that force was vestigial under reuse-OrigAlloc and has been removed.)
+; eliminated; the cleanup calls @use(42).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @may_throw()

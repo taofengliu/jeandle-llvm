@@ -116,8 +116,8 @@ unwind:
 ; CHECK-LABEL: define void @materialized_array_replay
 ; CHECK: @jeandle.new_array
 ; CHECK: store atomic ptr addrspace(1)
-; The old frontend barrier is folded; InsertGCBarriers adds exactly one barrier
-; for the replayed real store.
+; The frontend barrier on the virtual store is folded; InsertGCBarriers adds
+; exactly one barrier for the replayed real store.
 ; CHECK-COUNT-1: @jeandle.post_barrier
 ; CHECK: @llvm.experimental.gc.statepoint
 ; CHECK-SAME: @sink

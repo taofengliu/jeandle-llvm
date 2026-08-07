@@ -2,7 +2,8 @@
 
 ; Contradiction rule: a Case-B PHI carries the virtual ObjectID forward
 ; through both arms. Although the argument has no virtual identity, a
-; still-virtual fresh allocation cannot alias a pre-existing external value.
+; still-virtual, newly allocated object cannot alias a pre-existing
+; external value.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)

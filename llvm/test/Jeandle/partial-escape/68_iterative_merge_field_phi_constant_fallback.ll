@@ -1,11 +1,11 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA §A5 — constant-fold fast path must survive snapshot/restore. The merge
+; Constant-fold fast path must survive snapshot/restore. The merge
 ; has two virtual outer objects: outer1 has the SAME constant i32 stored at
 ; offset 8 on both preds (constant agreement -> no field PHI needed); outer2
 ; has a VirtualRef(inner) on the left arm and a different pointer on the
 ; right arm (forces field-PHI synthesis with a nested materialize, which
-; triggers the A5 retry). After the retry converges, outer1's field is still
+; triggers the merge retry). After the retry converges, outer1's field is still
 ; the constant 42 (NOT a PHI), and the post-merge load through outer1
 ; folds to the constant.
 

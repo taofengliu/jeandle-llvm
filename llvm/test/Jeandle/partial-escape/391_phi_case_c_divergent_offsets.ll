@@ -3,14 +3,12 @@
 ; PEA Case C — diamond CFG, both arms allocate the SAME Klass but store to
 ; DIFFERENT field offsets (left writes offset 8, right writes offset 16).
 ;
-; Regression for the bogus entryCount() compatibility gate: each per-pred VO
-; ends with a different Fields.size() (1 each, but for DIFFERENT offsets), and
-; the old `VO.entryCount() != Ref.entryCount()` check happened to pass here
-; (1 == 1) yet conveyed nothing — the synthetic VO's Fields must be the UNION
-; {8, 16}. After the merge, both fields are read back: offset 8 is known only
-; on the left path (default 0 on the right) and offset 16 only on the right
-; (default 0 on the left), so each folds to a per-entry PHI of {value, 0}.
-; Both allocations are eliminated.
+; Each per-pred VO ends with Fields.size() == 1 but for DIFFERENT offsets, so
+; a field-count comparison alone conveys nothing — the synthetic VO's Fields
+; must be the UNION {8, 16}. After the merge, both fields are read back:
+; offset 8 is known only on the left path (default 0 on the right) and offset
+; 16 only on the right (default 0 on the left), so each folds to a per-entry
+; PHI of {value, 0}. Both allocations are eliminated.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)

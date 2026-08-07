@@ -2,8 +2,8 @@
 
 ; Nested loops where the inner-body allocation escapes via a sink. With the
 ; default cutoff (20), this two-deep nest stays in Regular mode: it exercises
-; recursive B/B' convergence, not STOP_NEW overflow. The allocation is
-; retained as OrigAlloc and the sink consumes it directly.
+; recursive B/B' convergence, not StopNewInLoopNest overflow. The allocation
+; is retained as OrigAlloc and the sink consumes it directly.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))

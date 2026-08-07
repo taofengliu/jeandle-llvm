@@ -4,7 +4,7 @@
 ; The outer loop carries %o's field (1 -> %i across the outer back-edge);
 ; the inner loop carries %q's field (7 -> %j across the inner back-edge).
 ; %q is allocated in the outer body and consumed before the outer back-edge.
-; Pins per-level B isolation: the refactor's per-call context stack must
+; Pins per-level B isolation: the per-call context stack must
 ; keep the outer loop's B and the inner loop's B distinct (the inner loop's
 ; header captures must not clobber the outer's).
 

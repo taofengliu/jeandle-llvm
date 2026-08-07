@@ -5,9 +5,9 @@
 ; stored is a live SSA value (%i).
 ;
 ; Under the reuse-OrigAlloc model the original body alloc %X is KEPT (it
-; dominates the back-edge latch and the loop exit), so no fresh materialization
-; invoke is emitted. The tracked field store is replayed onto %X at the
-; back-edge (the latch), and the carried PHI's back-edge incoming stays %X.
+; dominates the back-edge latch and the loop exit). The tracked field store
+; is replayed onto %X at the back-edge (the latch), and the carried PHI's
+; back-edge incoming stays %X.
 ; The exit @sink receives the carried pointer directly. No poison.
 ;
 ; The header has a single forward predecessor (entry), so this exercises the
@@ -49,9 +49,9 @@ u:
   resume i64 %lp
 }
 
-; The original body alloc is RETAINED (no pea.mat materialization invoke); the
-; carried PHI's back-edge incoming stays %X, and the tracked field store is
-; replayed onto %X at the back-edge (latch). No poison anywhere.
+; The original body alloc is RETAINED; the carried PHI's back-edge incoming
+; stays %X, and the tracked field store is replayed onto %X at the back-edge
+; (latch). No poison anywhere.
 ; CHECK-LABEL: define void @test_143_inbody_carried
 ; CHECK: %px = phi ptr addrspace(1) [ null, %entry ], [ %X, %latch ]
 ; CHECK: %X = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance

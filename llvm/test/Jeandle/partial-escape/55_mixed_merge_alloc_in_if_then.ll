@@ -5,7 +5,7 @@
 ; arm escapes the object via @sink, the if-else arm leaves it virtual.
 ; Under the reuse-OrigAlloc model the ORIGINAL allocation is the single SSA
 ; value kept alive (it dominates every escape point and every use), so no
-; fresh materialization invoke is emitted and no materialized-object PHI is
+; additional allocation invoke is emitted and no materialized-object PHI is
 ; needed at the merge: the escape arm and the return both consume OrigAlloc.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)

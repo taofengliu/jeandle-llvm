@@ -7,14 +7,11 @@
 ;   left  (pred 0): stores i32 at offset 24    -> Fields {24}
 ;   right (pred 1): stores i64 at offset 8     -> Fields {8 (8 bytes)}
 ;
-; Sub-slot / narrowing loads are intentionally UNSUPPORTED (the lshr+trunc fold
-; was removed). The load bails to ineligible, which marks the synthetic VO and
-; both per-pred source VOs ineligible: both objects materialize, the stores and
-; the load survive, and the pointer PHI carries the two allocations. This is the
-; conservative-but-sound outcome. (Regression guard: the merge must NOT crash —
-; it previously hit a transform double-insert once the sub-slot load resolved to
-; a field PHI. The Fields union and PHINode-leaf transform fixes stay in place;
-; this test now just verifies the bail.)
+; Sub-slot / narrowing loads are intentionally UNSUPPORTED. The load bails to
+; ineligible, which marks the synthetic VO and both per-pred source VOs
+; ineligible: both objects materialize, the stores and the load survive, and
+; the pointer PHI carries the two allocations. This is the conservative-but-
+; sound outcome. (Regression guard: the merge must NOT crash on the bail.)
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)

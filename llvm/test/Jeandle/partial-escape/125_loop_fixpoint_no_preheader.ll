@@ -4,10 +4,9 @@
 ; LoopSimplify has canonicalised. We force the pipeline to run
 ; loop-simplify FIRST in this test so that PEA itself sees a proper
 ; preheader, but the residual invariant is that processLoop's "no
-; preheader" branch falls through to the legacy behaviour without
-; crashing. A self-test of that path is exercised today via the bail
-; case in materializeBeforeLoops. This test simply validates the
-; standard loop-with-preheader path still works under the loop fixpoint.
+; preheader" branch soundly marks every still-virtual VO ineligible
+; without crashing. This test simply validates the standard
+; loop-with-preheader path still works under the loop fixpoint.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))

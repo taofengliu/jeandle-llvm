@@ -2,7 +2,7 @@
 
 ; PEA: jeandle.get_class on a virtual receiver (whose exact klass is known)
 ; folds to a GC-safe load of the java.lang.Class mirror oop-handle, and the
-; non-escaping allocation is eliminated. Graal analog: GetClassNode.virtualize.
+; non-escaping allocation is eliminated.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc ptr addrspace(1) @jeandle.get_class(ptr addrspace(1))

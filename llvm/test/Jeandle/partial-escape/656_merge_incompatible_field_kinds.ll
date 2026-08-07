@@ -2,8 +2,8 @@
 
 ; Two predecessors store values of incompatible primitive kinds (same byte
 ; size, different LLVM types) at the same field offset. The entries cannot
-; merge into one field-PHI type, so — mirroring Graal's mergeObjectStates
-; compatible=false — the object is materialized at EVERY predecessor and
+; merge into one field-PHI type, so — as an incompatible merge —
+; the object is materialized at EVERY predecessor and
 ; the load stays a real load. Dropping just the offending offset would
 ; silently lose the eliminated stores and fold the load to the Java
 ; default 0.

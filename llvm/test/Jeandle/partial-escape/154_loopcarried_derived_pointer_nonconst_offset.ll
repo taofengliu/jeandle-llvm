@@ -1,8 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 ;
 ; A DERIVED pointer with a VARIABLE (non-constant) GEP index carried across the
-; back-edge: %sf = gep %X, %i. A constant byte offset cannot be re-derived at
-; the materialization point, so the sound fallback applies: the object is marked
+; back-edge: %sf = gep %X, %i. A variable-offset access cannot be mapped to a
+; tracked field, so the sound fallback applies: the object is marked
 ; ineligible and stays a real allocation; %sf keeps its real base; no poison.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
@@ -41,8 +41,8 @@ u:
   resume i64 %lp
 }
 
-; Sound fallback: the original allocation survives (AlwaysEscapes), %sf keeps its
-; real base %X (NOT poison), and no materialization is emitted.
+; Sound fallback: the original allocation survives (AlwaysEscapes) and %sf
+; keeps its real base %X (NOT poison).
 ; CHECK-LABEL: define void @test_154_nonconst
 ; CHECK: %X = invoke
 ; CHECK: %sf = getelementptr inbounds i8, ptr addrspace(1) %X, i64 %idx

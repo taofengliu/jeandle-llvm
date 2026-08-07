@@ -1,9 +1,9 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; PEA: alloc in entry, store one field in normal, then pass the oop
-; to an opaque sink. The opaque call is an escape — PEA materializes the
-; allocation as an InvokeInst immediately before the sink call (block-split),
-; replays the field store on the normal-dest, and erases the original invoke.
+; to an opaque sink. The opaque call is an escape point. The original
+; new_instance invoke is retained (it already dominates the sink), the
+; field store stays before the escape, and the sink receives OrigAlloc.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))

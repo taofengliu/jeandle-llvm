@@ -2,27 +2,23 @@
 ; RUN: opt -disable-output -passes="loop-simplify,require<partial-escape-analysis>" \
 ; RUN:     -jeandle-dump-pea-stats %s 2>&1 | FileCheck %s --check-prefix=STATS
 
-; Graal virtualPhiLoop: an object allocated BEFORE the loop is carried by a
-; loop-header pointer PHI, and conditionally REPLACED by a fresh allocation
-; inside the loop body; the replacement flows to the back-edge through an
-; in-loop join PHI. Identity of the carried object is never observed (only
-; its field is read; no == comparison, no leak).
+; Loop-carried replacement (Case C): an object allocated BEFORE the loop is
+; carried by a loop-header pointer PHI, and conditionally REPLACED by a fresh
+; allocation inside the loop body; the replacement flows to the back-edge
+; through an in-loop join PHI. Identity of the carried object is never
+; observed (only its field is read; no == comparison, no leak).
 ;
-; Expected (Graal Case C): the header Case C synthesizes one merged virtual
+; Expected (Case C): the header Case C synthesizes one merged virtual
 ; object covering both allocations' field state, and BOTH allocations are
 ; eliminated (NeverEscapes=2).
 ;
-; Regression anchor: previously the loop converged to PartiallyEscapes=2.
-; Iteration 0 succeeded fully (join Case C + post-body header Case C), but at
-; iteration 1's in-pass header merge the back-edge incoming's virtual alias
-; (registered inside the loop during iteration 0) had been rolled back by
-; restoreLoopSnapshot, while the latch's BlockExits was deliberately
-; preserved. The incoming then counted as a resolved non-virtual instead of
-; UNKNOWN, so the Case-A fallback materialized the carried VO at the
-; preheader (outside the loop, never rolled back), and the whole loop
-; cascaded to materialization. A back-edge predecessor that has not yet been
-; processed in the current body pass must be treated as unknown (abstain),
-; exactly like the first iteration's missing back-edge exit data.
+; Regression anchor: at an in-pass header merge, a back-edge predecessor
+; that has not yet been processed in the current body pass must be treated
+; as unknown (abstain), exactly like the first iteration's missing back-edge
+; exit data. Treating the back-edge incoming as a resolved non-virtual
+; instead would make the Case-A fallback materialize the carried VO at the
+; preheader (outside the loop, never rolled back), and the whole loop would
+; cascade to materialization (PartiallyEscapes=2 instead of NeverEscapes=2).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare i32 @__gxx_personality_v0(...)
@@ -68,7 +64,7 @@ u:
 
 ; Both allocations are NeverEscape: eliminated, all field loads folded to the
 ; merged field-PHI values; no replay, no poison. The merged field state must
-; be exactly Graal's virtualPhiLoop result: the header field PHI selects the
+; be exactly the Case-C result: the header field PHI selects the
 ; preheader default or the join PHI; the join PHI resets to the
 ; replacement's default 0 on the replace edge and carries the incremented
 ; value otherwise; the exit returns the join value.

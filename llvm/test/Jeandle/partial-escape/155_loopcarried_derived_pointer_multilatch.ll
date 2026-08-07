@@ -1,8 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 ;
 ; Multi-latch loop (header has TWO back-edge predecessors) carrying a DERIVED
-; pointer %sf = gep %X, 8 across BOTH back-edges. Each back-edge independently
-; materializes the object at its latch and re-derives the carried pointer.
+; pointer %sf = gep %X, 8 across BOTH back-edges. The body alloc %X is retained
+; and materializes at each latch, so %sf stays valid on both back-edges.
 ; (Derived-carry analogue of 144_loopcarried_inbody_multi_latch.)
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
@@ -44,8 +44,9 @@ u:
   resume i64 %lp
 }
 
-; The carried derived pointer is materialized at each back-edge and re-derived;
-; the exit @sink receives a valid (non-poison) carried pointer.
+; The carried object is materialized at each back-edge with %X retained, so
+; %sf stays valid; the exit @sink receives a valid (non-poison) carried
+; pointer.
 ; CHECK-LABEL: define void @test_155_multi_latch
 ; CHECK: call void @sink(ptr addrspace(1) %psf)
 ; CHECK-NOT: poison

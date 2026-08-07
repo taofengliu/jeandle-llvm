@@ -7,13 +7,11 @@
 ; cannot pin a byte offset). The stored value %v is itself a fresh virtual
 ; instance.
 ;
-; Before the fix the bail path did `markIneligible(arr); return true` without
-; touching %v. processInstruction then returned immediately, so the
-; materializeAllVirtualOperands gate never ran: %v was classified NeverEscapes
-; and RAUW'd to poison while the store survived, writing `store ptr poison`
-; into the materialized array. Now the unvirtualizable store materializes
-; BOTH %arr and %v AT the store (materializeOperandsAtStore), so the
-; surviving store keeps the live %v pointer.
+; The unvirtualizable store materializes BOTH %arr and %v AT the store
+; (materializeOperandsAtStore), so the surviving store keeps the live %v
+; pointer. Regression guard: a bail that only marks %arr ineligible would
+; classify %v NeverEscapes and RAUW it to poison while the store survives,
+; writing `store ptr poison` into the materialized array.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)

@@ -29,7 +29,7 @@ namespace llvm {
 /// object into \p Args, the operand list of a "deopt" operand bundle. This is
 /// the single emit chokepoint for Jeandle PEA deoptimization support: a VO
 /// that is still virtual at a safepoint must be described by a descriptor so
-/// HotSpot can reallocate it at deopt (C2/Graal scalar-replacement analog).
+/// HotSpot can reallocate it at deopt.
 ///
 /// The descriptor is the multi-location sequence documented on
 /// DeoptValueEncoding::ScalarValueType, emitted in this order:

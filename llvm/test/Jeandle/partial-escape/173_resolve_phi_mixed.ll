@@ -1,10 +1,10 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; A PHI mixing a virtual incoming with a non-virtual
-; incoming (a function-argument pointer). resolveVirtualRefImpl returns
+; incoming (a function-argument pointer). resolveVirtualRef returns
 ; nullopt because one arm resolves to None. processBlockPhis Case A
 ; handles this at the merge (per-pred materialization of the virtual
-; arm); the new resolveVirtualRefImpl PHI case must agree by NOT
+; arm); resolveVirtualRef's PHI case must agree by NOT
 ; pretending the PHI is fully virtual at downstream consumers.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)

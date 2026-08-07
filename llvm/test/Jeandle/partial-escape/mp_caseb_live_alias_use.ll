@@ -10,8 +10,8 @@
 ; the alias onto the GEP; the post-merge load folds to the stored constant
 ; and the PHI itself is erased (the VO is NeverEscapes).
 ;
-; This pins the Case-B alias-routing path that the MergeProcessor retry
-; rework must preserve: when the per-phi Aliases.resetAlias runs at the top
+; This pins the Case-B alias-routing path across MergeProcessor retries:
+; when the per-phi Aliases.resetAlias runs at the top
 ; of each fixpoint iteration, the alias is re-derived identically and the
 ; downstream load still folds.
 

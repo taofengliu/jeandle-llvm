@@ -2,7 +2,7 @@
 
 ; Coverage for a switch-created back-edge. %head dominates the latch, so this
 ; is a normal reducible loop despite the switch terminator. The test does not
-; claim to exercise the missed-LoopInfo defensive sweep; it pins the current
+; claim to exercise the unsafe-cyclic-blocks safety net; it pins the current
 ; conservative output for this CFG shape.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)

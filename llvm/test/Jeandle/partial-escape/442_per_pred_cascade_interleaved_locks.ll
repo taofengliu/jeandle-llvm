@@ -14,16 +14,14 @@
 ; balanced.
 ;
 ; Cascade SeqNo order (field-prereq recursion): c (deepest prereq, lowest SeqNo)
-; -> b -> a (tail, highest SeqNo). Per-effect emit (the BUG) emits each effect's
+; -> b -> a (tail, highest SeqNo). Per-effect emit would emit each effect's
 ; own Locks in SeqNo order: c's [c@3], b's [b@1], a's [a@0, a@2] => depths
 ; 3,1,0,2 — NOT strictly increasing, violating the lightweight-lock thread-stack
-; contract. The fix merges the group's locks and globally depth-sorts them, then
-; emits once from the tail (a): 0,1,2,3.
+; contract. The group's locks are merged and globally depth-sorted, then
+; emitted once from the tail (a): 0,1,2,3.
 ;
-; Graal analog: one CommitAllocationNode per materialize point flattens every
-; object's locks and lowers them globally depth-sorted
-; (DefaultJavaLoweringProvider.java:1132,1149;
-; PartialEscapeBlockState.java:267-269).
+; One materialize commit per materialize point flattens every object's locks
+; and lowers them globally depth-sorted.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr) nounwind
@@ -118,9 +116,10 @@ u:
 ; CHECK-LABEL: define void @per_pred_cascade_interleaved_locks
 ; The four re-emitted monitorenters must appear in strictly increasing lock
 ; depth on the right materialization path: a@0 (la0), b@1 (lb1), a@2 (la2,
-; re-entrant on the SAME object as la0), c@3 (lc3). Before the fix each VO's
-; locks were re-emitted together per-effect in SeqNo order (c@3, b@1, a@0,
-; a@2 => depths 3,1,0,2), violating the lightweight-lock thread-stack contract.
+; re-entrant on the SAME object as la0), c@3 (lc3). Re-emitting each VO's
+; locks together per-effect in SeqNo order (c@3, b@1, a@0,
+; a@2 => depths 3,1,0,2) would violate the lightweight-lock thread-stack
+; contract.
 ; Sequential CHECK is order-sensitive. Anchor it in the right-edge field replay
 ; so the left branch's original real-guard calls cannot satisfy these checks.
 ; CHECK: right:

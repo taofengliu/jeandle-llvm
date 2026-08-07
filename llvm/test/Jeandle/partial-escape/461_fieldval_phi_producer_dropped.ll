@@ -2,7 +2,7 @@
 
 ; Field-PHI producer under materialize-at-use: o.f = p.g where p.g is a
 ; MERGE field-PHI (analyzer-built, owned by p's CreatePHI effect). p then
-; escapes via a DERIVED pointer (%gp) — under Graal processNodeInputs this
+; escapes via a DERIVED pointer (%gp) — the generic escape path
 ; MATERIALIZES p at the call instead of marking it ineligible, so p's
 ; CreatePHI effect survives and the field-PHI is replayed onto p's
 ; OrigAlloc before the call. o likewise materializes at its escape,

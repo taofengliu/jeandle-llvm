@@ -17,7 +17,7 @@
 ; Under reuse-OrigAlloc all three OrigAllocs are KEPT (each dominates the single
 ; escape point), so every field store replays directly onto its OrigAlloc and
 ; the back edge C.h = A resolves through A's OrigAlloc — no cascade
-; coordination, no fresh pea.mat invoke, no materialized-object PHI.
+; coordination, no new allocation invoke, no materialized-object PHI.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare i32 @__gxx_personality_v0(...)
@@ -55,7 +55,7 @@ u3:
 ; CHECK: %[[A:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr)
 ; CHECK: %[[B:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr)
 ; CHECK: %[[C:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 33333 to ptr)
-; No fresh materialization invoke is emitted.
+; Materialization emits no new allocation invoke.
 ; CHECK-NOT: pea.mat = invoke
 ; All three field groups use OrigAlloc values — the back edge C.h = A resolves
 ; through A's OrigAlloc (kept alive), never poison.

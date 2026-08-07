@@ -3,8 +3,8 @@
 ; A loop-local object is passed to an invoke whose unwind destination is a
 ; catch landingpad. Passing %obj to @may_throw is the actual escape, so PEA
 ; retains OrigAlloc and both normal/unwind state use that same pointer.
-; Exception unwind is not deopt, and there is no separate processLoopExit
-; force-materialization policy.
+; Exception unwind is not deopt; loop exit adds no materialization beyond
+; the escape itself.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @may_throw(ptr addrspace(1))

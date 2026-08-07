@@ -4,10 +4,9 @@
 ; object; %g = gep %o, 8. Both %o and %g resolve to the same ObjectID
 ; (resolveVirtualRefImpl's GEP case chases the base and discards the offset).
 ;
-; Before the fix, foldICmpEquality folded `icmp eq ptr %o, ptr %g` to true
-; because *V0 == *V1, even though %o and %o+8 are distinct addresses. After the
-; fix, the same-ObjectID case also compares resolveFieldOffset: 0 != 8, so the
-; fold correctly yields false.
+; The same-ObjectID case must also compare resolveFieldOffset: 0 != 8, so
+; `icmp eq ptr %o, ptr %g` correctly folds to false. Folding on ObjectID
+; equality alone would wrongly yield true for distinct addresses.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i1)

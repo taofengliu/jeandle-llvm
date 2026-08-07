@@ -7,8 +7,8 @@
 ; unconditional branch to the normal dest, dropping the unwind edge.
 ;
 ; The analyzer detects this and marks the pred's unwind edge "killed",
-; so exitDataFor returns nullptr when the handler asks for its pred's
-; contribution. The handler therefore inherits NO virtual state from
+; so contributionFor reports the edge dead when the handler asks for its
+; pred's contribution. The handler therefore inherits NO virtual state from
 ; this pred — references to virtuals registered upstream do NOT resolve
 ; in the handler and so do NOT trigger materialization.
 ;

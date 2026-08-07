@@ -66,7 +66,7 @@ u:
 ; Both original allocation invokes are retained (outer, then inner).
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
-; No fresh materialization invokes and no critical-edge splits anywhere.
+; No additional allocation invokes and no critical-edge splits anywhere.
 ; CHECK-NOT: pea.mat = invoke
 ; CHECK-NOT: pea.crit.split
 ; The outer.f=inner field store is replayed onto OrigAlloc %outer with %inner

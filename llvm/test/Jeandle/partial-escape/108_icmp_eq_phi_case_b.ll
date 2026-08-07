@@ -37,7 +37,7 @@ u:
   resume i64 %lp
 }
 
-; Case B alias-of-virt is now exploited end-to-end:
+; Case B alias-of-virt is exploited end-to-end:
 ;   - processBlockPhis aliases %phi to the same ObjectID as %o.
 ;   - The icmp eq sees both operands resolve to that ObjectID and
 ;     folds to true; the transform replaces the conditional branch

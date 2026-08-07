@@ -1,11 +1,9 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; reuse-OrigAlloc model. The old (fresh-NewInv) model scrubbed the escape
-; sink's "deopt" bundle and dropped bundles on copy to avoid self-reference /
-; non-dominance hazards. Under reuse-OrigAlloc no fresh invoke is emitted;
-; OrigAlloc is KEPT and dominates every use, so the sink's "deopt" bundle
-; (which carries only constant values here, no OrigAlloc reference) is
-; preserved as-is, and the sink receives OrigAlloc directly.
+; An escaping VO keeps its original allocation: OrigAlloc is KEPT and
+; dominates every use, so the escape sink's "deopt" bundle (which carries
+; only constant values here, no OrigAlloc reference) is preserved as-is,
+; and the sink receives OrigAlloc directly.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -27,7 +25,7 @@ u:
 }
 
 ; CHECK-LABEL: define void @escape_with_bundle
-; The original allocation invoke is RETAINED (no fresh pea.mat invoke).
+; The original allocation invoke is RETAINED as the sole allocation.
 ; CHECK: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr {{.*}}, i32 16)
 ; CHECK-NOT: = invoke hotspotcc{{.*}}@jeandle.new_instance
 ; The sink receives OrigAlloc and keeps its deopt bundle.

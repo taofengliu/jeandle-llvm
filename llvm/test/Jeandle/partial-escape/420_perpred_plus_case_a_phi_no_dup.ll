@@ -6,17 +6,12 @@
 ; virtual) and ALSO has an explicit LLVM pointer PHI `%p` mixing null (then)
 ; and o (else) -- a Case-A candidate.
 ;
-; Historically the per-pred materialize at `else` for `merge` (on the
-; else->merge split edge) had to win over Case-A: without per-merge clone
-; threading, processBlockPhis would re-fire a SECOND Case-A materialize at
-; `else`'s terminator end for the same (else, merge, o), duplicating the
-; invoke. The test asserted exactly ONE materialize invoke (the per-pred
-; split) and no Case-A PH-end placement.
-;
-; Under reuse-OrigAlloc there is NO materialize at all -- the original %o is
-; the single value -- so the dedup concern is trivially satisfied: exactly
-; one allocation invoke (the retained original), no pea.mat, no split. The
-; merge PHI's else-incoming stays OrigAlloc %o directly.
+; Under reuse-OrigAlloc there is no separate materialize at all: the original
+; %o is the single retained value, so the historical dedup hazard (a per-pred
+; split materialize racing a second Case-A materialize for the same
+; (else, merge, o)) cannot reappear. The test asserts exactly one allocation
+; invoke (the retained original), no split, and that the merge PHI's
+; else-incoming stays OrigAlloc %o directly.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -40,8 +35,8 @@ else:
   ; o is virtual. TWO successors: merge and S.
   br i1 %c2, label %merge, label %S
 merge:
-  ; Mixed merge for o (per-pred mat at else) AND an LLVM PHI mixing null + o
-  ; (Case A candidate). The per-pred mat must win; Case A must NOT re-fire.
+  ; Mixed merge for o AND an LLVM PHI mixing null + o (Case-A candidate).
+  ; Neither may introduce an additional allocation.
   %p = phi ptr addrspace(1) [ null, %then ], [ %o, %else ]
   call void @sink(ptr addrspace(1) %p)
   ret void
@@ -59,8 +54,8 @@ u:
 ; The then arm replays the tracked field store onto OrigAlloc %o and escapes.
 ; CHECK: getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
 ; CHECK: call void @sink(ptr addrspace(1) %o)
-; `else` retains its original two-successor branch (no per-pred split, no
-; Case-A mat at PH end).
+; `else` retains its original two-successor branch (no critical-edge split
+; off else).
 ; CHECK: else:
 ; CHECK-NEXT: br i1 %c2, label %merge, label %S
 ; The merge PHI's else-incoming is OrigAlloc %o directly.

@@ -1,28 +1,27 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -verify-each %s | FileCheck %s
 
-; Regression for the dangling-Value* bug flagged at
-; PartialEscapeAnalysis.cpp:5118 (restoreLoopSnapshot cleanup).
+; Regression for a dangling-Value* in restoreLoopSnapshot's rollback cleanup.
 ;
-; restoreLoopSnapshot preserves BlockExits[BB] for every loop block (comment
-; at lines 5140-5148) so the next iteration's in-pass mergeStates(Header) can
-; read each back-edge pred's exit state via exitDataFor. The cleanup at lines
-; 5118-5126 deletes unparented PHIs created during the rolled-back iteration
-; from Result.OwnedPhis. A NON-HEADER in-loop merge block (here: "latch")
-; that synthesizes a field PHI via getOrCreateLoopFieldPhi's non-header
-; fallback (line 1287 → createUnparentedPhi → OwnedPhis) gets its PHI deleted
-; on rollback while BlockExits[latch].FieldStates[%o][12] still references it
-; → dangling Value* read on iter 1's mergeStates(Header) → exitDataFor.
+; restoreLoopSnapshot preserves BlockExits[BB] for every loop block so the
+; next iteration's in-pass mergeStates(Header) can read each back-edge
+; pred's exit state via exitDataFor, and its cleanup deletes unparented PHIs
+; created during the rolled-back iteration from Result.OwnedPhis. A
+; NON-HEADER in-loop merge block (here: "latch") must not have its
+; synthesized field PHI owned by OwnedPhis (via createUnparentedPhi): the
+; PHI would be deleted on rollback while
+; BlockExits[latch].FieldStates[%o][12] still references it, leaving a
+; dangling Value* for the next iteration's mergeStates(Header) ->
+; exitDataFor.
 ;
-; The fix widens getOrCreateLoopFieldPhi's gate (line 1287) from
-; `LoopHeaderSet.count(BB)` to `LI.getLoopFor(BB) != nullptr`, so every
-; in-loop merge-block PHI is cached per (BB, ID, Off) in OwnedLoopFieldPhis
-; (which restoreLoopSnapshot does NOT pop) and stays stable across iterations.
+; getOrCreateLoopFieldPhi therefore gates on LI.getLoopFor(BB) != nullptr
+; (not just LoopHeaderSet), so every in-loop merge-block PHI is cached per
+; (BB, ID, Off) in OwnedLoopFieldPhis (which restoreLoopSnapshot does NOT
+; pop) and stays stable across iterations.
 ;
-; Each variant forces loop-carried state so iter 0 does not converge → the
-; iter 1 rollback fires. A debug assert in restoreLoopSnapshot (added with
-; the fix) makes the UAF deterministic: pre-fix it fires on every variant
-; that builds a non-header in-loop merge PHI; post-fix all pass.
+; Each variant forces loop-carried state so iter 0 does not converge and the
+; iter 1 rollback fires. A debug assert in restoreLoopSnapshot makes the UAF
+; deterministic on every variant that builds a non-header in-loop merge PHI.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)
@@ -31,8 +30,7 @@ declare i32 @__gxx_personality_v0(...)
 
 ; -----------------------------------------------------------------------------
 ; Variant A: scalar i32 field, then/else merge at a non-header "latch".
-;             The exact reproducer from the reviewer comment. Exercises the
-;             mergeStates scalar field-PHI path (line 2062/2080).
+;             Exercises the mergeStates scalar field-PHI path.
 ; -----------------------------------------------------------------------------
 define void @test_scalar_field_merge(i32 %n, i1 %c)
     gc "hotspotgc" personality ptr @__gxx_personality_v0 {
@@ -81,8 +79,8 @@ u:
 
 ; -----------------------------------------------------------------------------
 ; Variant B: pointer-typed field, then/else merge at a non-header "latch".
-;             Exercises FieldValue::materializedRef(Phi) at line 2078
-;             (PhiType->isPointerTy() branch). Each arm stores a distinct
+;             Exercises FieldValue::materializedRef(Phi) (the
+;             PhiType->isPointerTy() branch). Each arm stores a distinct
 ;             scalar pointer (null vs a constant ptr); the merge builds a
 ;             ptr addrspace(1) field PHI.
 ; -----------------------------------------------------------------------------
@@ -204,8 +202,8 @@ u:
 ; Variant D: nested loop — a non-header merge block lives inside the INNER
 ;             loop. LI.getLoopFor(inner_latch) must return the inner loop so
 ;             the field PHI is cached and survives the inner fixpoint's
-;             rollback. Exercises the innermost-loop behaviour of the widened
-;             gate.
+;             rollback. Exercises the innermost-loop behaviour of the
+;             in-loop gate.
 ; -----------------------------------------------------------------------------
 define void @test_nested_loop_inner_merge(i32 %n, i32 %m, i1 %c)
     gc "hotspotgc" personality ptr @__gxx_personality_v0 {
@@ -267,10 +265,10 @@ u:
 ; -----------------------------------------------------------------------------
 ; Variant F (negative): straight-line loop body with NO non-header merge.
 ;             The only field PHI is the loop-carried header PHI (already
-;             cached by the existing loop-header path). Confirms the widened
+;             cached by the existing loop-header path). Confirms the in-loop
 ;             gate does not over-fire / break non-merge in-loop blocks, and
 ;             that a loop with no non-header merge PHI still eliminates
-;             cleanly (this shape is unaffected by the bug).
+;             cleanly.
 ; -----------------------------------------------------------------------------
 define void @test_no_merge_straight_body(i32 %n)
     gc "hotspotgc" personality ptr @__gxx_personality_v0 {

@@ -56,7 +56,7 @@ u:
 ; Both A and B must be materialized: B because it escaped; A because the
 ; narrow cascade rule cascades the OUTER (still-virtual) lock when the
 ; INNER object is materialized. The locks re-emitted at the escape point are
-; globally depth-sorted (Graal flattens them into one CommitAllocationNode):
+; globally depth-sorted (flattened into one materialize commit):
 ; outer A (lock_a, depth 0) before inner B (lock_b, depth 1). The original
 ; monitorexits survive at their source locations.
 ; CHECK-LABEL: define void @test_strict_lock_cascade

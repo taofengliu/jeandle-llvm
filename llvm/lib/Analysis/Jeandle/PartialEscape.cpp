@@ -40,9 +40,10 @@
 using namespace llvm;
 using namespace llvm::jeandle;
 
-// Per-effect dbgs() trace. Effects are published only after the analyzer has
-// selected a winning transactional attempt, so discarded attempts cannot leak
-// provisional decisions. Off by default; turn on with -jeandle-trace-pea.
+// Per-effect dbgs() trace. Effects are published only from
+// publishAttemptOutputs, after the analysis attempt has validated, so a
+// discarded attempt cannot leak provisional decisions. Off by default; turn
+// on with -jeandle-trace-pea.
 static llvm::cl::opt<bool> JeandleTracePEA(
     "jeandle-trace-pea", llvm::cl::init(false), llvm::cl::Hidden,
     llvm::cl::desc("PEA: emit a one-line dbgs() trace on every major "
@@ -59,6 +60,13 @@ std::optional<bool> VirtualObject::FieldDesc::overlaps(int64_t Off,
   return jeandle::pea::checkedRangesOverlap(Offset, ByteSize, Off, Size);
 }
 
+// Find the FieldDesc slot for (Offset, Ty), creating it if needed while
+// keeping Fields sorted by Offset. Returns the slot's index on success.
+// Returns -1 whenever the field cannot be modeled safely — unsupported or
+// non-heap-pointer type, unrepresentable byte range, size/reference-ness
+// conflict with the existing slot, or overlap with a neighbor; every caller
+// treats -1 as "keep everything real" (the access conservatively escapes),
+// so this function may refuse anything it cannot model exactly.
 int VirtualObject::getOrCreateFieldIndex(int64_t Offset, Type *Ty,
                                          const DataLayout &DL) {
   assert(Ty && "field type must be non-null");
@@ -103,13 +111,15 @@ int VirtualObject::getOrCreateFieldIndex(int64_t Offset, Type *Ty,
     ByteSize = static_cast<uint8_t>((FixedBits + 7) / 8);
   }
 
-  // Every tracked field is a representable half-open byte range. This check
-  // is required even for the first field, where there is no neighbor overlap
-  // query to validate the endpoint.
+  // This endpoint check is required even for the first field, where there is
+  // no neighbor overlap query to validate the endpoint.
   if (!jeandle::pea::isUsableFieldOffset(Offset) ||
       !jeandle::pea::checkedOffsetAdd(Offset, ByteSize))
     return -1;
 
+  // Fields is sorted by Offset. Locate the insertion point for Offset, reuse
+  // an exact-match slot, otherwise verify the new slot overlaps neither
+  // neighbor before inserting.
   auto It = std::lower_bound(
       Fields.begin(), Fields.end(), Offset,
       [](const FieldDesc &F, int64_t Off) { return F.Offset < Off; });
@@ -193,13 +203,12 @@ static Value *matchAddBasePlusScaledIndex(Value *ByteOff,
   if (Scale == 0)
     return nullptr;
 
-  // Recognise the constant byte-offset operand of an `add C, X` pair.
+  // Bind the constant base and the scaled-index operand of an `add C, X`
+  // pair, accepting either operand order.
   Value *ScaledIdx = nullptr;
   ConstantInt *BaseCI = nullptr;
   if (match(ByteOff, m_Add(m_ConstantInt(BaseCI), m_Value(ScaledIdx)))) {
-    // matched
   } else if (match(ByteOff, m_Add(m_Value(ScaledIdx), m_ConstantInt(BaseCI)))) {
-    // matched
   } else {
     return nullptr;
   }
@@ -429,11 +438,10 @@ PEABlockState::getArrayForModification() {
     ObjectStates =
         std::make_shared<SmallVector<std::optional<ObjectState>, 8>>();
   } else if (ObjectStates.use_count() > 1) {
-    // Defensive copy-on-write detach. Unreachable today: processBlock() resets
+    // Copy-on-write detach. Unreachable by construction: processBlock() resets
     // CurrentState to a fresh PEABlockState at every block header, so the loop
     // snapshot (the sole producer of shared state) never leaves CurrentState
-    // shared at a mutation point. Retained as a guard against silent snapshot
-    // corruption if that per-block-reset invariant ever changes.
+    // shared at a mutation point. The detach guard keeps snapshots sound.
     ObjectStates = std::make_shared<SmallVector<std::optional<ObjectState>, 8>>(
         *ObjectStates);
     assert(ObjectStates.use_count() == 1 &&
@@ -534,6 +542,15 @@ void AliasMap::restore(const AliasMap &S) { *this = S; }
 // PEAResult
 // ===========================================================================
 
+// Build the final physical lock-replay batches from the surviving
+// MaterializeEffects (see the LockReplayBatches field doc in PartialEscape.h
+// for the batching rules this implements). Steps: bucket the effects by their
+// edge-normalized emit site (InsertBefore); form one batch per lock-carrying
+// site and elect its highest-SeqNo effect as the tail emitter; merge each
+// site's per-effect locks into MergedLocks, deduplicating identical folded
+// enters while recording every logical consumer; sort each batch ascending by
+// BytecodeDepth; finally emit the -jeandle-trace-pea LockReplay rows with
+// deterministic provenance IDs.
 void PEAResult::computeEscapePointLocks() {
   LockReplayBatches.clear();
   LockReplayBatchForSite.clear();
@@ -574,6 +591,8 @@ void PEAResult::computeEscapePointLocks() {
     return It->second;
   };
 
+  // Bucket effects by emit site. Effects without a resolved insertion point
+  // cannot carry a batch and are skipped.
   for (jeandle::MaterializeEffect *ME : Effects) {
     Instruction *EmitSite =
         dyn_cast_or_null<Instruction>((Value *)ME->InsertBefore);
@@ -588,6 +607,9 @@ void PEAResult::computeEscapePointLocks() {
     SiteEffects[SiteIt->second].push_back(ME);
   }
 
+  // Form one physical batch per lock-carrying site (lockless sites replay
+  // only their fields and consume no batch). The site's highest-SeqNo effect
+  // becomes EmitterSeqNo, the tail emitter that replays the merged list.
   for (unsigned SiteID = 0; SiteID < Sites.size(); ++SiteID) {
     ArrayRef<jeandle::MaterializeEffect *> EffectsAtSite = SiteEffects[SiteID];
     if (llvm::none_of(EffectsAtSite, [](jeandle::MaterializeEffect *ME) {
@@ -612,6 +634,9 @@ void PEAResult::computeEscapePointLocks() {
            "one physical lock replay batch must have exactly one tail emitter");
   }
 
+  // Merge each batch's per-effect locks into MergedLocks: identical folded
+  // enters dedup to one physical replay operation, and each effect's
+  // LogicalEscape (falling back to the emit site) is recorded as a consumer.
   for (unsigned BatchID = 0; BatchID < LockReplayBatches.size(); ++BatchID) {
     LockReplayBatch &Batch = LockReplayBatches[BatchID];
     ArrayRef<jeandle::MaterializeEffect *> EffectsAtSite =
@@ -626,8 +651,8 @@ void PEAResult::computeEscapePointLocks() {
       const Value *LogicalEscape =
           ME->LogicalEscape ? ME->LogicalEscape : Batch.EmitSite;
       for (const jeandle::MaterializedLock &ML : ME->Locks) {
-        // Preserve the existing defensive dedup: a physical batch must never
-        // contain the same folded enter twice.
+        // Defensive dedup: a physical batch must never contain the same
+        // folded enter twice.
         jeandle::MergedLock *Existing = nullptr;
         for (jeandle::MergedLock &X : Batch.Locks) {
           if (X.Callee == ML.Callee && X.BytecodeDepth == ML.BytecodeDepth &&
@@ -652,12 +677,16 @@ void PEAResult::computeEscapePointLocks() {
     }
   }
 
+  // The runtime lock stack requires re-emission in strictly increasing depth
+  // order, so each batch is globally sorted ascending by BytecodeDepth.
   for (LockReplayBatch &Batch : LockReplayBatches)
     llvm::sort(Batch.Locks,
                [](const jeandle::MergedLock &A, const jeandle::MergedLock &B) {
                  return A.BytecodeDepth < B.BytecodeDepth;
                });
 
+  // Trace: one LockReplay row per (physical lock, logical consumer)
+  // association, all sharing the lock's physical ordinal within the batch.
   if (!JeandleTracePEA)
     return;
   for (unsigned BatchID = 0; BatchID < LockReplayBatches.size(); ++BatchID) {
@@ -878,13 +907,12 @@ bool PEAResult::currentIdentityRepresentsSource(ObjectID CurrentID,
 }
 
 bool PEAResult::hasOptimizationOpportunity() const {
-  // VirtualizationDelta and AllocationDelta are mutated in lockstep (each
-  // virtualization does ++VirtualizationDelta/--AllocationDelta, each
-  // de-virtualization the opposite), so AllocationDelta == -VirtualizationDelta
-  // always. VirtualizationDelta is never decremented below 0, so
-  // VirtualizationDelta > 0 implies AllocationDelta != 0 — the latter term is
-  // redundant and dropped. Kept: any virtualization, OR any escaped-materialize
-  // effect recorded (PartiallyEscapes / AlwaysEscapes need a transform pass),
-  // OR an explicit CFG-cleanup obligation.
+  // True when there is work for the transform: any net virtualization, any
+  // recorded effect (folds and materializations must be applied even when no
+  // allocation stays virtual on net), or an explicit CFG-cleanup obligation.
+  // VirtualizationDelta and AllocationDelta are exact negations (see the
+  // field doc) and VirtualizationDelta is never decremented below 0, so
+  // VirtualizationDelta > 0 covers AllocationDelta != 0 and only one of the
+  // two terms is tested.
   return VirtualizationDelta > 0 || !BlockEffects.empty() || NeedsCFGCleanup;
 }

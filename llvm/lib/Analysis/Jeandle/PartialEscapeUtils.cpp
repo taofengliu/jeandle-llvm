@@ -254,10 +254,10 @@ std::optional<bool> checkedRangesOverlap(int64_t AStart, uint64_t ASize,
 // may emit between the two casts). Tagged/masked encodings (any non-zero
 // addend) are NOT round-trips and return nullptr.
 //
-// Shared by resolveVirtualRefImpl (identity resolution, case 7) and
+// Shared by resolveVirtualIdentityImpl (identity resolution, case (7)) and
 // stripPointerCastsAndOffsets (offset resolution) so the two agree on exactly
 // which laundered pointers are transparent: an `inttoptr` that is NOT a clean
-// round-trip is opaque to both (identity -> nullopt, offset -> stop walking).
+// round-trip is opaque to both (identity -> Unknown, offset -> stop walking).
 // Recognize an IntToPtr over both Instruction and ConstantExpr forms. LLVM
 // has `PtrToIntOperator` but no `IntToPtrOperator`, so match via the generic
 // Operator + opcode. Used at both call sites so identity and offset
@@ -405,7 +405,7 @@ Value *stripPointerCastsAndOffsets(Value *Ptr, const DataLayout &DL,
 }
 
 // ===========================================================================
-// resolveVirtualRef
+// Virtual identity resolution
 // ===========================================================================
 
 // Bound on structural recursion through PHI/Select. With Visited-set cycle
@@ -440,6 +440,21 @@ struct StackGuard {
 };
 } // namespace
 
+// Core of virtual-identity resolution, shared by resolveVirtualIdentity and
+// (in WholeObject mode) isProvablyDistinctFromVirtual. Resolution proceeds in
+// priority order: the AliasMap first (authoritative for alias-registered
+// Values such as loads and already-processed PHIs, which have no structural
+// relationship with their allocation site), then constants (poison is a
+// refinement wildcard; null, undef, globals, and numeric constants are never
+// a virtual object), then carrier peeling (GEP, addrspacecast within
+// JavaHeapAddrSpace, bitcast, freeze, same-width inttoptr(ptrtoint(x))
+// round-trips), and finally PHI/select merge resolution, where the merge
+// denotes a virtual object only when every defined alternative resolves to
+// the same ObjectID, with poison refining to that identity. WholeObject mode
+// additionally requires offset zero on every path. Recursion is depth-capped
+// at ResolveVirtualRefMaxDepth and cycle-guarded by the on-stack Visited set
+// (see StackGuard), so pathological merge graphs degrade to Unknown instead
+// of diverging. Unknown means "may denote anything": callers materialize.
 static VirtualIdentityResult
 resolveVirtualIdentityImpl(Value *V, const PEABlockState &State,
                            const AliasMap &Aliases, const DataLayout &DL,
@@ -527,9 +542,9 @@ resolveVirtualIdentityImpl(Value *V, const PEABlockState &State,
   // (7) IntToPtr(PtrToInt(x)) round-trip with matching widths is a legal
   // laundering pattern (see getIntToPtrRoundTripInner); tagged-pointer
   // encodings (with masking/shifting) must escape. A non-round-trip inttoptr
-  // is opaque — return nullopt so the caller materializes. isIntToPtrOp
+  // is opaque — return Unknown so the caller materializes. isIntToPtrOp
   // covers both Instruction and ConstantExpr forms, keeping this symmetric
-  // with the identity-resolution path above.
+  // with the offset-resolution path in stripPointerCastsAndOffsets.
   if (isIntToPtrOp(V)) {
     if (Value *Inner = getIntToPtrRoundTripInner(V, DL))
       return resolveVirtualIdentityImpl(Inner, State, Aliases, DL, Mode,
@@ -537,12 +552,15 @@ resolveVirtualIdentityImpl(Value *V, const PEABlockState &State,
     return VirtualIdentityResult::unknown();
   }
 
-  // (8) PHINode / (9) SelectInst — recursion through Case-B-style merges that
-  // the AliasMap didn't pre-install (e.g. PHIs outside the current BlockState
-  // domain, chained PHIs not yet processed, or Selects, which have no
-  // Case-B-style pre-installation since Select isn't a PHI). If every operand
-  // resolves to the same ObjectID, the merge denotes that virtual object on
-  // every execution path. StackGuard guarantees that Visited reverts to the
+  // (8) PHINode / (9) SelectInst — recursion through merges that the
+  // AliasMap did not pre-register as aliases (e.g. PHIs outside the current
+  // BlockState domain, chained PHIs not yet processed, or Selects, which are
+  // never pre-registered because alias registration only covers PHIs). If
+  // every operand resolves to the same ObjectID, the merge denotes that
+  // virtual object on every execution path. (This is the resolver-side
+  // counterpart of a "Case B" merge: a pointer PHI whose incoming values all
+  // resolve to the SAME still-virtual object, so the PHI is registered as
+  // that object's alias.) StackGuard guarantees that Visited reverts to the
   // caller's state on every return path, so a sibling subtree that shares a
   // value with an earlier sibling can still descend through it.
   if (auto *Phi = dyn_cast<PHINode>(V)) {
@@ -605,6 +623,26 @@ std::optional<ObjectID> resolveVirtualRef(Value *V, const PEABlockState &State,
   return R.getObjectID();
 }
 
+// Recursive proof engine behind isProvablyDistinctFromVirtual: returns true
+// only when V provably cannot denote TargetID's (unpublished) allocation.
+// Proof routes, tried in order:
+//  - whole-object identity: V resolves in WholeObject mode to a different
+//    still-virtual object;
+//  - stale alias: the AliasMap still ties V to a different allocation and V
+//    is that allocation's offset-zero address (a materialized object fails
+//    resolution through State, but its recorded identity still excludes
+//    TargetID);
+//  - scalar-alias unwrapping;
+//  - PHI/select conjunction: every alternative is provably distinct;
+//  - carrier peeling: freeze of a provably-defined operand, offset-zero GEP,
+//    bitcast, JavaHeap addrspacecast, same-width inttoptr(ptrtoint(x))
+//    round-trip, launder/strip.invariant.group, ptr.annotation;
+//  - terminal rule: null and globals are always distinct, and a direct
+//    Argument/Load/Call result cannot denote an unpublished virtual
+//    allocation. Poison, undef, other constants, and any unrecognized
+//    pointer-producing structure fail the proof: they may be carriers for
+//    TargetID.
+// Depth-capped and on-stack-cycle-guarded exactly like identity resolution.
 static bool isProvablyDistinctFromVirtualImpl(
     Value *V, ObjectID TargetID, const PEABlockState &State,
     const AliasMap &Aliases, const DataLayout &DL,
@@ -616,6 +654,8 @@ static bool isProvablyDistinctFromVirtualImpl(
   if (!Guard.Inserted)
     return false;
 
+  // Poison and undef may refine to any value, including TargetID's object,
+  // so distinctness is never provable for them.
   if (isa<PoisonValue>(V) || isa<UndefValue>(V))
     return false;
 
@@ -630,9 +670,10 @@ static bool isProvablyDistinctFromVirtualImpl(
   if (Whole.isDefined())
     return Whole.getObjectID() != TargetID;
 
-  // A materialized/stale alias no longer resolves through State, but the
-  // AliasMap still records its allocation identity. Only its whole-object
-  // address can participate in the allocation-site distinctness proof.
+  // A materialized/stale alias fails the WholeObject resolution above
+  // because its object is not virtual in State, but the AliasMap still
+  // records its allocation identity. Only its whole-object address can
+  // participate in the allocation-site distinctness proof.
   if (auto AliasID = Aliases.getVirtualAlias(V)) {
     std::optional<int64_t> Offset = resolveFieldOffset(V, DL);
     return Offset && *Offset == 0 && *AliasID != TargetID;
@@ -642,6 +683,9 @@ static bool isProvablyDistinctFromVirtualImpl(
                                              DL, Visited, IdentityScratch,
                                              Depth + 1);
 
+  // Merge conjunction: a PHI/select can denote TargetID only when some
+  // feasible alternative can, so it is provably distinct exactly when every
+  // alternative is. (An empty PHI conservatively fails.)
   if (auto *PN = dyn_cast<PHINode>(V)) {
     if (PN->getNumIncomingValues() == 0)
       return false;
@@ -744,8 +788,8 @@ std::optional<int64_t> resolveFieldOffset(Value *Ptr, const DataLayout &DL) {
   // bitcast, JavaHeap addrspacecast, freeze, launder/strip.invariant.group,
   // ptr.annotation, inttoptr(ptrtoint(x)) round-trip): a pointer that resolves
   // to a virtual base yields its true byte offset here. A non-constant GEP ->
-  // nullopt (caller materializes); a non-GEP base (the object itself, a
-  // whole-object Case-B PHI/Select) -> 0.
+  // nullopt (caller materializes); a non-GEP base (the object itself, or a
+  // merge with a defined whole-object identity) -> 0.
   int64_t Off = 0;
   bool NonConst = false;
   stripPointerCastsAndOffsets(Ptr, DL, &Off, &NonConst);
@@ -758,6 +802,9 @@ bool hasUnremovedSemanticUses(Value *Root,
                               function_ref<bool(const Use &)> IsRemoved) {
   SmallPtrSet<Value *, 16> Visited;
   SmallVector<Value *, 16> Worklist(1, Root);
+  // Walk users transitively: carrier instructions forward the pointer value
+  // without observing it, so the walk continues through them; every other
+  // (semantic) use must be accepted by IsRemoved.
   while (!Worklist.empty()) {
     Value *Current = Worklist.pop_back_val();
     if (!Current || !Visited.insert(Current).second)
@@ -820,6 +867,12 @@ std::optional<uint32_t> extractArrayLength(const CallBase *NewArray) {
 // Deopt bundle scope structure
 // ===========================================================================
 
+// Decode a raw deopt-value encoding constant into its checked form. Bit
+// layout of the i64: [63:32] = index (signed), [31:16] = deopt value type,
+// [15:0] = HotSpot basic type. This is the assertion-free counterpart of
+// DeoptValueEncoding::decode: non-constant or non-i64 inputs and out-of-range
+// value/basic types yield std::nullopt instead of trapping, so the parser is
+// safe to run on arbitrary IR.
 std::optional<CheckedDeoptValueEncoding>
 decodeDeoptValueEncoding(const Value *V) {
   auto *CI = dyn_cast_or_null<ConstantInt>(V);
@@ -878,6 +931,25 @@ decodeDeoptValueEncoding(const Value *V) {
 
 namespace {
 
+// Recursive-descent parser for the record grammar of Jeandle's "deopt"
+// operand bundle. Wire layout:
+//
+//   [i64 should_reexecute]   production records only; hand-written tests
+//                            omit it
+//   root scope header        duplicated equal-i32 BCI pair
+//   VO descriptor pool       zero or more descriptors, each: header
+//                            encoding, i64 klass, i32 field count, then
+//                            per-field encoding + value records
+//   root scope body          locals, stack values, monitors, [original PC]
+//   inlinee scopes           each: method marker pair, scope header, scope
+//                            body; the innermost scope is LAST
+//   narrow-oop tail          zero or more marker + narrow-oop pairs
+//
+// The parser enforces grammar order, record shapes, descriptor wire-ID
+// uniqueness, and VO-reference well-formedness; it records every operand
+// position as a semantic cell and builds the structural fingerprint used to
+// detect later bundle edits. All failures are reported as data
+// (DeoptBundleParseError); it never asserts, so it is safe on arbitrary IR.
 class SemanticDeoptBundleParser {
 public:
   explicit SemanticDeoptBundleParser(ArrayRef<Value *> Inputs)
@@ -886,6 +958,9 @@ public:
       Bundle.OriginalInputs.emplace_back(Input);
   }
 
+  // Parse the whole bundle: root scope (header, VO descriptor pool, body),
+  // then inlinee scopes (method marker, header, body each; innermost last),
+  // then the narrow-oop tail, and finally the VO-reference validation.
   DeoptBundleParseResult parse() {
     ParsedDeoptScope Root;
     if (!parseScopeHeader(Root))
@@ -920,8 +995,11 @@ public:
   }
 
 private:
+  // Section ordering enforced within a scope body.
   enum class ScopePhase : uint8_t { Locals, Stack, Monitors, OrigPc };
 
+  // Failure reporting: record the error and produce an empty result. The
+  // parser stops at the first failure, so only one error is ever recorded.
   DeoptBundleParseResult fail(DeoptBundleParseErrorCode Code,
                               unsigned OperandIndex) {
     Error = {Code, OperandIndex};
@@ -942,6 +1020,10 @@ private:
     return CI && CI->getType()->isIntegerTy(BitWidth) ? CI : nullptr;
   }
 
+  // Record operand Index as a fingerprint cell and return its semantic
+  // cell. Grammar constants (KeepConstant) contribute their exact bits to
+  // the fingerprint; semantic values contribute only their type, so
+  // legitimate RAUW does not register as staleness.
   DeoptSemanticCell recordCell(DeoptSemanticCellRole Role, unsigned Index,
                                bool KeepConstant) {
     DeoptStructuralCell Structural{Role, Index, Inputs[Index]->getType(),
@@ -953,6 +1035,8 @@ private:
     return {Role, Index};
   }
 
+  // Parse one scope header: the optional i64 should_reexecute slot followed
+  // by the duplicated equal-i32 BCI pair that opens every scope.
   bool parseScopeHeader(ParsedDeoptScope &Scope) {
     if (Pos >= Inputs.size())
       return failBool(DeoptBundleParseErrorCode::InvalidScopeHeader, Pos);
@@ -990,6 +1074,9 @@ private:
     return true;
   }
 
+  // Parse the root scope's VO descriptor pool: the run of ScalarValueType
+  // descriptor records. Stops successfully at the first non-descriptor
+  // operand, which begins the root scope body.
   bool parseRootPool() {
     while (Pos < Inputs.size()) {
       std::optional<CheckedDeoptValueEncoding> Encoding =
@@ -1003,6 +1090,12 @@ private:
     return true;
   }
 
+  // Parse one VO descriptor: the header encoding (ScalarValueType; index =
+  // wire ID; basic type T_OBJECT or T_ARRAY), the nonzero i64 klass pointer,
+  // the non-negative i32 field count, then that many (encoding, value)
+  // field records. Field offsets must be unique within the descriptor. A
+  // VORefLocalType field references another descriptor by wire ID and is
+  // queued in References for the final dangling-reference check.
   bool parseDescriptor(const CheckedDeoptValueEncoding &Header) {
     unsigned HeaderIndex = Pos;
     if (Header.Index < 0 ||
@@ -1038,6 +1131,9 @@ private:
     if (Count > (Inputs.size() - Pos) / 2)
       return failBool(DeoptBundleParseErrorCode::TruncatedRecord, HeaderIndex);
 
+    // Field records: an encoding operand followed by a value operand. The
+    // truncation check above guarantees Count records fit in the remaining
+    // inputs; offsets must be unique within the descriptor.
     SmallSet<int32_t, 8> FieldOffsets;
     Descriptor.Fields.reserve(static_cast<unsigned>(Count));
     for (uint64_t I = 0; I < Count; ++I) {
@@ -1061,6 +1157,8 @@ private:
       Field.ValueCell = {DeoptSemanticCellRole::DescriptorFieldValue, Pos};
 
       if (FieldEncoding->ValueType == DeoptValueEncoding::VORefLocalType) {
+        // VO-reference field: the value operand is the wire ID of the
+        // referenced descriptor, carried as an i32 constant.
         if (FieldEncoding->BasicType != T_OBJECT)
           return failBool(DeoptBundleParseErrorCode::InvalidEncoding,
                           EncodingIndex);
@@ -1071,6 +1169,9 @@ private:
         References.push_back({*Target, Pos});
         recordCell(DeoptSemanticCellRole::DescriptorFieldValue, Pos, true);
       } else {
+        // Scalar field: the value must match the encoding's basic type. A
+        // T_ILLEGAL filler is a grammar constant (zero) and contributes its
+        // exact bits to the fingerprint.
         if (!isValidScalarValue(FieldEncoding->BasicType, Inputs[Pos]))
           return failBool(DeoptBundleParseErrorCode::InvalidSemanticValue, Pos);
         recordCell(DeoptSemanticCellRole::DescriptorFieldValue, Pos,
@@ -1083,8 +1184,17 @@ private:
     return true;
   }
 
+  // Parse one scope body: locals, then stack values, then monitors, then
+  // (at most once, root scope only) the original-PC marker. The phase
+  // machine enforces that order: a record may continue the current phase or
+  // advance it, never go back. MethodType (an inlinee scope follows) and
+  // NarrowOopMarkerType (the tail follows) end the body; a ScalarValueType
+  // descriptor here is an error, because descriptors live only in the root
+  // pool.
   bool parseScopeBody(ParsedDeoptScope &Scope, bool IsRoot) {
     ScopePhase Phase = ScopePhase::Locals;
+    // Next expected slot index within the locals and stack sections; scalar
+    // records must carry consecutive indices (see parseScopeValue).
     int64_t NextLocalIndex = 0;
     int64_t NextStackIndex = 0;
     while (Pos < Inputs.size()) {
@@ -1136,6 +1246,12 @@ private:
     return true;
   }
 
+  // Parse one local or stack slot: an encoding operand followed by a value
+  // operand. Scalar slots must carry consecutive slot indices starting at
+  // NextSlotIndex, which advances by the slot width (long/double occupy two
+  // frame slots). A VORef slot instead names its descriptor's wire ID in
+  // the encoding index, and the value operand repeats that wire ID as an
+  // i32 constant (queued in References for the dangling-reference check).
   bool parseScopeValue(SmallVectorImpl<ParsedDeoptScopeValue> &Values,
                        const CheckedDeoptValueEncoding &Encoding,
                        int64_t &NextSlotIndex) {
@@ -1176,6 +1292,11 @@ private:
     return true;
   }
 
+  // Parse one monitor record: encoding, owner, lock. The encoding index
+  // distinguishes an eliminated monitor (1), whose owner operand is the
+  // wire ID of the owner VO's descriptor, from a surviving monitor (0),
+  // whose owner operand is a wide oop. The lock operand is always an
+  // addrspace(0) pointer.
   bool parseMonitor(ParsedDeoptScope &Scope,
                     const CheckedDeoptValueEncoding &Encoding) {
     if (Inputs.size() - Pos < 3)
@@ -1214,6 +1335,9 @@ private:
     return true;
   }
 
+  // Parse the root scope's original-PC marker: an OrigPcSlotType encoding
+  // (index 0, basic type T_ADDRESS) followed by the PC as an addrspace(0)
+  // pointer.
   bool parseOrigPc(ParsedDeoptScope &Scope,
                    const CheckedDeoptValueEncoding &Encoding) {
     if (Inputs.size() - Pos < 2)
@@ -1235,6 +1359,9 @@ private:
     return true;
   }
 
+  // Parse an inlinee scope's method marker: a MethodType encoding (index 0,
+  // basic type T_METADATA) followed by the inlinee's MethodType pointer as
+  // a nonzero i64.
   bool parseMethodMarker(ParsedDeoptScope &Scope) {
     if (Inputs.size() - Pos < 2)
       return failBool(DeoptBundleParseErrorCode::TruncatedRecord, Pos);
@@ -1259,6 +1386,9 @@ private:
     return true;
   }
 
+  // Parse the narrow-oop tail, which runs to the end of the inputs: zero or
+  // more records of a NarrowOopMarkerType encoding (index 0, basic type
+  // T_NARROWOOP) followed by a narrow oop (NarrowOopAddrSpace pointer).
   bool parseNarrowOopTail() {
     while (Pos < Inputs.size()) {
       if (Inputs.size() - Pos < 2)
@@ -1287,6 +1417,8 @@ private:
     return true;
   }
 
+  // Every VO reference collected during the parse must name a descriptor
+  // present in the root pool.
   bool validateReferences() {
     for (const auto &[WireID, OperandIndex] : References)
       if (!DescriptorIDs.contains(WireID))
@@ -1294,6 +1426,7 @@ private:
     return true;
   }
 
+  // A wire ID operand is a non-negative i32 constant.
   static std::optional<int32_t> parseWireID(Value *V) {
     ConstantInt *CI = getIntegerConstant(V, 32);
     if (!CI || CI->isNegative())
@@ -1301,6 +1434,8 @@ private:
     return static_cast<int32_t>(CI->getZExtValue());
   }
 
+  // A wide oop is a JavaHeapAddrSpace pointer; the only permitted constant
+  // is null.
   static bool isValidWideOop(Value *V) {
     auto *Ty = dyn_cast<PointerType>(V->getType());
     if (!Ty || Ty->getAddressSpace() != AddrSpace::JavaHeapAddrSpace)
@@ -1308,6 +1443,8 @@ private:
     return !isa<Constant>(V) || isa<ConstantPointerNull>(V);
   }
 
+  // Type-check a scalar value operand against its declared basic type.
+  // T_ILLEGAL marks a dead slot and must be a zero constant.
   static bool isValidScalarValue(HotspotBasicType BasicType, Value *V) {
     Type *Ty = V->getType();
     switch (BasicType) {
@@ -1330,11 +1467,13 @@ private:
     }
   }
 
-  ArrayRef<Value *> Inputs;
-  unsigned Pos = 0;
-  ParsedDeoptBundle Bundle;
-  DeoptBundleParseError Error;
-  SmallSet<int32_t, 8> DescriptorIDs;
+  ArrayRef<Value *> Inputs;           // Bundle inputs, in wire order.
+  unsigned Pos = 0;                   // Index of the next unparsed input.
+  ParsedDeoptBundle Bundle;           // Parse tree under construction.
+  DeoptBundleParseError Error;        // The failure that ended the parse.
+  SmallSet<int32_t, 8> DescriptorIDs; // Descriptor wire IDs seen so far.
+  // (WireID, operand index) of every VO reference, validated against
+  // DescriptorIDs after the whole bundle is parsed.
   SmallVector<std::pair<int32_t, unsigned>, 8> References;
 };
 
@@ -1355,6 +1494,12 @@ DeoptBundleParseResult parseDeoptBundle(const CallBase &CB) {
   return parseDeoptBundleInputs(Inputs);
 }
 
+// Per-operand staleness check of a parsed bundle against a bundle's current
+// inputs. An operand matches iff (a) it is the very SSA value recorded at
+// parse time (the tracking handles follow legitimate RAUW, so a RAUW'd
+// value still matches), (b) its LLVM type is unchanged, and (c) for
+// grammar-constant cells its constant bits are exactly equal. Any mismatch
+// means the bundle was structurally edited since the parse.
 static bool matchesFingerprint(const ParsedDeoptBundle &Bundle,
                                ArrayRef<Value *> Inputs) {
   if (Inputs.size() != Bundle.OriginalInputs.size() ||

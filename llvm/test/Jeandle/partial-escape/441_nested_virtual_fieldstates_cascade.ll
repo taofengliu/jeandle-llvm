@@ -20,7 +20,7 @@
 ; (MatReason::Nested) at the escape point. For conservative fallback, commit
 ; reconstructs only live outer->inner dependencies from surviving/observed
 ; EliminateStore effects and VirtualRefStoreTargets; overwritten dead stores
-; do not create persistent edges. This mirrors Graal's recursive entry
+; do not create persistent edges. This mirrors the recursive entry
 ; materialization while preserving Jeandle's analysis/transform split.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)

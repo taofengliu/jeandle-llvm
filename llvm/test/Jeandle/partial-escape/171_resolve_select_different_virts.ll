@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; A Select between two arms that are different virtuals.
-; resolveVirtualRefImpl returns nullopt (different ObjectIDs do not
+; resolveVirtualRef returns nullopt (different ObjectIDs do not
 ; merge), and propagatePointerAlias falls through to
 ; materializeAllVirtualOperands, forcing BOTH allocs to escape. The
 ; expected behavior is no crash, clean materialization of both allocs,

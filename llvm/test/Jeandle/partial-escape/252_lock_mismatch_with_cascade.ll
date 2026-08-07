@@ -3,24 +3,21 @@
 ; RUN:   -passes="require<partial-escape-analysis>,partial-escape-transform" %s 2>&1 \
 ; RUN:   | FileCheck %s --check-prefix=TRACE
 
-; Lock-mismatch on A across a diamond, with two objects (A and B) live, under
-; the reuse-OrigAlloc model.
+; Lock-mismatch on A across a diamond, with two objects (A and B) live.
 ;
-;   then: monitorenter(B) then monitorenter(A) — both tracked virtually; in
-;         the old model the narrow strict-lock-order rule would have cascaded
-;         B's materialization onto A's at the then-pred.
+;   then: monitorenter(B) then monitorenter(A) — both tracked virtually.
 ;   else: two external padding monitors.
 ;   merge: lock counts on A disagree (1 vs 0); lock counts on B disagree
 ;          (1 vs 0).
 ; Both arms therefore enter the merge at scalar depth two, then release the
 ; selected inner and outer owners in reverse order.
 ;
-; Under reuse-OrigAlloc neither object is re-materialized per pred: the
-; ORIGINAL allocations (OrigAlloc %oA and OrigAlloc %oB) dominate every use
-; and are kept verbatim. Both surviving monitorenters stay in their original
-; block, receivers pointing at their own OrigAlloc. No fresh materialization
-; invoke or materialized-object PHI is emitted for either object; owner PHIs
-; are used only by the balancing exits.
+; Neither object is materialized per pred: the ORIGINAL allocations
+; (OrigAlloc %oA and OrigAlloc %oB) dominate every use and are kept verbatim.
+; Both surviving monitorenters stay in their original block, receivers
+; pointing at their own OrigAlloc. No additional allocation invoke or
+; materialized-object PHI is emitted for either object; owner PHIs are used
+; only by the balancing exits.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr) nounwind
@@ -71,10 +68,10 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_lock_mismatch_with_cascade
-; Both ORIGINAL allocation invokes are RETAINED (no fresh materialization).
+; Both ORIGINAL allocation invokes are RETAINED as the only allocations.
 ; CHECK: %oA = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
 ; CHECK: %oB = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
-; No pea.mat materialization invoke is emitted.
+; No second materialization invoke is emitted.
 ; CHECK-NOT: pea.mat = invoke
 ; Each virtual source is a tail call, while its canonical replay is bare and
 ; keeps B-before-A ordering.

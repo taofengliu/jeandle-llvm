@@ -4,11 +4,11 @@
 ; PHI-incoming index 0, i.e. the Ref/duplicate() source) stores NOTHING while
 ; the right arm stores offset 8. The left VO's Fields is therefore empty.
 ;
-; Under the old entryCount() gate this always bailed (0 != 1) and both objects
-; materialized. With entryCount removed, the merge succeeds; the synthetic VO's
-; Fields = union {8} (seeded by the right arm even though duplicate() copied the
-; empty left Fields). Offset 8 is default 0 on the left arm and 5 on the right,
-; folding to a phi {0, 5}. Both allocations are eliminated.
+; The differing stored-field counts (0 vs 1) do not block the merge: the
+; synthetic VO's Fields = union {8} (seeded by the right arm even though
+; duplicate() copied the empty left Fields). Offset 8 is default 0 on the
+; left arm and 5 on the right, folding to a phi {0, 5}. Both allocations
+; are eliminated.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)

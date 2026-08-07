@@ -4,20 +4,17 @@
 ; object %o is allocated in `entry` (OUTSIDE any funclet) but only escapes
 ; (via @sink) INSIDE the cleanup funclet.
 ;
-; Historically PEA virtualized %o in entry and emitted a fresh materialization
-; invoke INSIDE the funclet, which had to carry a `[ "funclet"(token %pad) ]`
-; operand bundle naming the enclosing funclet pad (synthesized via
-; colorEHFunclets) or the verifier rejected it.
+; The original allocation %o is KEPT: allocated outside the funclet, it
+; correctly carries no funclet bundle, and it dominates the escape. The
+; tracked field store is replayed onto %o inside the funclet (a gep + store
+; atomic onto %o), and @sink receives %o directly. The funclet bundle lives
+; on the @sink call (where the IR author placed it), not on any new invoke.
+; PEA must not introduce a new invoke inside the funclet: such an invoke
+; would have to carry a `[ "funclet"(token %pad) ]` operand bundle naming
+; the enclosing funclet pad or the verifier would reject it.
 ;
-; Under reuse-OrigAlloc there is no materialization invoke: the original
-; allocation %o (allocated outside the funclet, so it correctly carries no
-; funclet bundle) is KEPT and dominates the escape. The tracked field store
-; is replayed onto %o inside the funclet (a gep + store atomic onto %o), and
-; @sink receives %o directly. The funclet bundle lives on the @sink call
-; (where the IR author placed it), not on any new invoke.
-;
-; Jeandle does not currently target Windows; this is the IR-defensiveness
-; rule (review requirement #6 -- PEA must tolerate any legal IR).
+; Jeandle does not currently target Windows; this is an IR-defensiveness
+; rule: PEA must tolerate any legal IR.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @may_throw()

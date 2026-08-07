@@ -38,8 +38,7 @@ u:
   resume i64 %lp
 }
 
-; No crash (previously a use-after-free in the transform); both objects are
-; eliminated once the folded enter/exit die.
+; No crash; both objects are eliminated once the folded enter/exit die.
 ; CHECK-LABEL: define void @rewrite_then_replace_uaf
 ; CHECK-NOT: jeandle.monitorenter
 ; CHECK-NOT: jeandle.new_instance

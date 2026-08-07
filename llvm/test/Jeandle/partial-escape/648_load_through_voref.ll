@@ -15,11 +15,11 @@
 ; (its OrigAlloc is a bundle operand) and its offset-16 field is a VORef to
 ; %inner, so both VOs must be described.
 ;
-; Pre-fix bug (the "identity != address" trap): recordDeoptBundleMappings banned
-; any bundle operand with V != AllocationCall, so %inner was banned; the
-; greatest-fixpoint then made %outer Bad too (its VORef field pointed at a
-; banned VO), and both materialized. The fix accepts alias-map virtual-alias
-; entries as identity.
+; Regression guard (the "identity != address" trap):
+; recordDeoptBundleMappings accepts alias-map virtual-alias entries as
+; identity. Banning any bundle operand with V != AllocationCall would ban
+; %inner; the greatest-fixpoint would then make %outer Bad too (its VORef
+; field pointed at a banned VO), and both would materialize.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(i32, i32)

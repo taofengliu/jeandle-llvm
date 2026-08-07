@@ -5,8 +5,8 @@
 ; propagatePointerAlias registered it in the alias map unconditionally. The
 ; strengthened IsIdentityAlias check (alias-map hit AND
 ; resolveFieldOffset==0) bans it, so the VO is kept real and the GEP stays
-; valid (pre-fix: admitted as identity, transform bailed on the
-; OrigAlloc scan, Pass 2 produced `gep poison, 16`).
+; valid. Admitting it as identity would make the transform bail on the
+; OrigAlloc scan and Pass 2 would produce `gep poison, 16`.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(i32)

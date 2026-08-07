@@ -7,7 +7,7 @@
 ; RUN:     -passes="require<partial-escape-analysis>,partial-escape-transform" \
 ; RUN:     -jeandle-pea-loop-cutoff=0 %s 2>&1 | FileCheck %s --check-prefix=TRACE
 
-; E1 — STOP_NEW overflow escalation carrying a live lock.
+; STOP_NEW overflow escalation carrying a live lock.
 ;
 ; The pre-loop virtual object is monitorenter-locked before the loop, then
 ; escapes via @sink inside the loop body. With -jeandle-pea-loop-cutoff=0 the
@@ -16,7 +16,7 @@
 ; preheader. The drain (processStateBeforeLoopOnOverflow -> materializeAt...
 ; -> ensureMaterialized) must capture the live lock stack into the Materialize
 ; effect so the re-emitted monitorenter/exit bracket the materialized object
-; (Graal materializeWithCommit lock capture). Validates that the overflow
+; (materialize-commit lock capture). Validates that the overflow
 ; escalation composes with the lock model.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)

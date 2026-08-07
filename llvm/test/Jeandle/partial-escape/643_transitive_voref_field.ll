@@ -10,8 +10,8 @@
 ; Both must be described: %a's ref field is a VORef FIELD (encoding ValueTy =
 ; VORefLocalType, value slot = i32 wire ID of %b), and %b gets its own
 ; descriptor (referenced by ID from %a's field) with NO bundle slot rewritten
-; (its OrigAlloc is not a bundle operand). This mirrors C2/Graal nested
-; ObjectValue + ID back-ref. Asserts the transitive closure is complete: no
+; (its OrigAlloc is not a bundle operand). This mirrors nested virtual-object
+; descriptors with ID back-refs. Asserts the transitive closure is complete: no
 ; VORef to an undescribed VO.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)

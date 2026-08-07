@@ -11,9 +11,9 @@
 ; a's effect carries Locks=[a@0, a@2], b's=[b@1], c's=[c@3]. Re-emitting per
 ; effect (a's two enters, then b's, then c's) yields depth order 0,2,1,3 -- NOT
 ; strictly increasing, which violates the lightweight-lock thread-stack
-; contract. The fix merges every lock materialized at one escape point and
-; re-emits them globally sorted by depth (0,1,2,3), matching Graal's single
-; CommitAllocationNode + DefaultJavaLoweringProvider sort.
+; contract. All locks materialized at one escape point are merged and
+; re-emitted globally sorted by depth (0,1,2,3), matching the single
+; materialize-commit + depth-sorted lowering.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr) nounwind
@@ -65,9 +65,9 @@ u:
 ; CHECK-LABEL: define void @test_reentrant_interleaved_cascade
 ; The four re-emitted monitorenters must appear in strictly increasing lock
 ; depth: a@0 (la), b@1 (lb), a@2 (la2, re-entrant on the SAME object as la),
-; c@3 (lc). Before the fix each VO's locks were re-emitted together per-effect,
-; producing an out-of-order sequence (e.g. lb, la, la2, lc = depths 1,0,2,3),
-; violating the lightweight-lock thread-stack contract.
+; c@3 (lc). Re-emitting each VO's locks together per-effect would produce an
+; out-of-order sequence (e.g. lb, la, la2, lc = depths 1,0,2,3), violating
+; the lightweight-lock thread-stack contract.
 ; CHECK: monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MATA:.*]], ptr %la)
 ; CHECK: monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MATB:.*]], ptr %lb)
 ; CHECK: monitorenter_with_lightweight_lock(ptr addrspace(1) %[[MATA]], ptr %la2)

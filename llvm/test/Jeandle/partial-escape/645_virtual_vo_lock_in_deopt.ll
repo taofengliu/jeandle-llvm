@@ -11,9 +11,8 @@
 ;     (enc index=1, object = i32 vo-id), so HotSpot relock_objects re-acquires
 ;     the lock on the realloc'd owner at deopt. The basic_lock slot is kept.
 ;
-; Mirror of C2
-; MonitorValue{owner=ObjectValue, eliminated=true} + Graal
-; HotSpotDebugInfoBuilder.computeLockValue / collectLockedVirtualObjects.
+; Mirrors the standard virtualizing-EA deopt encoding: an eliminated monitor
+; entry carrying a virtual-object owner reference.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr) nounwind

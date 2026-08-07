@@ -3,10 +3,11 @@
 ; foldICmpEquality: same virtual object on both sides, one via a
 ; symbolic-offset GEP — the offsets can be proven neither equal nor
 ; distinct, so the icmp cannot fold. The object materializes AT the icmp
-; (Graal processNodeInputs): reuse-OrigAlloc keeps both derived operands
+; reuse-OrigAlloc keeps both derived operands
 ; valid, the tracked store is replayed before the icmp, the earlier folded
-; load stays folded, and the icmp survives as a real compare. Before the
-; fix the object was marked ineligible: the fold was dropped function-wide.
+; load stays folded, and the icmp survives as a real compare. Regression
+; guard: marking the object ineligible instead would drop the fold
+; function-wide.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i1)
@@ -34,7 +35,7 @@ u:
 
 ; CHECK-LABEL: define void @test_icmp_symbolic
 ; CHECK: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
-; The folded load STAYS folded (old bail-all dropped it function-wide).
+; The folded load STAYS folded (a bail would drop it function-wide).
 ; CHECK: call void @use_int(i32 33)
 ; The tracked store is replayed immediately before the icmp.
 ; CHECK: %pea.matslot = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8

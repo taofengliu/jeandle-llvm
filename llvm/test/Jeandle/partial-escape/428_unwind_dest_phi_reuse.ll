@@ -4,18 +4,13 @@
 ; has TWO invoke predecessors (the alloc %o and a second may_throw invoke)
 ; and a USED PHI (`%sel`) over them.
 ;
-; Historically, when %o escaped and was materialized, the fresh materialization
-; invoke needed an unwind dest; Strategy 1 reused %uw verbatim without
-; checking phis().empty(), making its block a predecessor of %uw with no
-; matching PHI incoming -- a PHI/predecessor mismatch the verifier rejects.
-; After the fix, a PHI-carrying unwind dest was not reused; a synthesized
-; pea.unwind block was.
-;
-; Under reuse-OrigAlloc there is NO fresh materialization invoke -- the
-; original allocation %o is retained with its ORIGINAL unwind dest %uw -- so
-; no unwind-dest choice is made at all. %uw keeps exactly its two original
-; predecessors (entry, cont) and its `%sel` PHI is intact; no pea.unwind block
-; is synthesized. The escape consumes %o directly.
+; There is no new materialization invoke, so no unwind-dest choice is made at
+; all: the original allocation %o is retained with its ORIGINAL unwind dest
+; %uw. %uw keeps exactly its two original predecessors (entry, cont) and its
+; `%sel` PHI is intact; no pea.unwind block is synthesized. The escape
+; consumes %o directly. This guards the invariant that a PHI-carrying unwind
+; dest is never reused for a new invoke without a matching PHI incoming (a
+; PHI/predecessor mismatch the verifier rejects).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @may_throw()
@@ -42,7 +37,7 @@ uw:
 
 ; CHECK-LABEL: define void @test_unwind_dest_phi_reuse
 ; The original allocation invoke is retained with its original unwind dest
-; %uw (no fresh materialize invoke, so no unwind-dest choice is made).
+; %uw (no new invoke, so no unwind-dest choice is made).
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
 ; CHECK: to label %cont unwind label %uw
 ; The escape consumes OrigAlloc %o directly (no materialize invoke inserted).

@@ -2,8 +2,8 @@
 
 ; Edge case: two unrelated virtuals A and B passed as separate
 ; arguments to the same external sink call. Both escape at the same
-; instruction. Both must materialize at the call's safe insertion point
-; without interfering with each other (e.g. SeqNo collision, mis-ordering).
+; instruction. Both materialize at the call without interfering with each
+; other (e.g. SeqNo collision, mis-ordering).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink2(ptr addrspace(1), ptr addrspace(1))
@@ -29,8 +29,8 @@ u2:
   resume i64 %lp2
 }
 
-; Both materializations appear, distinct klasses, then the sink call uses
-; the materialized pointers.
+; Both original allocations are retained, distinct klasses, and the sink
+; call uses them directly.
 ; CHECK-LABEL: define void @test_two_escapes_same_call
 ; CHECK-DAG: invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
 ; CHECK-DAG: invoke hotspotcc{{.*}}ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)

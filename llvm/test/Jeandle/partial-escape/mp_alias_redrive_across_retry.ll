@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; MergeProcessor retry rework: alias re-derivation across fixpoint iterations.
+; MergeProcessor retry: alias re-derivation across fixpoint iterations.
 ;
 ; The merge combines two effects that force the do/while to run >= 2
 ; iterations AND exercise a Case-B pointer alias at the same merge:
@@ -18,7 +18,7 @@
 ;      uniform scalar field (offset 16 = 7, stored before the branch) must
 ;      still fold to the constant 7 through the re-derived alias.
 ;
-; This is the key regression test for the retry rework (reset-output-state
+; This is the key regression test for the merge retry (reset-output-state
 ; + clear-effect-buffer + per-phi Aliases.resetAlias): if the alias is not
 ; correctly re-derived after a retry, the @use(i32 7) fold breaks.
 

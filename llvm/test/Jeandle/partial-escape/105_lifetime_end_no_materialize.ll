@@ -2,8 +2,7 @@
 
 ; Edge case: virtual with llvm.lifetime.start / llvm.lifetime.end
 ; bracketing its store/load region. lifetime.end on a virtual must NOT
-; trigger materialization (per intrinsic-noop fix). Allocation is fully
-; eliminated.
+; trigger materialization. Allocation is fully eliminated.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @llvm.lifetime.start.p1(i64, ptr addrspace(1))

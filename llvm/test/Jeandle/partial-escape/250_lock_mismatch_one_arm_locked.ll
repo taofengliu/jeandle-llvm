@@ -3,7 +3,7 @@
 ; RUN:   -passes="require<partial-escape-analysis>,partial-escape-transform" %s 2>&1 \
 ; RUN:   | FileCheck %s --check-prefix=TRACE
 
-; Lock-count mismatch at a merge, under the reuse-OrigAlloc model.
+; Lock-count mismatch at a merge.
 ;
 ; entry: alloc o (virtual). branch on %c.
 ; then: monitorenter(o) — tracked virtually, LockCount[o]=1 at then exit.
@@ -12,12 +12,12 @@
 ; Both arms have scalar CFG depth one and the merged owner is released before
 ; return, so the function is balanced independently of the PEA object state.
 ;
-; Under reuse-OrigAlloc the lock-count mismatch no longer drives a per-pred
-; materialization cascade. The ORIGINAL allocation (OrigAlloc %o) dominates
-; every escape point and every use, so it is kept verbatim and the tail-marked
-; source enter is replaced by a canonical bare replay on OrigAlloc. No fresh
-; materialization invoke or materialized-object PHI is emitted; the owner PHI
-; exists only to release the path-selected real monitor.
+; The lock-count mismatch does not drive a per-pred materialization cascade:
+; the ORIGINAL allocation (OrigAlloc %o) dominates every escape point and
+; every use, so it is kept verbatim and the tail-marked source enter is
+; replaced by a canonical bare replay on OrigAlloc. No additional allocation
+; invoke or materialized-object PHI is emitted; the owner PHI exists only to
+; release the path-selected real monitor.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr) nounwind
@@ -53,9 +53,9 @@ u:
 }
 
 ; CHECK-LABEL: define void @test_lock_mismatch_one_arm_locked
-; The original allocation invoke is RETAINED (no fresh materialization).
+; The original allocation invoke is RETAINED as the sole allocation.
 ; CHECK: %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 12345 to ptr), i32 16)
-; No pea.mat materialization invoke is emitted.
+; No second materialization invoke is emitted.
 ; CHECK-NOT: pea.mat = invoke
 ; The canonical replay uses OrigAlloc %o.
 ; CHECK-NOT: tail call hotspotcc void @jeandle.monitorenter_with_thin_lock

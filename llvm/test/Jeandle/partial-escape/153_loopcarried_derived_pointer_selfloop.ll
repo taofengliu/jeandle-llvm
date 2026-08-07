@@ -3,9 +3,9 @@
 ; TRUE self-loop (the header is its own back-edge predecessor) carrying a
 ; DERIVED pointer %sf = gep %X, 8. A call-form allocation is used so the alloc
 ; lives inside the self-loop header (mirrors 145_loopcarried_inbody_selfloop).
-; Exercises the hardest timing case for the re-derivation: the back-edge pred is
-; the header itself, so the per-pred materialization + re-derive placement runs
-; against the header terminator.
+; Exercises the hardest timing case for carried-pointer resolution: the
+; back-edge pred is the header itself, so the per-pred materialization runs
+; against the header terminator, and the retained %X keeps %sf valid.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -34,8 +34,9 @@ done:
   ret void
 }
 
-; The carried derived pointer is materialized at the back-edge and re-derived;
-; the exit @sink receives a valid (non-poison) carried pointer.
+; The carried object is materialized at the back-edge with %X retained, so
+; %sf stays valid; the exit @sink receives a valid (non-poison) carried
+; pointer.
 ; CHECK-LABEL: define void @test_153_selfloop
 ; CHECK: call void @sink(ptr addrspace(1) %psf)
 ; CHECK-NOT: poison

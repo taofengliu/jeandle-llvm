@@ -1,14 +1,14 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" \
 ; RUN:     -jeandle-pea-loop-cutoff=1 %s | FileCheck %s
 
-; A4 — StopNew -> Regular mode reset at depth==1 convergence.
+; StopNew -> Regular mode reset at depth==1 convergence.
 ;
 ; Two sequential loops in one function. Loop 1 is a 2-deep nest: with
 ; -jeandle-pea-loop-cutoff=1 its max depth (2) exceeds the cutoff, so the
 ; outermost processLoop enters Mode::StopNewInLoopNest and the depth-2
 ; loop-local alloc (klass 0x4444) is REFUSED from virtualization (it survives
 ; verbatim, like test 300). Loop 1 has no escape, so it CONVERGES in StopNew
-; and — per Graal EffectsClosure.java:482-488 — the mode is reset to Regular at
+; and the mode is reset to Regular at
 ; depth==1 success. Loop 2 is a sibling SINGLE loop (depth 1, max depth 1, not
 ; > cutoff) that must therefore run in Regular and fully virtualize its loop-
 ; local alloc (klass 0x5555). If the mode reset leaked, Loop 2's alloc would

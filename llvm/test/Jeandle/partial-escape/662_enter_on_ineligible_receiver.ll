@@ -6,7 +6,7 @@
 ; A monitorenter whose receiver resolves to an ALREADY-INELIGIBLE virtual
 ; object cannot be elided — the fold would be revoked at commit anyway.
 ; The surviving REAL enter must fire the strict-lock-order cascade
-; (materializeVirtualLocksBefore), like Graal's canVirtualizeLock=false
+; (materializeVirtualLocksBefore), like the cannot-virtualize-lock
 ; path: the still-virtual %obj holding a shallower elided lock must
 ; materialize BEFORE the real enter, so its re-emitted lock lands below
 ; %bad's on the runtime lock stack instead of after it (inverted nesting).

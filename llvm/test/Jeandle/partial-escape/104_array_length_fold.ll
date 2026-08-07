@@ -14,7 +14,7 @@
 ;   * test_length_then_escape: array_length is read first (folds to 4), THEN
 ;     the array escapes via @sink. The length call still folds; under the
 ;     reuse-OrigAlloc model the ORIGINAL new_array allocation is kept alive
-;     and the sink consumes it directly (no fresh materialization invoke).
+;     and the sink consumes it directly.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) readonly)

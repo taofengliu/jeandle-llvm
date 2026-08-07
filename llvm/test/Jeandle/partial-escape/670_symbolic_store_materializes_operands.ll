@@ -2,14 +2,14 @@
 
 ; processStore with an unresolvable (symbolic-index) derived address on a
 ; virtual array, storing a virtual value that has its own tracked field
-; store and folded load. Graal: a node whose virtualize() fails keeps its
-; inputs and processNodeInputs materializes them at the node. Here the array
+; store and folded load. A node whose virtualize() fails keeps its
+; inputs and the generic escape path materializes them at the node. Here the array
 ; and the value both materialize AT the store: the value's tracked field
 ; store is replayed onto its OrigAlloc immediately before the symbolic
 ; store, the folded load stays folded, and the symbolic store survives
-; writing the live value pointer. Before the fix both objects were marked
-; ineligible: the folded load was dropped function-wide and the field store
-; stayed in place.
+; writing the live value pointer. Regression guard: marking both objects
+; ineligible instead would drop the folded load function-wide and leave the
+; field store in place.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
@@ -41,8 +41,8 @@ u:
 ; Both allocations survive (both materialize at the symbolic store).
 ; CHECK: invoke hotspotcc ptr addrspace(1) @jeandle.new_array
 ; CHECK: call hotspotcc ptr addrspace(1) @jeandle.new_instance
-; The folded load of %v's field STAYS folded (old bail-all dropped it
-; function-wide, so use_int received a real load).
+; The folded load of %v's field STAYS folded (a bail would drop the fold
+; function-wide and use_int would receive a real load).
 ; CHECK: call void @use_int(i32 66)
 ; %v's field store is replayed immediately before the symbolic store.
 ; CHECK: %pea.matslot = getelementptr inbounds i8, ptr addrspace(1) %v, i64 8

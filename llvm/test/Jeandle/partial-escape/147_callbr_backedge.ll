@@ -2,7 +2,7 @@
 
 ; Coverage for a callbr back-edge. This reducible CFG has a dominating header
 ; and can be represented as a natural loop; it does not prove that the
-; missed-LoopInfo defensive sweep ran. The oracle records the current
+; unsafe-cyclic-blocks safety net ran. The oracle records the current
 ; conservative output while exercising the callbr terminator shape.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)

@@ -5,8 +5,8 @@
 ;
 ; Under the reuse-OrigAlloc model the original body alloc %X is KEPT (it
 ; dominates the loop body and the latch), so the body GEP %sf of %X stays valid
-; and the carried PHI's back-edge incoming stays %sf -- no re-derivation and no
-; pea.matoff. The tracked field store is replayed onto %X at the back-edge
+; and the carried PHI's back-edge incoming stays %sf -- no re-derivation is
+; needed. The tracked field store is replayed onto %X at the back-edge
 ; (latch); the exit @sink receives the carried derived pointer. No poison.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
@@ -46,8 +46,8 @@ u:
 }
 
 ; The carried PHI's back-edge incoming stays the original body GEP %sf (the body
-; alloc %X is retained, so %sf stays valid; no re-derived pea.matoff). The body
-; GEP is kept and the tracked field store is replayed onto %X at the latch.
+; alloc %X is retained, so %sf stays valid). The body GEP is kept and the
+; tracked field store is replayed onto %X at the latch.
 ; CHECK-LABEL: define void @test_149_carried_gep
 ; CHECK: %psf = phi ptr addrspace(1) [ null, %entry ], [ %sf, %latch ]
 ; CHECK: %X = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance

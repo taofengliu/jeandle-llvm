@@ -1,14 +1,15 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Materialised invoke preserves metadata and function/arg attrs of the
-; original allocation. applyMaterialize carries over the calling convention,
-; the JavaKlass / JavaKlassExact / NonNull return attrs, plus !prof,
+; The retained original allocation invoke preserves its metadata and
+; function/arg attrs. Because materialization keeps the original
+; jeandle.new_instance invoke verbatim, the calling convention, the
+; JavaKlass / JavaKlassExact / NonNull return attrs, plus !prof,
 ; !alias.scope, !noalias, custom Jeandle metadata, and function-level attrs
-; (nofree, nosync, cold) onto the materialised invoke.
+; (nofree, nosync, cold) all survive untouched.
 ;
-; The test forces a materialisation by passing the virtual to an opaque
-; sink, then asserts the materialisation invoke still carries the
-; frontend-attached !prof and !alias.scope metadata from the original alloc.
+; The test forces a materialization by passing the virtual to an opaque
+; sink, then asserts the retained invoke still carries the
+; frontend-attached !prof and !alias.scope metadata.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -28,8 +29,8 @@ u:
 }
 
 ; CHECK-LABEL: define void @meta_preserved
-; The materialised invoke must carry forward the !prof and !alias.scope
-; metadata that the frontend attached to the original allocation.
+; The retained invoke must keep the !prof and !alias.scope metadata that the
+; frontend attached to the original allocation.
 ; CHECK: invoke {{.*}}@jeandle.new_instance
 ; CHECK-NEXT: to label %{{.*}} unwind label %{{.*}}, !prof !{{[0-9]+}}, !alias.scope !{{[0-9]+}}
 

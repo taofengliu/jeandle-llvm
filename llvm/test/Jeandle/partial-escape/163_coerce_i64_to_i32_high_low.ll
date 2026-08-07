@@ -1,10 +1,10 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Store i64 into a virtual's slot at offset 8, then read both halves as i32 —
-; both are sub-slot narrowing reads (i64 -> i32). PEA no longer supports
-; sub-slot / narrowing loads (the lshr+trunc fold was removed) — the loads bail
-; to ineligible and the object materializes: alloc, store, and loads survive
-; intact, no coercion synthesized.
+; both are sub-slot narrowing reads (i64 -> i32). PEA does not support
+; sub-slot / narrowing loads — the loads bail to ineligible and the object
+; materializes: alloc, store, and loads survive intact, no coercion
+; synthesized.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 

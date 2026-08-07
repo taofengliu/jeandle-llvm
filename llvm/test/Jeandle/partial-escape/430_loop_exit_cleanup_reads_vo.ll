@@ -8,9 +8,7 @@
 ; (field = 42) to the cleanup via the unwind-edge pre-invoke snapshot, so the
 ; cleanup's load FOLDS to the stored constant. %o stays NeverEscapes and is
 ; eliminated; the cleanup calls @use(42) — the value that would have been in
-; %o's field. (Previously processLoopExit conservatively force-materialized %o
-; at such exits; that force was vestigial under reuse-OrigAlloc and has been
-; removed — see deopt_within_reach_* tests.)
+; %o's field.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @may_throw()

@@ -6,13 +6,12 @@
 ; Invoke-unwind lock re-emit vs the unwind-edge state split.
 ; A locked VO escapes at a TERMINATOR invoke `foo(o)`. The materialize is
 ; placed BEFORE the invoke, so the re-emitted monitorenter executes on BOTH
-; the normal and unwind edges. Pre-fix, the unwind successor inherited the
-; PRE-invoke snapshot (VO still virtual+locked), so the handler's escape
-; re-emitted the same enter AGAIN (double acquire) and the unwind path had
-; no matching exit. The UnwindData patch now records the VO as materialized
-; (locks cleared — the re-emit already covers them) in the pre-invoke
-; snapshot: the handler sees the real object, no second re-emit, and each edge
-; releases the single acquired monitor before its real exit.
+; the normal and unwind edges. The UnwindData patch records the VO as
+; materialized (locks cleared — the re-emit already covers them) in the
+; pre-invoke snapshot inherited by the unwind successor: the handler sees the
+; real object, so its escape does not re-emit the same enter AGAIN (a double
+; acquire with no matching exit on the unwind path), and each edge releases
+; the single acquired monitor before its real exit.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr) nounwind

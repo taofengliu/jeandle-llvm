@@ -1,12 +1,12 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" \
 ; RUN:     -jeandle-pea-loop-cutoff=0 %s | FileCheck %s
 
-; B1 — StopNew tracks existing virtuals (StopNew != MaterializeAll).
+; StopNew tracks existing virtuals (StopNew != MaterializeAll).
 ;
 ; With -jeandle-pea-loop-cutoff=0 the single loop (depth 1) enters
 ; Mode::StopNewInLoopNest. A pre-loop virtual object (allocated and field-stored
-; before the loop) is only LOADED inside the body — it never escapes. Graal's
-; STOP_NEW_VIRTUALIZATIONS_LOOP_NEST suppresses NEW virtualizations but keeps
+; before the loop) is only LOADED inside the body — it never escapes.
+; StopNewInLoopNest suppresses NEW virtualizations but keeps
 ; tracking already-virtual objects (loads/stores/merges proceed as in Regular).
 ; Jeandle matches this: the load folds to the stored constant and the object is
 ; eliminated. Crucially, the in-body load is NOT a materialization, so the

@@ -1,12 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; Select whose two arms are aliased to the same virtual. Originally
-; documented as a "missed-opt pin" because the analyzer's
-; processBlockPhis Case B only handled PHINodes, not Selects, so the
-; Select consumed virtual operands and forced materialization.
-;
-; Now: processInstruction dispatches SelectInst into propagatePointerAlias,
-; which uses resolveVirtualRefImpl's Select case to verify that both arms
+; Select whose two arms are aliased to the same virtual.
+; processInstruction dispatches SelectInst into propagatePointerAlias,
+; which uses resolveVirtualRef's Select case to verify that both arms
 ; resolve to the same ObjectID and then aliases the Select to that
 ; virtual. The icmp eq downstream resolves both operands to the same
 ; ObjectID and folds to true; the diff arm becomes unreachable and the

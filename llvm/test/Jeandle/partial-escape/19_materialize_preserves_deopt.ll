@@ -1,15 +1,11 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; reuse-OrigAlloc model: a PartiallyEscapes object materializes by replaying
-; its field stores onto its ORIGINAL allocation (OrigAlloc), which is kept
-; alive. No fresh materialization invoke is emitted, so there is no question
-; of "dropping" a deopt bundle from a new invoke — the original allocation's
-; own deopt operand bundle is preserved verbatim (the whole point of the
-; model: a freshly-emitted jeandle.new_instance at a materialization point
-; could not get the right deopt state, but the original allocation site
-; already carries it). Here the allocation carries a "deopt" bundle and the
-; sink does not; after PEA the original invoke (with its bundle) is retained
-; and the sink receives OrigAlloc directly.
+; A PartiallyEscapes object materializes by replaying its field stores onto
+; its ORIGINAL allocation (OrigAlloc), which is kept alive, so the original
+; allocation's own deopt operand bundle is preserved verbatim. Here the
+; allocation carries a "deopt" bundle and the sink does not; after PEA the
+; original invoke (with its bundle) is retained and the sink receives
+; OrigAlloc directly.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -33,7 +29,7 @@ u:
 ; The original allocation invoke is RETAINED with its deopt bundle intact.
 ; CHECK: = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr {{.*}}, i32 16) [ "deopt"(i32 42) ]
 ; CHECK: to label %{{.*}} unwind label %{{.*}}
-; The sink receives the original allocation directly (no pea.mat).
+; The sink receives the original allocation directly.
 ; CHECK: call void @sink(ptr addrspace(1) %o)
 
 !java-method-compilation = !{}

@@ -1,6 +1,6 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
-; PEA §A5 — iterative merge stabilization. Two outer virtual objects (allocated
+; Iterative merge stabilization. Two outer virtual objects (allocated
 ; in entry, so both are virtual at every pred of the merge) each carry a field
 ; that references the SAME inner virtual on the left arm but disagree on the
 ; right arm. At the merge, the per-VO loop in mergeStates processes outer1

@@ -1,8 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/667_arraystorecheck_null_value.cblog %s | FileCheck %s
 
 ; A null value can be stored into any Object[] — the store check always
-; passes, so it is eliminated (Graal's StoreIndexedNode does the same for
-; isPointerAlwaysNull(value)). Without the elision, the unknown value klass
+; passes, so it is eliminated (an array store of a always-null value needs no
+; check). Without the elision, the unknown value klass
 ; would force the whole virtual array to materialize.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)

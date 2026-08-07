@@ -5,8 +5,8 @@
 ; LoopInfo does not recognise the cycle as a natural loop, so
 ; processLoop is never invoked; the outer RPO walk handles each block
 ; once. The first escape inside the cycle (whichever block RPO visits
-; first) drives a per-instruction materialise; the alloc survives in
-; IR and the analyzer does not crash. This is the "alloc whose virtual
+; first) classifies the object as escaping; the original alloc survives
+; in IR and the analyzer does not crash. This is the "alloc whose virtual
 ; would cross the irreducible region" case.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
@@ -35,7 +35,7 @@ u:
   resume i64 %lp
 }
 
-; The alloc survives (materialised at the escape), no crash. All
+; The original alloc survives (retained at the escape), no crash. All
 ; @sink and @use_after calls intact.
 ; CHECK-LABEL: define void @test_irreducible_with_alloc
 ; CHECK: invoke {{.*}}@jeandle.new_instance

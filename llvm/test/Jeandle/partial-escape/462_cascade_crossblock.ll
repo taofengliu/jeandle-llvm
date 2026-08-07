@@ -4,17 +4,14 @@
 ; escape moved into a LATER block (`tail`). arr[0]=inner0 (constant index)
 ; records VirtualRef and an EliminateStore; arr[i]=innerI (SYMBOLIC index)
 ; cannot be virtualized, so arr and innerI materialize AT the symbolic store
-; in n2. Under the pre-materialize-at-store design (symbolic store ->
-; markIneligible) the commit cascade read the per-block live FieldStates —
-; which held only `tail`'s (empty) state — missed the arr->inner0 edge, left
-; inner0 NeverEscapes, and the surviving real store wrote POISON into the
-; escaped array. With materialize-at-store the hazard is gone by
-; construction: the materialize point sits in n2 next to the VirtualRef, and
-; materializeAt RECURSIVELY materializes inner0 (MatReason::Nested) before
-; replaying the tracked arr[0]=inner0 store onto arr's OrigAlloc
-; (pea.matslot), so the replayed store and the symbolic store both write
-; live pointers. Conservative fallback dependencies are rebuilt at commit
-; from surviving/observed EliminateStore effects plus
+; in n2. Regression guard: leaving inner0 NeverEscapes while the real store
+; survives would write POISON into the escaped array. Materialize-at-store
+; prevents the hazard by construction: the materialize point sits in n2 next
+; to the VirtualRef, and materializeAt RECURSIVELY materializes inner0
+; (MatReason::Nested) before replaying the tracked arr[0]=inner0 store onto
+; arr's OrigAlloc (pea.matslot), so the replayed store and the symbolic
+; store both write live pointers. Conservative fallback dependencies are
+; rebuilt at commit from surviving/observed EliminateStore effects plus
 ; VirtualRefStoreTargets, so only live VirtualRef definitions participate.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)

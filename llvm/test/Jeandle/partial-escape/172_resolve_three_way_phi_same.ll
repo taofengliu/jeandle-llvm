@@ -3,7 +3,7 @@
 ; A three-way PHI whose incomings all alias to the same
 ; virtual. processBlockPhis Case B already covers this at the merge
 ; block (because the AliasMap has all three incomings registered for
-; the same ObjectID), so resolveVirtualRefImpl's PHINode case is a
+; the same ObjectID), so resolveVirtualRef's PHINode case is a
 ; redundant safety net here; the test pins the end-to-end fold
 ; regardless of which path resolves first.
 

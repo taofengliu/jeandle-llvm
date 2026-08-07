@@ -1,5 +1,4 @@
-//===- PartialEscapeTransform.h - PEA (transform pass) ------------*- C++
-//-*-===//
+//===- PartialEscapeTransform.h - PEA (transform pass) ----------*- C++ -*-===//
 //
 // Copyright (c) 2026, the Jeandle-LLVM Authors. All Rights Reserved.
 //
@@ -16,6 +15,9 @@
 
 namespace llvm {
 
+// Applies the PEAResult produced by PartialEscapeAnalysis to a function's IR:
+// three ordered effect phases plus canonical cleanups. See
+// PartialEscapeTransform.cpp for the full contract.
 class PartialEscapeTransform : public PassInfoMixin<PartialEscapeTransform> {
 public:
   PartialEscapeTransform() = default;

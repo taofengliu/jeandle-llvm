@@ -1,14 +1,14 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; MergeProcessor / mergeObjectState AllMaterialized under the reuse-OrigAlloc
-; model (escape-driven, NO materializedValuePhi).
+; model (escape-driven, NO materialized-object PHI).
 ;
 ; Both arms escape the same virtual object via a sink call. Under reuse-OrigAlloc
 ; the ORIGINAL allocation dominates both arms and the merge, so it is the single
-; sound SSA value kept alive; no fresh materialization invoke is emitted and no
-; ptr addrspace(1) materializedValuePhi is synthesized at the merge. Both sinks
+; sound SSA value kept alive; no new allocation invoke is emitted and no
+; materialized-object PHI is synthesized at the merge. Both sinks
 ; and the return consume OrigAlloc directly. Pinning the no-PHI outcome here
-; guards the refactor's routing: escapes must NOT be misrouted into the
+; guards the merge routing: escapes must NOT be misrouted into the
 ; PHI-synthesis else-branch.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)

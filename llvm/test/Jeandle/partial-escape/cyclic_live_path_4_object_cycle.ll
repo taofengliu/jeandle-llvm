@@ -16,8 +16,8 @@
 ; whole group (4 objects, one shared escape point). Under reuse-OrigAlloc all
 ; four OrigAllocs are KEPT (each dominates the escape point), so every field
 ; store replays directly onto its OrigAlloc and the back edge D.i = A resolves
-; through A's OrigAlloc — no cascade coordination, no fresh pea.mat invoke, no
-; materialized-object PHI. Larger group than the 2-/3-object cyclic tests.
+; through A's OrigAlloc — no cascade coordination, no new allocation invoke,
+; no materialized-object PHI. Larger group than the 2-/3-object cyclic tests.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare i32 @__gxx_personality_v0(...)
@@ -63,7 +63,7 @@ u4:
 ; CHECK: %[[B:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr)
 ; CHECK: %[[C:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 33333 to ptr)
 ; CHECK: %[[D:[A-Za-z0-9._]+]] = invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 44444 to ptr)
-; No fresh materialization invoke is emitted.
+; Materialization emits no new allocation invoke.
 ; CHECK-NOT: pea.mat = invoke
 ; All four field groups use OrigAlloc values (no poison): the back edge D.i = A
 ; resolves through A's OrigAlloc (kept alive).

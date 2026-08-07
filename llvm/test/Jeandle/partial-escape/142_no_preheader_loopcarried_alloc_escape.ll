@@ -1,25 +1,23 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s --check-prefix=NOPRE
 ; RUN: opt -S -passes="loop-simplify,require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s --check-prefix=FIXPOINT
 ;
-; Regression guard for a PEA soundness bug that affected BOTH the !Preheader
+; Regression guard for a PEA soundness hazard that affects BOTH the !Preheader
 ; single-pass path AND the fixpoint path. A loop-LOCAL object %X allocated in
 ; the body is carried across the back-edge by the header PHI %px and observed
 ; at the loop exit (load %px's field -> @use).
 ;
-; Before the fix, the in-pass header merge (header first in RPO) ran before %X
-; was virtualized, so the back-edge slot of %px resolved to nullopt and the PHI
-; was skipped. PEA never saw %X escape via the PHI, classified it NeverEscapes,
-; and the transform RAUW'd %X -> poison, leaking poison to @use. Both paths were
-; affected (the fixpoint's post-body merge discarded its materialization effect).
+; The hazard: the in-pass header merge (header first in RPO) runs before %X
+; is virtualized, so the back-edge slot of %px cannot resolve yet. If the PHI
+; is skipped there, PEA never sees %X escape via the PHI, classifies it
+; NeverEscapes, and the transform RAUWs %X -> poison, leaking poison to @use.
 ;
-; After the fix, the post-body merge (run AFTER the body, Graal
-; EffectsClosure.java:461-466) persists its Case-A materialization at the
-; back-edge pred (Graal PartialEscapeClosure.java:996/1504), so %X is never
-; eliminated. This accumulation shape references the previous iteration's field
-; (%pv = load %px.f), so %X is conservatively classified AlwaysEscapes here and
-; the original alloc + stores survive unchanged -- the key assertion is NO
-; poison and the alloc survives. See 143_* for the simpler shape that achieves
-; Graal-aligned back-edge materialization (PartiallyEscapes).
+; The post-body merge (run AFTER the body) persists its Case-A materialization
+; at the back-edge pred, so %X is never eliminated. This accumulation shape
+; references the previous iteration's field (%pv = load %px.f), so %X is
+; conservatively classified AlwaysEscapes here and the original alloc + stores
+; survive unchanged -- the key assertion is NO poison and the alloc survives.
+; See 143_* for the simpler shape that achieves back-edge materialization
+; (PartiallyEscapes).
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @use(i32)

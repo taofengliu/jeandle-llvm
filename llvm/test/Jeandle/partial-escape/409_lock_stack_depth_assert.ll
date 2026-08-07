@@ -1,8 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 ; REQUIRES: asserts
 
-; Lock-stack depth monotonicity asserts (mirror Graal ObjectState.addLock,
-; ObjectState.java:212). Re-entrant locks on the SAME object acquire strictly
+; Lock-stack depth monotonicity asserts mirror ObjectState::addLock.
+; Re-entrant locks on the SAME object acquire strictly
 ; increasing bytecode depth (0 then 1); the debug asserts in ObjectState::addLock
 ; and the LiveLockEnters push must accept this and not false-fire. (Two DISTINCT
 ; virtual objects would instead trigger the elide-path cascade, so a single

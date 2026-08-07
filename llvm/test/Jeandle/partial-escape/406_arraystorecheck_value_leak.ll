@@ -2,8 +2,8 @@
 
 ; jeandle.array_store_check(value, array) where the VALUE is a virtual instance
 ; and the ARRAY is a non-virtual parameter. foldArrayStoreCheck cannot elide
-; (array operand is not a virtual), so by the processJavaOp contract (Graal
-; processNodeInputs on a non-deleted node) it returns false and the generic
+; (array operand is not a virtual), so by the processJavaOp contract (a
+; non-deleted node materializes its virtual operands) it returns false and the generic
 ; escape path materializes the virtual VALUE operand — the surviving check must
 ; observe a real pointer, never poison.
 

@@ -3,8 +3,8 @@
 ; Mutual reference (o.f = p, p.g = o) escaping at a shared merge. Under
 ; reuse-OrigAlloc both OrigAllocs are KEPT (each dominates the escape point),
 ; so every field store replays directly onto its OrigAlloc and the back edge
-; p.g = o resolves through o's OrigAlloc — no cascade coordination, no fresh
-; pea.mat invoke, no materialized-object PHI.
+; p.g = o resolves through o's OrigAlloc — no cascade coordination, no
+; additional allocation invoke, no materialized-object PHI.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -41,7 +41,7 @@ u:
 ; Both OrigAllocs (klass 11111 = o, klass 22222 = p) are retained.
 ; CHECK-DAG: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr)
 ; CHECK-DAG: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr)
-; No fresh materialization invoke is emitted.
+; No additional allocation invoke is emitted.
 ; CHECK-NOT: pea.mat = invoke
 ; Replayed field stores use OrigAlloc values — the back edge p.g = o resolves
 ; through o's OrigAlloc (kept alive), never poison.

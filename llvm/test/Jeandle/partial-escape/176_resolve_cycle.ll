@@ -29,7 +29,7 @@ loop:
   %phi = phi ptr addrspace(1) [ %o, %ph ], [ %phi, %loop ]
   ; A consumer that queries resolveVirtualRef on %phi: the icmp eq
   ; against %o. Without on-stack cycle detection in
-  ; resolveVirtualRefImpl, the PHI->PHI back-edge would infinite-recurse.
+  ; resolveVirtualRef, the PHI->PHI back-edge would infinite-recurse.
   %eq = icmp eq ptr addrspace(1) %phi, %o
   br i1 %c, label %loop, label %exit
 exit:

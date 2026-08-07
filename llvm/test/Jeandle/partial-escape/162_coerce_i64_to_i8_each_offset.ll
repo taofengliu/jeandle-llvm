@@ -2,10 +2,9 @@
 
 ; Store i64 into a virtual's slot at offset 8, then perform 8 separate i8 loads,
 ; one at each byte offset 0..7 within the slot. Every one of these is a sub-slot
-; narrowing read (i64 -> i8). PEA no longer supports sub-slot / narrowing loads
-; (the lshr+trunc fold was removed) — the first such load bails to ineligible
-; and the object materializes: alloc, store, and loads survive intact, no
-; coercion synthesized.
+; narrowing read (i64 -> i8). PEA does not support sub-slot / narrowing loads —
+; the first such load bails to ineligible and the object materializes: alloc,
+; store, and loads survive intact, no coercion synthesized.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 

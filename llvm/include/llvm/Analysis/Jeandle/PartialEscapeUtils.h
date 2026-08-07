@@ -1,5 +1,4 @@
-//===- PartialEscapeUtils.h - PEA helpers ------------------------*- C++
-//-*-===//
+//===- PartialEscapeUtils.h - PEA helpers -----------------------*- C++ -*-===//
 //
 // Copyright (c) 2026, the Jeandle-LLVM Authors. All Rights Reserved.
 //
@@ -45,8 +44,13 @@ namespace llvm::jeandle::pea {
 // signed because descriptor IDs and field offsets have different semantic
 // validity rules.
 struct CheckedDeoptValueEncoding {
+  // Index field (bits [63:32] of the raw encoding): a frame slot number, a
+  // descriptor wire ID, or a field offset, per the enclosing record.
   int32_t Index = 0;
+  // Value-type field (bits [31:16]): which grammar record the value belongs
+  // to (local, stack, monitor, VO reference, marker, ...).
   DeoptValueEncoding::DeoptValueType ValueType = DeoptValueEncoding::LocalType;
+  // Basic-type field (bits [15:0]): the HotSpot basic type of the value.
   HotspotBasicType BasicType = T_ILLEGAL;
 
   bool operator==(const CheckedDeoptValueEncoding &Other) const {
@@ -55,32 +59,55 @@ struct CheckedDeoptValueEncoding {
   }
 };
 
+// Decode one i64 deopt-value encoding constant into its checked,
+// assertion-free form. Returns std::nullopt for non-constant or non-i64
+// values and for out-of-range value/basic types.
 std::optional<CheckedDeoptValueEncoding>
 decodeDeoptValueEncoding(const Value *V);
 
+// Grammar role of one operand position ("cell") within a "deopt" operand
+// bundle. A cell identifies exactly one bundle input, so edits and audits
+// can refer back to exact operands without re-parsing. The roles mirror the
+// bundle grammar: scope preamble, VO descriptor pool records, scope-value
+// records, monitor records, the original-PC marker, inlinee method markers,
+// and the narrow-oop tail.
 enum class DeoptSemanticCellRole : uint8_t {
-  ShouldReexecute,
-  BCI,
-  DescriptorHeader,
-  DescriptorKlass,
-  DescriptorFieldCount,
-  DescriptorFieldEncoding,
-  DescriptorFieldValue,
-  ScopeValueEncoding,
-  ScopeValue,
-  MonitorEncoding,
-  MonitorOwner,
-  MonitorLock,
-  OrigPcEncoding,
-  OrigPcValue,
-  MethodEncoding,
-  MethodValue,
-  NarrowOopEncoding,
-  NarrowOopValue
+  // Scope preamble.
+  ShouldReexecute, // i64 should_reexecute slot preceding the BCI pair.
+  BCI,             // One operand of the duplicated equal-i32 BCI pair.
+  // VO descriptor pool records (root scope only).
+  DescriptorHeader,       // Descriptor header encoding (index = wire ID).
+  DescriptorKlass,        // i64 klass pointer of a descriptor.
+  DescriptorFieldCount,   // i32 field count of a descriptor.
+  DescriptorFieldEncoding, // Encoding operand of one descriptor field.
+  DescriptorFieldValue,   // Value operand of one descriptor field (scalar,
+                          // or wire ID for a VORef field).
+  // Scope-value records (locals and expression stack).
+  ScopeValueEncoding, // Encoding operand of a local/stack slot.
+  ScopeValue,         // Value operand of a local/stack slot (scalar, or
+                      // wire ID for a VORef slot).
+  // Monitor records.
+  MonitorEncoding, // Encoding operand of a monitor record.
+  MonitorOwner,    // Owner operand (wide oop, or wire ID when eliminated).
+  MonitorLock,     // Lock-slot operand (addrspace(0) pointer).
+  // Original-PC marker (root scope only).
+  OrigPcEncoding, // Encoding operand of the original-PC marker.
+  OrigPcValue,    // PC operand (addrspace(0) pointer).
+  // Inlinee method marker (non-root scopes).
+  MethodEncoding, // Encoding operand of a method marker.
+  MethodValue,    // MethodType pointer operand, as i64.
+  // Narrow-oop tail records.
+  NarrowOopEncoding, // Encoding operand of a narrow-oop tail record.
+  NarrowOopValue     // Narrow-oop operand (NarrowOopAddrSpace pointer).
 };
 
+// A semantic cell: one operand position in a "deopt" bundle's input list,
+// tagged with the grammar role the parser assigned to it. Bundle edits and
+// audits refer back to exact operands through these cells.
 struct DeoptSemanticCell {
+  // Grammar role of the operand at OperandIndex.
   DeoptSemanticCellRole Role = DeoptSemanticCellRole::ScopeValue;
+  // Index into the bundle's input list.
   unsigned OperandIndex = 0;
 };
 
@@ -88,9 +115,15 @@ struct DeoptSemanticCell {
 // which carry program state contribute their LLVM type but not their SSA
 // identity; grammar constants additionally contribute their exact bit value.
 struct DeoptStructuralCell {
+  // Grammar role and input position of the operand, as recorded at parse
+  // time.
   DeoptSemanticCellRole Role = DeoptSemanticCellRole::ScopeValue;
   unsigned OperandIndex = 0;
+  // LLVM type of the operand at parse time; a type change means the bundle
+  // was edited.
   Type *OperandType = nullptr;
+  // Exact constant bits for grammar-constant cells; std::nullopt for
+  // semantic-value cells, whose SSA value may follow legitimate RAUW.
   std::optional<uint64_t> ConstantValue;
 
   bool operator==(const DeoptStructuralCell &Other) const {
@@ -100,7 +133,11 @@ struct DeoptStructuralCell {
   }
 };
 
+// Structural fingerprint of a parsed bundle: the ordered structural cells of
+// every bundle input. Together with the tracked SSA values, a fingerprint
+// mismatch detects that the bundle was structurally edited since the parse.
 struct DeoptBundleStructuralFingerprint {
+  // One cell per bundle input, in wire order.
   SmallVector<DeoptStructuralCell, 16> Cells;
 
   bool operator==(const DeoptBundleStructuralFingerprint &Other) const {
@@ -111,104 +148,171 @@ struct DeoptBundleStructuralFingerprint {
   }
 };
 
+// One field of a VO descriptor: an (offset, value) pair recording what the
+// object's field at Offset must hold when the object is rematerialized at
+// the deopt point.
 struct ParsedDeoptField {
+  // Byte offset of the field within the object (the encoding's index).
   int32_t Offset = 0;
+  // The field's deopt value encoding.
   CheckedDeoptValueEncoding Encoding;
+  // Cells of the encoding and value operands, for bundle edits/audits.
   DeoptSemanticCell EncodingCell;
   DeoptSemanticCell ValueCell;
+  // For VORefLocalType fields: wire ID of the referenced descriptor. A wire
+  // ID is an index into the root scope's VO descriptor pool; a reference
+  // operand carries it as an i32 constant.
   std::optional<int32_t> TargetWireID;
 };
 
+// One VO descriptor from the root scope's object pool: the klass and field
+// state needed to rematerialize one virtual object at the deopt point.
 struct ParsedDeoptDescriptor {
+  // This descriptor's wire ID (index into the object pool), referenced by
+  // VORef records elsewhere in the bundle.
   int32_t WireID = 0;
+  // True for array VOs (header basic type T_ARRAY), false for instances.
   bool IsArray = false;
+  // Klass pointer of the object, as a raw i64.
   uint64_t Klass = 0;
+  // Cells of the header, klass, and field-count operands.
   DeoptSemanticCell HeaderCell;
   DeoptSemanticCell KlassCell;
   DeoptSemanticCell FieldCountCell;
+  // Field records, in wire order.
   SmallVector<ParsedDeoptField, 4> Fields;
 };
 
+// One local or expression-stack slot of a deopt scope.
 struct ParsedDeoptScopeValue {
+  // Logical slot index in the locals/stack section, counting double-word
+  // values as two slots.
   unsigned PhysicalSlot = 0;
+  // Number of frame slots occupied: 2 for long/double, 1 otherwise.
   unsigned SlotWidth = 1;
+  // The slot's deopt value encoding.
   CheckedDeoptValueEncoding Encoding;
+  // Cells of the encoding and value operands.
   DeoptSemanticCell EncodingCell;
   DeoptSemanticCell ValueCell;
+  // For VORef slots: wire ID of the referenced descriptor.
   std::optional<int32_t> TargetWireID;
 };
 
+// One monitor record of a deopt scope: owner object plus lock slot.
 struct ParsedDeoptMonitor {
+  // The monitor's deopt value encoding; index 1 marks an eliminated
+  // (scalar-replaced) monitor, 0 a surviving one.
   CheckedDeoptValueEncoding Encoding;
+  // True when the monitor was eliminated and its owner is a VO reference.
   bool Eliminated = false;
+  // Cells of the encoding, owner, and lock operands.
   DeoptSemanticCell EncodingCell;
   DeoptSemanticCell OwnerCell;
   DeoptSemanticCell LockCell;
+  // For eliminated monitors: wire ID of the owner VO's descriptor.
   std::optional<int32_t> OwnerWireID;
 };
 
+// A two-operand marker record (encoding + value): used for the root scope's
+// original-PC slot and for each narrow-oop tail entry.
 struct ParsedDeoptMarker {
+  // The marker's deopt value encoding.
   CheckedDeoptValueEncoding Encoding;
+  // Cells of the encoding and value operands.
   DeoptSemanticCell EncodingCell;
   DeoptSemanticCell ValueCell;
 };
 
+// An inlinee scope's method marker: the MethodType pointer identifying the
+// inlined method.
 struct ParsedDeoptMethod {
+  // MethodType pointer as a raw i64.
   uint64_t Method = 0;
+  // Cells of the encoding and value operands.
   DeoptSemanticCell EncodingCell;
   DeoptSemanticCell ValueCell;
 };
 
+// One parsed deopt scope (one frame): root or inlinee. The root scope may
+// carry should_reexecute and the original-PC marker; an inlinee scope
+// carries a method marker instead.
 struct ParsedDeoptScope {
+  // Inlinee scopes only: the method marker. Absent for the root scope.
   std::optional<ParsedDeoptMethod> Method;
+  // The should_reexecute flag, when the scope header carries one
+  // (production records; hand-written tests omit it).
   std::optional<uint64_t> ShouldReexecute;
+  // Cell of the should_reexecute operand, when present.
   std::optional<DeoptSemanticCell> ShouldReexecuteCell;
+  // Bytecode index of this frame (sign-extended from the duplicated i32
+  // BCI pair).
   int32_t BCI = 0;
+  // Cells of the duplicated BCI pair (two operands with equal values).
   DeoptSemanticCell FirstBCICell;
   DeoptSemanticCell SecondBCICell;
+  // Locals, expression stack, and monitor records, in wire order.
   SmallVector<ParsedDeoptScopeValue, 8> Locals;
   SmallVector<ParsedDeoptScopeValue, 8> Stack;
   SmallVector<ParsedDeoptMonitor, 2> Monitors;
+  // Root scope only: the original-PC marker.
   std::optional<ParsedDeoptMarker> OrigPc;
 };
 
+// A fully parsed "deopt" operand bundle: the VO descriptor pool, all scopes
+// (root first, innermost inlinee last), the narrow-oop tail, and the
+// structural fingerprint used to detect later edits.
 struct ParsedDeoptBundle {
   // The parsed bundle is analysis data that may outlive ordinary effect
   // application. Tracking handles follow legitimate RAUW and become null when
   // an input is erased without replacement.
   SmallVector<WeakTrackingVH, 16> OriginalInputs;
+  // VO descriptor pool (the root scope's VO section), in wire order.
   SmallVector<ParsedDeoptDescriptor, 4> Descriptors;
+  // All scopes: root scope first, innermost (current-method) scope last.
   SmallVector<ParsedDeoptScope, 2> Scopes;
+  // Narrow-oop tail markers, in wire order.
   SmallVector<ParsedDeoptMarker, 2> NarrowOopMarkers;
+  // Structural fingerprint for staleness detection; one cell per input.
   DeoptBundleStructuralFingerprint Fingerprint;
 };
 
+// Why a bundle parse failed. Parse failures are reported as data through
+// this code plus the operand index where the problem was found; the parser
+// never asserts, so it is safe to run on arbitrary (even malformed) IR.
 enum class DeoptBundleParseErrorCode : uint8_t {
-  None,
-  MissingBundle,
-  InvalidScopeHeader,
-  MismatchedBCI,
-  InvalidEncoding,
-  TruncatedRecord,
-  DescriptorNotInRootPool,
-  DuplicateDescriptorID,
-  DuplicateFieldOffset,
-  DanglingVORef,
-  InvalidScopeOrder,
-  InvalidSemanticValue,
-  InvalidMonitor,
-  InvalidOrigPc,
-  InvalidMethodMarker,
-  InvalidNarrowOopMarker
+  None,                    // No error (parse succeeded).
+  MissingBundle,           // The call has no "deopt" operand bundle.
+  InvalidScopeHeader,      // Missing/malformed should_reexecute or BCI pair.
+  MismatchedBCI,           // The duplicated BCI values differ.
+  InvalidEncoding,         // An i64 encoding constant failed to decode.
+  TruncatedRecord,         // Fewer operands remain than a record requires.
+  DescriptorNotInRootPool, // A VO descriptor appeared outside the root pool.
+  DuplicateDescriptorID,   // Two descriptors share a wire ID.
+  DuplicateFieldOffset,    // Two fields of a descriptor share an offset.
+  DanglingVORef,           // A VO reference names an unknown wire ID.
+  InvalidScopeOrder,       // Records out of grammar order within a scope.
+  InvalidSemanticValue,    // A value operand does not match its encoding.
+  InvalidMonitor,          // Malformed monitor record.
+  InvalidOrigPc,           // Malformed or misplaced original-PC marker.
+  InvalidMethodMarker,     // Malformed inlinee method marker.
+  InvalidNarrowOopMarker   // Malformed narrow-oop tail record.
 };
 
+// A parse failure: what failed, and where.
 struct DeoptBundleParseError {
+  // The kind of failure.
   DeoptBundleParseErrorCode Code = DeoptBundleParseErrorCode::None;
+  // Bundle input index at which the parser detected the failure.
   unsigned OperandIndex = 0;
 };
 
+// Result of parsing a "deopt" operand bundle: exactly one of Bundle (on
+// success) or Error (on failure) is meaningful.
 struct DeoptBundleParseResult {
+  // The parsed bundle; std::nullopt on failure.
   std::optional<ParsedDeoptBundle> Bundle;
+  // The failure; Code == None on success.
   DeoptBundleParseError Error;
 };
 
@@ -289,17 +393,16 @@ bool isUsableFieldOffset(int64_t Offset);
 std::optional<bool> checkedRangesOverlap(int64_t AStart, uint64_t ASize,
                                          int64_t BStart, uint64_t BSize);
 
-// Strip pointer-identity-preserving operations (bitcast, addrspacecast within
-// addrspace(1), freeze, launder/strip.invariant.group, ptr.annotation, and a
-// pre-existing same-width inttoptr(ptrtoint(x)) round-trip) and
+// Strip pointer-identity-preserving operations (bitcast, addrspacecast
+// within addrspace(1), freeze, launder/strip.invariant.group, ptr.annotation,
+// and a pre-existing same-width inttoptr(ptrtoint(x)) round-trip) and
 // constant-offset GEPs, accumulating the constant offset into *OutOffset.
-// Instruction dispatch still treats PtrToIntInst as an identity observation;
-// structural round-trip support does not keep a virtual live across it. Returns
-// the root pointer. Sets
-// *Unresolved = true if a non-constant GEP index, a non-representable APInt, or
-// an overflowing accumulated offset was encountered (then the accumulated
-// offset is invalid). Shared structural helper used by resolveVirtualRef and
-// resolveFieldOffset.
+// Returns the root pointer. Sets *Unresolved = true if a non-constant GEP
+// index, a non-representable APInt, or an overflowing accumulated offset was
+// encountered (then the accumulated offset is invalid). Instruction dispatch
+// treats PtrToIntInst as an identity observation regardless; structural
+// round-trip peeling does not keep a virtual object alive across it. Shared
+// structural helper used by resolveVirtualRef and resolveFieldOffset.
 Value *stripPointerCastsAndOffsets(Value *Ptr, const DataLayout &DL,
                                    int64_t *OutOffset, bool *Unresolved);
 
@@ -333,8 +436,8 @@ public:
 private:
   VirtualIdentityResult(Kind K, ObjectID ID) : K(K), ID(ID) {}
 
-  Kind K;
-  ObjectID ID;
+  Kind K;      // Which outcome this result represents.
+  ObjectID ID; // Resolved object; valid only for DefinedIdentity.
 };
 
 enum class VirtualIdentityMode : uint8_t {
@@ -407,10 +510,11 @@ std::optional<unsigned> findInnermostDeoptScopeBCIPairStart(const CallBase &CB);
 /// slot VALUE is always followed by an i64 encoding — so an adjacent
 /// equal-i32 pair can only ever be a scope's BCI marker, and the FIRST one
 /// anchors the root scope. PEA places ALL VO descriptors into the root
-/// scope's VO section (the deopt-point-level object pool — C2's
-/// dump_object_pool-before-scope-values analog), so this finder (not the
-/// innermost one) anchors the descriptor insert position. Graceful: returns
-/// std::nullopt on malformed bundles so callers can bail conservatively.
+/// scope's VO section — the deopt-point-level object pool, whose descriptor
+/// records physically precede the scope-value records in the bundle's wire
+/// order — so this finder (not the innermost one) anchors the descriptor
+/// insert position. Graceful: returns std::nullopt on malformed bundles so
+/// callers can bail conservatively.
 std::optional<unsigned> findFirstDeoptScopeBCIPairStart(const CallBase &CB);
 
 // Returns the klass pointer (as uintptr_t) attached to the allocation call's

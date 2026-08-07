@@ -4,7 +4,7 @@
 ; Under reuse-OrigAlloc all three OrigAllocs are KEPT (each dominates the escape
 ; point), so every field store replays directly onto its OrigAlloc and the
 ; cycle's back edge q.h = o resolves through o's OrigAlloc — no cascade
-; coordination, no fresh pea.mat invoke, no materialized-object PHI.
+; coordination, no additional allocation invoke, no materialized-object PHI.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare void @sink(ptr addrspace(1))
@@ -47,7 +47,7 @@ u:
 ; CHECK-DAG: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr)
 ; CHECK-DAG: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr)
 ; CHECK-DAG: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 33333 to ptr)
-; No fresh materialization invoke is emitted.
+; No additional allocation invoke is emitted.
 ; CHECK-NOT: pea.mat = invoke
 ; Replayed field stores use OrigAlloc values — the cycle's back edge q.h = o
 ; resolves through o's OrigAlloc (kept alive), never poison.

@@ -4,7 +4,7 @@
 ; (offset-0) back-edge value. The iter-0 header merge sees only the
 ; preheader incoming (the back edge has no exit data yet); treating the
 ; unresolved incoming as unknown — not as a divergence — takes Case B
-; (Graal's textbook uniqueVirtualObject case), and the VO stays virtual
+; (the identity-singleton case), and the VO stays virtual
 ; across the whole loop: allocation, stores, loads and the PHI all fold
 ; away.
 

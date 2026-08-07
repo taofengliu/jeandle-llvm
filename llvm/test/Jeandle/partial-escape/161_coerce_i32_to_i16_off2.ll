@@ -2,9 +2,9 @@
 
 ; Store i32 into a virtual's slot at offset 8, load i16 at byte offset 10
 ; (within-slot byte offset 2). This is a sub-slot read of a wider stored field.
-; PEA no longer supports sub-slot / narrowing loads (the lshr+trunc fold was
-; removed) — the load bails to ineligible and the object materializes: alloc,
-; store, and load survive intact, no coercion synthesized.
+; PEA does not support sub-slot / narrowing loads — the load bails to
+; ineligible and the object materializes: alloc, store, and load survive
+; intact, no coercion synthesized.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 

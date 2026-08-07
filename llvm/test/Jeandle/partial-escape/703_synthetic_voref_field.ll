@@ -4,7 +4,7 @@
 ; %inner stored into both branches, so AllSame across preds) is DESCRIBED with a
 ; VORef FIELD pointing at %inner's descriptor. %inner is reached only
 ; transitively (not a direct bundle operand), so the transitive descriptor
-; closure must describe it. Mirrors C2/Graal nested ObjectValue + id back-ref.
+; closure must describe it. Mirrors nested virtual-object descriptors + id back-ref.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32) nounwind
 declare void @safepoint()

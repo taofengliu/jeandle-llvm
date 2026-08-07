@@ -6,11 +6,11 @@
 ; return -1 (ByteSize/IsReference mismatch) -> bail path 2. The second store's
 ; value %v is a fresh virtual instance.
 ;
-; Before the fix bail path 2 did `markIneligible(o); return true` without
-; touching %v, so %v leaked (NeverEscapes -> poison) while the reference store
-; survived as `store ptr poison`. Now the unvirtualizable store materializes
-; BOTH %o and %v AT the store (materializeOperandsAtStore), so the surviving
-; store keeps the live %v pointer.
+; The unvirtualizable store materializes BOTH %o and %v AT the store
+; (materializeOperandsAtStore), so the surviving store keeps the live %v
+; pointer. Regression guard: a bail that only marks %o ineligible would let
+; %v leak (NeverEscapes -> poison) while the reference store survives as
+; `store ptr poison`.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare i32 @__gxx_personality_v0(...)

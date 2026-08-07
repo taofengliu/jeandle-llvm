@@ -2,20 +2,20 @@
 
 ; ConstantExpr inttoptr/ptrtoint round-trip wrapper-stripping.
 ;
-; getIntToPtrRoundTripInner and the resolveVirtualRefImpl case-7 gate used
-; Instruction-only casts (`IntToPtrInst`/`PtrToIntInst`), so a ConstantExpr
-; round-trip was opaque to BOTH identity and offset resolution (symmetric, so
-; sound but a missed opt). The shared walker stripPointerCastsAndOffsets
-; already used `*Operator` for GEP/BitCast/AddrSpaceCast; only the
-; inttoptr/ptrtoint branch lagged. After the fix both paths use Operator-form
-; casts so a ConstantExpr round-trip is peeled the same way an
-; Instruction-form round-trip is, keeping Trap-4 identity/offset symmetry.
+; getIntToPtrRoundTripInner and the resolveVirtualRefImpl case-7 gate use
+; Operator-form casts: Instruction-only casts (`IntToPtrInst`/`PtrToIntInst`)
+; would make a ConstantExpr round-trip opaque to BOTH identity and offset
+; resolution (symmetric, so sound but a missed opt). The shared walker
+; stripPointerCastsAndOffsets already used `*Operator` for
+; GEP/BitCast/AddrSpaceCast; the inttoptr/ptrtoint branch matches it, so a
+; ConstantExpr round-trip is peeled the same way an Instruction-form
+; round-trip is, keeping Trap-4 identity/offset symmetry.
 ;
-; Honest scope note (req-#6 robustness, NOT virtualization-observable): a
+; Honest scope note (IR robustness, NOT virtualization-observable): a
 ; ConstantExpr round-trip wraps only CONSTANT pointers (a runtime virtual
 ; pointer is non-constant), so this construct cannot by itself exercise a
 ; virtual reference through the round-trip — the pass behavior is identical
-; with and without the fix for any constructible IR here. The value of this
+; either way for any constructible IR here. The value of this
 ; test is as a non-crash / symmetry guard: the `*Operator` path runs, no
 ; miscompile or verifier failure is produced, and the offset path's
 ; wrapper-stripping stays symmetric with the identity path. See the sibling
@@ -30,7 +30,8 @@ define void @test_inttoptr_roundtrip_constexpr() gc "hotspotgc" personality ptr 
 entry:
   ; ConstantExpr round-trip of a constant pointer, wrapped in a GEP exercised
   ; by PEA's offset resolver. The inttoptr(ptrtoint(@g)) round-trip is a
-  ; ConstantExpr, not an Instruction, so the old `*Inst` casts missed it.
+  ; ConstantExpr, not an Instruction, so an Instruction-only cast would miss
+  ; it.
   %p = getelementptr i8, ptr addrspace(1) inttoptr (i64 ptrtoint (ptr @g to i64) to ptr addrspace(1)), i64 8
   store i32 111, ptr addrspace(1) %p
   call void @sink(ptr addrspace(1) %p)

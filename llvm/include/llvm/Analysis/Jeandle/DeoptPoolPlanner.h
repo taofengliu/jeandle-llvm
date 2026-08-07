@@ -33,7 +33,11 @@ namespace llvm {
 namespace jeandle {
 namespace pea {
 
+// Analysis-local identity of a current (PEA-described) virtual object, valid
+// only within one planning round.
 using CurrentDeoptNodeID = uint32_t;
+// Operand index of an exact value cell in the parsed source bundle. The
+// planner treats it as an opaque provenance handle for the lowering layer.
 using DeoptPoolSemanticCellID = uint32_t;
 
 inline constexpr CurrentDeoptNodeID InvalidCurrentDeoptNodeID =
@@ -43,8 +47,13 @@ inline constexpr DeoptPoolSemanticCellID InvalidDeoptPoolSemanticCellID =
 inline constexpr uint32_t InvalidDeoptPoolWireID =
     std::numeric_limits<uint32_t>::max();
 
+// Which input node table a DeoptPoolNodeRef addresses: Legacy nodes are
+// identified by their frontend-assigned wire ID, Current nodes by their
+// analysis-local ID. The two ID spaces are unrelated.
 enum class DeoptPoolNodeNamespace : uint8_t { Legacy, Current };
 
+// A typed reference to one input pool node. The namespace tag is part of the
+// identity because legacy wire IDs and current IDs share the same integers.
 struct DeoptPoolNodeRef {
   DeoptPoolNodeNamespace Namespace = DeoptPoolNodeNamespace::Legacy;
   uint32_t ID = 0;
@@ -69,6 +78,12 @@ struct DeoptPoolNodeRef {
 // ScalarToken is equally opaque. It is a planner-only handle for scalar
 // payload identity; lowering must resolve it to its tracked LLVM Value. The
 // numeric token itself is never serialized onto the deopt wire.
+//
+// Offset is the raw heap byte offset of the field (array elements use their
+// scaled element offset); it is serialized as the deopt value-encoding index.
+// IsReference selects the payload union: a reference field carries a Target
+// node ref and is always T_OBJECT, a scalar field carries a ScalarToken and
+// its computational BasicType.
 struct DeoptPoolFieldInput {
   DeoptPoolSemanticCellID SemanticCell = InvalidDeoptPoolSemanticCellID;
   int64_t Offset = 0;
@@ -103,10 +118,16 @@ struct DeoptPoolFieldInput {
   bool isReference() const { return IsReference; }
 };
 
+// A virtual-object descriptor already present in the frontend's original
+// bundle. It is durable input: the planner may prune it as unreachable but
+// never alters its shape.
 struct LegacyDeoptPoolNode {
+  // Frontend-assigned pool ID from the original bundle.
   uint32_t WireID = InvalidDeoptPoolWireID;
+  // Raw klass identity (InstanceKlass/ArrayKlass pointer) serialized verbatim.
   uint64_t Klass = 0;
   bool IsArray = false;
+  // Fields in wire order.
   SmallVector<DeoptPoolFieldInput, 8> Fields;
 };
 
@@ -116,15 +137,25 @@ struct CurrentDeoptPoolNode {
   CurrentDeoptNodeID ID = InvalidCurrentDeoptNodeID;
   uint64_t Klass = 0;
   bool IsArray = false;
+  // False when PEA cannot describe this object on the wire (e.g. an array
+  // whose element layout is not canonical). A reachable undescribable node
+  // aborts planning and is reported as a fallback seed for the caller to
+  // materialize before retrying.
   bool Describable = true;
   SmallVector<DeoptPoolFieldInput, 8> Fields;
 };
 
+// Which scope slot a root cell occupies. The kind selects the VORef encoding
+// type on the wire (locals and stack slots are distinct types) and the
+// occurrence classification at lowering time.
 enum class DeoptPoolRootKind : uint8_t { Local, Stack, MonitorOwner };
 
 // A root cell may already be a legacy/current VORef, or it may still be a
 // scalar oop cell which an exact-cell overlay reclassifies as a current VO.
+// IsReference selects the payload union: a reference root carries a Target
+// node ref, a scalar root carries a ScalarToken.
 struct DeoptPoolRootInput {
+  // Exact source cell of the root's value operand.
   DeoptPoolSemanticCellID SemanticCell = InvalidDeoptPoolSemanticCellID;
   DeoptPoolRootKind Kind = DeoptPoolRootKind::Local;
   bool IsReference = false;
@@ -155,11 +186,17 @@ struct DeoptPoolRootInput {
   bool isReference() const { return IsReference; }
 };
 
+// Reclassifies the exact scalar oop cell SemanticCell as a reference to the
+// current node CurrentTarget. Overlays redirect both reachability and the
+// final field/root target without mutating the input nodes.
 struct DeoptPoolScalarOverlay {
   DeoptPoolSemanticCellID SemanticCell = InvalidDeoptPoolSemanticCellID;
   CurrentDeoptNodeID CurrentTarget = InvalidCurrentDeoptNodeID;
 };
 
+// Complete planner input for one safepoint: the legacy descriptors parsed
+// from the original bundle, the current PEA nodes in deterministic discovery
+// order, every scope root cell in wire order, and the exact-cell overlays.
 struct DeoptPoolPlannerInput {
   SmallVector<LegacyDeoptPoolNode, 8> LegacyNodes;
   SmallVector<CurrentDeoptPoolNode, 8> CurrentNodes;
@@ -167,9 +204,16 @@ struct DeoptPoolPlannerInput {
   SmallVector<DeoptPoolScalarOverlay, 8> Overlays;
 };
 
+// Provenance of a final plan node: a kept legacy descriptor or a newly
+// described current node.
 enum class DeoptPoolNodeOrigin : uint8_t { Legacy, Current };
 
+// One resolved field of a final node. TargetWireID is meaningful iff
+// IsReference and holds the target's fresh dense wire ID; otherwise
+// ScalarToken carries the scalar payload identity for lowering to resolve.
 struct FinalDeoptPoolField {
+  // Provenance of a legacy field; InvalidDeoptPoolSemanticCellID for current
+  // fields, which are newly emitted and have no source cell.
   DeoptPoolSemanticCellID SemanticCell = InvalidDeoptPoolSemanticCellID;
   int64_t Offset = 0;
   HotspotBasicType BasicType = T_ILLEGAL;
@@ -180,6 +224,9 @@ struct FinalDeoptPoolField {
   bool isReference() const { return IsReference; }
 };
 
+// One node of the final pool with its fresh dense wire ID. LegacySourceIndex
+// indexes the input's LegacyNodes iff Origin is Legacy; CurrentID is the
+// analysis-local ID iff Origin is Current. The other one stays invalid.
 struct FinalDeoptPoolNode {
   uint32_t WireID = InvalidDeoptPoolWireID;
   uint64_t Klass = 0;
@@ -190,12 +237,22 @@ struct FinalDeoptPoolNode {
   SmallVector<FinalDeoptPoolField, 8> Fields;
 };
 
+// A scope root cell whose final value is a reference to the pool node
+// TargetWireID. Roots that remain scalar are not part of the plan.
 struct FinalDeoptPoolRoot {
   DeoptPoolSemanticCellID SemanticCell = InvalidDeoptPoolSemanticCellID;
   DeoptPoolRootKind Kind = DeoptPoolRootKind::Local;
   uint32_t TargetWireID = InvalidDeoptPoolWireID;
 };
 
+// The planner's immutable output: a semantic pool graph with fresh dense
+// wire IDs. Nodes are ordered by wire ID — reachable legacy nodes first (in
+// input order), then reachable current nodes (in input order). Roots hold
+// only the source roots whose final value is a reference, in input order.
+// CurrentMembers lists the surviving current IDs in node order. NeedsRewrite
+// is false when the plan reproduces the original bundle exactly, letting the
+// caller skip the rewrite. Construction is restricted to the planner through
+// DeoptPoolPlannerAccess so every instance is a validated plan.
 class FinalDeoptPoolGraphPlan {
   friend struct DeoptPoolPlannerAccess;
 
@@ -220,26 +277,45 @@ private:
 };
 
 enum class DeoptPoolPlannerErrorCode : uint8_t {
+  // Two legacy nodes claim the same frontend wire ID.
   DuplicateLegacyWireID,
+  // Two current nodes share an analysis-local ID.
   DuplicateCurrentNodeID,
+  // Two input cells map to the same bundle operand index.
   DuplicateSemanticCellID,
+  // A legacy field or root cell is InvalidDeoptPoolSemanticCellID.
   InvalidSemanticCellID,
+  // A reference targets a node absent from both input tables.
   MissingNodeReference,
+  // An overlay names an unknown or non-overlayable cell, targets an unknown
+  // current node, or duplicates another overlay.
   InvalidScalarOverlay,
+  // A current node's field carries a semantic cell; current fields are newly
+  // emitted and have no source cell.
   CurrentFieldHasSemanticCell,
 };
 
+// A planner failure. Subject is the offending identity (wire ID, node ID, or
+// semantic cell) when the code has one.
 struct DeoptPoolPlannerError {
   DeoptPoolPlannerErrorCode Code;
   uint32_t Subject = 0;
 };
 
+// Exactly one of three outcomes: Error is set for malformed input;
+// FallbackSeeds is non-empty (with no Plan) when reachable current nodes are
+// undescribable and must be materialized by the caller before retrying;
+// otherwise Plan holds the graph.
 struct DeoptPoolPlannerResult {
   std::optional<FinalDeoptPoolGraphPlan> Plan;
   SmallVector<CurrentDeoptNodeID, 4> FallbackSeeds;
   std::optional<DeoptPoolPlannerError> Error;
 };
 
+// Plan one safepoint's deopt pool: validate the input, prune nodes
+// unreachable from the roots, redirect overlaid scalar cells to their current
+// targets, and assign fresh dense wire IDs. Pure: performs no IR mutation and
+// its result depends only on Input.
 LLVM_ABI DeoptPoolPlannerResult
 planDeoptPool(const DeoptPoolPlannerInput &Input);
 

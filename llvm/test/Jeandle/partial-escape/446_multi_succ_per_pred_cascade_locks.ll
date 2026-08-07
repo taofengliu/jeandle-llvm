@@ -12,16 +12,16 @@
 ;
 ; A per-pred materialize whose captured lock stack is NON-EMPTY takes the
 ; shared-flip (Case-A) path: the first merge's processing flips
-; BlockExits[right] to materialized (Graal ensureMaterialized at
-; pred.endNode), so the second merge sees %a/%b already materialized and
-; does NOT re-capture the same lock stack. Pre-fix, MaterializedAtPred keyed
-; the dedup per (pred, TARGET MERGE), so each merge produced its own effect
-; capturing the SAME stack and the merged emit concatenated both — every
-; lock was re-acquired TWICE on every path out of `right` (la,la,lb,lb).
-; Now each lock is re-emitted exactly once (la then lb, strictly increasing
-; depth). The padding-only left arm keeps the per-pred path; its two per-merge
-; effects replay the a.f=b store at left's terminator twice — idempotent,
-; harmless. Each merge releases its selected inner and outer owners.
+; BlockExits[right] to materialized (ensureMaterialized at
+; the pred's end), so the second merge sees %a/%b already materialized and
+; does NOT re-capture the same lock stack. The dedup is keyed per
+; (pred, object): keying it per (pred, TARGET MERGE) would let each merge
+; capture the SAME stack and re-acquire every lock TWICE on every path out
+; of `right` (la,la,lb,lb). Each lock is re-emitted exactly once (la then
+; lb, strictly increasing depth). The padding-only left arm keeps the
+; per-pred path; its two per-merge effects replay the a.f=b store at left's
+; terminator twice — idempotent, harmless. Each merge releases its selected
+; inner and outer owners.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
 declare hotspotcc void @jeandle.monitorenter_with_lightweight_lock(ptr addrspace(1), ptr) nounwind
@@ -95,7 +95,7 @@ u:
 ; Both original allocation invokes are retained (a, then b).
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 11111 to ptr), i32 16)
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
-; No fresh materialization invokes anywhere.
+; No additional allocation invokes anywhere.
 ; CHECK-NOT: pea.mat = invoke
 ; The a.f=b field store is replayed onto OrigAlloc %a with OrigAlloc %b (twice
 ; on the lock-free left arm — idempotent per-merge replay — once on right).

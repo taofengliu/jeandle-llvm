@@ -3,7 +3,7 @@
 ; Select of symbolic-offset derived GEPs into a virtual object. %g1 and %g2 are
 ; gep %o, %idx where %idx is a non-constant SSA value, so resolveFieldOffset
 ; returns nullopt and the select is NOT alias-forwarded. The generic escape
-; path materializes %o at the select (Graal processNodeInputs): under
+; path materializes %o at the select: under
 ; reuse-OrigAlloc OrigAlloc dominates the pre-computed arms, so they stay
 ; valid. The object survives (PartiallyEscapes) with its tracked store (7 at
 ; offset 0) replayed via pea.matslot before the select, the select/load

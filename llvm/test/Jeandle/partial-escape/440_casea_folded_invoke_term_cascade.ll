@@ -1,16 +1,18 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Case-A CASCADE: two objects %o1 (array) and %o2 (instance), both virtual on
-; `else` and absent on `then`, both Case-A-materialized at `else`'s terminator
-; — a folded jeandle.arraylength invoke on %o1. The eager-update hook
-; (`relocateDependentMaterializes`) re-aims BOTH cascade members' InsertBefore
-; off the erased invoke onto the in-block successor. Without the eager update,
-; both members' InsertBefore would be null and applyMaterialize's assert fires.
+; `else` and absent on `then`; `else`'s terminator is a folded
+; jeandle.arraylength invoke on %o1 (ReplaceCall erases it, leaving a plain
+; branch). PEA must tolerate the erased terminator for the whole cascade
+; group: pending insertion points aimed at it must be re-aimed before the
+; erased value's handle is nulled, and no dangling-insertion-point assert may
+; fire.
 ;
-; Under reuse-OrigAlloc neither object is re-materialized: the ORIGINAL
-; allocation invokes (OrigAlloc %o1 and OrigAlloc %o2) are both KEPT (no fresh
-; pea.mat invokes). The folded arraylength invoke is erased, and `else`
-; becomes a plain br to %merge. The merge PHIs and sink calls are preserved.
+; Under reuse-OrigAlloc neither object is re-allocated: the ORIGINAL
+; allocation invokes (OrigAlloc %o1 and OrigAlloc %o2) are both KEPT and no
+; new invoke is introduced. The folded arraylength invoke is erased, and
+; `else` becomes a plain br to %merge. The merge PHIs and sink calls are
+; preserved.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
@@ -29,8 +31,8 @@ then:
   br label %merge
 else:
   ; arraylength reads %o1 (virtual) -> folds, erasing this invoke (else's
-  ; terminator). Both %o1 and %o2 are virtual here, absent on `then` -> two
-  ; Case-A materializes at the same erased terminator (cascade group).
+  ; terminator). Both %o1 and %o2 are virtual here and absent on `then`, so
+  ; both merge PHIs are Case-A candidates resolved to their OrigAllocs.
   %len = invoke hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) %o1) to label %merge unwind label %handler
 merge:
   %p1 = phi ptr addrspace(1) [ null, %then ], [ %o1, %else ]
@@ -54,12 +56,12 @@ u2:
 ; CHECK-LABEL: define void @casea_folded_invoke_term_cascade
 ; The folded arraylength invoke is erased.
 ; CHECK-NOT: @jeandle.arraylength
-; Both ORIGINAL allocation invokes are RETAINED (no fresh materialization).
+; Both ORIGINAL allocation invokes are RETAINED (materialization adds none).
 ; CHECK: %o1 = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 12345 to ptr), i32 7, i32 44, i32 16, i32 1048576)
 ; CHECK: %o2 = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr inttoptr (i64 22222 to ptr), i32 16)
-; No pea.mat materialization invoke is emitted.
+; No additional allocation invoke is emitted.
 ; CHECK-NOT: pea.mat = invoke
-; The else block is now just a plain br to merge (no mat.cont chaining).
+; The else block is now just a plain br to merge (no continuation blocks).
 ; CHECK: else:
 ; CHECK-NEXT: br label %merge
 ; The merge PHIs and sink calls are preserved.

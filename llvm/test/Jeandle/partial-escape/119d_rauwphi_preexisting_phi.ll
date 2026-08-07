@@ -4,20 +4,16 @@
 ; RUN:   -passes="require<partial-escape-analysis>,partial-escape-transform" %s 2>&1 \
 ; RUN:   | FileCheck %s --check-prefix=TRACE
 
-; Guarded RAUW for RAUWOrigToPHI. When PEA inserts a per-pred merge PHI
-; (Case-A) for an OrigAlloc that escapes via lock mismatch, a blanket
-; replaceAllUsesWith would substitute the new PHI into every remaining use
-; of OrigAlloc — including any pre-existing PHI in the same (or
-; downstream) merge block that references OrigAlloc on its incoming edges.
-; The PEA-inserted PHI is defined in MergeBB and does not dominate the
-; predecessor edges; retargeting a pre-existing PHI's incoming value to it
-; produces an SSA dominance violation that opt -verify-each rejects.
+; Case-A merge in the presence of a pre-existing PHI that names the virtual
+; object's allocation on its incoming edges. The %held PHI merges the
+; still-virtual %o (then arm) with the non-virtual %pad (else arm), so %o
+; materializes per-pred: its original new_instance invoke is retained and
+; the missing monitorenter is re-emitted (LockReplay). Because the retained
+; OrigAlloc dominates the merge block, the pre-existing %pre PHI's incomings
+; stay valid and need no use rewriting; %pre is later collapsed by the
+; trivial-PHI fold. The -verify-each RUN line guards that this merge
+; produces no SSA dominance violation.
 ;
-; Only non-PHI users (or PHI users in the PEA PHI's own block that ARE the
-; PEA PHI itself) are rewritten; pre-existing PHIs naming OrigAlloc are
-; left alone and become poison-incomings when EliminateAllocation RAUWs
-; OrigAlloc to PoisonValue (which is safe because the pre-existing PHI is
-; itself dead-coded by the trivial-dead sweep).
 ; An external padding monitor on the else arm keeps the scalar CFG depth
 ; balanced without changing the virtual object's per-pred lock mismatch.
 
@@ -45,12 +41,9 @@ else:
               ptr addrspace(1) %pad, ptr %pad.lock)
   br label %merge
 merge:
-  ; Pre-existing PHI naming OrigAlloc on both incoming preds. With a
-  ; blanket RAUW the PEA-inserted PHI would have replaced both incomings,
-  ; defining itself in terms of a value (itself) that doesn't dominate the
-  ; predecessor edges. With the guarded RAUW the pre-existing PHI is left
-  ; alone (and dead-coded by the trivial-dead sweep after
-  ; EliminateAllocation).
+  ; Pre-existing PHI naming OrigAlloc on both incoming preds. OrigAlloc is
+  ; retained and dominates the merge, so both incomings remain valid with
+  ; no rewriting; the trivial-PHI fold later collapses this PHI to %o.
   %pre = phi ptr addrspace(1) [ %o, %then ], [ %o, %else ]
   %held = phi ptr addrspace(1) [ %o, %then ], [ %pad, %else ]
   %held.lock = phi ptr [ %lock, %then ], [ %pad.lock, %else ]
@@ -62,11 +55,11 @@ u:
   resume i64 %lp
 }
 
-; Round-trips through opt -verify-each — if a malformed PHI sneaks past the
-; guarded RAUW, the verifier would abort and FileCheck would never see the
-; label. The transformation itself is verified by the first RUN line; this
-; FileCheck is just a smoke test that the materialisation pipeline still
-; produces a per-pred allocation invoke.
+; Round-trips through opt -verify-each — a malformed PHI would abort the
+; verifier and FileCheck would never see the label. The transformation
+; itself is verified by the first RUN line; this FileCheck is just a smoke
+; test that the lock-mismatch replay retains the original allocation invoke
+; and re-emits the monitorenter as a plain (non-tail) call.
 ; CHECK-LABEL: define void @rauwphi_safe
 ; CHECK: invoke hotspotcc{{.*}}@jeandle.new_instance
 ; CHECK-NOT: tail call hotspotcc void @jeandle.monitorenter_with_thin_lock

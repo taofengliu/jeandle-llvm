@@ -2,8 +2,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
 
 ; Three-successor per-pred materialization under the reuse-OrigAlloc model.
-; PH (`else`) has THREE successors via a switch: merge1, merge2 (both mixed ->
-; per-pred mat at else) and D (o virtual, no escape, single-pred).
+; PH (`else`) has THREE successors via a switch: merge1, merge2 (both mixed
+; merges) and D (o virtual, no escape, single-pred).
 ;
 ; OrigAlloc %o dominates all three successors. With no field or lock state to
 ; replay, the two per-merge state transitions need no physical effects and no
