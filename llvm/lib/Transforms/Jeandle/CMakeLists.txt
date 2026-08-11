@@ -10,6 +10,10 @@ add_llvm_component_library(LLVMJeandleTransforms
   JeandleInliner.cpp
   RecoverTypeInfo.cpp
   RepeatedConstantFolding.cpp
+  SafepointCoverageVerifier.cpp
+  SafepointPollElimination.cpp
+  SafepointStripMining.cpp
+  SafepointUtils.cpp
   TLSPointerRewrite.cpp
   TypeCheckElimination.cpp
   JeandleTransformUtils.cpp
