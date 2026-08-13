@@ -1,25 +1,25 @@
-; RUN: opt -S --jeandle \
+; RUN: opt -S --jeandle -jeandle-pea-iterations=0 \
 ; RUN:   -jeandle-verify-safepoint-coverage=off \
 ; RUN:   -jeandle-enable-inclusive-loop-versioning --print-pipeline-passes %s 2>&1 \
 ; RUN:   | FileCheck %s --implicit-check-not='verify<jeandle-safepoint-coverage>' \
 ; RUN:                    --implicit-check-not='safepoint-poll-elimination<cleanup>'
-; RUN: opt -S --jeandle \
+; RUN: opt -S --jeandle -jeandle-pea-iterations=0 \
 ; RUN:   -jeandle-enable-inclusive-loop-versioning \
 ; RUN:   -jeandle-verify-safepoint-coverage=warn --print-pipeline-passes %s 2>&1 \
 ; RUN:   | FileCheck %s --check-prefix=VERIFY \
 ; RUN:                    --implicit-check-not='safepoint-poll-elimination<cleanup>'
-; RUN: opt -S --jeandle \
+; RUN: opt -S --jeandle -jeandle-pea-iterations=0 \
 ; RUN:   -jeandle-verify-safepoint-coverage=off \
 ; RUN:   -jeandle-enable-inclusive-loop-versioning=false \
 ; RUN:   --print-pipeline-passes %s 2>&1 \
 ; RUN:   | FileCheck %s --check-prefix=NO-INCLUSIVE \
 ; RUN:                    --implicit-check-not='safepoint-poll-elimination<cleanup>'
-; RUN: opt -S --jeandle -jeandle-loop-strip-mining-iter=0 \
+; RUN: opt -S --jeandle -jeandle-pea-iterations=0 -jeandle-loop-strip-mining-iter=0 \
 ; RUN:   -jeandle-verify-safepoint-coverage=off \
 ; RUN:   --print-pipeline-passes %s 2>&1 \
 ; RUN:   | FileCheck %s --check-prefix=NO-STRIP \
 ; RUN:                    --implicit-check-not='safepoint-poll-elimination<cleanup>'
-; RUN: opt -S -passes='jeandle<O0>' -jeandle-loop-strip-mining-iter=0 \
+; RUN: opt -S -passes='jeandle<O0>' -jeandle-pea-iterations=0 -jeandle-loop-strip-mining-iter=0 \
 ; RUN:   -jeandle-verify-safepoint-coverage=off \
 ; RUN:   --print-pipeline-passes %s 2>&1 \
 ; RUN:   | FileCheck %s --check-prefix=O0 \

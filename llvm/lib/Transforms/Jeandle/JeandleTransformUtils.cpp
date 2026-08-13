@@ -193,7 +193,12 @@ CallInst *insertJavaTypeAssume(Value *V, jeandle::JavaType T, Instruction *I) {
 }
 
 int getCurrentDeoptBCI(const CallBase &CB) {
-  return findCurrentDeoptScope(CB).BCI;
+  // The bytecode index is the first i32 of the current (innermost) deopt
+  // scope's adjacent bci pair, located at BCIPairStart.
+  DeoptScopeInfo Scope = findCurrentDeoptScope(CB);
+  OperandBundleUse Deopt = *CB.getOperandBundle(LLVMContext::OB_deopt);
+  const auto *BCI = cast<ConstantInt>(Deopt.Inputs[Scope.BCIPairStart].get());
+  return static_cast<int>(BCI->getSExtValue());
 }
 
 Function *getOrInsertJavaMethodFunction(Module &M, StringRef Name,

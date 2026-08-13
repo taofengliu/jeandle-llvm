@@ -21,8 +21,8 @@
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Jeandle/Attributes.h"
 #include "llvm/IR/Jeandle/Deoptimization.h"
-#include "llvm/IR/Jeandle/JeandleUtils.h"
 #include "llvm/IR/Jeandle/JavaType.h"
+#include "llvm/IR/Jeandle/JeandleUtils.h"
 
 namespace llvm {
 
