@@ -903,9 +903,17 @@ struct jeandle::TransformContext {
       &SkippedDeoptPoolEffects;
 };
 
-// Replace the load with its analyzer-computed replacement and erase it,
-// carrying over precise value metadata (see below). An unparented
-// analyzer-built replacement is spliced into the IR first.
+// Replace the load with its analyzer-computed replacement and erase it. An
+// unparented analyzer-built replacement is spliced into the IR first.
+//
+// The erased load's metadata (!nonnull, !dereferenceable, !align, ...) is NOT
+// transferred onto the replacement: those facts only held at the erased
+// load's program point, while the replacement may also execute on paths that
+// never reach it. Copying them would promote path-local facts to global ones
+// (poison/UB on the bypassing paths). Graal keeps such a refinement sound by
+// wrapping the replacement in a fresh PiNode anchored at the replaced node's
+// position (GraphEffectList.replaceAtUsages); LLVM has no per-position value
+// refinement here, so the refinement is dropped.
 void jeandle::ReplaceLoadEffect::apply(jeandle::TransformContext &Ctx) {
   if (!Target || !Replacement)
     return;
@@ -913,34 +921,6 @@ void jeandle::ReplaceLoadEffect::apply(jeandle::TransformContext &Ctx) {
   // so the instruction is still alive.
   Instruction *Target = cast<Instruction>((Value *)this->Target);
   Value *Repl = Replacement;
-  // The analyzer may know the replacement's value more precisely than the
-  // erased load's type conveys. LLVM has no per-Value type-refinement
-  // mechanism at this layer — the closest analogue is the load-only metadata
-  // the original load may have carried. Transfer those (only when both sides
-  // are LoadInsts and the Replacement is missing the kind) so downstream LLVM
-  // passes do not lose the narrower-than-default knowledge after RAUW. Only
-  // VALUE properties are transferable: invariant.load is intentionally
-  // excluded — it asserts a memory-LOCATION property of the original pointer,
-  // and the replacement reads a different location (possibly fully mutable),
-  // so carrying it would give downstream GVN/LICM a false invariance
-  // guarantee.
-  if (auto *TargetLoad = dyn_cast<LoadInst>(Target)) {
-    if (auto *ReplLoad = dyn_cast<LoadInst>(Repl)) {
-      static constexpr unsigned PreservableKinds[] = {
-          LLVMContext::MD_nonnull,
-          LLVMContext::MD_dereferenceable,
-          LLVMContext::MD_dereferenceable_or_null,
-          LLVMContext::MD_align,
-          LLVMContext::MD_noundef,
-      };
-      for (unsigned K : PreservableKinds) {
-        if (ReplLoad->getMetadata(K))
-          continue; // already at least as precise; do not overwrite.
-        if (MDNode *MD = TargetLoad->getMetadata(K))
-          ReplLoad->setMetadata(K, MD);
-      }
-    }
-  }
   // The analyzer may have synthesized an unparented coercion instruction as the
   // replacement (a same-bit-width `bitcast` reinterpretation). Splice it, and
   // any still-unparented operand, in postorder so each operand is parented
