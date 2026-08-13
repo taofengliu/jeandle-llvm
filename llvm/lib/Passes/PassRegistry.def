@@ -589,6 +589,7 @@ FUNCTION_PASS("vector-combine", VectorCombinePass())
 FUNCTION_PASS("verify", VerifierPass())
 FUNCTION_PASS("verify<cycles>", CycleInfoVerifierPass())
 FUNCTION_PASS("verify<domtree>", DominatorTreeVerifierPass())
+FUNCTION_PASS("verify<jeandle-safepoint-coverage>", SafepointCoverageVerifier())
 FUNCTION_PASS("verify<loops>", LoopVerifierPass())
 FUNCTION_PASS("verify<memoryssa>", MemorySSAVerifierPass())
 FUNCTION_PASS("verify<regions>", RegionInfoVerifierPass())
@@ -720,6 +721,21 @@ FUNCTION_PASS_WITH_PARAMS(
     "separate-const-offset-from-gep", "SeparateConstOffsetFromGEPPass",
     [](bool LowerGEP) { return SeparateConstOffsetFromGEPPass(LowerGEP); },
     parseSeparateConstOffsetFromGEPPassOptions, "lower-gep")
+FUNCTION_PASS_WITH_PARAMS(
+    "safepoint-poll-elimination", "SafepointPollElimination",
+    [](SafepointPollEliminationOptions Options) {
+      return SafepointPollElimination(Options.Mode,
+                                      Options.DeferEmptyLoopDeletion);
+    },
+    parseSafepointPollEliminationOptions,
+    "early;after-strip-mining;loop-deletion-prep;defer-empty-loop-deletion")
+FUNCTION_PASS_WITH_PARAMS(
+    "safepoint-strip-mining", "SafepointStripMining",
+    [](SafepointStripMiningOptions Options) {
+      return SafepointStripMining(Options.Mode, Options.DeferEmptyLoopDeletion);
+    },
+    parseSafepointStripMiningOptions,
+    "inclusive-loop-versioning;strip-mining;defer-empty-loop-deletion")
 FUNCTION_PASS_WITH_PARAMS(
     "simplifycfg", "SimplifyCFGPass",
     [](SimplifyCFGOptions Opts) { return SimplifyCFGPass(Opts); },

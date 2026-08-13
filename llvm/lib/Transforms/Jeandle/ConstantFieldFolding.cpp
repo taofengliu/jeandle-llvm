@@ -108,13 +108,6 @@ struct FieldLoadMatch {
   int Offset;
 };
 
-// If `LI` is a load from an oop_handle_* global, return its id.
-std::optional<int> getOopHandleLoadId(LoadInst *LI) {
-  if (!LI || !isJavaOopType(LI->getType()))
-    return std::nullopt;
-  return getOopHandleId(LI->getPointerOperand());
-}
-
 // Returns true for instructions that we treat as a one-step pointer
 // forwarder in the lattice — i.e. their result's ConstOop lattice value
 // is determined by their operands.
@@ -362,11 +355,9 @@ bool foldFieldLoad(Module &M, const jeandle::VMCallbacks &CB,
   int OopId = Match.OopId;
   int Offset = Match.Offset;
 
-  int BasicType = CB.GetConstantFieldInfo(OopId, Offset);
+  auto [BasicType, RawValue] = CB.GetConstantField(OopId, Offset);
   if (BasicType < 0)
     return false;
-
-  int64_t RawValue = CB.GetConstantFieldValue(OopId, Offset);
 
   IRBuilder<> Builder(LI);
 
@@ -507,8 +498,7 @@ PreservedAnalyses ConstantFieldFolding::run(Function &F,
     return PreservedAnalyses::all();
 
   const jeandle::VMCallbacks *CB = jeandle::getVMCallbacks();
-  assert(CB && CB->GetConstantFieldInfo && CB->GetConstantFieldValue &&
-         "VMCallbacks must be set");
+  assert(CB && CB->GetConstantField && "VMCallbacks must be set");
 
   const DataLayout &DL = M->getDataLayout();
 
