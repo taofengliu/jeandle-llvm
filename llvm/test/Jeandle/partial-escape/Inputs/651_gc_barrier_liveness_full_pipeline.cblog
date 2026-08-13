@@ -1,0 +1,9 @@
+# Object[] plus two ordinary virtualizable instance classes.
+RequiresStrictLockOrder = 1
+ElementBasicTypeOfArrayKlass 8888 = 8
+HasFinalizer 100 = false
+CanVirtualize 100 = true
+IsBoxed 100 = 9
+HasFinalizer 200 = false
+CanVirtualize 200 = true
+IsBoxed 200 = 9

@@ -11,6 +11,8 @@
 #ifndef LLVM_TRANSFORMS_JEANDLE_JEANDLEUTILS_H
 #define LLVM_TRANSFORMS_JEANDLE_JEANDLEUTILS_H
 
+#include "llvm/ADT/STLFunctionalExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/DomTreeUpdater.h"
 #include "llvm/IR/Attributes.h"
 #include "llvm/IR/Dominators.h"
@@ -20,8 +22,73 @@
 #include "llvm/IR/Jeandle/Attributes.h"
 #include "llvm/IR/Jeandle/Deoptimization.h"
 #include "llvm/IR/Jeandle/JavaType.h"
+#include "llvm/IR/Jeandle/JeandleUtils.h"
 
 namespace llvm {
+
+/// Append a PEA virtual-object (VO) descriptor for a never-escaping instance
+/// object into \p Args, the operand list of a "deopt" operand bundle. This is
+/// the single emit chokepoint for Jeandle PEA deoptimization support: a VO
+/// that is still virtual at a safepoint must be described by a descriptor so
+/// HotSpot can reallocate it at deopt.
+///
+/// The descriptor is the multi-location sequence documented on
+/// DeoptValueEncoding::ScalarValueType, emitted in this order:
+///   [header]   DeoptValueEncoding(VObjID, ScalarValueType, T_OBJECT|T_ARRAY)
+///              .encode()  — T_ARRAY when \p IsArray, else T_OBJECT.
+///   [klass]    i64 constant = raw InstanceKlass / ArrayKlass identity
+///   [count]    i32 constant = number of (encoding,value) field pairs
+///   [field 0]  (DeoptValueEncoding(0, LocalType, basic_type).encode(), value)
+///   ...
+///   [field N-1]
+/// The parser consumes (3 + 2*field_count) locations for one descriptor.
+///
+/// One emitted VO field: its byte offset (carried in the encoding's Index
+/// field so the HotSpot parser can match it to an InstanceKlass field
+/// (instance) or compute the element index (array) and pad untouched fields
+/// with defaults — HotSpot's reassign_fields_by_klass consumes ALL non-static
+/// fields, so the descriptor must be alignable to the full layout), and either
+/// a scalar value or a VORef to another in-scope VO.
+struct VODescriptorField {
+  int64_t Offset;
+  jeandle::HotspotBasicType BasicTy;
+  // When false: a scalar field; \p V is the concrete value and the field is
+  // emitted as (enc(offset, LocalType, BasicTy), V).
+  // When true: a VORef field; \p VORefID is the referenced VO's vo-id and the
+  // field is emitted as (enc(offset, VORefLocalType, T_OBJECT), i32 VORefID).
+  // \p V is unused in this case. See DeoptValueEncoding::ScalarValueType for
+  // the wire contract (transitive VO references / cycles).
+  bool IsVORef = false;
+  Value *V = nullptr;
+  unsigned VORefID = 0;
+};
+
+/// \p Fields may be in any order; each carries its byte offset. The caller is
+/// responsible for computing each scalar field's HotspotBasicType from its
+/// declared LLVM type. A VORef field (IsVORef) is emitted with T_OBJECT and the
+/// vo-id; BasicTy is ignored for VORef fields. Each long/double field or array
+/// element is emitted as one typed wire pair
+/// (enc(offset, LocalType, T_LONG/T_DOUBLE), i64/f64 value); the HotSpot parser
+/// expands it to the two ScopeValue slots reassign_fields_by_klass consumes.
+/// For an array
+/// (\p IsArray) the caller MUST expand every element 0..ArrayLength-1 into
+/// \p Fields (touched + default) so field_count == ArrayLength; the header
+/// basicType is then T_ARRAY. Locks/monitors are out of scope for this
+/// helper's callers.
+void appendVirtualObjectDescriptor(SmallVectorImpl<Value *> &Args,
+                                   IRBuilder<> &B, uint64_t Klass,
+                                   unsigned VObjID, bool IsArray,
+                                   ArrayRef<VODescriptorField> Fields);
+
+/// Returns the operand index immediately AFTER the duplicated-BCI pair of the
+/// FIRST (root/outermost) "deopt" scope on \p CB. The VO descriptor section
+/// is placed at this position — AFTER the root scope's duplicated-BCI marker
+/// and BEFORE the root locals — and serves as the deopt-point-level object
+/// pool: every VO is described before any VORef slot in ANY scope references
+/// it (mirrors C2's dump_object_pool before create_scope_values). \p CB must
+/// carry a well-formed "deopt" bundle (the same precondition
+/// createPreCallDeoptBundle relies on).
+unsigned getDeoptScopeVOInsertPos(const CallBase &CB);
 
 /// Emits an llvm.experimental.deoptimize and terminates the current block.
 ///
@@ -184,6 +251,21 @@ uintptr_t getCurrentDeoptMethod(const CallBase &CB, uintptr_t RootMethod);
 /// \returns Pre called deoptimization operand bundle.
 OperandBundleDef createPreCallDeoptBundle(InvokeInst &CB);
 
+/// Build a GC-safe load of a constant JavaHeap oop from its oop-handle global
+/// `@oop_handle_<klass>_<id>`.
+///
+/// The global is addrspace(0) storage holding an addrspace(1) pointer; the
+/// loaded value is a managed pointer that downstream RewriteStatepointsForGC
+/// relocates across safepoints. The JVM resolves the `oop_handle_*` name via
+/// oop relocation (jeandleCompiledCode / jeandleReloc). Used by
+/// ConstantFieldFolding (constant object/array fields) and PEA's foldGetClass
+/// (the `java.lang.Class` mirror of a virtual object's exact klass).
+///
+/// \param M Module used to look up or create the oop-handle global.
+/// \param Builder IR builder positioned where the load should be inserted.
+/// \param OopId The constant oop's id (from the VM callback contract).
+/// \returns The newly inserted load of the oop-handle global.
+LoadInst *createConstOopLoad(Module &M, IRBuilder<> &Builder, int OopId);
 // If `LI` is a load from an oop_handle_* global, return its id.
 inline std::optional<int> getOopHandleLoadId(LoadInst *LI) {
   if (!LI || !jeandle::isJavaOopType(LI->getType()))

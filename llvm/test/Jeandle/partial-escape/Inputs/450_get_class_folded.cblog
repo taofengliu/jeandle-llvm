@@ -1,0 +1,12 @@
+# Analyzer ctor consults RequiresStrictLockOrder() once per compilation.
+RequiresStrictLockOrder = 1
+# processAllocation for the klass=7 instance: non-finalizable, virtualizable,
+# not an autobox wrapper (JBasicType::Count == 9).
+HasFinalizer 7 = false
+CanVirtualize 7 = true
+IsBoxed 7 = 9
+# foldGetClass: the virtual's exact klass is 7, so its Class mirror is the
+# constant oop with id 0.
+GetJavaMirror 7 = 0
+# createConstOopLoad names the oop-handle global from the mirror's oop id.
+GetOopHandleName 0 = "oop_handle_Test_0"

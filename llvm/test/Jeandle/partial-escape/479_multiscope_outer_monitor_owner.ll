@@ -1,0 +1,69 @@
+; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+
+; Multi-scope descriptors, outer-scope monitor owner: a NEVER-escaping VO is
+; referenced ONLY by the ROOT scope — as the owner of a monitor entry (the
+; balanced monitorenter/monitorexit below are folded by PEA, so the bundle
+; monitor entry is the frame-state reconstruction point of the eliminated
+; lock). The descriptor is emitted into the ROOT scope's VO section (right
+; after the first duplicated-BCI pair) and the outer-scope monitor entry is
+; rewritten to eliminated=true with a VORef owner by vo-id — same treatment
+; as an innermost-scope monitor (see 645_virtual_vo_lock_in_deopt.ll).
+
+declare hotspotcc ptr addrspace(1) @jeandle.new_instance(ptr, i32)
+declare hotspotcc void @jeandle.monitorenter_with_thin_lock(ptr addrspace(1), ptr) nounwind
+declare hotspotcc void @jeandle.monitorexit_with_thin_lock(ptr addrspace(1), ptr) nounwind
+declare void @sink(i32)
+declare i32 @__gxx_personality_v0(...)
+
+define void @multiscope_monitor(i32 %x) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
+entry:
+  %lock = alloca i64, align 8
+  %o = invoke hotspotcc ptr addrspace(1) @jeandle.new_instance(
+            ptr inttoptr (i64 100 to ptr), i32 16)
+       to label %n1 unwind label %u
+n1:
+  %of = getelementptr inbounds i8, ptr addrspace(1) %o, i64 8
+  store atomic i32 %x, ptr addrspace(1) %of unordered, align 4
+  ; Folded monitorenter on the virtual receiver (lock elision).
+  call hotspotcc void @jeandle.monitorenter_with_thin_lock(
+                  ptr addrspace(1) %o, ptr %lock)
+  ; Two-scope bundle: ROOT scope (bci 5, preceded by its should_reexecute
+  ; i64) carries ONE MONITOR entry whose
+  ; owner is %o (enc MonitorType index=0 T_OBJECT = (3<<16)|12 = 196620);
+  ; the INNERMOST scope (bci 9) has one i32 local and no monitors.
+  ; (i64 393233 = MethodType marker pair encoding: (6<<16)|T_METADATA(17).)
+  call void @sink(i32 %x)
+       [ "deopt"(i64 0, i32 5, i32 5, i64 196620, ptr addrspace(1) %o, ptr %lock,
+                 i64 393233, i64 777,
+                 i64 1, i32 9, i32 9, i64 10, i32 %x) ]
+  ; Matching folded monitorexit (balanced -> LockCounts==0 at commit).
+  call hotspotcc void @jeandle.monitorexit_with_thin_lock(
+                  ptr addrspace(1) %o, ptr %lock)
+  ret void
+u:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
+; %o is NeverEscapes: eliminated and described right AFTER THE ROOT SCOPE
+; PREFIX (should_reexecute i64 0 + duplicated-BCI pair i32 5, i32 5):
+; header (vo_id=0, ScalarValueType, T_OBJECT):
+; (0<<32)|(4<<16)|12 = 262156; klass 100; field_count 1; field (offset 8,
+; LocalType/T_INT): (8<<32)|10 = 34359738378 -> %x. The ROOT-scope monitor
+; entry is rewritten to eliminated=true (index=1) with a VORef owner:
+; (1<<32)|(3<<16)|12 = 4295163916, then i32 vo-id 0; the basic_lock %lock is
+; preserved verbatim.
+; CHECK-LABEL: define void @multiscope_monitor(
+; CHECK-NOT: invoke hotspotcc ptr addrspace(1) @jeandle.new_instance
+; CHECK-NOT: jeandle.monitorenter
+; CHECK: call void @sink(i32 %x)
+; CHECK-SAME: [ "deopt"(i64 0, i32 5, i32 5, i64 262156, i64 100, i32 1, i64 34359738378, i32 %x, i64 4295163916, i32 0, ptr %lock,
+; CHECK-SAME: i64 393233, i64 777,
+; CHECK-SAME: i64 1, i32 9, i32 9, i64 10, i32 %x) ]
+; The monitorexit sits AFTER the sink call in the input, so its elimination
+; is checked in the region after `ret void` (scanning to EOF).
+; CHECK: ret void
+; CHECK-NOT: jeandle.monitorexit
+; CHECK-NOT: poison
+
+!java-method-compilation = !{}

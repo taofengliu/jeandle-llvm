@@ -307,17 +307,6 @@ bool isSubIntBasicType(int BasicType) {
          BasicType == T_SHORT;
 }
 
-LoadInst *createConstOopLoad(Module &M, IRBuilder<> &Builder, int OopId) {
-  LLVMContext &Ctx = M.getContext();
-  Type *OopTy = PointerType::get(Ctx, jeandle::AddrSpace::JavaHeapAddrSpace);
-  const auto *CB = jeandle::getVMCallbacks();
-  assert(CB && CB->GetOopHandleName && "GetOopHandleName callback required");
-  std::string Name = CB->GetOopHandleName(OopId);
-  GlobalVariable *GV = cast<GlobalVariable>(M.getOrInsertGlobal(Name, OopTy));
-  GV->setDSOLocal(true);
-  return Builder.CreateLoad(OopTy, GV, "folded.oop");
-}
-
 bool replaceSubIntLoad(LoadInst *LI, int BasicType, int Value) {
   if (!isSubIntBasicType(BasicType))
     return false;

@@ -1,0 +1,11 @@
+# 441: Object[] (klass 8888) with Object element kind (JBasicType::Object = 8)
+# so processStore's constant-index store records FieldStates[arr][16] as a
+# VirtualRef(inner0). The instance klasses (5555/5556) must register
+# HasFinalizer / CanVirtualize so processAllocation does not abort on the
+# callback log lookup. RequiresStrictLockOrder is the standard PEA cblog flag.
+RequiresStrictLockOrder = 1
+ElementBasicTypeOfArrayKlass 8888 = 8
+HasFinalizer 5555 = false
+CanVirtualize 5555 = true
+HasFinalizer 5556 = false
+CanVirtualize 5556 = true

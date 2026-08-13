@@ -1,0 +1,3 @@
+RequiresStrictLockOrder = 0
+HasFinalizer 74501 = false
+CanVirtualize 74501 = true

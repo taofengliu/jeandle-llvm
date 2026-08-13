@@ -1,0 +1,4 @@
+RequiresStrictLockOrder = 1
+ElementBasicTypeOfArrayKlass 54004 = 8
+HasFinalizer 54005 = false
+CanVirtualize 54005 = true

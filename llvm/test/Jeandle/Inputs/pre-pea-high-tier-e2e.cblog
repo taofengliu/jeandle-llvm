@@ -1,0 +1,4 @@
+# VM callback replay for pre-pea-high-tier-e2e.ll: the int[] klass pointer
+# 12345 resolves to element type Int (4), so PEA can virtualize the array.
+RequiresStrictLockOrder = 1
+ElementBasicTypeOfArrayKlass 12345 = 4

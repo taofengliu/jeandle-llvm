@@ -1,0 +1,17 @@
+RequiresStrictLockOrder = 1
+HasFinalizer 69001 = false
+CanVirtualize 69001 = true
+IsBoxed 69001 = 9
+HasFinalizer 69002 = false
+CanVirtualize 69002 = true
+IsBoxed 69002 = 9
+HasFinalizer 69011 = false
+CanVirtualize 69011 = true
+IsBoxed 69011 = 9
+HasFinalizer 69012 = false
+CanVirtualize 69012 = true
+IsBoxed 69012 = 9
+HasFinalizer 69013 = false
+CanVirtualize 69013 = true
+IsBoxed 69013 = 9
+ElementBasicTypeOfArrayKlass 69014 = 8

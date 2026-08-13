@@ -5,6 +5,9 @@ add_llvm_component_library(LLVMJeandleTransforms
   InsertGCBarriers.cpp
   JavaOperationDeletion.cpp
   JavaOperationLower.cpp
+  JavaOpLengthFolding.cpp
+  PartialEscapeIterative.cpp
+  PartialEscapeTransform.cpp
   JeandleNarrowOopMarker.cpp
   JeandleInlineDriver.cpp
   JeandleInliner.cpp
@@ -20,10 +23,12 @@ add_llvm_component_library(LLVMJeandleTransforms
 
   ADDITIONAL_HEADER_DIRS
   ${LLVM_MAIN_INCLUDE_DIR}/llvm/Transforms/Jeandle
+  ${LLVM_MAIN_INCLUDE_DIR}/llvm/Analysis/Jeandle
 
   LINK_COMPONENTS
   Analysis
   Core
+  InstCombine
   IRReader
   Scalar
   TransformUtils

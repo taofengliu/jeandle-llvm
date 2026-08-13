@@ -2,7 +2,9 @@
 
 ; Inlined call sites carry statepoint-id attributes cloned from callee template
 ; IR. The template call sites keep their original ids, so every inlined copy must
-; get a fresh id before it is attached to the root method.
+; get a fresh id before it is attached to the root method. GetNewStatepointID is
+; an id-allocation callback and is never recorded in the replay log, so replay
+; allocates synthetic fresh ids from a counter (1, 2, ... in allocation order).
 
 @jeandle.personality = global ptr null
 
@@ -44,5 +46,5 @@ attributes #4 = { "java-method"="109" }
 ; CHECK-LABEL: define hotspotcc i32 @root(
 ; CHECK: invoke hotspotcc void @leaf_with_duplicate_statepoint() #[[FIRST_ATTR:[0-9]+]]
 ; CHECK: invoke hotspotcc void @leaf_with_duplicate_statepoint() #[[SECOND_ATTR:[0-9]+]]
-; CHECK-DAG: attributes #[[FIRST_ATTR]] = { {{.*}}"statepoint-id"="1007"{{.*}} }
-; CHECK-DAG: attributes #[[SECOND_ATTR]] = { {{.*}}"statepoint-id"="1008"{{.*}} }
+; CHECK-DAG: attributes #[[FIRST_ATTR]] = { {{.*}}"statepoint-id"="1"{{.*}} }
+; CHECK-DAG: attributes #[[SECOND_ATTR]] = { {{.*}}"statepoint-id"="2"{{.*}} }

@@ -10,10 +10,14 @@
 
 #include "llvm/Transforms/Jeandle/JeandleTransformUtils.h"
 #include "llvm/Analysis/DomTreeUpdater.h"
+#include "llvm/Analysis/Jeandle/PartialEscapeUtils.h"
+#include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Jeandle/Deoptimization.h"
 #include "llvm/IR/Jeandle/GCStrategy.h"
 #include "llvm/IR/Jeandle/Metadata.h"
+#include "llvm/IR/Jeandle/VMCallback.h"
 #include "llvm/IR/Module.h"
+#include "llvm/Support/MathExtras.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 
 #include <string>
@@ -40,24 +44,25 @@ struct DeoptScopeInfo {
 }
 
 DeoptScopeInfo findCurrentDeoptScope(const CallBase &CB) {
-  auto Deopt = CB.getOperandBundle(LLVMContext::OB_deopt);
-  if (!Deopt)
+  // Built on the shared graceful finder (jeandle::pea::
+  // findInnermostDeoptScopeBCIPairStart). The innermost variant is now used
+  // only by this file's computeDeoptStackLayout — PEA's analysis side and
+  // getDeoptScopeVOInsertPos anchor on the FIRST (root) scope via
+  // findFirstDeoptScopeBCIPairStart instead. The transform side keeps the
+  // hard failure: every Jeandle frontend path that reaches these transforms
+  // upholds the well-formed-bundle invariant, so a malformed bundle here is
+  // a genuine bug.
+  // TODO(robustness): thread std::optional<DeoptScopeInfo> through
+  // getDeoptScopeVOInsertPos + computeDeoptStackLayout and their callers
+  // instead; deferred as it is not cheap.
+  if (!CB.getOperandBundle(LLVMContext::OB_deopt))
     reportInvalidDeoptBundle(CB, "missing deopt bundle for bci");
-
-  for (unsigned I = Deopt->Inputs.size(); I > 1; --I) {
-    auto *BCI0 = dyn_cast<ConstantInt>(Deopt->Inputs[I - 2].get());
-    auto *BCI1 = dyn_cast<ConstantInt>(Deopt->Inputs[I - 1].get());
-    if (!BCI0 || !BCI1 || !BCI0->getType()->isIntegerTy(32) ||
-        !BCI1->getType()->isIntegerTy(32))
-      continue;
-
-    if (BCI0->getSExtValue() != BCI1->getSExtValue())
-      reportInvalidDeoptBundle(CB, "mismatched adjacent i32 bci values");
-
-    return {I - 2, static_cast<int>(BCI0->getSExtValue())};
-  }
-
-  reportInvalidDeoptBundle(CB, "missing adjacent i32 deopt bci pair");
+  std::optional<unsigned> Start =
+      jeandle::pea::findInnermostDeoptScopeBCIPairStart(CB);
+  if (!Start)
+    reportInvalidDeoptBundle(
+        CB, "missing or mismatched adjacent i32 deopt bci pair");
+  return {*Start, 0};
 }
 
 } // namespace
@@ -188,7 +193,12 @@ CallInst *insertJavaTypeAssume(Value *V, jeandle::JavaType T, Instruction *I) {
 }
 
 int getCurrentDeoptBCI(const CallBase &CB) {
-  return findCurrentDeoptScope(CB).BCI;
+  // The bytecode index is the first i32 of the current (innermost) deopt
+  // scope's adjacent bci pair, located at BCIPairStart.
+  DeoptScopeInfo Scope = findCurrentDeoptScope(CB);
+  OperandBundleUse Deopt = *CB.getOperandBundle(LLVMContext::OB_deopt);
+  const auto *BCI = cast<ConstantInt>(Deopt.Inputs[Scope.BCIPairStart].get());
+  return static_cast<int>(BCI->getSExtValue());
 }
 
 Function *getOrInsertJavaMethodFunction(Module &M, StringRef Name,
@@ -299,6 +309,101 @@ OperandBundleDef createPreCallDeoptBundle(InvokeInst &CB) {
     Args.push_back(Deopt.Inputs[I].get());
 
   return OperandBundleDef("deopt", Args);
+}
+
+LoadInst *createConstOopLoad(Module &M, IRBuilder<> &Builder, int OopId) {
+  LLVMContext &Ctx = M.getContext();
+  Type *OopTy = PointerType::get(Ctx, jeandle::AddrSpace::JavaHeapAddrSpace);
+  const auto *CB = jeandle::getVMCallbacks();
+  assert(CB && CB->GetOopHandleName && "GetOopHandleName callback required");
+  std::string Name = CB->GetOopHandleName(OopId);
+  GlobalVariable *GV = cast<GlobalVariable>(M.getOrInsertGlobal(Name, OopTy));
+  GV->setDSOLocal(true);
+  return Builder.CreateLoad(OopTy, GV, "folded.oop");
+}
+
+void appendVirtualObjectDescriptor(SmallVectorImpl<Value *> &Args,
+                                   IRBuilder<> &B, uint64_t Klass,
+                                   unsigned VObjID, bool IsArray,
+                                   ArrayRef<VODescriptorField> Fields) {
+  // Single emit chokepoint for PEA deopt VO descriptors. See the contract on
+  // DeoptValueEncoding::ScalarValueType (include/llvm/IR/Jeandle/
+  // Deoptimization.h) and appendVirtualObjectDescriptor in the header. The
+  // parser consumes (3 + 2*field_count) wire locations for one descriptor.
+  // Each field or array element is one typed wire pair. For T_LONG/T_DOUBLE,
+  // HotSpot expands that pair to two ScopeValue slots.
+  LLVMContext &Ctx = B.getContext();
+
+  // [header] DeoptValueEncoding(VObjID, ScalarValueType, T_ARRAY|T_OBJECT).
+  // The header basicType tells the HotSpot parser whether to rebuild an array
+  // (T_ARRAY, uniform elements indexed by offset, field_count == length) or an
+  // instance (T_OBJECT, fields matched to an InstanceKlass layout walk).
+  jeandle::HotspotBasicType HeaderBT =
+      IsArray ? jeandle::T_ARRAY : jeandle::T_OBJECT;
+  uint64_t Header =
+      jeandle::DeoptValueEncoding(
+          VObjID, jeandle::DeoptValueEncoding::ScalarValueType, HeaderBT)
+          .encode();
+  Args.push_back(ConstantInt::get(Type::getInt64Ty(Ctx), Header));
+
+  // [klass] raw InstanceKlass / ArrayKlass identity
+  Args.push_back(B.getInt64(Klass));
+
+  // [field_count]
+  Args.push_back(B.getInt32(Fields.size()));
+
+  // [field i] (DeoptValueEncoding(offset, LocalType/VORefLocalType, bt), value)
+  // The offset rides in the encoding's Index field so the HotSpot parser can
+  // match each emitted field to an InstanceKlass field (instance) or compute
+  // the element index (array) and pad the untouched fields with defaults
+  // (reassign_fields_by_klass consumes ALL non-static fields). Field order in
+  // the bundle is irrelevant — the parser keys by offset. A scalar field
+  // carries enc(offset, LocalType, BasicTy) + the concrete Value; a VORef
+  // field carries enc(offset, VORefLocalType, T_OBJECT) + the referenced VO's
+  // vo-id as an i32 constant (transitive VO references / cycles). For an
+  // array the caller has already expanded ALL elements (touched + default) into
+  // Fields, so field_count == ArrayLength.
+  for (const VODescriptorField &F : Fields) {
+    assert(isInt<32>(F.Offset) &&
+           "PEA deopt field offset must fit DeoptValueEncoding::Index");
+    if (F.IsVORef) {
+      uint64_t FieldEnc =
+          jeandle::DeoptValueEncoding(
+              static_cast<int>(F.Offset),
+              jeandle::DeoptValueEncoding::VORefLocalType, jeandle::T_OBJECT)
+              .encode();
+      Args.push_back(ConstantInt::get(Type::getInt64Ty(Ctx), FieldEnc));
+      Args.push_back(B.getInt32(F.VORefID));
+    } else {
+      uint64_t FieldEnc = jeandle::DeoptValueEncoding(
+                              static_cast<int>(F.Offset),
+                              jeandle::DeoptValueEncoding::LocalType, F.BasicTy)
+                              .encode();
+      Args.push_back(ConstantInt::get(Type::getInt64Ty(Ctx), FieldEnc));
+      Args.push_back(F.V);
+    }
+  }
+}
+
+unsigned getDeoptScopeVOInsertPos(const CallBase &CB) {
+  // The VO section is the deopt-point-level object pool: it sits in the ROOT
+  // (outermost) scope, right AFTER the FIRST duplicated-BCI marker and BEFORE
+  // the root scope's locals, so every descriptor precedes any VORef slot in
+  // any scope (the HotSpot parser walks scopes outermost-first and resolves
+  // VORefs through a record-level vo_map). Mirrors C2's dump_object_pool
+  // before create_scope_values. findFirstDeoptScopeBCIPairStart returns the
+  // index of the first BCI of the FIRST adjacent-equal i32 pair; the insert
+  // position is immediately past the pair (BCIPairStart + 2). The transform
+  // keeps the hard failure on malformed bundles (frontend invariant), unlike
+  // the analysis side's graceful bail.
+  if (!CB.getOperandBundle(LLVMContext::OB_deopt))
+    reportInvalidDeoptBundle(CB, "missing deopt bundle for VO section");
+  std::optional<unsigned> Start =
+      jeandle::pea::findFirstDeoptScopeBCIPairStart(CB);
+  if (!Start)
+    reportInvalidDeoptBundle(
+        CB, "missing or mismatched adjacent i32 deopt bci pair");
+  return *Start + 2;
 }
 
 } // namespace llvm

@@ -1,0 +1,6 @@
+# 216: same allocation/klass setup as 214 — Object[] (8888) + instance (5555).
+RequiresStrictLockOrder = 1
+ElementBasicTypeOfArrayKlass 8888 = 8
+HasFinalizer 5555 = false
+CanVirtualize 5555 = true
+IsBoxed 5555 = 9
