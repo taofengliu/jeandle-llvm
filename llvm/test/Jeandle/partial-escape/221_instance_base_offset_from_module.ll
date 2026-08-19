@@ -1,4 +1,4 @@
-; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" %s | FileCheck %s
+; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-pea-verify-header-access=off %s | FileCheck %s
 
 ; VMConstants::fromModule verification for instance fields:
 ;   The module declares the runtime-defined global that HotSpot patches for
@@ -9,6 +9,11 @@
 ;   opt-only InstanceBaseOffset==0 default.  If it ignored this global, the
 ;   store/load at offset 8 would be treated as a scalar-replaceable field
 ;   round trip and folded to `ret i32 42`.
+;
+;   The raw header access used here deliberately violates the frontend
+;   invariant that jeandle-pea-verify-header-access polices (Fatal by default
+;   in asserts builds); the explicit =off keeps this test focused on the
+;   VMConstants::fromModule behavior.
 
 @instanceOopDesc.base_offset_in_bytes = private constant i32 12
 
