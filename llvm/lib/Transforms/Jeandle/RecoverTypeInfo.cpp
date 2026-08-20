@@ -435,8 +435,7 @@ PreservedAnalyses RecoverTypeInfo::run(Function &F,
         }
         // For a variable-index address the accumulated constant part (if any)
         // is not a field offset, so only the constant-offset case keeps it.
-        LoadInfos[LI] = {QueryBase,
-                         HasVariableIndex ? std::nullopt : OffOpt};
+        LoadInfos[LI] = {QueryBase, HasVariableIndex ? std::nullopt : OffOpt};
         States[&I] = Lattice::top(); // resolved during the fixpoint
         continue;
       }
@@ -665,7 +664,8 @@ PreservedAnalyses RecoverTypeInfo::run(Function &F,
       } else {
         // Dynamic contains exactly the Top-seeded values, which are seeded
         // only as tracked typed loads or forwarders.
-        llvm_unreachable("dynamic value is neither a tracked load nor a forwarder");
+        llvm_unreachable(
+            "dynamic value is neither a tracked load nor a forwarder");
       }
       Lattice &Old = States[I];
       if (Old != New) {

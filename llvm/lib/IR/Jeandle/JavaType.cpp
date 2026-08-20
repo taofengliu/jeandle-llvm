@@ -982,8 +982,7 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
 /// The result depends only on the CFG, branch conditions and VM callbacks; it
 /// is constant while those are unchanged.
 JavaType jeandle::sharpenFromDominators(Value *V, Instruction *Context,
-                                        DominatorTree &DT,
-                                        BasicBlock *DestBB) {
+                                        DominatorTree &DT, BasicBlock *DestBB) {
   const VMCallbacks *CB = getVMCallbacks();
   assert(CB && CB->IsSubtype && "VMCallbacks must be set");
 
