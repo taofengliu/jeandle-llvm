@@ -229,6 +229,38 @@ AnalysisKey PartialEscapeAnalysis::Key;
 
 namespace {
 
+// Frontend-invariant verifier for raw object-header accesses. The frontend
+// must keep every mark/klass-word access inside a lower-phase >= 1 JavaOp
+// that PEA folds by name (load_klass, the monitor ops, arraylength, ...); a
+// raw header access reaching the analyzer can only force conservative
+// materialization. Off skips the check; Warn reports each violation on
+// errs() and keeps the conservative behavior; Fatal aborts the compile.
+// Defaults to Fatal in asserts builds to catch frontend regressions loudly,
+// Off in release builds (zero cost, conservative behavior preserved).
+enum class HeaderAccessCheck { Off, Warn, Fatal };
+static llvm::cl::opt<HeaderAccessCheck> JeandlePEAVerifyHeaderAccess(
+    "jeandle-pea-verify-header-access",
+    llvm::cl::values(
+        clEnumValN(HeaderAccessCheck::Off, "off",
+                   "Do not check for raw object-header accesses"),
+        clEnumValN(HeaderAccessCheck::Warn, "warn",
+                   "Report each raw object-header access without aborting"),
+        clEnumValN(HeaderAccessCheck::Fatal, "fatal",
+                   "Abort the compile on any raw object-header access")),
+#ifndef NDEBUG
+    llvm::cl::init(HeaderAccessCheck::Fatal),
+#else
+    llvm::cl::init(HeaderAccessCheck::Off),
+#endif
+    llvm::cl::Hidden,
+    llvm::cl::desc("PEA: verify that no raw object-header memory access "
+                   "(constant byte offset < "
+                   "instanceOopDesc.base_offset_in_bytes through a virtual "
+                   "instance receiver) reaches the analyzer. Arrays are "
+                   "exempt: a sub-base constant offset can arise from a "
+                   "constant negative array index, a designed "
+                   "out-of-bounds case."));
+
 // A live (still-unbalanced) monitorenter on a virtual object.
 //   * Call is the original jeandle.monitorenter call site (used by
 //     materializeAt to undo the ReplaceCall elision).
@@ -1678,6 +1710,22 @@ private:
   // every virtualized load/store path: instance-field and array-element
   // accesses alike reduce to one constant byte offset into the object.
   std::optional<int64_t> resolveAccess(Value *Ptr, jeandle::ObjectID BaseID);
+  // Frontend-invariant check (JeandlePEAVerifyHeaderAccess): a load/store on
+  // a virtual receiver whose constant byte offset is below
+  // instanceOopDesc.base_offset_in_bytes is a raw object-header access that
+  // should have lived inside a lower-phase >= 1 JavaOp (which PEA folds by
+  // name). Called from the resolveAccess bail paths, where the access is
+  // about to force conservative materialization of its virtual base — the
+  // only places PEA is actually harmed. Offsets that merely fail resolution
+  // (symbolic index, non-constant GEP) do not report. Only INSTANCE virtuals
+  // are checked: on array virtuals a sub-base constant byte offset can
+  // legitimately arise from a constant negative array index (the abstract
+  // interpreter's typed-element GEP shape, e.g. a[-1] on a scale-8 array
+  // resolves to ArrayBaseOffset-8), which resolveAccess already rejects at
+  // the array-element fast path as a designed out-of-bounds case — firing
+  // there would be a false positive on legal bytecode.
+  void checkRawHeaderAccess(const Instruction *I, Value *Ptr,
+                            jeandle::ObjectID BaseID);
   // TODO(unsafe-inliner): processAtomicRMW / processCmpXchg (re-add with the
   // jeandle-jdk frontend inliner for Unsafe atomic intrinsics),
   // processArrayCopy (System.arraycopy → llvm.memcpy/memmove), processMemSet
@@ -5442,7 +5490,18 @@ std::optional<int64_t> Analyzer::resolveAccess(Value *Ptr,
   // and must not be virtualized into a field slot. Instances are guarded by
   // instanceBaseOffset; arrays are mirrored by ArrayBaseOffset (a raw GEP
   // into the array header, e.g. an offset-0 store to the mark word, would
-  // otherwise replay as a Java-field write on materialization).
+  // otherwise replay as a Java-field write on materialization). The frontend
+  // keeps every header access inside a lower-phase >= 1 JavaOp that PEA
+  // folds by name (load_klass, arraylength, the monitor ops, ...), so the
+  // instance side of this guard is unreachable for frontend-emitted IR, and
+  // the materializing callers run checkRawHeaderAccess
+  // (JeandlePEAVerifyHeaderAccess) to turn an instance-side violation into a
+  // diagnosable failure instead of a silent performance regression. The array
+  // side stays reachable by design: with no element metadata available, a
+  // constant negative array index (the typed-element GEP shape) skips the
+  // array-element fast path and resolves here to a sub-base byte offset,
+  // which is a legitimate out-of-bounds case, not a header access —
+  // checkRawHeaderAccess skips arrays for that reason.
   if (VObj.isInstance()) {
     if (*Offset < VMConsts.instanceBaseOffset())
       return std::nullopt;
@@ -5476,6 +5535,29 @@ std::optional<int64_t> Analyzer::resolveAccess(Value *Ptr,
   }
 
   return Offset;
+}
+
+void Analyzer::checkRawHeaderAccess(const Instruction *I, Value *Ptr,
+                                    jeandle::ObjectID BaseID) {
+  if (JeandlePEAVerifyHeaderAccess == HeaderAccessCheck::Off)
+    return;
+  jeandle::VirtualObject &VObj = *Result.VirtualObjects[BaseID];
+  if (!VObj.isInstance())
+    return;
+  std::optional<int64_t> Offset = jeandle::pea::resolveFieldOffset(Ptr, DL);
+  if (!Offset || *Offset >= VMConsts.instanceBaseOffset())
+    return;
+  std::string Msg;
+  llvm::raw_string_ostream OS(Msg);
+  OS << "PEA: raw object-header memory access (constant byte offset " << *Offset
+     << " < instanceOopDesc.base_offset_in_bytes "
+     << VMConsts.instanceBaseOffset() << ") in function '"
+     << I->getFunction()->getName() << "': " << *I;
+  llvm::StringRef MsgRef = OS.str();
+  if (JeandlePEAVerifyHeaderAccess == HeaderAccessCheck::Fatal)
+    llvm::report_fatal_error(MsgRef);
+  else
+    llvm::errs() << "PEA WARNING: " << MsgRef.drop_front(5) << "\n";
 }
 
 // Fold a store whose pointer operand bottoms out on a virtual base. On a
@@ -5583,6 +5665,7 @@ bool Analyzer::processStore(StoreInst *SI) {
   // array index, non-constant GEP, header offset) -> bail.
   std::optional<int64_t> Offset = resolveAccess(Ptr, *BaseID);
   if (!Offset) {
+    checkRawHeaderAccess(SI, Ptr, *BaseID);
     materializeOperandsAtStore();
     return true;
   }
@@ -5749,6 +5832,7 @@ void Analyzer::processLoad(LoadInst *LI) {
   // Shared offset resolution; see resolveAccess.
   std::optional<int64_t> Offset = resolveAccess(Ptr, *BaseID);
   if (!Offset) {
+    checkRawHeaderAccess(LI, Ptr, *BaseID);
     // Unresolvable offset (symbolic array index, non-constant GEP, header):
     // the load cannot be tracked. Materialize the base AT the load: tracked
     // stores are replayed onto OrigAlloc right before LI, and OrigAlloc is
