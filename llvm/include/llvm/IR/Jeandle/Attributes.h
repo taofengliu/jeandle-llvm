@@ -69,6 +69,10 @@ public:
 
   static constexpr const char *MonomorphicTarget = "monomorphic-target";
 
+  /// Marks virtual fallback calls that must not be profile-devirtualized again.
+  static constexpr const char *ProfileDevirtualizationMiss =
+      "profile-devirtualization-miss";
+
   /// Classification attributes attached to jeandle.arraycopy call sites.
   static constexpr const char *ArrayCopyKind = "jeandle.arraycopy.kind";
 

@@ -499,6 +499,36 @@ struct TraceResult {
 
 } // anonymous namespace
 
+/// Match `jeandle.check_exact_klass(ExpectedKlass, ActualKlass)`, where
+/// one argument is loaded directly from `QueryObj` by `jeandle.load_klass`.
+/// The intrinsic arguments are treated symmetrically because IR rewrites may
+/// place the loaded Klass in either position.
+static bool isLoadKlassOf(Value *ValueToCheck, Value *QueryObj) {
+  auto *Load = dyn_cast<CallBase>(ValueToCheck->stripPointerCastsAndAliases());
+  return Load && Load->getCalledFunction() &&
+         Load->getCalledFunction()->getName() == "jeandle.load_klass" &&
+         Load->arg_size() == 1 &&
+         Load->getArgOperand(0)->stripPointerCastsAndAliases() ==
+             QueryObj->stripPointerCastsAndAliases();
+}
+
+static uintptr_t traceExactKlassGuard(Value *Cond, Value *QueryObj) {
+  auto *CB = dyn_cast<CallBase>(Cond);
+  Function *Callee = CB ? CB->getCalledFunction() : nullptr;
+  if (!Callee || Callee->getName() != "jeandle.check_exact_klass" ||
+      CB->arg_size() != 2)
+    return 0;
+
+  bool FirstIsActual = isLoadKlassOf(CB->getArgOperand(0), QueryObj);
+  bool SecondIsActual = isLoadKlassOf(CB->getArgOperand(1), QueryObj);
+  if (FirstIsActual == SecondIsActual)
+    return 0;
+
+  Value *ExpectedKlass =
+      FirstIsActual ? CB->getArgOperand(1) : CB->getArgOperand(0);
+  return extractKlassConstant(ExpectedKlass);
+}
+
 /// AllOf: pick the more specific klass (both confirmed — tighter bound).
 /// Returns 0 if unrelated (e.g., two interfaces an object can implement).
 static uintptr_t pickMostSpecific(uintptr_t A, uintptr_t B) {
@@ -1002,14 +1032,37 @@ JavaType jeandle::sharpenFromDominators(Value *V, Instruction *Context,
     if (BB == ContextBB && !DestBB)
       continue;
 
+    BasicBlock *TrueBB = BI->getSuccessor(0);
+    BasicBlock *FalseBB = BI->getSuccessor(1);
+
+    uintptr_t Exact = traceExactKlassGuard(BI->getCondition(), V);
+    if (Exact != 0) {
+      bool TrueApplies;
+      if (BB == ContextBB) {
+        TrueApplies = TrueBB == DestBB && FalseBB != DestBB;
+      } else {
+        TrueApplies = DT.dominates(BasicBlockEdge(BB, TrueBB), ContextBB);
+      }
+      if (TrueApplies) {
+        LLVM_DEBUG(dbgs() << "JavaType: sharpened " << *V << " to exact klass "
+                          << Exact << " from dominating klass guard in "
+                          << BB->getName() << "\n");
+        JavaType ExactType;
+        ExactType.Klass = Exact;
+        ExactType.Exact = true;
+        Best = typeIntersect(Best, ExactType);
+      }
+      // A failed exact-class guard does not imply that the receiver is not an
+      // instance of the guarded class: it may still be a subclass.
+      continue;
+    }
+
     SmallPtrSet<Value *, 16> TraceVisited;
     TraceResult TR =
         traceToCheckInstanceof(BI->getCondition(), V, TraceVisited, DT);
     if (!TR.matched())
       continue;
 
-    BasicBlock *TrueBB = BI->getSuccessor(0);
-    BasicBlock *FalseBB = BI->getSuccessor(1);
     uintptr_t Klass = 0;
     const SmallDenseSet<uintptr_t, 2> *Exclusions = nullptr;
 
