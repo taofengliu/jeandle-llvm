@@ -24,7 +24,9 @@
 #include "llvm/IR/Jeandle/VMCallback.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
+#include <algorithm>
 #include <cstdint>
+#include <memory>
 
 #define DEBUG_TYPE "java-type"
 
@@ -388,13 +390,9 @@ JavaType jeandle::typeIntersect(JavaType A, JavaType B) {
 // Context-insensitive type query
 // =============================================================================
 
-/// Memo of complete base-type computations, keyed by value alone: a base
-/// type is a pure function of the value (attributes, metadata, constant oop
-/// identity, PHI/select structure), never of the query point. Entries are
-/// written only for computations that never hit a PHI cycle — a cycle-hit
-/// result depends on where the recursion was cut and must not be reused.
-/// Cycle-aware memoization keeps shared PHI sub-DAGs linear: without it, a
-/// chain of PHIs whose arms share children costs 2^depth.
+/// Complete context-insensitive types, independent of the query point.
+/// An absorbing unknown input can complete a query early; other cyclic
+/// dependencies are cached only after the whole SCC has been evaluated.
 using BaseMemo = DenseMap<Value *, JavaType>;
 
 /// Join one more arm into an accumulator where the first arm seeds it:
@@ -409,14 +407,7 @@ static void joinArm(JavaType &Acc, bool &First, JavaType Arm) {
   }
 }
 
-// No exclusions during context-insensitive type query.
-static JavaType getBaseJavaTypeRaw(Value *V,
-                                   SmallPtrSetImpl<const PHINode *> &Visited,
-                                   BaseMemo &Memo, bool &CycleHit, bool IsRoot);
-
-static JavaType getBaseJavaTypeCase(Value *V,
-                                    SmallPtrSetImpl<const PHINode *> &Visited,
-                                    BaseMemo &Memo, bool &CycleHit) {
+static JavaType getBaseJavaTypeLeaf(Value *V) {
   // Argument: check param attributes.
   if (auto *Arg = dyn_cast<Argument>(V)) {
     const Function *F = Arg->getParent();
@@ -484,115 +475,188 @@ static JavaType getBaseJavaTypeCase(Value *V,
     return {};
   }
 
-  // PHI: compute LCA of all incoming values. The visited set is a recursion
-  // stack, not a whole-query cache: an incoming PHI is skipped only while it
-  // is on the stack (a true cycle — the type is then determined by the values
-  // entering the cycle, which are exactly the non-cyclic incomings). Skipping
-  // a merely-visited PHI would silently drop it from the LCA and produce a
-  // too-narrow type when the same PHI feeds two different arms.
-  if (auto *PN = dyn_cast<PHINode>(V)) {
-    if (!Visited.insert(PN).second) {
-      CycleHit = true;
-      return {}; // Cycle detected — caller will skip this incoming.
-    }
-    auto StackGuard = make_scope_exit([&]() { Visited.erase(PN); });
-    JavaType Result;
-    bool First = true;
-    for (unsigned I = 0, E = PN->getNumIncomingValues(); I != E; ++I) {
-      Value *Inc = PN->getIncomingValue(I);
-      if (auto *IncPN = dyn_cast<PHINode>(Inc)) {
-        if (Visited.count(IncPN)) {
-          CycleHit = true;
-          continue; // Skip cyclic incoming.
-        }
-      }
-      // JavaType does not model nullability. Any positive facts derived from
-      // jeandle.check_instanceof remain sound here only because current
-      // consumers query it under check_instanceof's non-null oop contract.
-      // CycleHit is frame-local: a sibling's earlier cycle must not disable
-      // this frame's memoization, so each child gets its own flag and only
-      // the disjunction propagates upward.
-      bool ChildHit = false;
-      JavaType IncType =
-          getBaseJavaTypeRaw(Inc, Visited, Memo, ChildHit, /*IsRoot=*/false);
-      CycleHit |= ChildHit;
-      if (IncType.isUnknown())
-        return {};
-      joinArm(Result, First, IncType);
-      if (Result.isUnknown())
-        return {};
-    }
-    return Result;
-  }
-
-  // Select: LCA of both operands.
-  if (auto *SI = dyn_cast<SelectInst>(V)) {
-    bool TrueHit = false;
-    JavaType TrueType = getBaseJavaTypeRaw(SI->getTrueValue(), Visited, Memo,
-                                           TrueHit, /*IsRoot=*/false);
-    if (TrueType.isUnknown()) {
-      CycleHit |= TrueHit;
-      return {};
-    }
-    bool FalseHit = false;
-    JavaType FalseType = getBaseJavaTypeRaw(SI->getFalseValue(), Visited, Memo,
-                                            FalseHit, /*IsRoot=*/false);
-    CycleHit |= TrueHit || FalseHit;
-    return typeUnion(TrueType, FalseType);
-  }
-
-  // BitCast / AddrSpaceCast / Freeze: pass through.
-  if (auto *BC = dyn_cast<BitCastInst>(V)) {
-    bool ChildHit = false;
-    JavaType R = getBaseJavaTypeRaw(BC->getOperand(0), Visited, Memo, ChildHit,
-                                    /*IsRoot=*/false);
-    CycleHit |= ChildHit;
-    return R;
-  }
-  if (auto *ASC = dyn_cast<AddrSpaceCastInst>(V)) {
-    bool ChildHit = false;
-    JavaType R = getBaseJavaTypeRaw(ASC->getOperand(0), Visited, Memo, ChildHit,
-                                    /*IsRoot=*/false);
-    CycleHit |= ChildHit;
-    return R;
-  }
-  if (auto *FI = dyn_cast<FreezeInst>(V)) {
-    bool ChildHit = false;
-    JavaType R = getBaseJavaTypeRaw(FI->getOperand(0), Visited, Memo, ChildHit,
-                                    /*IsRoot=*/false);
-    CycleHit |= ChildHit;
-    return R;
-  }
-
   return {};
 }
 
-// =============================================================================
-/// Frame-level memoizing driver around getBaseJavaTypeCase: one frame per
-/// value; cache on completion when the frame's own sub-computation never hit
-/// a PHI cycle, or unconditionally for the query's root (see BaseMemo).
-static JavaType getBaseJavaTypeRaw(Value *V,
-                                   SmallPtrSetImpl<const PHINode *> &Visited,
-                                   BaseMemo &Memo, bool &CycleHit,
-                                   bool IsRoot) {
-  if (auto It = Memo.find(V); It != Memo.end())
-    return It->second;
-  JavaType R = getBaseJavaTypeCase(V, Visited, Memo, CycleHit);
-  if (IsRoot || !CycleHit)
-    Memo[V] = R;
-  return R;
-}
+namespace {
 
-/// Base-type query root. Pass a Memo to share the completion cache across a
-/// whole query (the engine's value dimension does); without one, a fresh
-/// per-call cache is used (the base-only query path).
-static JavaType getBaseJavaType(Value *V,
-                                SmallPtrSetImpl<const PHINode *> &Visited,
-                                BaseMemo *Memo = nullptr) {
+struct BaseTypeNode {
+  Value *V;
+  SmallVector<Value *, 2> Inputs;
+  size_t NextInput = 0;
+  unsigned Index;
+  bool HasNonPhi;
+  bool OnStack = true;
+  BaseTypeNode *PendingChild = nullptr;
+  JavaType Result;
+  bool First = true;
+};
+
+} // namespace
+
+/// PHIs and selects union their inputs; casts and freeze forward one input.
+/// Evaluate inputs on demand with an iterative path-based SCC traversal.
+/// Completed inputs are cached before siblings; cyclic types are published only
+/// when the whole SCC is complete. Neither traversal uses the C++ call stack.
+static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr) {
   BaseMemo LocalMemo;
   BaseMemo &Cache = Memo ? *Memo : LocalMemo;
-  bool CycleHit = false;
-  return getBaseJavaTypeRaw(V, Visited, Cache, CycleHit, /*IsRoot=*/true);
+  if (auto It = Cache.find(V); It != Cache.end())
+    return It->second;
+  if (!isa<PHINode, SelectInst, BitCastInst, AddrSpaceCastInst, FreezeInst>(
+          V)) {
+    JavaType Result = getBaseJavaTypeLeaf(V);
+    Cache[V] = Result;
+    return Result;
+  }
+
+  DenseMap<Value *, std::unique_ptr<BaseTypeNode>> Nodes;
+  SmallVector<BaseTypeNode *, 16> Frames;
+  SmallVector<BaseTypeNode *, 16> OpenNodes;
+  SmallVector<BaseTypeNode *, 16> Roots;
+  unsigned NextIndex = 0;
+  auto Discover = [&](Value *Input) {
+    auto N = std::make_unique<BaseTypeNode>();
+    N->V = Input;
+    N->Index = NextIndex++;
+    N->HasNonPhi = !isa<PHINode>(Input);
+    if (auto *PN = dyn_cast<PHINode>(Input)) {
+      for (Value *Arm : PN->incoming_values())
+        N->Inputs.push_back(Arm);
+    } else if (auto *SI = dyn_cast<SelectInst>(Input)) {
+      N->Inputs.push_back(SI->getTrueValue());
+      N->Inputs.push_back(SI->getFalseValue());
+    } else if (isa<BitCastInst, AddrSpaceCastInst, FreezeInst>(Input)) {
+      N->Inputs.push_back(cast<Instruction>(Input)->getOperand(0));
+    } else {
+      Cache[Input] = getBaseJavaTypeLeaf(Input);
+    }
+    BaseTypeNode *Raw = N.get();
+    Nodes[Input] = std::move(N);
+    Frames.push_back(Raw);
+    OpenNodes.push_back(Raw);
+    Roots.push_back(Raw);
+    return Raw;
+  };
+  auto CompleteUnknown = [&](Value *Witness) {
+    // Only dependency ancestors of the witness are proved unknown. Cache
+    // them for later roots, without caching unfinished sibling subgraphs.
+    DenseMap<Value *, SmallVector<Value *, 2>> Users;
+    for (const auto &Entry : Nodes)
+      for (Value *Input : Entry.second->Inputs)
+        Users[Input].push_back(Entry.first);
+    SmallVector<Value *, 16> Pending{Witness};
+    SmallPtrSet<Value *, 16> Visited;
+    while (!Pending.empty()) {
+      Value *Unknown = Pending.pop_back_val();
+      if (!Visited.insert(Unknown).second)
+        continue;
+      Cache[Unknown] = {};
+      if (auto It = Users.find(Unknown); It != Users.end())
+        Pending.append(It->second.begin(), It->second.end());
+    }
+  };
+  auto JoinInput = [&](BaseTypeNode *N, Value *Input) {
+    joinArm(N->Result, N->First, Cache.lookup(Input));
+    if (!N->Result.isUnknown())
+      return false;
+    CompleteUnknown(N->V);
+    return true;
+  };
+  Discover(V);
+  while (!Frames.empty()) {
+    BaseTypeNode *N = Frames.back();
+    if (auto It = Cache.find(N->V); It != Cache.end()) {
+      if (It->second.isUnknown()) {
+        CompleteUnknown(N->V);
+        return {};
+      }
+      // Leaves cannot belong to a cycle.
+      assert(OpenNodes.back() == N && "leaf must be the last open node");
+      assert(Roots.back() == N && "leaf must be its own component root");
+      OpenNodes.pop_back();
+      Roots.pop_back();
+      N->OnStack = false;
+      Frames.pop_back();
+      continue;
+    }
+    if (BaseTypeNode *Child = N->PendingChild) {
+      N->PendingChild = nullptr;
+      if (!Child->OnStack && JoinInput(N, Child->V))
+        return {};
+    }
+    if (N->NextInput != N->Inputs.size()) {
+      Value *Input = N->Inputs[N->NextInput++];
+      if (Cache.contains(Input)) {
+        if (JoinInput(N, Input))
+          return {};
+      } else if (auto It = Nodes.find(Input); It != Nodes.end()) {
+        BaseTypeNode *InputNode = It->second.get();
+        assert(InputNode->OnStack && "completed input must be cached");
+        // Merge the component roots joined by this edge, including a cross
+        // edge to a completed DFS frame that is still in an open component.
+        while (Roots.back()->Index > InputNode->Index) {
+          BaseTypeNode *Joined = Roots.pop_back_val();
+          Roots.back()->HasNonPhi |= Joined->HasNonPhi;
+        }
+        if (Roots.back()->HasNonPhi) {
+          CompleteUnknown(N->V);
+          return {};
+        }
+      } else {
+        N->PendingChild = Discover(Input);
+      }
+      continue;
+    }
+    Frames.pop_back();
+    if (Roots.back() != N)
+      continue;
+    Roots.pop_back();
+
+    SmallVector<BaseTypeNode *, 4> Members;
+    BaseTypeNode *Member;
+    do {
+      Member = OpenNodes.pop_back_val();
+      Member->OnStack = false;
+      Members.push_back(Member);
+    } while (Member != N);
+    bool HasCycle = Members.size() != 1 || llvm::is_contained(N->Inputs, N->V);
+    if (!HasCycle) {
+      // All inputs have completed, including unions that became unknown.
+      Cache[N->V] = N->Result;
+      if (N->Result.isUnknown()) {
+        CompleteUnknown(N->V);
+        return {};
+      }
+      continue;
+    }
+    JavaType Result;
+    bool First = true;
+    // Preserve the old unknown result when a recursive path could end with
+    // no non-cyclic incoming, or cross select/cast/freeze on its way back.
+    // Do not strengthen those results: a later freeze can expose poison.
+    bool HasUnsupportedCycle = llvm::any_of(Members, [&](BaseTypeNode *M) {
+      return !isa<PHINode>(M->V) || !llvm::any_of(M->Inputs, [&](Value *Input) {
+        return Cache.contains(Input);
+      });
+    });
+    for (BaseTypeNode *M : Members) {
+      if (HasUnsupportedCycle)
+        break;
+      for (Value *Input : M->Inputs) {
+        // Internal edges add no type; only completed external inputs join.
+        if (auto It = Cache.find(Input); It != Cache.end())
+          joinArm(Result, First, It->second);
+      }
+    }
+    for (BaseTypeNode *M : Members)
+      Cache[M->V] = Result;
+    if (Result.isUnknown()) {
+      CompleteUnknown(N->V);
+      return {};
+    }
+  }
+  return Cache.lookup(V);
 }
 
 // Condition tracing: trace from a branch condition to a check_instanceof call
@@ -1496,14 +1560,7 @@ static JavaType phiValueType(PHINode *PN, JavaTypeQueryContext &Q) {
 static JavaType valueDimension(Value *V, JavaTypeQueryContext &Q) {
   if (auto *PN = dyn_cast<PHINode>(V))
     return phiValueType(PN, Q);
-  // Fresh recursion stack, deliberately not Q.PhiVisited: the IsRoot memo
-  // exemption (see BaseMemo) is only sound when every truncation the root
-  // computation sees is a back edge of its own recursion. Sharing the value
-  // dimension's stack would let an outer phiValueType frame be mistaken for
-  // a cycle, silently dropping a live incoming and caching the too-narrow
-  // result.
-  SmallPtrSet<const PHINode *, 8> BaseStack;
-  return getBaseJavaType(V, BaseStack, &Q.BaseTypes);
+  return getBaseJavaType(V, &Q.BaseTypes);
 }
 
 JavaType jeandle::sharpen(Value *V, Instruction *Context, DominatorTree &DT,
@@ -1532,8 +1589,7 @@ JavaType jeandle::getJavaType(Value *V, DominatorTree *DT, Instruction *Context,
   V = stripCastsAndFreeze(V);
 
   if (!DT || !Context) {
-    SmallPtrSet<const PHINode *, 8> Visited;
-    return getBaseJavaType(V, Visited);
+    return getBaseJavaType(V);
   }
 
   JavaTypeQueryContext Q{*DT, IsNullEdge};
