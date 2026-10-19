@@ -1,4 +1,8 @@
 ; RUN: opt -S --jeandle -jeandle-vm-callback-log=%S/Inputs/osr-char-arraycopy-e2e.cblog %s 2>&1 | FileCheck %s
+; RUN: opt -S -verify-each --jeandle -mattr=+avx512bw,+avx512vl -jeandle-vm-callback-log=%S/Inputs/osr-char-arraycopy-e2e.cblog %s 2>&1 | FileCheck %s --check-prefix=MASKED
+; REQUIRES: x86-registered-target
+; MASKED: call <16 x i16> @llvm.masked.load
+; MASKED: call void @llvm.masked.store
 ;
 ; End-to-end replay of a real pre-optimization dump of an OSR compilation of
 ; TestArrayCopyOSR.copyLoop (char[] locals arrive as naked OSR-buffer loads;

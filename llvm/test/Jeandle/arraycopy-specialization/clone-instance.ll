@@ -2,6 +2,7 @@
 ; RUN: %if aarch64-registered-target %{ opt -S -passes="function(arraycopy-specialization),java-operation-lower<phase=1>" -jeandle-vm-callback-log=%S/Inputs/clone-instance.cblog %s 2>&1 | llc -mtriple=aarch64-linux-gnu -O2 -o - | FileCheck %s --check-prefix=AARCH64 %}
 ; RUN: opt -S -passes="function(arraycopy-specialization),java-operation-lower<phase=1>" -jeandle-vm-callback-log=%S/Inputs/clone-instance-gc-barrier.cblog %s 2>&1 | FileCheck %s --check-prefix=BARRIER
 ; RUN: opt -S -passes="function(arraycopy-specialization,insert-gc-barriers),java-operation-lower<phase=1>" -jeandle-vm-callback-log=%S/Inputs/clone-instance.cblog %s 2>&1 | FileCheck %s --check-prefix=GC-BARRIER
+; RUN: opt -S -verify-each -passes="function(arraycopy-specialization),java-operation-lower<phase=1>" %s | FileCheck %s --check-prefix=NO-CALLBACK
 
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-p3:32:32:32-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32"
 target triple = "aarch64-unknown-linux-gnu"
@@ -76,6 +77,12 @@ entry:
 ; BARRIER-LABEL: define void @clone_exact(
 ; BARRIER: call void @StubRoutines_jlong_disjoint_arraycopy
 ; BARRIER: ret void
+
+; Without VM layout callbacks, even a known exact source must use the bulk
+; clone JavaOp rather than asserting or guessing a field layout.
+; NO-CALLBACK-LABEL: define void @clone_exact(
+; NO-CALLBACK: call void @StubRoutines_jlong_disjoint_arraycopy
+; NO-CALLBACK: ret void
 
 define void @clone_nonexact_decline(
     ptr addrspace(1) "java-klass"="43" %src,

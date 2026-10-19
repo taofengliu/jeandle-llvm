@@ -13,7 +13,7 @@ declare hotspotcc ptr addrspace(1) @"java_lang_invoke_MethodHandle_invokeBasic(L
 define hotspotcc ptr addrspace(1) @caller(ptr addrspace(1) %arg) #0 gc "hotspotgc" personality ptr @jeandle.personality {
 entry:
   %method_handle = load ptr addrspace(1), ptr @oop_handle_java.lang.invoke.MethodHandle_5, align 8
-  %ret = invoke hotspotcc ptr addrspace(1) @"java_lang_invoke_MethodHandle_invokeBasic(Ljava/lang/Object;)Ljava/lang/Object;"(ptr addrspace(1) %method_handle, ptr addrspace(1) %arg) #2 [ "deopt"(i64 0, i32 17, i32 17) ]
+  %ret = invoke hotspotcc ptr addrspace(1) @"java_lang_invoke_MethodHandle_invokeBasic(Ljava/lang/Object;)Ljava/lang/Object;"(ptr addrspace(1) %method_handle, ptr addrspace(1) %arg) #2 [ "deopt"(i64 0, i32 17, i32 17, i64 12, ptr addrspace(1) %arg, i64 65548, ptr addrspace(1) %method_handle) ]
           to label %normal unwind label %unwind
 
 normal:
@@ -27,10 +27,10 @@ unwind:
 
 ; CHECK-LABEL: define hotspotcc ptr addrspace(1) @caller(
 ; CHECK: invoke hotspotcc ptr addrspace(1) @"Target_invoke(Ljava/lang/invoke/MethodHandle;Ljava/lang/Object;)Ljava/lang/Object;"(ptr addrspace(1) %method_handle, ptr addrspace(1) %arg) #[[CALLATTR:[0-9]+]]
-; CHECK-SAME: [ "deopt"(
+; CHECK-SAME: [ "deopt"(i64 0, i32 17, i32 17, i64 12, ptr addrspace(1) %arg, i64 65548, ptr addrspace(1) %method_handle) ]
 ; CHECK: declare hotspotcc ptr addrspace(1) @"Target_invoke(Ljava/lang/invoke/MethodHandle;Ljava/lang/Object;)Ljava/lang/Object;"(ptr addrspace(1), ptr addrspace(1)) #[[TARGETATTR:[0-9]+]] gc "hotspotgc"
 ; CHECK: attributes #[[TARGETATTR]] = { "java-method"="500" }
-; CHECK: attributes #[[CALLATTR]] = { {{.*}}"monomorphic-target"{{.*}}"statepoint-num-patch-bytes"="5"{{.*}} }
+; CHECK: attributes #[[CALLATTR]] = { "bytecode"="invokestatic" {{.*}}"monomorphic-target"{{.*}}"statepoint-num-patch-bytes"="5"{{.*}} }
 
 attributes #0 = { "java-method"="100" }
 attributes #1 = { "java-method"="200" }

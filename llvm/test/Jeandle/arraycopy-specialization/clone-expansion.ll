@@ -91,7 +91,7 @@ exception:
 ; CHECK: arraycopy.slow_call:
 ; CHECK: invoke hotspotcc void @SharedRuntime_slow_arraycopy_C
 ; CHECK: arraycopy.result:
-; CHECK-NEXT: fence seq_cst
+; CHECK-NEXT: fence release
 ; CHECK: arraycopy.nonpositive:
 ; CHECK: [[NEGATIVE:%.*]] = icmp slt i64 %length, 0
 ; CHECK: br i1 [[NEGATIVE]], label %arraycopy.slow_region, label %arraycopy.length.fast
@@ -135,7 +135,7 @@ exception:
 ; CHECK-NOT: @jeandle.arraycopy
 ; CHECK: br i1 true, label %arraycopy.nonpositive, label %arraycopy.nonpositive.fast
 ; CHECK: arraycopy.result:
-; CHECK-NEXT: fence seq_cst
+; CHECK-NEXT: fence release
 ; CHECK: arraycopy.nonpositive:
 ; CHECK-NEXT: br label %arraycopy.result
 
