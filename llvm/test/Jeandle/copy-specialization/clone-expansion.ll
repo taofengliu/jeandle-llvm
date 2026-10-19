@@ -1,5 +1,5 @@
-; RUN: opt -S -passes="function(arraycopy-specialization),java-operation-lower<phase=1>" -jeandle-vm-callback-log=%S/Inputs/clone-instance.cblog %s 2>&1 | FileCheck %s
-; RUN: %if aarch64-registered-target %{ opt -S -passes="function(arraycopy-specialization),java-operation-lower<phase=1>" -jeandle-vm-callback-log=%S/Inputs/clone-instance.cblog %s 2>&1 | llc -mtriple=aarch64-linux-gnu -O2 -o - | FileCheck %s --check-prefix=AARCH64 %}
+; RUN: opt -S -passes="function(copy-specialization),java-operation-lower<phase=1>" -jeandle-vm-callback-log=%S/Inputs/clone-instance.cblog %s 2>&1 | FileCheck %s
+; RUN: %if aarch64-registered-target %{ opt -S -passes="function(copy-specialization),java-operation-lower<phase=1>" -jeandle-vm-callback-log=%S/Inputs/clone-instance.cblog %s 2>&1 | llc -mtriple=aarch64-linux-gnu -O2 -o - | FileCheck %s --check-prefix=AARCH64 %}
 
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-p3:32:32:32-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32"
 target triple = "aarch64-unknown-linux-gnu"
@@ -11,7 +11,7 @@ target triple = "aarch64-unknown-linux-gnu"
 @WordSize = constant i32 8
 @ArrayOperationPartialInlineSize = constant i32 0
 
-declare hotspotcc void @jeandle.arraycopy(
+declare hotspotcc void @jeandle.copy(
     ptr addrspace(1), i64, ptr addrspace(1), i64, i64,
     ptr, ptr, i64, i64)
 declare void @StubRoutines_jlong_disjoint_arraycopy(
@@ -22,10 +22,10 @@ declare hotspotcc void @SharedRuntime_slow_arraycopy_C(
     ptr addrspace(1), i32, ptr addrspace(1), i32, i32, ptr)
 
 ; Serial and G1 with ReduceInitialCardMarks use the generic raw clone path.
-define hotspotcc void @jeandle.clone_at_expansion(
+define hotspotcc void @jeandle.clone_payload(
     ptr addrspace(1) %src, i64 %src_offset,
     ptr addrspace(1) %dest, i64 %dest_offset, i64 %length,
-    i1 %is_clone_inst) #3 {
+    i1 %is_clone_instance) #3 {
 entry:
   %payload_src = getelementptr i8, ptr addrspace(1) %src, i64 %src_offset
   %payload_dest = getelementptr i8, ptr addrspace(1) %dest, i64 %dest_offset
@@ -35,11 +35,11 @@ entry:
   ret void
 }
 
-define hotspotcc void @clone_basic_expansion(
+define hotspotcc void @clone_payload_expansion(
     ptr addrspace(1) %src, ptr addrspace(1) %dest) #0
     gc "hotspotgc" personality ptr @jeandle.personality {
 entry:
-  invoke hotspotcc void @jeandle.arraycopy(
+  invoke hotspotcc void @jeandle.copy(
       ptr addrspace(1) %src, i64 8,
       ptr addrspace(1) %dest, i64 8, i64 5,
       ptr null, ptr null, i64 48, i64 48) #1
@@ -54,14 +54,14 @@ exception:
   ret void
 }
 
-; CHECK-LABEL: define hotspotcc void @clone_basic_expansion(
+; CHECK-LABEL: define hotspotcc void @clone_payload_expansion(
 ; CHECK: [[SRC:%.*]] = getelementptr i8, ptr addrspace(1) %src, i64 8
 ; CHECK: [[DEST:%.*]] = getelementptr i8, ptr addrspace(1) %dest, i64 8
 ; CHECK: call void @StubRoutines_jlong_disjoint_arraycopy(ptr addrspace(1) [[SRC]], ptr addrspace(1) [[DEST]], i64 5)
-; CHECK-NOT: @jeandle.arraycopy
+; CHECK-NOT: @jeandle.copy
 ; CHECK: br label %normal
 
-; AARCH64-LABEL: clone_basic_expansion:
+; AARCH64-LABEL: clone_payload_expansion:
 ; AARCH64: add x0, x1, #8
 ; AARCH64: add x1, x2, #8
 ; AARCH64: bl StubRoutines_jlong_disjoint_arraycopy
@@ -70,7 +70,7 @@ define hotspotcc void @clone_oop_array_expansion(
     ptr addrspace(1) %src, ptr addrspace(1) %dest, i64 %length,
     ptr %klass) #0 gc "hotspotgc" personality ptr @jeandle.personality {
 entry:
-  invoke hotspotcc void @jeandle.arraycopy(
+  invoke hotspotcc void @jeandle.copy(
       ptr addrspace(1) %src, i64 0,
       ptr addrspace(1) %dest, i64 0, i64 %length,
       ptr %klass, ptr %klass, i64 %length, i64 %length) #2
@@ -101,7 +101,7 @@ exception:
 ; CHECK: [[DEST_BASE:%.*]] = getelementptr i8, ptr addrspace(1) %dest, i64 16
 ; CHECK: [[DEST_ADDRESS:%.*]] = getelementptr i8, ptr addrspace(1) [[DEST_BASE]], i64 0
 ; CHECK: call void @StubRoutines_arrayof_oop_disjoint_arraycopy(ptr addrspace(1) [[SRC_ADDRESS]], ptr addrspace(1) [[DEST_ADDRESS]], i64 %length)
-; CHECK-NOT: @jeandle.arraycopy
+; CHECK-NOT: @jeandle.copy
 
 ; AARCH64-LABEL: clone_oop_array_expansion:
 ; AARCH64: cmp {{[wx]}}{{[0-9]+}}, #1
@@ -116,7 +116,7 @@ define hotspotcc void @clone_oop_array_zero(
     ptr addrspace(1) %src, ptr addrspace(1) %dest, ptr %klass) #0
     gc "hotspotgc" personality ptr @jeandle.personality {
 entry:
-  invoke hotspotcc void @jeandle.arraycopy(
+  invoke hotspotcc void @jeandle.copy(
       ptr addrspace(1) %src, i64 0,
       ptr addrspace(1) %dest, i64 0, i64 0,
       ptr %klass, ptr %klass, i64 0, i64 0) #2
@@ -132,7 +132,7 @@ exception:
 }
 
 ; CHECK-LABEL: define hotspotcc void @clone_oop_array_zero(
-; CHECK-NOT: @jeandle.arraycopy
+; CHECK-NOT: @jeandle.copy
 ; CHECK: br i1 true, label %arraycopy.nonpositive, label %arraycopy.nonpositive.fast
 ; CHECK: arraycopy.result:
 ; CHECK-NEXT: fence release
@@ -144,8 +144,8 @@ exception:
 ; AARCH64: ret
 
 attributes #0 = { "java-method"="0" }
-attributes #1 = { "jeandle.arraycopy.kind"="clone-array" }
-attributes #2 = { "jeandle.arraycopy.kind"="clone-oop-array" }
+attributes #1 = { "jeandle.copy.kind"="clone-array" }
+attributes #2 = { "jeandle.copy.kind"="clone-reference-array" }
 attributes #3 = { noinline nounwind "gc-leaf-function" "lower-phase"="1" }
 
 !current-thread = !{!0}

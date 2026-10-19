@@ -1,8 +1,8 @@
-; RUN: opt -S -passes="function(arraycopy-specialization),java-operation-lower<phase=1>" -jeandle-vm-callback-log=%S/Inputs/clone-instance.cblog %s 2>&1 | FileCheck %s --check-prefix=IR
-; RUN: %if aarch64-registered-target %{ opt -S -passes="function(arraycopy-specialization),java-operation-lower<phase=1>" -jeandle-vm-callback-log=%S/Inputs/clone-instance.cblog %s 2>&1 | llc -mtriple=aarch64-linux-gnu -O2 -o - | FileCheck %s --check-prefix=AARCH64 %}
-; RUN: opt -S -passes="function(arraycopy-specialization),java-operation-lower<phase=1>" -jeandle-vm-callback-log=%S/Inputs/clone-instance-gc-barrier.cblog %s 2>&1 | FileCheck %s --check-prefix=BARRIER
-; RUN: opt -S -passes="function(arraycopy-specialization,insert-gc-barriers),java-operation-lower<phase=1>" -jeandle-vm-callback-log=%S/Inputs/clone-instance.cblog %s 2>&1 | FileCheck %s --check-prefix=GC-BARRIER
-; RUN: opt -S -verify-each -passes="function(arraycopy-specialization),java-operation-lower<phase=1>" %s | FileCheck %s --check-prefix=NO-CALLBACK
+; RUN: opt -S -passes="function(copy-specialization),java-operation-lower<phase=1>" -jeandle-vm-callback-log=%S/Inputs/clone-instance.cblog %s 2>&1 | FileCheck %s --check-prefix=IR
+; RUN: %if aarch64-registered-target %{ opt -S -passes="function(copy-specialization),java-operation-lower<phase=1>" -jeandle-vm-callback-log=%S/Inputs/clone-instance.cblog %s 2>&1 | llc -mtriple=aarch64-linux-gnu -O2 -o - | FileCheck %s --check-prefix=AARCH64 %}
+; RUN: opt -S -passes="function(copy-specialization),java-operation-lower<phase=1>" -jeandle-vm-callback-log=%S/Inputs/clone-instance-gc-barrier.cblog %s 2>&1 | FileCheck %s --check-prefix=BARRIER
+; RUN: opt -S -passes="function(copy-specialization,insert-gc-barriers),java-operation-lower<phase=1>" -jeandle-vm-callback-log=%S/Inputs/clone-instance.cblog %s 2>&1 | FileCheck %s --check-prefix=GC-BARRIER
+; RUN: opt -S -verify-each -passes="function(copy-specialization),java-operation-lower<phase=1>" %s | FileCheck %s --check-prefix=NO-CALLBACK
 
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-p3:32:32:32-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32"
 target triple = "aarch64-unknown-linux-gnu"
@@ -12,7 +12,7 @@ target triple = "aarch64-unknown-linux-gnu"
 @UseG1GC = constant i1 false
 @ReduceInitialCardMarks = constant i1 false
 
-declare void @jeandle.arraycopy(ptr addrspace(1), i64,
+declare void @jeandle.copy(ptr addrspace(1), i64,
                                 ptr addrspace(1), i64, i64,
                                 ptr, ptr, i64, i64)
 
@@ -22,10 +22,10 @@ declare hotspotcc void @jeandle.pre_barrier(ptr addrspace(1))
 declare hotspotcc void @jeandle.post_barrier(
     ptr addrspace(1), ptr addrspace(1))
 
-define hotspotcc void @jeandle.clone_at_expansion(
+define hotspotcc void @jeandle.clone_payload(
     ptr addrspace(1) %src, i64 %src_offset,
     ptr addrspace(1) %dest, i64 %dest_offset, i64 %length,
-    i1 %is_clone_inst) #2 {
+    i1 %is_clone_instance) #2 {
 entry:
   %payload_src = getelementptr i8, ptr addrspace(1) %src, i64 %src_offset
   %payload_dest = getelementptr i8, ptr addrspace(1) %dest, i64 %dest_offset
@@ -39,7 +39,7 @@ define void @clone_exact(
     ptr addrspace(1) "java-klass"="42" "java-klass-exact" %src,
     ptr addrspace(1) %dest) #0 gc "hotspotgc" {
 entry:
-  call void @jeandle.arraycopy(
+  call void @jeandle.copy(
       ptr addrspace(1) %src, i64 8, ptr addrspace(1) %dest, i64 8, i64 4,
       ptr null, ptr null, i64 32, i64 32) #1
   ret void
@@ -58,7 +58,7 @@ entry:
 ; IR: [[DEST2:%.*]] = getelementptr inbounds i8, ptr addrspace(1) %dest, i64 24
 ; IR: [[LOAD2:%.*]] = load atomic volatile ptr addrspace(3), ptr addrspace(1) [[SRC2]] unordered
 ; IR: store atomic ptr addrspace(3) [[LOAD2]], ptr addrspace(1) [[DEST2]] unordered
-; IR-NOT: call void @jeandle.arraycopy
+; IR-NOT: call void @jeandle.copy
 ; IR: ret void
 
 ; AARCH64-LABEL: clone_exact:
@@ -88,7 +88,7 @@ define void @clone_nonexact_decline(
     ptr addrspace(1) "java-klass"="43" %src,
     ptr addrspace(1) %dest) #0 gc "hotspotgc" {
 entry:
-  call void @jeandle.arraycopy(
+  call void @jeandle.copy(
       ptr addrspace(1) %src, i64 8, ptr addrspace(1) %dest, i64 8, i64 4,
       ptr null, ptr null, i64 32, i64 32) #1
   ret void
@@ -102,7 +102,7 @@ define void @clone_concurrent_subclass_decline(
     ptr addrspace(1) "java-klass"="44" %src,
     ptr addrspace(1) %dest) #0 gc "hotspotgc" {
 entry:
-  call void @jeandle.arraycopy(
+  call void @jeandle.copy(
       ptr addrspace(1) %src, i64 8, ptr addrspace(1) %dest, i64 8, i64 4,
       ptr null, ptr null, i64 32, i64 32) #1
   ret void
@@ -113,7 +113,7 @@ entry:
 ; IR: ret void
 
 attributes #0 = { "java-method"="0" }
-attributes #1 = { "jeandle.arraycopy.kind"="clone-inst" }
+attributes #1 = { "jeandle.copy.kind"="clone-instance" }
 attributes #2 = { noinline nounwind "gc-leaf-function" "lower-phase"="1" }
 
 !java-method-compilation = !{}
