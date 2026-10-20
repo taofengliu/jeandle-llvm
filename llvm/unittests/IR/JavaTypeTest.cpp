@@ -8,11 +8,17 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/IR/Jeandle/JavaType.h"
+#include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/LazyValueInfo.h"
+#include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Jeandle/VMCallback.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/PassInstrumentation.h"
+#include "llvm/IR/PassManager.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Transforms/Jeandle/TypeCheckElimination.h"
 #include "gtest/gtest.h"
 
 using namespace llvm;
@@ -26,6 +32,7 @@ protected:
   Module M{"java-type-test", Context};
   IRBuilder<> B{Context};
   VMCallbacks Saved{};
+  bool HadCallbacks = false;
   Function *F = nullptr;
   BasicBlock *Entry = nullptr;
   BasicBlock *Loop = nullptr;
@@ -35,8 +42,10 @@ protected:
   void SetUp() override {
     CommonSuperQueries = 0;
     InterfaceQueries = 0;
-    if (const VMCallbacks *CB = getVMCallbacks())
+    if (const VMCallbacks *CB = getVMCallbacks()) {
       Saved = *CB;
+      HadCallbacks = true;
+    }
     VMCallbacks CB{};
     CB.IsInterface = [](uintptr_t) { return false; };
     CB.IsEffectivelyFinal = [](uintptr_t) { return false; };
@@ -61,7 +70,13 @@ protected:
     B.SetInsertPoint(Loop);
   }
 
-  void TearDown() override { registerVMCallbacks(Saved); }
+  // Registering a zeroed table would leave an empty-but-registered callback
+  // state behind when no callbacks existed before the test; restore only
+  // what was actually there.
+  void TearDown() override {
+    if (HadCallbacks)
+      registerVMCallbacks(Saved);
+  }
 
   Argument *seed(unsigned Index, unsigned Klass, bool Exact = false) {
     F->addParamAttr(
@@ -129,6 +144,25 @@ protected:
     JavaType T = queryAt(Root, Return, DT);
     EXPECT_EQ(T.Klass, 9U);
     EXPECT_FALSE(T.Exact);
+    if (!UnknownFirst) {
+      // The typed chain must be expanded once and then served from the
+      // query's completion cache; without reuse every arm re-walked all
+      // Depth levels. The unknown variant cannot be bounded this way: its
+      // absorbing unknown arm fires no CommonSuperKlass callback at all.
+      EXPECT_LE(CommonSuperQueries, Depth + 4 * Arms);
+    }
+  }
+
+  // The fixture's default class lattice: 9 and 22 are unrelated subclasses
+  // of 5 and both implement interface 7.
+  void registerCommonInterfaceCallbacks() {
+    VMCallbacks CB = *getVMCallbacks();
+    CB.IsInterface = [](uintptr_t K) { return K == 7; };
+    CB.GetSecondarySupers = [](uintptr_t K) {
+      return (K == 9 || K == 22) ? std::vector<uintptr_t>{7}
+                                 : std::vector<uintptr_t>{};
+    };
+    registerVMCallbacks(CB);
   }
 };
 
@@ -351,7 +385,7 @@ TEST_F(JavaBaseTypeTest, NestedPhisCompleteSharedInputsBeforeShortCircuit) {
   EXPECT_LE(CommonSuperQueries, Depth + 4 * Arms);
 }
 
-TEST_F(JavaBaseTypeTest, SelectCycleShortCircuitsTypedSibling) {
+TEST_F(JavaBaseTypeTest, SelectCycleWithTypedSiblingJoinsSeeds) {
   B.SetInsertPoint(Entry->getTerminator());
   Value *Other = typedSelectChain(2048);
   B.SetInsertPoint(Loop);
@@ -364,11 +398,14 @@ TEST_F(JavaBaseTypeTest, SelectCycleShortCircuitsTypedSibling) {
   B.SetInsertPoint(Exit);
   B.CreateRet(P);
   ASSERT_FALSE(verifyFunction(*F));
-  EXPECT_TRUE(query(P).isUnknown());
-  EXPECT_EQ(CommonSuperQueries, 0U);
+  JavaType T = query(P);
+  EXPECT_EQ(T.Klass, 5U);
+  EXPECT_FALSE(T.Exact);
+  // The typed sibling chain is expanded once, not once per cycle entry.
+  EXPECT_LE(CommonSuperQueries, 2048 + 4);
 }
 
-TEST_F(JavaBaseTypeTest, SelectCycleThroughPhiShortCircuitsTypedSibling) {
+TEST_F(JavaBaseTypeTest, SelectCycleThroughPhiJoinsSeeds) {
   B.SetInsertPoint(Entry->getTerminator());
   Value *Other = typedSelectChain(2048);
   B.SetInsertPoint(Loop);
@@ -384,8 +421,10 @@ TEST_F(JavaBaseTypeTest, SelectCycleThroughPhiShortCircuitsTypedSibling) {
   B.SetInsertPoint(Exit);
   B.CreateRet(P);
   ASSERT_FALSE(verifyFunction(*F));
-  EXPECT_TRUE(query(P).isUnknown());
-  EXPECT_EQ(CommonSuperQueries, 0U);
+  JavaType T = query(P);
+  EXPECT_EQ(T.Klass, 5U);
+  EXPECT_FALSE(T.Exact);
+  EXPECT_LE(CommonSuperQueries, 2048 + 4);
 }
 
 TEST_F(JavaBaseTypeTest, NonPhiAncestorOutsideCyclePreservesType) {
@@ -406,7 +445,7 @@ TEST_F(JavaBaseTypeTest, NonPhiAncestorOutsideCyclePreservesType) {
   EXPECT_FALSE(T.Exact);
 }
 
-TEST_F(JavaBaseTypeTest, CrossBranchSelectCycleShortCircuitsTypedSibling) {
+TEST_F(JavaBaseTypeTest, CrossBranchSelectCycleJoinsSeeds) {
   B.SetInsertPoint(Entry->getTerminator());
   Value *Other = typedSelectChain(2048);
   B.SetInsertPoint(Loop);
@@ -430,8 +469,10 @@ TEST_F(JavaBaseTypeTest, CrossBranchSelectCycleShortCircuitsTypedSibling) {
   B.SetInsertPoint(Exit);
   B.CreateRet(A);
   ASSERT_FALSE(verifyFunction(*F));
-  EXPECT_TRUE(query(A).isUnknown());
-  EXPECT_EQ(CommonSuperQueries, 0U);
+  JavaType T = query(A);
+  EXPECT_EQ(T.Klass, 5U);
+  EXPECT_FALSE(T.Exact);
+  EXPECT_LE(CommonSuperQueries, 2048 + 4);
 }
 
 TEST_F(JavaBaseTypeTest, CrossBranchPurePhiCyclePreservesType) {
@@ -647,6 +688,304 @@ TEST_F(JavaBaseTypeTest, FreezeOutsideUnseededCycleMemberStaysUnknown) {
   C->addIncoming(C, Loop);
   auto *Mixed = B.CreateSelect(F->getArg(2), B.CreateFreeze(A), Seed);
   EXPECT_TRUE(query(Mixed).isUnknown());
+}
+
+TEST_F(JavaBaseTypeTest, SelectCycleJoinsExternalSeeds) {
+  registerCommonInterfaceCallbacks();
+  for (auto &Arg : F->args())
+    Arg.addAttr(Attribute::NoUndef);
+  auto *A = B.CreatePHI(F->getReturnType(), 2, "a");
+  auto *C = B.CreatePHI(F->getReturnType(), 2, "c");
+  auto *S = B.CreateSelect(F->getArg(2), C, seed(1, 22, true));
+  A->addIncoming(seed(0, 9, true), Entry);
+  A->addIncoming(S, Loop);
+  C->addIncoming(seed(3, 22, true), Entry);
+  C->addIncoming(A, Loop);
+  auto *Exit = BasicBlock::Create(Context, "exit", F);
+  auto *Again = B.CreateCall(M.getOrInsertFunction("iterate", B.getInt1Ty()));
+  Again->addRetAttr(Attribute::NoUndef);
+  B.CreateCondBr(Again, Loop, Exit);
+  B.SetInsertPoint(Exit);
+  auto *W = B.CreateSelect(F->getArg(2), A, F->getArg(0));
+  auto *Return = B.CreateRet(W);
+  ASSERT_FALSE(verifyFunction(*F));
+  DominatorTree DT(*F);
+  JavaType T = query(A);
+  EXPECT_EQ(T.Klass, 5U);
+  EXPECT_FALSE(T.Exact);
+  EXPECT_TRUE(T.Interfaces.contains(7));
+  JavaType TW = queryAt(W, Return, DT);
+  EXPECT_EQ(TW.Klass, 5U);
+  EXPECT_TRUE(TW.Interfaces.contains(7));
+  // With only exact 9 seeds the whole cycle keeps the exact type.
+  seed(1, 9, true);
+  seed(3, 9, true);
+  JavaType Same = query(A);
+  EXPECT_EQ(Same.Klass, 9U);
+  EXPECT_TRUE(Same.Exact);
+}
+
+TEST_F(JavaBaseTypeTest, PhiCycleWithoutDirectSeedJoinsCycleSeeds) {
+  registerCommonInterfaceCallbacks();
+  for (auto &Arg : F->args())
+    Arg.addAttr(Attribute::NoUndef);
+  auto *P = B.CreatePHI(F->getReturnType(), 2, "p");
+  auto *R = B.CreatePHI(F->getReturnType(), 2, "r");
+  auto *Left = BasicBlock::Create(Context, "left", F);
+  auto *Right = BasicBlock::Create(Context, "right", F);
+  auto *Latch = BasicBlock::Create(Context, "latch", F);
+  auto *Exit = BasicBlock::Create(Context, "exit", F);
+  auto *Pick = B.CreateICmpNE(
+      F->getArg(3),
+      ConstantPointerNull::get(cast<PointerType>(F->getReturnType())));
+  B.CreateCondBr(Pick, Left, Right);
+  B.SetInsertPoint(Left);
+  B.CreateBr(Latch);
+  B.SetInsertPoint(Right);
+  B.CreateBr(Latch);
+  B.SetInsertPoint(Latch);
+  // Q only merges cycle members; its type still follows the seeds entering
+  // the cycle through P and R.
+  auto *Q = B.CreatePHI(F->getReturnType(), 2, "q");
+  Q->addIncoming(P, Left);
+  Q->addIncoming(R, Right);
+  P->addIncoming(seed(0, 9, true), Entry);
+  P->addIncoming(Q, Latch);
+  R->addIncoming(seed(1, 22, true), Entry);
+  R->addIncoming(P, Latch);
+  auto *W = B.CreateSelect(F->getArg(2), Q, F->getArg(0));
+  auto *Mark = B.CreateCall(
+      M.getOrInsertFunction("observe", B.getVoidTy(), F->getReturnType()), {W});
+  auto *Again = B.CreateCall(M.getOrInsertFunction("iterate", B.getInt1Ty()));
+  Again->addRetAttr(Attribute::NoUndef);
+  B.CreateCondBr(Again, Loop, Exit);
+  B.SetInsertPoint(Exit);
+  B.CreateRet(P);
+  ASSERT_FALSE(verifyFunction(*F));
+  DominatorTree DT(*F);
+  JavaType T = query(Q);
+  EXPECT_EQ(T.Klass, 5U);
+  EXPECT_FALSE(T.Exact);
+  EXPECT_TRUE(T.Interfaces.contains(7));
+  JavaType TW = queryAt(W, Mark, DT);
+  EXPECT_EQ(TW.Klass, 5U);
+  EXPECT_TRUE(TW.Interfaces.contains(7));
+}
+
+TEST_F(JavaBaseTypeTest, TypeCheckEliminationFoldsCyclicPhiCheck) {
+  VMCallbacks CB = *getVMCallbacks();
+  CB.IsInterface = [](uintptr_t K) { return K == 7; };
+  CB.GetSecondarySupers = [](uintptr_t K) {
+    return (K == 9 || K == 22) ? std::vector<uintptr_t>{7}
+                               : std::vector<uintptr_t>{};
+  };
+  CB.IsObjectKlass = [](uintptr_t K) { return K == 5; };
+  CB.IsSubtype = [](uintptr_t A, uintptr_t B) {
+    return A == B || B == 5 || (B == 7 && (A == 9 || A == 22));
+  };
+  registerVMCallbacks(CB);
+  F->getArg(0)->addAttr(Attribute::NonNull);
+  F->getArg(1)->addAttr(Attribute::NonNull);
+  for (auto &Arg : F->args())
+    Arg.addAttr(Attribute::NoUndef);
+  auto *P = B.CreatePHI(F->getReturnType(), 2, "p");
+  auto *R = B.CreatePHI(F->getReturnType(), 2, "r");
+  auto *Left = BasicBlock::Create(Context, "left", F);
+  auto *Right = BasicBlock::Create(Context, "right", F);
+  auto *Latch = BasicBlock::Create(Context, "latch", F);
+  auto *Exit = BasicBlock::Create(Context, "exit", F);
+  auto *Pick = B.CreateICmpNE(
+      F->getArg(3),
+      ConstantPointerNull::get(cast<PointerType>(F->getReturnType())));
+  B.CreateCondBr(Pick, Left, Right);
+  B.SetInsertPoint(Left);
+  B.CreateBr(Latch);
+  B.SetInsertPoint(Right);
+  B.CreateBr(Latch);
+  B.SetInsertPoint(Latch);
+  auto *Q = B.CreatePHI(F->getReturnType(), 2, "q");
+  Q->addIncoming(P, Left);
+  Q->addIncoming(R, Right);
+  P->addIncoming(seed(0, 9, true), Entry);
+  P->addIncoming(Q, Latch);
+  R->addIncoming(seed(1, 22, true), Entry);
+  R->addIncoming(P, Latch);
+  auto *W = B.CreateSelect(F->getArg(2), Q, F->getArg(0));
+  auto *Mark = B.CreateCall(
+      M.getOrInsertFunction("observe", B.getVoidTy(), F->getReturnType()), {W});
+  auto *Again = B.CreateCall(M.getOrInsertFunction("iterate", B.getInt1Ty()));
+  Again->addRetAttr(Attribute::NoUndef);
+  B.CreateCondBr(Again, Loop, Exit);
+  B.SetInsertPoint(Exit);
+  B.CreateRet(P);
+  ASSERT_FALSE(verifyFunction(*F));
+  B.SetInsertPoint(Mark);
+  auto CheckFn =
+      M.getOrInsertFunction("jeandle.check_instanceof", B.getInt1Ty(),
+                            PointerType::get(Context, 0), F->getReturnType());
+  auto *Check = B.CreateCall(
+      CheckFn,
+      {ConstantExpr::getIntToPtr(B.getInt64(7), PointerType::get(Context, 0)),
+       W});
+  Check->addParamAttr(1, Attribute::NonNull);
+  auto *Use = B.CreateCall(
+      M.getOrInsertFunction("consume", B.getVoidTy(), B.getInt1Ty()), {Check});
+  M.getOrInsertNamedMetadata("java-method-compilation");
+  ASSERT_FALSE(verifyFunction(*F));
+  FunctionAnalysisManager FAM;
+  FAM.registerPass([] { return PassInstrumentationAnalysis(); });
+  FAM.registerPass([] { return TargetIRAnalysis(); });
+  FAM.registerPass([] { return AssumptionAnalysis(); });
+  FAM.registerPass([] { return DominatorTreeAnalysis(); });
+  FAM.registerPass([] { return LazyValueAnalysis(); });
+  TypeCheckElimination().run(*F, FAM);
+  auto *Folded = dyn_cast<ConstantInt>(Use->getArgOperand(0));
+  ASSERT_NE(Folded, nullptr);
+  EXPECT_TRUE(Folded->isOne());
+}
+
+TEST_F(JavaBaseTypeTest, PoisonedCycleSeedFreezeStaysUnknown) {
+  // Legal closed CFG: header and latch are separate blocks, and the pick
+  // choosing the frozen member is independent of the loop exit condition.
+  Value *Seed = seed(0, 9, true);
+  auto *OtherSeed = seed(1, 9, true);
+  auto *Poisoned =
+      SelectInst::Create(PoisonValue::get(B.getInt1Ty()), Seed, OtherSeed,
+                         "poisoned", Entry->getTerminator());
+  auto *A = B.CreatePHI(F->getReturnType(), 2, "a");
+  auto *Latch = BasicBlock::Create(Context, "latch", F);
+  auto *Exit = BasicBlock::Create(Context, "exit", F);
+  B.CreateCondBr(F->getArg(2), Latch, Exit);
+  B.SetInsertPoint(Latch);
+  auto *C = B.CreatePHI(F->getReturnType(), 2, "c");
+  C->addIncoming(A, Loop);
+  C->addIncoming(C, Latch);
+  B.CreateCondBr(F->getArg(2), Latch, Loop);
+  A->addIncoming(Poisoned, Entry);
+  A->addIncoming(C, Latch);
+  B.SetInsertPoint(Exit);
+  auto *Pick = B.CreateICmpNE(
+      F->getArg(3),
+      ConstantPointerNull::get(cast<PointerType>(F->getReturnType())));
+  auto *Mixed = B.CreateSelect(Pick, B.CreateFreeze(A), Seed);
+  B.CreateRet(Mixed);
+  ASSERT_FALSE(verifyFunction(*F));
+  // The cycle seed is a select with a poison condition: freezing the member
+  // can expose an arbitrary reference, so the query must stay unknown even
+  // though every seed carries exact 9.
+  EXPECT_TRUE(query(Mixed).isUnknown());
+}
+
+TEST_F(JavaBaseTypeTest, BoundedSharedCyclicDagCountsCommonSuperQueries) {
+  auto *A = B.CreatePHI(F->getReturnType(), 2, "a");
+  auto *C = B.CreatePHI(F->getReturnType(), 2, "c");
+  A->addIncoming(seed(0, 9, true), Entry);
+  A->addIncoming(A, Loop);
+  C->addIncoming(seed(1, 22, true), Entry);
+  C->addIncoming(C, Loop);
+  Value *Left = A;
+  Value *Right = C;
+  constexpr unsigned Depth = 18;
+  for (unsigned I = 0; I != Depth; ++I) {
+    auto *L = B.CreateSelect(F->getArg(2), Left, Right);
+    auto *R = B.CreateSelect(F->getArg(2), Right, Left);
+    Left = L;
+    Right = R;
+  }
+  auto *Exit = BasicBlock::Create(Context, "exit", F);
+  B.CreateCondBr(F->getArg(2), Loop, Exit);
+  B.SetInsertPoint(Exit);
+  B.CreateRet(Left);
+  ASSERT_FALSE(verifyFunction(*F));
+  JavaType T = query(Left);
+  EXPECT_EQ(T.Klass, 5U);
+  // The self-cycled seeds complete once and the DAG above them joins cached
+  // inputs; without the completion cache each level re-expanded both arms
+  // (2^Depth CommonSuperKlass calls on the old recursion).
+  EXPECT_LE(CommonSuperQueries, 4 * Depth);
+}
+
+TEST_F(JavaBaseTypeTest, ZeroCommonSuperKlassStaysUnknown) {
+  VMCallbacks CB = *getVMCallbacks();
+  CB.GetCommonSuperKlass = [](uintptr_t X, uintptr_t Y) {
+    ++CommonSuperQueries;
+    return X == Y ? X : uintptr_t(0);
+  };
+  registerVMCallbacks(CB);
+  auto *A = B.CreatePHI(F->getReturnType(), 2);
+  auto *C = B.CreatePHI(F->getReturnType(), 2);
+  A->addIncoming(seed(0, 9, true), Entry);
+  A->addIncoming(C, Loop);
+  C->addIncoming(seed(1, 22, true), Entry);
+  C->addIncoming(A, Loop);
+  auto *Exit = BasicBlock::Create(Context, "exit", F);
+  B.CreateCondBr(F->getArg(2), Loop, Exit);
+  B.SetInsertPoint(Exit);
+  auto *S = B.CreateSelect(F->getArg(2), A, C);
+  B.CreateRet(A);
+  ASSERT_FALSE(verifyFunction(*F));
+  EXPECT_TRUE(query(A).isUnknown());
+  EXPECT_TRUE(query(S).isUnknown());
+}
+
+TEST_F(JavaBaseTypeTest, CallReturnAndLoadMetadataLeaves) {
+  auto Callee = M.getOrInsertFunction("leaf", F->getReturnType());
+  auto *Call = B.CreateCall(Callee);
+  Call->addRetAttr(Attribute::get(Context, "java-klass", "9"));
+  Call->addRetAttr(Attribute::get(Context, "java-klass-exact"));
+  auto *Load = B.CreateLoad(F->getReturnType(), F->getArg(3));
+  Load->setMetadata("java-klass", MDNode::get(Context, ConstantAsMetadata::get(
+                                                           B.getInt64(22))));
+  Load->setMetadata("java-klass-exact", MDNode::get(Context, {}));
+  auto *S = B.CreateSelect(F->getArg(2), Call, Load);
+  B.CreateRet(S);
+  ASSERT_FALSE(verifyFunction(*F));
+  EXPECT_EQ(query(Call).Klass, 9U);
+  EXPECT_TRUE(query(Call).Exact);
+  EXPECT_EQ(query(Load).Klass, 22U);
+  EXPECT_TRUE(query(Load).Exact);
+  EXPECT_EQ(query(S).Klass, 5U);
+}
+
+TEST_F(JavaBaseTypeTest, InvokeReturnAttributeLeaf) {
+  auto Callee = M.getOrInsertFunction("invokee", F->getReturnType());
+  F->setPersonalityFn(cast<Function>(
+      M.getOrInsertFunction("__gxx_personality_v0", B.getInt32Ty())
+          .getCallee()));
+  auto *Unwind = BasicBlock::Create(Context, "unwind", F);
+  Entry->getTerminator()->eraseFromParent();
+  B.SetInsertPoint(Entry);
+  auto *Invoke = B.CreateInvoke(Callee, Loop, Unwind);
+  Invoke->addRetAttr(Attribute::get(Context, "java-klass", "9"));
+  Invoke->addRetAttr(Attribute::get(Context, "java-klass-exact"));
+  B.SetInsertPoint(Loop);
+  B.CreateRet(Invoke);
+  B.SetInsertPoint(Unwind);
+  auto *Pad = B.CreateLandingPad(PointerType::get(Context, 0), 0);
+  Pad->setCleanup(true);
+  B.CreateResume(Pad);
+  ASSERT_FALSE(verifyFunction(*F));
+  JavaType T = query(Invoke);
+  EXPECT_EQ(T.Klass, 9U);
+  EXPECT_TRUE(T.Exact);
+}
+
+TEST_F(JavaBaseTypeTest, OopHandleLoadQueriesExactKlass) {
+  VMCallbacks CB = *getVMCallbacks();
+  CB.GetOopKlass = [](int Id) { return Id == 3 ? uintptr_t(9) : uintptr_t(0); };
+  registerVMCallbacks(CB);
+  auto *Handle =
+      new GlobalVariable(M, F->getReturnType(), false,
+                         GlobalValue::ExternalLinkage, nullptr, "oop_handle_3");
+  auto *Load = B.CreateLoad(F->getReturnType(), Handle);
+  auto *Exit = BasicBlock::Create(Context, "exit", F);
+  B.CreateCondBr(F->getArg(2), Loop, Exit);
+  B.SetInsertPoint(Exit);
+  B.CreateRet(Load);
+  ASSERT_FALSE(verifyFunction(*F));
+  JavaType T = query(Load);
+  EXPECT_EQ(T.Klass, 9U);
+  EXPECT_TRUE(T.Exact);
 }
 
 } // namespace

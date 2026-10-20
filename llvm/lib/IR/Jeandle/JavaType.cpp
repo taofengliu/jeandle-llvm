@@ -44,6 +44,11 @@ STATISTIC(NumJavaTypeBudgetExhausted,
 /// Prevents infinite recursion on deeply nested or cyclic IR patterns.
 static constexpr unsigned MaxExtractKlassDepth = 16;
 
+/// Maximum recursion depth for isProvenDefined. Values nested deeper than
+/// this are conservatively treated as not proven defined; this bounds the
+/// C++ call stack the same way the iterative base-type traversal does.
+static constexpr unsigned MaxProvenDefinedDepth = 64;
+
 static uintptr_t extractKlassConstantImpl(Value *V, unsigned Depth) {
   if (Depth > MaxExtractKlassDepth)
     return 0;
@@ -395,6 +400,59 @@ JavaType jeandle::typeIntersect(JavaType A, JavaType B) {
 /// dependencies are cached only after the whole SCC has been evaluated.
 using BaseMemo = DenseMap<Value *, JavaType>;
 
+/// Whether every execution of V produces a fully defined value (never undef
+/// or poison). Only such values may lend their type through freeze: freeze
+/// of a possibly-poison reference is an arbitrary, observable reference that
+/// the operand's type cannot bound, while a possibly-poison value itself is
+/// unobservable without undefined behavior and is harmless to a type join.
+/// noundef arguments, non-poison/undef constants, noundef call results and
+/// PHI/select/cast/freeze combinations of those are proven defined; anything
+/// else is not. An in-progress value (a cycle) counts as not proven, an
+/// under-approximation of the greatest fixpoint that keeps the answer sound.
+static bool isProvenDefined(Value *V, SmallPtrSetImpl<Value *> &OnStack,
+                            DenseMap<Value *, bool> &Memo, unsigned Depth) {
+  if (auto It = Memo.find(V); It != Memo.end())
+    return It->second;
+  if (Depth > MaxProvenDefinedDepth)
+    return false;
+
+  bool Result = false;
+  auto Recurse = [&](Value *Op) {
+    return isProvenDefined(Op, OnStack, Memo, Depth + 1);
+  };
+  if (isa<PoisonValue, UndefValue>(V)) {
+    Result = false;
+  } else if (auto *Arg = dyn_cast<Argument>(V)) {
+    Result = Arg->hasAttribute(llvm::Attribute::NoUndef);
+  } else if (auto *CB = dyn_cast<CallBase>(V)) {
+    Result = CB->hasRetAttr(llvm::Attribute::NoUndef);
+  } else if (auto *CE = dyn_cast<ConstantExpr>(V)) {
+    // Constants are fully defined unless poison/undef hides inside an
+    // expression.
+    Result = llvm::all_of(CE->operands(), Recurse);
+  } else if (isa<Constant>(V)) {
+    Result = true;
+  } else if (isa<PHINode, SelectInst, FreezeInst, BitCastInst,
+                 AddrSpaceCastInst>(V)) {
+    if (!OnStack.insert(V).second)
+      return false; // Cycle cut; the enclosing frame stays sound.
+    SmallVector<Value *, 4> Operands;
+    if (auto *PN = dyn_cast<PHINode>(V))
+      Operands.append(PN->incoming_values().begin(),
+                      PN->incoming_values().end());
+    else if (auto *SI = dyn_cast<SelectInst>(V)) {
+      Operands.push_back(SI->getCondition());
+      Operands.push_back(SI->getTrueValue());
+      Operands.push_back(SI->getFalseValue());
+    } else // Freeze, bitcast, addrspacecast forward their single operand.
+      Operands.push_back(cast<Instruction>(V)->getOperand(0));
+    Result = llvm::all_of(Operands, Recurse);
+    OnStack.erase(V);
+  }
+  Memo[V] = Result;
+  return Result;
+}
+
 /// Join one more arm into an accumulator where the first arm seeds it:
 /// typeUnion treats unknown as absorbing (typeUnion({}, X) == {}), so the
 /// first arm must seed the accumulator rather than union into an empty one.
@@ -485,7 +543,6 @@ struct BaseTypeNode {
   SmallVector<Value *, 2> Inputs;
   size_t NextInput = 0;
   unsigned Index;
-  bool HasNonPhi;
   bool OnStack = true;
   BaseTypeNode *PendingChild = nullptr;
   JavaType Result;
@@ -496,8 +553,10 @@ struct BaseTypeNode {
 
 /// PHIs and selects union their inputs; casts and freeze forward one input.
 /// Evaluate inputs on demand with an iterative path-based SCC traversal.
-/// Completed inputs are cached before siblings; cyclic types are published only
-/// when the whole SCC is complete. Neither traversal uses the C++ call stack.
+/// Completed inputs are cached before siblings; a whole cycle is typed at
+/// once by the join of the completed inputs entering it, and freeze only
+/// forwards a type that comes with a definedness proof. Neither traversal
+/// uses the C++ call stack.
 static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr) {
   BaseMemo LocalMemo;
   BaseMemo &Cache = Memo ? *Memo : LocalMemo;
@@ -511,6 +570,7 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr) {
   }
 
   DenseMap<Value *, std::unique_ptr<BaseTypeNode>> Nodes;
+  DenseMap<Value *, bool> DefinedMemo;
   SmallVector<BaseTypeNode *, 16> Frames;
   SmallVector<BaseTypeNode *, 16> OpenNodes;
   SmallVector<BaseTypeNode *, 16> Roots;
@@ -519,7 +579,6 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr) {
     auto N = std::make_unique<BaseTypeNode>();
     N->V = Input;
     N->Index = NextIndex++;
-    N->HasNonPhi = !isa<PHINode>(Input);
     if (auto *PN = dyn_cast<PHINode>(Input)) {
       for (Value *Arm : PN->incoming_values())
         N->Inputs.push_back(Arm);
@@ -595,14 +654,8 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr) {
         assert(InputNode->OnStack && "completed input must be cached");
         // Merge the component roots joined by this edge, including a cross
         // edge to a completed DFS frame that is still in an open component.
-        while (Roots.back()->Index > InputNode->Index) {
-          BaseTypeNode *Joined = Roots.pop_back_val();
-          Roots.back()->HasNonPhi |= Joined->HasNonPhi;
-        }
-        if (Roots.back()->HasNonPhi) {
-          CompleteUnknown(N->V);
-          return {};
-        }
+        while (Roots.back()->Index > InputNode->Index)
+          Roots.pop_back_val();
       } else {
         N->PendingChild = Discover(Input);
       }
@@ -622,33 +675,42 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr) {
     } while (Member != N);
     bool HasCycle = Members.size() != 1 || llvm::is_contained(N->Inputs, N->V);
     if (!HasCycle) {
-      // All inputs have completed, including unions that became unknown.
-      Cache[N->V] = N->Result;
-      if (N->Result.isUnknown()) {
+      JavaType Result = std::move(N->Result);
+      // freeze(x) is x only when x is defined; freezing a possibly-poison
+      // reference yields an arbitrary one, so the operand's type cannot be
+      // forwarded without a definedness proof.
+      if (auto *FI = dyn_cast<FreezeInst>(N->V)) {
+        SmallPtrSet<Value *, 8> DefOnStack;
+        if (!Result.isUnknown() &&
+            !isProvenDefined(FI->getOperand(0), DefOnStack, DefinedMemo, 0))
+          Result = {};
+      }
+      Cache[N->V] = Result;
+      if (Result.isUnknown()) {
         CompleteUnknown(N->V);
         return {};
       }
       continue;
     }
+    // Every member of a cycle derives its values from the completed inputs
+    // entering the cycle — PHI and select only choose among their operands —
+    // so all defined observations of any member stay inside the join of
+    // those inputs, and a member whose inputs all come from inside the cycle
+    // is covered by the other members' inputs. A cycle with no completed
+    // input at all joins nothing and stays unknown. A freeze member rejects
+    // the join instead: it can turn a possibly-poison member into an
+    // arbitrary reference that no seed join describes.
+    bool HasFreeze = llvm::any_of(
+        Members, [](BaseTypeNode *M) { return isa<FreezeInst>(M->V); });
     JavaType Result;
     bool First = true;
-    // Preserve the old unknown result when a recursive path could end with
-    // no non-cyclic incoming, or cross select/cast/freeze on its way back.
-    // Do not strengthen those results: a later freeze can expose poison.
-    bool HasUnsupportedCycle = llvm::any_of(Members, [&](BaseTypeNode *M) {
-      return !isa<PHINode>(M->V) || !llvm::any_of(M->Inputs, [&](Value *Input) {
-        return Cache.contains(Input);
-      });
-    });
-    for (BaseTypeNode *M : Members) {
-      if (HasUnsupportedCycle)
-        break;
-      for (Value *Input : M->Inputs) {
-        // Internal edges add no type; only completed external inputs join.
-        if (auto It = Cache.find(Input); It != Cache.end())
-          joinArm(Result, First, It->second);
-      }
-    }
+    if (!HasFreeze)
+      for (BaseTypeNode *M : Members)
+        for (Value *Input : M->Inputs) {
+          // Internal edges add no type; only completed external inputs join.
+          if (auto It = Cache.find(Input); It != Cache.end())
+            joinArm(Result, First, It->second);
+        }
     for (BaseTypeNode *M : Members)
       Cache[M->V] = Result;
     if (Result.isUnknown()) {
@@ -1330,8 +1392,9 @@ namespace {
 struct JavaTypeQueryContext {
   DominatorTree &DT;
   IsNullEdgeOracle NullOracle;
-  /// Shared PHI cycle-detection set for the value dimension (base-type PHI
-  /// handling and phiValueType): a re-encountered PHI contributes nothing.
+  /// PHI cycle-detection set for the value dimension (phiValueType): a
+  /// re-encountered PHI contributes nothing. Base-type queries detect
+  /// cycles with their own SCC state and do not use this set.
   SmallPtrSet<const PHINode *, 8> PhiVisited;
   /// Complete base-type memo shared across the whole query (see BaseMemo).
   BaseMemo BaseTypes;
