@@ -16,12 +16,14 @@
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/IR/GlobalAlias.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Jeandle/Attributes.h"
 #include "llvm/IR/Jeandle/JeandleUtils.h"
 #include "llvm/IR/Jeandle/Metadata.h"
 #include "llvm/IR/Jeandle/VMCallback.h"
+#include "llvm/IR/Operator.h"
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include <algorithm>
@@ -43,11 +45,6 @@ STATISTIC(NumJavaTypeBudgetExhausted,
 /// Maximum recursion depth for extractKlassConstantImpl.
 /// Prevents infinite recursion on deeply nested or cyclic IR patterns.
 static constexpr unsigned MaxExtractKlassDepth = 16;
-
-/// Maximum recursion depth for isProvenDefined. Values nested deeper than
-/// this are conservatively treated as not proven defined; this bounds the
-/// C++ call stack the same way the iterative base-type traversal does.
-static constexpr unsigned MaxProvenDefinedDepth = 64;
 
 static uintptr_t extractKlassConstantImpl(Value *V, unsigned Depth) {
   if (Depth > MaxExtractKlassDepth)
@@ -399,58 +396,174 @@ JavaType jeandle::typeIntersect(JavaType A, JavaType B) {
 /// An absorbing unknown input can complete a query early; other cyclic
 /// dependencies are cached only after the whole SCC has been evaluated.
 using BaseMemo = DenseMap<Value *, JavaType>;
+using DefinedMemo = DenseMap<Value *, bool>;
 
-/// Whether every execution of V produces a fully defined value (never undef
-/// or poison). Only such values may lend their type through freeze: freeze
-/// of a possibly-poison reference is an arbitrary, observable reference that
-/// the operand's type cannot bound, while a possibly-poison value itself is
-/// unobservable without undefined behavior and is harmless to a type join.
-/// noundef arguments, non-poison/undef constants, noundef call results and
-/// PHI/select/cast/freeze combinations of those are proven defined; anything
-/// else is not. An in-progress value (a cycle) counts as not proven, an
-/// under-approximation of the greatest fixpoint that keeps the answer sound.
-static bool isProvenDefined(Value *V, SmallPtrSetImpl<Value *> &OnStack,
-                            DenseMap<Value *, bool> &Memo, unsigned Depth) {
+/// Follow one pointer identity expression without skipping explicit type seeds.
+static Value *getIdentityInput(Value *V) {
+  if (!V->getType()->isPointerTy())
+    return nullptr;
+  if (auto *GEP = dyn_cast<GEPOperator>(V))
+    return GEP->hasAllZeroIndices() ? GEP->getPointerOperand() : nullptr;
+  if (auto *Alias = dyn_cast<GlobalAlias>(V))
+    return Alias->getAliasee();
+  if (auto *CB = dyn_cast<CallBase>(V)) {
+    if (CB->getAttributes().hasRetAttr(jeandle::Attribute::JavaKlass))
+      return nullptr;
+    return CB->getReturnedArgOperand();
+  }
+  if (Operator::getOpcode(V) == Instruction::BitCast ||
+      Operator::getOpcode(V) == Instruction::AddrSpaceCast)
+    return cast<User>(V)->getOperand(0);
+  return nullptr;
+}
+
+/// The inputs whose types bound V. Identity expressions participate in the
+/// same dependency graph as PHIs and selects, including when nested in cycles.
+static bool getBaseTypeInputs(Value *V, SmallVectorImpl<Value *> &Inputs) {
+  if (auto *PN = dyn_cast<PHINode>(V)) {
+    Inputs.append(PN->incoming_values().begin(), PN->incoming_values().end());
+  } else if (auto *SI = dyn_cast<SelectInst>(V)) {
+    if (auto *C = dyn_cast<ConstantInt>(SI->getCondition()))
+      Inputs.push_back(C->isZero() ? SI->getFalseValue() : SI->getTrueValue());
+    else {
+      Inputs.push_back(SI->getTrueValue());
+      Inputs.push_back(SI->getFalseValue());
+    }
+  } else if (auto *FI = dyn_cast<FreezeInst>(V)) {
+    Inputs.push_back(FI->getOperand(0));
+  } else if (Value *Input = getIdentityInput(V)) {
+    Inputs.push_back(Input);
+  } else {
+    return false;
+  }
+  return true;
+}
+
+/// A leaf has a known definedness result. Other supported operations are
+/// defined if all the collected inputs are defined. This is deliberately
+/// context independent so the completion cache can be shared by CFG queries.
+static std::optional<bool>
+getDefinednessInputs(Value *V, SmallVectorImpl<Value *> &Inputs) {
+  if (isa<PoisonValue, UndefValue>(V))
+    return false;
+  if (isa<FreezeInst, AllocaInst>(V))
+    return true;
+  if (auto *Arg = dyn_cast<Argument>(V))
+    return Arg->hasAttribute(llvm::Attribute::NoUndef) ||
+           Arg->hasAttribute(llvm::Attribute::Dereferenceable) ||
+           Arg->hasAttribute(llvm::Attribute::DereferenceableOrNull);
+  // A returned argument does not prove the result defined: parameter or return
+  // attributes can introduce poison even when the actual argument is defined.
+  if (auto *CB = dyn_cast<CallBase>(V))
+    return CB->hasRetAttr(llvm::Attribute::NoUndef) ||
+           CB->hasRetAttr(llvm::Attribute::Dereferenceable) ||
+           CB->hasRetAttr(llvm::Attribute::DereferenceableOrNull);
+  if (auto *LI = dyn_cast<LoadInst>(V))
+    return LI->hasMetadata(LLVMContext::MD_noundef) ||
+           LI->hasMetadata(LLVMContext::MD_dereferenceable) ||
+           LI->hasMetadata(LLVMContext::MD_dereferenceable_or_null);
+  if (isa<ConstantInt, ConstantFP, ConstantPointerNull, GlobalValue,
+          ConstantAggregateZero>(V))
+    return true;
+  if (auto *PN = dyn_cast<PHINode>(V)) {
+    if (PN->getNumIncomingValues() == 0)
+      return false;
+    getBaseTypeInputs(V, Inputs);
+    return std::nullopt;
+  }
+  if (auto *SI = dyn_cast<SelectInst>(V)) {
+    getBaseTypeInputs(V, Inputs);
+    Inputs.push_back(SI->getCondition());
+    return std::nullopt;
+  }
+  if (auto *GEP = dyn_cast<GEPOperator>(V)) {
+    if (!GEP->hasAllZeroIndices())
+      return false;
+    // All-zero indices cannot violate GEP's bounds or no-wrap promises.
+    Inputs.push_back(GEP->getPointerOperand());
+    return std::nullopt;
+  }
+  if (auto *Op = dyn_cast<Operator>(V)) {
+    if (Op->hasPoisonGeneratingFlags())
+      return false;
+    switch (Op->getOpcode()) {
+    case Instruction::ICmp:
+    case Instruction::BitCast:
+    case Instruction::PtrToInt:
+    case Instruction::IntToPtr:
+    case Instruction::Trunc:
+    case Instruction::ZExt:
+    case Instruction::SExt:
+    case Instruction::Add:
+    case Instruction::Sub:
+    case Instruction::Mul:
+    case Instruction::And:
+    case Instruction::Or:
+    case Instruction::Xor:
+      Inputs.append(Op->op_begin(), Op->op_end());
+      return std::nullopt;
+    default:
+      break;
+    }
+  }
+  // In particular, an addrspacecast may produce poison even from a defined
+  // pointer when the target does not support the conversion.
+  return false;
+}
+
+/// Prove definedness without recursion. A supported cycle needs a path to a
+/// defined leaf, and every dependency must be supported and defined. Reverse
+/// edges first ground the cycles, then propagate unsupported/poison inputs.
+/// Only completed results enter Memo, including intermediate cycle members.
+static bool isProvenDefined(Value *V, DefinedMemo &Memo) {
   if (auto It = Memo.find(V); It != Memo.end())
     return It->second;
-  if (Depth > MaxProvenDefinedDepth)
-    return false;
 
-  bool Result = false;
-  auto Recurse = [&](Value *Op) {
-    return isProvenDefined(Op, OnStack, Memo, Depth + 1);
-  };
-  if (isa<PoisonValue, UndefValue>(V)) {
-    Result = false;
-  } else if (auto *Arg = dyn_cast<Argument>(V)) {
-    Result = Arg->hasAttribute(llvm::Attribute::NoUndef);
-  } else if (auto *CB = dyn_cast<CallBase>(V)) {
-    Result = CB->hasRetAttr(llvm::Attribute::NoUndef);
-  } else if (auto *CE = dyn_cast<ConstantExpr>(V)) {
-    // Constants are fully defined unless poison/undef hides inside an
-    // expression.
-    Result = llvm::all_of(CE->operands(), Recurse);
-  } else if (isa<Constant>(V)) {
-    Result = true;
-  } else if (isa<PHINode, SelectInst, FreezeInst, BitCastInst,
-                 AddrSpaceCastInst>(V)) {
-    if (!OnStack.insert(V).second)
-      return false; // Cycle cut; the enclosing frame stays sound.
-    SmallVector<Value *, 4> Operands;
-    if (auto *PN = dyn_cast<PHINode>(V))
-      Operands.append(PN->incoming_values().begin(),
-                      PN->incoming_values().end());
-    else if (auto *SI = dyn_cast<SelectInst>(V)) {
-      Operands.push_back(SI->getCondition());
-      Operands.push_back(SI->getTrueValue());
-      Operands.push_back(SI->getFalseValue());
-    } else // Freeze, bitcast, addrspacecast forward their single operand.
-      Operands.push_back(cast<Instruction>(V)->getOperand(0));
-    Result = llvm::all_of(Operands, Recurse);
-    OnStack.erase(V);
+  DenseMap<Value *, SmallVector<Value *, 2>> Users;
+  SmallPtrSet<Value *, 32> Visited;
+  SmallVector<Value *, 16> Pending{V};
+  SmallVector<Value *, 16> Defined;
+  SmallVector<Value *, 16> Unknown;
+  while (!Pending.empty()) {
+    Value *Current = Pending.pop_back_val();
+    if (!Visited.insert(Current).second)
+      continue;
+    SmallVector<Value *, 4> Inputs;
+    std::optional<bool> Leaf;
+    if (auto It = Memo.find(Current); It != Memo.end())
+      Leaf = It->second;
+    else
+      Leaf = getDefinednessInputs(Current, Inputs);
+    if (Leaf) {
+      (*Leaf ? Defined : Unknown).push_back(Current);
+      continue;
+    }
+    for (Value *Input : Inputs) {
+      Users[Input].push_back(Current);
+      Pending.push_back(Input);
+    }
   }
-  Memo[V] = Result;
-  return Result;
+
+  auto Propagate = [&](SmallVectorImpl<Value *> &Work,
+                       SmallPtrSetImpl<Value *> &Reached) {
+    while (!Work.empty()) {
+      Value *Current = Work.pop_back_val();
+      if (!Reached.insert(Current).second)
+        continue;
+      if (auto It = Users.find(Current); It != Users.end())
+        Work.append(It->second.begin(), It->second.end());
+    }
+  };
+  SmallPtrSet<Value *, 32> Grounded;
+  Propagate(Defined, Grounded);
+  for (Value *Current : Visited)
+    if (!Grounded.contains(Current))
+      Unknown.push_back(Current);
+  SmallPtrSet<Value *, 32> NotDefined;
+  Propagate(Unknown, NotDefined);
+  for (Value *Current : Visited)
+    Memo[Current] = !NotDefined.contains(Current);
+  return Memo.lookup(V);
 }
 
 /// Join one more arm into an accumulator where the first arm seeds it:
@@ -551,26 +664,28 @@ struct BaseTypeNode {
 
 } // namespace
 
-/// PHIs and selects union their inputs; casts and freeze forward one input.
+/// PHIs and selects union their inputs; identity expressions forward an input.
 /// Evaluate inputs on demand with an iterative path-based SCC traversal.
 /// Completed inputs are cached before siblings; a whole cycle is typed at
 /// once by the join of the completed inputs entering it, and freeze only
 /// forwards a type that comes with a definedness proof. Neither traversal
 /// uses the C++ call stack.
-static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr) {
+static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr,
+                                DefinedMemo *Defined = nullptr) {
   BaseMemo LocalMemo;
   BaseMemo &Cache = Memo ? *Memo : LocalMemo;
   if (auto It = Cache.find(V); It != Cache.end())
     return It->second;
-  if (!isa<PHINode, SelectInst, BitCastInst, AddrSpaceCastInst, FreezeInst>(
-          V)) {
+  SmallVector<Value *, 2> Inputs;
+  if (!getBaseTypeInputs(V, Inputs)) {
     JavaType Result = getBaseJavaTypeLeaf(V);
     Cache[V] = Result;
     return Result;
   }
 
   DenseMap<Value *, std::unique_ptr<BaseTypeNode>> Nodes;
-  DenseMap<Value *, bool> DefinedMemo;
+  DefinedMemo LocalDefined;
+  DefinedMemo &DefinedCache = Defined ? *Defined : LocalDefined;
   SmallVector<BaseTypeNode *, 16> Frames;
   SmallVector<BaseTypeNode *, 16> OpenNodes;
   SmallVector<BaseTypeNode *, 16> Roots;
@@ -579,17 +694,8 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr) {
     auto N = std::make_unique<BaseTypeNode>();
     N->V = Input;
     N->Index = NextIndex++;
-    if (auto *PN = dyn_cast<PHINode>(Input)) {
-      for (Value *Arm : PN->incoming_values())
-        N->Inputs.push_back(Arm);
-    } else if (auto *SI = dyn_cast<SelectInst>(Input)) {
-      N->Inputs.push_back(SI->getTrueValue());
-      N->Inputs.push_back(SI->getFalseValue());
-    } else if (isa<BitCastInst, AddrSpaceCastInst, FreezeInst>(Input)) {
-      N->Inputs.push_back(cast<Instruction>(Input)->getOperand(0));
-    } else {
+    if (!getBaseTypeInputs(Input, N->Inputs))
       Cache[Input] = getBaseJavaTypeLeaf(Input);
-    }
     BaseTypeNode *Raw = N.get();
     Nodes[Input] = std::move(N);
     Frames.push_back(Raw);
@@ -680,9 +786,8 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr) {
       // reference yields an arbitrary one, so the operand's type cannot be
       // forwarded without a definedness proof.
       if (auto *FI = dyn_cast<FreezeInst>(N->V)) {
-        SmallPtrSet<Value *, 8> DefOnStack;
         if (!Result.isUnknown() &&
-            !isProvenDefined(FI->getOperand(0), DefOnStack, DefinedMemo, 0))
+            !isProvenDefined(FI->getOperand(0), DefinedCache))
           Result = {};
       }
       Cache[N->V] = Result;
@@ -697,14 +802,15 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr) {
     // so all defined observations of any member stay inside the join of
     // those inputs, and a member whose inputs all come from inside the cycle
     // is covered by the other members' inputs. A cycle with no completed
-    // input at all joins nothing and stays unknown. A freeze member rejects
-    // the join instead: it can turn a possibly-poison member into an
-    // arbitrary reference that no seed join describes.
-    bool HasFreeze = llvm::any_of(
-        Members, [](BaseTypeNode *M) { return isa<FreezeInst>(M->V); });
+    // input at all joins nothing and stays unknown. A freeze can participate
+    // only if its operand is defined, making it an identity expression.
+    bool HasUnknownFreeze = llvm::any_of(Members, [&](BaseTypeNode *M) {
+      auto *FI = dyn_cast<FreezeInst>(M->V);
+      return FI && !isProvenDefined(FI->getOperand(0), DefinedCache);
+    });
     JavaType Result;
     bool First = true;
-    if (!HasFreeze)
+    if (!HasUnknownFreeze)
       for (BaseTypeNode *M : Members)
         for (Value *Input : M->Inputs) {
           // Internal edges add no type; only completed external inputs join.
@@ -852,19 +958,21 @@ combinedInterfaces(const SmallDenseSet<uintptr_t, 2> &A,
   return Result;
 }
 
-/// Strip pointer casts, aliases and freeze wrappers down to the canonical
-/// underlying value. freeze is transparent for value identity: freeze(x)
-/// equals x unless x is poison, and a branch on poison has undefined
-/// behavior, so facts proved about x transfer to freeze(x) and vice versa.
-static Value *stripCastsAndFreeze(Value *V) {
-  while (true) {
-    V = V->stripPointerCastsAndAliases();
+/// Canonicalize identity expressions for matching CFG facts. A freeze shares
+/// its operand's identity only when that operand is proven defined.
+static Value *stripCastsAndFreeze(Value *V, DefinedMemo &Defined) {
+  SmallPtrSet<Value *, 8> Visited;
+  while (Visited.insert(V).second) {
     if (auto *FI = dyn_cast<FreezeInst>(V)) {
+      if (!isProvenDefined(FI->getOperand(0), Defined))
+        break;
       V = FI->getOperand(0);
-      continue;
-    }
-    return V;
+    } else if (Value *Input = getIdentityInput(V)) {
+      V = Input;
+    } else
+      break;
   }
+  return V;
 }
 
 /// Check if IncomingBB is reached only when Obj is null.
@@ -1398,6 +1506,8 @@ struct JavaTypeQueryContext {
   SmallPtrSet<const PHINode *, 8> PhiVisited;
   /// Complete base-type memo shared across the whole query (see BaseMemo).
   BaseMemo BaseTypes;
+  /// Definedness proofs shared by base typing and CFG identity matching.
+  DefinedMemo DefinedValues;
   /// Per-(value, block) evaluation state for the block dimension: absent =
   /// not yet evaluated, nullopt = currently on the evaluation stack (a cycle
   /// the back-edge rule cannot cut), engaged = the completed join. One
@@ -1519,7 +1629,7 @@ static bool isNullEdge(Value *V, BasicBlock *From, BasicBlock *To,
 /// edges of (facts at the predecessor, narrowed by the edge guard).
 /// Facts-only: check-derived constraints, never attribute/metadata base types.
 static JavaType factsAt(Value *V, BasicBlock *BB, JavaTypeQueryContext &Q) {
-  V = stripCastsAndFreeze(V);
+  V = stripCastsAndFreeze(V, Q.DefinedValues);
 
   // Seed cuts (exact, see the design comment above).
   if (BB->isEntryBlock())
@@ -1623,7 +1733,7 @@ static JavaType phiValueType(PHINode *PN, JavaTypeQueryContext &Q) {
 static JavaType valueDimension(Value *V, JavaTypeQueryContext &Q) {
   if (auto *PN = dyn_cast<PHINode>(V))
     return phiValueType(PN, Q);
-  return getBaseJavaType(V, &Q.BaseTypes);
+  return getBaseJavaType(V, &Q.BaseTypes, &Q.DefinedValues);
 }
 
 JavaType jeandle::sharpen(Value *V, Instruction *Context, DominatorTree &DT,
@@ -1631,8 +1741,8 @@ JavaType jeandle::sharpen(Value *V, Instruction *Context, DominatorTree &DT,
   assert(getVMCallbacks() && getVMCallbacks()->IsSubtype &&
          "VMCallbacks must be set");
 
-  V = stripCastsAndFreeze(V);
   JavaTypeQueryContext Q{DT, IsNullEdge};
+  V = stripCastsAndFreeze(V, Q.DefinedValues);
   JavaType Facts = factsAt(V, Context->getParent(), Q);
   mergePathFacts(Facts, edgeGuard(Context->getParent(), DestBB, V, DT));
   normalizeExcludedKlasses(Facts);
@@ -1645,17 +1755,14 @@ JavaType jeandle::sharpen(Value *V, Instruction *Context, DominatorTree &DT,
 
 JavaType jeandle::getJavaType(Value *V, DominatorTree *DT, Instruction *Context,
                               IsNullEdgeOracle IsNullEdge) {
-  // Strip pointer casts (and freeze wrappers) at the API boundary so that
-  // downstream identity comparisons (traceToCheckInstanceof, isNullCheckPath,
-  // isNullEdge) work correctly even when optimization passes introduce
-  // bitcast/addrspacecast/freeze wrappers.
-  V = stripCastsAndFreeze(V);
-
   if (!DT || !Context) {
-    return getBaseJavaType(V);
+    DefinedMemo Defined;
+    V = stripCastsAndFreeze(V, Defined);
+    return getBaseJavaType(V, nullptr, &Defined);
   }
 
   JavaTypeQueryContext Q{*DT, IsNullEdge};
+  V = stripCastsAndFreeze(V, Q.DefinedValues);
   JavaType T = valueDimension(V, Q);
   return typeIntersect(T, factsAt(V, Context->getParent(), Q));
 }

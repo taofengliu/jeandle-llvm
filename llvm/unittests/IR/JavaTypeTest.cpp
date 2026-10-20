@@ -11,6 +11,7 @@
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/LazyValueInfo.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/AsmParser/Parser.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Jeandle/VMCallback.h"
@@ -18,6 +19,7 @@
 #include "llvm/IR/PassInstrumentation.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/IR/Verifier.h"
+#include "llvm/Support/SourceMgr.h"
 #include "llvm/Transforms/Jeandle/TypeCheckElimination.h"
 #include "gtest/gtest.h"
 
@@ -99,6 +101,42 @@ protected:
     for (unsigned I = 0; I != Depth; ++I)
       V = B.CreateSelect(F->getArg(2), V, Other);
     return V;
+  }
+
+  void checkPattern(StringRef Body, uintptr_t BaseKlass, bool BaseExact,
+                    uintptr_t ContextKlass, bool ContextExact) {
+    SCOPED_TRACE(Body.str());
+    std::string IR = R"IR(
+      declare i1 @jeandle.check_instanceof(ptr, ptr addrspace(1) nonnull)
+      declare ptr addrspace(1) @identity(ptr addrspace(1) returned)
+      declare ptr addrspace(1) @nonnull_identity(ptr addrspace(1) returned nonnull)
+      define ptr addrspace(1) @pattern(
+        ptr addrspace(1) noundef "java-klass"="9" "java-klass-exact" %a,
+        ptr addrspace(1) noundef "java-klass"="9" "java-klass-exact" %b,
+        ptr addrspace(1) "java-klass"="9" "java-klass-exact" %maybe,
+        ptr addrspace(1) %unknown, ptr %slot,
+        i1 noundef %pick, i1 %maybecond, i32 noundef %x, i32 noundef %y) {
+    )IR";
+    IR += Body.str();
+    IR += R"IR(
+      }
+      !0 = !{}
+      !1 = !{i64 9}
+    )IR";
+    SMDiagnostic Error;
+    auto Parsed = parseAssemblyString(IR, Error, Context);
+    ASSERT_NE(Parsed, nullptr) << Error.getMessage().str();
+    ASSERT_FALSE(verifyModule(*Parsed, &errs()));
+    auto *Pattern = Parsed->getFunction("pattern");
+    auto *Return = cast<ReturnInst>(Pattern->back().getTerminator());
+    Value *V = Return->getReturnValue();
+    EXPECT_EQ(query(V), JavaType(BaseKlass, BaseExact));
+    DominatorTree DT(*Pattern);
+    EXPECT_EQ(queryAt(V, Return, DT), JavaType(ContextKlass, ContextExact));
+  }
+
+  void checkPattern(StringRef Body, uintptr_t Klass, bool Exact = true) {
+    checkPattern(Body, Klass, Exact, Klass, Exact);
   }
 
   void checkGuardedIncomingReuse(bool UnknownFirst) {
@@ -986,6 +1024,316 @@ TEST_F(JavaBaseTypeTest, OopHandleLoadQueriesExactKlass) {
   JavaType T = query(Load);
   EXPECT_EQ(T.Klass, 9U);
   EXPECT_TRUE(T.Exact);
+}
+
+TEST_F(JavaBaseTypeTest, RootFreezeRequiresDefinedOperand) {
+  checkPattern("%f = freeze ptr addrspace(1) %maybe\n"
+               "ret ptr addrspace(1) %f",
+               0, false);
+  checkPattern("%f = freeze ptr addrspace(1) %a\n"
+               "ret ptr addrspace(1) %f",
+               9);
+}
+
+TEST_F(JavaBaseTypeTest, RootFreezeOfPoisonedCycleStaysUnknown) {
+  checkPattern(R"IR(
+    entry:
+      br label %loop
+    loop:
+      %p = phi ptr addrspace(1) [%a, %entry], [%s, %loop]
+      %i = phi i32 [0, %entry], [%next, %loop]
+      %s = select i1 poison, ptr addrspace(1) %p, ptr addrspace(1) %a
+      %next = add i32 %i, 1
+      %again = icmp ult i32 %next, 2
+      br i1 %again, label %loop, label %exit
+    exit:
+      %f = freeze ptr addrspace(1) %p
+      ret ptr addrspace(1) %f
+  )IR",
+               0, false);
+}
+
+TEST_F(JavaBaseTypeTest, FreezeDoesNotInheritOperandGuard) {
+  checkPattern(R"IR(
+    entry:
+      %check = call i1 @jeandle.check_instanceof(ptr inttoptr (i64 9 to ptr),
+                                                ptr addrspace(1) %unknown)
+      br i1 %check, label %accepted, label %exit
+    exit:
+      ret ptr addrspace(1) null
+    accepted:
+      %f = freeze ptr addrspace(1) %unknown
+      ret ptr addrspace(1) %f
+  )IR",
+               0, false);
+}
+
+TEST_F(JavaBaseTypeTest, FreezeRetainsItsOwnGuard) {
+  checkPattern(R"IR(
+    entry:
+      %f = freeze ptr addrspace(1) %unknown
+      %check = call i1 @jeandle.check_instanceof(ptr inttoptr (i64 9 to ptr),
+                                                ptr addrspace(1) %f)
+      br i1 %check, label %accepted, label %exit
+    exit:
+      ret ptr addrspace(1) null
+    accepted:
+      ret ptr addrspace(1) %f
+  )IR",
+               0, false, 9, false);
+}
+
+TEST_F(JavaBaseTypeTest, NestedFreezeOfDefinedLoadRetainsType) {
+  checkPattern(R"IR(
+    %v = load ptr addrspace(1), ptr %slot, !noundef !0,
+              !java-klass !1, !java-klass-exact !0
+    %f = freeze ptr addrspace(1) %v
+    %r = select i1 %pick, ptr addrspace(1) %f, ptr addrspace(1) %a
+    ret ptr addrspace(1) %r
+  )IR",
+               9);
+  checkPattern(R"IR(
+    %v = load ptr addrspace(1), ptr %slot,
+              !java-klass !1, !java-klass-exact !0
+    %f = freeze ptr addrspace(1) %v
+    %r = select i1 %pick, ptr addrspace(1) %f, ptr addrspace(1) %a
+    ret ptr addrspace(1) %r
+  )IR",
+               0, false);
+}
+
+TEST_F(JavaBaseTypeTest, NestedFreezeOfDefinedSelfPhiRetainsType) {
+  checkPattern(R"IR(
+    entry:
+      br label %loop
+    loop:
+      %p = phi ptr addrspace(1) [%a, %entry], [%p, %loop]
+      br i1 %pick, label %loop, label %exit
+    exit:
+      %f = freeze ptr addrspace(1) %p
+      %r = select i1 %pick, ptr addrspace(1) %f, ptr addrspace(1) %a
+      ret ptr addrspace(1) %r
+  )IR",
+               9);
+}
+
+TEST_F(JavaBaseTypeTest, NestedFreezeOfDefinedMutualPhisRetainsType) {
+  checkPattern(R"IR(
+    entry:
+      br label %loop
+    loop:
+      %p = phi ptr addrspace(1) [%a, %entry], [%q, %loop]
+      %q = phi ptr addrspace(1) [%b, %entry], [%p, %loop]
+      br i1 %pick, label %loop, label %exit
+    exit:
+      %f = freeze ptr addrspace(1) %p
+      %r = select i1 %pick, ptr addrspace(1) %f, ptr addrspace(1) %a
+      ret ptr addrspace(1) %r
+  )IR",
+               9);
+}
+
+TEST_F(JavaBaseTypeTest, DefinedCycleContainingFreezeRetainsType) {
+  checkPattern(R"IR(
+    entry:
+      br label %loop
+    loop:
+      %p = phi ptr addrspace(1) [%a, %entry], [%f, %loop]
+      %f = freeze ptr addrspace(1) %p
+      br i1 %pick, label %loop, label %exit
+    exit:
+      ret ptr addrspace(1) %p
+  )IR",
+               9);
+}
+
+TEST_F(JavaBaseTypeTest, NestedFreezeOfICmpSelectRetainsType) {
+  checkPattern(R"IR(
+    %c = icmp eq i32 %x, 0
+    %s = select i1 %c, ptr addrspace(1) %a, ptr addrspace(1) %b
+    %f = freeze ptr addrspace(1) %s
+    %r = select i1 %pick, ptr addrspace(1) %f, ptr addrspace(1) %a
+    ret ptr addrspace(1) %r
+  )IR",
+               9);
+}
+
+TEST_F(JavaBaseTypeTest, NestedFreezeOfPoisonGeneratingICmpStaysUnknown) {
+  checkPattern(R"IR(
+    %c = icmp samesign eq i32 %x, %y
+    %s = select i1 %c, ptr addrspace(1) %a, ptr addrspace(1) %b
+    %f = freeze ptr addrspace(1) %s
+    %r = select i1 %pick, ptr addrspace(1) %f, ptr addrspace(1) %a
+    ret ptr addrspace(1) %r
+  )IR",
+               0, false);
+}
+
+TEST_F(JavaBaseTypeTest, NestedFreezeOfArithmeticConditionChecksPoisonFlags) {
+  checkPattern(R"IR(
+    %sum = add i32 %x, %y
+    %c = icmp eq i32 %sum, 0
+    %s = select i1 %c, ptr addrspace(1) %a, ptr addrspace(1) %b
+    %f = freeze ptr addrspace(1) %s
+    %r = select i1 %pick, ptr addrspace(1) %f, ptr addrspace(1) %a
+    ret ptr addrspace(1) %r
+  )IR",
+               9);
+  checkPattern(R"IR(
+    %sum = add nsw i32 %x, %y
+    %c = icmp eq i32 %sum, 0
+    %s = select i1 %c, ptr addrspace(1) %a, ptr addrspace(1) %b
+    %f = freeze ptr addrspace(1) %s
+    %r = select i1 %pick, ptr addrspace(1) %f, ptr addrspace(1) %a
+    ret ptr addrspace(1) %r
+  )IR",
+               0, false);
+}
+
+TEST_F(JavaBaseTypeTest, NestedFreezeOfAddressSpaceCastStaysConservative) {
+  checkPattern(R"IR(
+    %cast = addrspacecast ptr addrspace(1) %a to ptr addrspace(3)
+    %f = freeze ptr addrspace(3) %cast
+    %r = addrspacecast ptr addrspace(3) %f to ptr addrspace(1)
+    ret ptr addrspace(1) %r
+  )IR",
+               0, false);
+}
+
+TEST_F(JavaBaseTypeTest, ReturnedCallNestedInSelectRetainsType) {
+  checkPattern(R"IR(
+    %v = call ptr addrspace(1) @identity(ptr addrspace(1) %a)
+    %r = select i1 %pick, ptr addrspace(1) %v, ptr addrspace(1) %b
+    ret ptr addrspace(1) %r
+  )IR",
+               9);
+}
+
+TEST_F(JavaBaseTypeTest, ReturnedCallRetainsItsOwnTypeSeed) {
+  checkPattern(R"IR(
+    %v = call "java-klass"="9" "java-klass-exact" ptr addrspace(1)
+              @identity(ptr addrspace(1) %unknown)
+    %r = select i1 %pick, ptr addrspace(1) %v, ptr addrspace(1) %a
+    ret ptr addrspace(1) %r
+  )IR",
+               9);
+  checkPattern(R"IR(
+    %v = call "java-klass"="9" "java-klass-exact" ptr addrspace(1)
+              @identity(ptr addrspace(1) %unknown)
+    %g = getelementptr i8, ptr addrspace(1) %v, i64 0
+    ret ptr addrspace(1) %g
+  )IR",
+               9);
+}
+
+TEST_F(JavaBaseTypeTest, FreezeOfReturnedCallNeedsDefinedResult) {
+  checkPattern(R"IR(
+    %v = call nonnull ptr addrspace(1) @identity(ptr addrspace(1) %a)
+    %f = freeze ptr addrspace(1) %v
+    ret ptr addrspace(1) %f
+  )IR",
+               0, false);
+  checkPattern(R"IR(
+    %v = call ptr addrspace(1) @nonnull_identity(ptr addrspace(1) %a)
+    %f = freeze ptr addrspace(1) %v
+    ret ptr addrspace(1) %f
+  )IR",
+               0, false);
+  checkPattern(R"IR(
+    %v = call noundef ptr addrspace(1) @identity(ptr addrspace(1) %a)
+    %f = freeze ptr addrspace(1) %v
+    ret ptr addrspace(1) %f
+  )IR",
+               9);
+}
+
+TEST_F(JavaBaseTypeTest, ZeroGepNestedInSelectRetainsType) {
+  checkPattern(R"IR(
+    %g = getelementptr i8, ptr addrspace(1) %a, i64 0
+    %r = select i1 %pick, ptr addrspace(1) %g, ptr addrspace(1) %a
+    ret ptr addrspace(1) %r
+  )IR",
+               9);
+}
+
+TEST_F(JavaBaseTypeTest, ZeroGepNestedInPhiRetainsType) {
+  checkPattern(R"IR(
+    entry:
+      br i1 %pick, label %left, label %right
+    left:
+      %g = getelementptr i8, ptr addrspace(1) %a, i64 0
+      br label %merge
+    right:
+      br label %merge
+    merge:
+      %p = phi ptr addrspace(1) [%g, %left], [%b, %right]
+      ret ptr addrspace(1) %p
+  )IR",
+               9);
+}
+
+TEST_F(JavaBaseTypeTest, ZeroGepInSelectCycleRetainsType) {
+  checkPattern(R"IR(
+    entry:
+      br label %loop
+    loop:
+      %p = phi ptr addrspace(1) [%a, %entry], [%s, %loop]
+      %g = getelementptr i8, ptr addrspace(1) %p, i64 0
+      %s = select i1 %pick, ptr addrspace(1) %g, ptr addrspace(1) %b
+      br i1 %pick, label %loop, label %exit
+    exit:
+      ret ptr addrspace(1) %p
+  )IR",
+               9);
+}
+
+TEST_F(JavaBaseTypeTest, NonzeroGepDoesNotForwardObjectType) {
+  checkPattern(R"IR(
+    %g = getelementptr i8, ptr addrspace(1) %a, i64 1
+    %r = select i1 %pick, ptr addrspace(1) %g, ptr addrspace(1) %a
+    ret ptr addrspace(1) %r
+  )IR",
+               0, false);
+}
+
+TEST_F(JavaBaseTypeTest, ConstantSelectIgnoresUnselectedArm) {
+  checkPattern(R"IR(
+    %s = select i1 true, ptr addrspace(1) %a, ptr addrspace(1) %unknown
+    ret ptr addrspace(1) %s
+  )IR",
+               9);
+  checkPattern(R"IR(
+    %s = select i1 false, ptr addrspace(1) %unknown, ptr addrspace(1) %b
+    ret ptr addrspace(1) %s
+  )IR",
+               9);
+  checkPattern(R"IR(
+    %s = select i1 true, ptr addrspace(1) %a, ptr addrspace(1) poison
+    %f = freeze ptr addrspace(1) %s
+    %r = select i1 %pick, ptr addrspace(1) %f, ptr addrspace(1) %b
+    ret ptr addrspace(1) %r
+  )IR",
+               9);
+  checkPattern(R"IR(
+    %s = select i1 false, ptr addrspace(1) %a, ptr addrspace(1) %unknown
+    ret ptr addrspace(1) %s
+  )IR",
+               0, false);
+}
+
+TEST_F(JavaBaseTypeTest, DeepDefinedChainThroughFreezeRetainsType) {
+  constexpr unsigned Depth = 20000;
+  for (auto &Arg : F->args())
+    Arg.addAttr(Attribute::NoUndef);
+  Value *Root = typedSelectChain(Depth);
+  Value *Frozen = B.CreateFreeze(Root);
+  Value *Result = B.CreateSelect(F->getArg(2), Frozen, F->getArg(0));
+  B.CreateRet(Result);
+  ASSERT_FALSE(verifyFunction(*F));
+  JavaType T = query(Result);
+  EXPECT_EQ(T.Klass, 5U);
+  EXPECT_FALSE(T.Exact);
+  EXPECT_LE(CommonSuperQueries, Depth + 4);
 }
 
 } // namespace
