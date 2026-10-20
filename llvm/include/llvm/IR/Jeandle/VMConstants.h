@@ -106,6 +106,8 @@ struct VMConstants {
   bool UseCompressedClassPointers = true;
   bool UseCompressedOops = true;
   bool ReduceBulkZeroing = true;
+  // Standalone modules must opt in to the fresh-reference-copy GC policy.
+  bool ReduceInitialCardMarks = false;
 
   // Arraycopy optimization thresholds supplied by HotSpot VM flags.
   int64_t ArrayOperationPartialInlineSize = 0;
@@ -124,6 +126,7 @@ struct VMConstants {
     return ArrayCopyLoadStoreMaxElem;
   }
   bool reduceBulkZeroing() const { return ReduceBulkZeroing; }
+  bool reduceInitialCardMarks() const { return ReduceInitialCardMarks; }
 
   // Returns the array base offset for an element type. Returns -1 if Ty is not
   // a recognised Jeandle element type.

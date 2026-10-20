@@ -155,6 +155,8 @@ VMConstants VMConstants::fromModule(const Module &M) {
     C.UseCompressedOops = *V;
   if (auto V = readGlobalBool(M, "VMOptions.ReduceBulkZeroing"))
     C.ReduceBulkZeroing = *V;
+  if (auto V = readGlobalBool(M, "VMOptions.ReduceInitialCardMarks"))
+    C.ReduceInitialCardMarks = *V;
   if (auto V = readGlobalInt(M, "VMOptions.ArrayOperationPartialInlineSize"))
     C.ArrayOperationPartialInlineSize = *V;
   if (auto V = readGlobalInt(M, "VMOptions.ArrayCopyLoadStoreMaxElem"))

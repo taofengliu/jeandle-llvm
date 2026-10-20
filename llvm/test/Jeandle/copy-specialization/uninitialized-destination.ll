@@ -35,6 +35,9 @@ exception:
 ; COMMON-NOT: @jeandle.check_klass_subtype
 ; UNINIT: call void @StubRoutines_arrayof_oop_disjoint_arraycopy_uninit({{.*}}i64 8)
 ; INIT: call void @StubRoutines_arrayof_oop_disjoint_arraycopy({{.*}}i64 8)
+; COMMON: arraycopy.result:
+; COMMON-NEXT: fence release
+; COMMON-NEXT: br label %normal
 ; COMMON-NOT: @jeandle.copy
 
 define ptr addrspace(1) @copyof_range(ptr addrspace(1) "java-klass"="201" %src) #0 personality ptr @personality {
@@ -52,6 +55,9 @@ exception:
 ; COMMON-NOT: @jeandle.check_klass_subtype
 ; UNINIT: call void @StubRoutines_oop_disjoint_arraycopy_uninit({{.*}}i64 7)
 ; INIT: call void @StubRoutines_oop_disjoint_arraycopy({{.*}}i64 7)
+; COMMON: arraycopy.result:
+; COMMON-NEXT: fence release
+; COMMON-NEXT: br label %normal
 ; COMMON-NOT: @jeandle.copy
 
 ; Ordinary tightly coupled arraycopy is accepted by the allocation finder,
@@ -97,6 +103,7 @@ exception:
 ; COMMON-LABEL: define void @checkcast_existing(
 ; COMMON: call i32 @StubRoutines_checkcast_arraycopy(
 ; COMMON: call void @StubRoutines_arrayof_oop_disjoint_arraycopy(
+; COMMON-NOT: fence
 ; COMMON-NOT: @jeandle.copy
 
 attributes #0 = { "java-method"="0" }

@@ -21,6 +21,7 @@
 #include "llvm/IR/Jeandle/JeandleUtils.h"
 #include "llvm/IR/Jeandle/Metadata.h"
 #include "llvm/IR/Jeandle/VMConstants.h"
+#include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/MDBuilder.h"
 #include "llvm/Transforms/Jeandle/JeandleTransformUtils.h"
 
@@ -141,10 +142,42 @@ CallBase *findTightlyCoupledArrayAllocation(CallBase &CI) {
   return Allocation;
 }
 
+bool needsCopyPublicationBarrier(CallBase &CI) {
+  // Payload clones retain the frontend's barrier. Reference-array clones and
+  // copies into fresh arrays need ordering after their final payload stores,
+  // including when those stores replace the pseudo call entirely.
+  return isReferenceArrayClone(CI) ||
+         (isAllocTightlyCoupled(CI) &&
+          findTightlyCoupledArrayAllocation(CI) != nullptr);
+}
+
+// Keep publication ordering as a JavaOp until JavaOperationLower(1), matching
+// the frontend's instance/primitive-array clone path. Standalone modules may
+// lack its template definition; a system release fence supplies the same
+// StoreStore ordering in that case.
+void emitStoreStoreBarrier(IRBuilder<> &B, Module &M) {
+  Function *StoreStore = M.getFunction("jeandle.membar_storestore");
+  if (StoreStore != nullptr && !StoreStore->isDeclaration()) {
+    CallInst *Call = B.CreateCall(StoreStore, {});
+    Call->setCallingConv(CallingConv::Hotspot_JIT);
+    return;
+  }
+
+  B.CreateFence(AtomicOrdering::Release);
+}
+
 CopyFacts analyzeCopy(CallBase &CB, DominatorTree &DT,
                       jeandle::IsNullEdgeOracle IsNullEdge) {
   CopyFacts Facts;
   Facts.CB = &CB;
+
+  // copyOf's frontend guards establish reference-array operands even when
+  // the destination klass comes from a runtime mirror. Such allocations may
+  // have no java-klass return attribute for a JavaType query to recover.
+  if (isCopyOf(CB) || isCopyOfRange(CB)) {
+    Facts.SrcElem = Facts.DestElem = jeandle::JBasicType::Object;
+    return Facts;
+  }
 
   // JavaType queries themselves need VM type callbacks. Standalone modules
   // without a VM must keep the generic copy or bulk clone path.
@@ -152,7 +185,7 @@ CopyFacts analyzeCopy(CallBase &CB, DominatorTree &DT,
   if (Callbacks == nullptr)
     return Facts;
 
-  if (isArrayCopy(CB) || isCopyOfRange(CB) || isCopyOf(CB)) {
+  if (isArrayCopy(CB)) {
     const jeandle::JavaType SrcType =
         jeandle::getJavaType(CB.getArgOperand(0), &DT, &CB, IsNullEdge);
     const jeandle::JavaType DestType =
@@ -355,10 +388,14 @@ bool prepareArrayCopy(CallBase &CI, const CopyFacts &Facts, IRBuilder<> &B,
       return false;
     }
 
-    // Jeandle currently takes a more conservative approach than C2: only
-    // primitive copies are scalarized into loads/stores. Keep reference
-    // copies on the bulk path so the collector's barriers are preserved.
-    if (!isPrimitiveArrayElementType(DestElem))
+    // Match the supported collectors' array-copy barrier policy: reference
+    // copies require a fresh destination and reduced initial card marks.
+    // Keep oop accesses typed so InsertGCBarriers can still process them.
+    const auto VMConsts = jeandle::VMConstants::fromModule(*CI.getModule());
+    if (!isPrimitiveArrayElementType(DestElem) &&
+        (DestElem != jeandle::JBasicType::Object || !DisjointBases ||
+         findTightlyCoupledArrayAllocation(CI) == nullptr ||
+         !VMConsts.reduceInitialCardMarks()))
       return false;
 
     // TODO: Retain the source element value_type for typed oop accesses and
@@ -640,6 +677,10 @@ bool tryScalarizeCopy(CallBase &CI, const CopyFacts &Facts) {
 
   BasicBlock *NormalCtl = Invoke.getNormalDest();
   BasicBlock *ExceptionCtl = Invoke.getUnwindDest();
+  if (needsCopyPublicationBarrier(CI)) {
+    IRBuilder<> ResultFenceBuilder(&Invoke);
+    emitStoreStoreBarrier(ResultFenceBuilder, *M);
+  }
   ExceptionCtl->removePredecessor(ResultCtl);
   Invoke.eraseFromParent();
   BranchInst::Create(NormalCtl, ResultCtl);
@@ -687,24 +728,18 @@ CallInst *makeLeafCall(IRBuilder<> &B, Module &M, FunctionType *CallTy,
   return Call;
 }
 
-// Keep publication ordering as a JavaOp until JavaOperationLower(1), matching
-// the frontend's instance/primitive-array clone path. Standalone modules may
-// lack its template definition; a system release fence supplies the same
-// StoreStore ordering in that case.
-void emitStoreStoreBarrier(IRBuilder<> &B, Module &M) {
-  Function *StoreStore = M.getFunction("jeandle.membar_storestore");
-  if (StoreStore != nullptr && !StoreStore->isDeclaration()) {
-    CallInst *Call = B.CreateCall(StoreStore, {});
-    Call->setCallingConv(CallingConv::Hotspot_JIT);
-    return;
-  }
-
-  B.CreateFence(AtomicOrdering::Release);
-}
-
 // Jeandle counterpart of C2 BarrierSetC2::clone_at_expansion().
-void expandClonePayloadCopy(CallBase &CI) {
+bool expandClonePayloadCopy(CallBase &CI) {
   assert(isPayloadClone(CI) && "must be a clone payload copy");
+
+  Module &M = *CI.getModule();
+  Function *ClonePayload = M.getFunction("jeandle.clone_payload");
+  if (ClonePayload == nullptr || ClonePayload->isDeclaration()) {
+    CI.getContext().emitError(&CI,
+                              "copy-specialization requires a definition of "
+                              "jeandle.clone_payload for payload clones");
+    return false;
+  }
 
   Value *Src = CI.getArgOperand(0);
   IRBuilder<> B(&CI);
@@ -713,10 +748,6 @@ void expandClonePayloadCopy(CallBase &CI) {
   Value *DestOffset = toI64(B, CI.getArgOperand(3), "clone.dest_offset64");
   Value *PayloadLongCount =
       toI64(B, CI.getArgOperand(4), "clone.payload_long_count64");
-  Module &M = *CI.getModule();
-  Function *ClonePayload = M.getFunction("jeandle.clone_payload");
-  assert(ClonePayload != nullptr && !ClonePayload->isDeclaration() &&
-         "clone-payload JavaOp must be defined");
   CallInst *Expansion = B.CreateCall(
       ClonePayload, {Src, SrcOffset, Dest, DestOffset, PayloadLongCount,
                      B.getInt1(isInstanceClone(CI))});
@@ -726,6 +757,7 @@ void expandClonePayloadCopy(CallBase &CI) {
   // remains in place when this pass replaces the clone pseudo call.
 
   eraseCopyPseudoCall(CI);
+  return true;
 }
 
 //------------------------------generateGuard---------------------------
@@ -1206,6 +1238,7 @@ bool generateArrayCopy(CallBase &CI, CallBase *Allocation,
   Module *M = CI.getModule();
   LLVMContext &Ctx = CI.getContext();
   Function *F = ControlBB->getParent();
+  const bool NeedsPublicationBarrier = needsCopyPublicationBarrier(CI);
   InvokeInst &Invoke = cast<InvokeInst>(CI);
   BasicBlock *UnwindDest = Invoke.getUnwindDest();
   if (SlowRegion == nullptr)
@@ -1439,11 +1472,9 @@ bool generateArrayCopy(CallBase &CI, CallBase *Allocation,
                           CopyLength);
   }
 
-  // C2 places a StoreStore barrier after a freshly allocated clone's payload
-  // copy.  The pseudo invoke is replaced by this pass, so make the publication
-  // ordering explicit on the common result edge.  Ordinary arraycopy calls do
-  // not carry the fresh-allocation proof and must retain their existing path.
-  if (isReferenceArrayClone(CI)) {
+  // Order all successful copy paths, including zero-length and slow copies,
+  // before publishing the freshly allocated destination.
+  if (NeedsPublicationBarrier) {
     IRBuilder<> ResultFenceBuilder(ResultRegion->getTerminator());
     emitStoreStoreBarrier(ResultFenceBuilder, *M);
   }
@@ -1460,8 +1491,7 @@ bool expandCopyPseudoCall(CallBase &CI, const CopyFacts &Facts,
   assert(isCopyPseudoCall(CI) && "should be a copy pseudo call");
 
   if (isPayloadClone(CI)) {
-    expandClonePayloadCopy(CI);
-    return true;
+    return expandClonePayloadCopy(CI);
   }
 
   Value *Src = CI.getArgOperand(0);
