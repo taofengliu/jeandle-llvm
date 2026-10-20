@@ -31,8 +31,8 @@ using namespace llvm;
 
 namespace {
 
-#define PROB_MIN (1e-6f)
-#define PROB_MAX (1.0f - 1e-6f)
+constexpr float PROB_MIN = 1e-6f;
+constexpr float PROB_MAX = 1.0f - PROB_MIN;
 
 constexpr uint32_t BranchWeightScale = 1000000;
 
@@ -923,7 +923,11 @@ void generatePartialInliningBlock(BasicBlock *&ControlBB, BasicBlock *&ExitBB,
                                 "arraycopy.partial.inline_ok");
   BranchInst *Guard = HeadBuilder.CreateCondBr(InlineCopy, InlineBB, StubBB);
   MDBuilder MDB(Ctx);
-  Guard->setMetadata(LLVMContext::MD_prof, MDB.createBranchWeights(1, 1));
+  const uint32_t InlineWeight =
+      static_cast<uint32_t>(PROB_MAX * BranchWeightScale);
+  Guard->setMetadata(
+      LLVMContext::MD_prof,
+      MDB.createBranchWeights(InlineWeight, BranchWeightScale - InlineWeight));
 
   IRBuilder<> InlineBuilder(InlineBB);
   Type *MaskBitsTy = InlineBuilder.getIntNTy(VectorLaneCount);
@@ -1054,6 +1058,8 @@ CallInst *generateCheckcastArrayCopy(BasicBlock *&ControlBB,
 
   GlobalVariable *SuperCheckOffsetOffsetGlobal =
       M.getGlobalVariable("Klass.super_check_offset_offset", true);
+  if (SuperCheckOffsetOffsetGlobal == nullptr)
+    return nullptr;
   Value *SuperCheckOffsetOffset =
       B.CreateLoad(B.getInt32Ty(), SuperCheckOffsetOffsetGlobal,
                    "arraycopy.super_check_offset_offset");
@@ -1520,11 +1526,9 @@ bool expandCopyPseudoCall(CallBase &CI, const CopyFacts &Facts,
     // kinds can use Object/disjoint expansion without ordinary bounds guards.
     // The validated attribute separately proves element assignability; its
     // absence still requires the subtype/checkcast path below.
-    CallBase *Allocation = nullptr;
-    if (isAllocTightlyCoupled(CI)) {
-      Allocation = findTightlyCoupledArrayAllocation(CI);
-      assert(Allocation != nullptr && "expect allocation");
-    }
+    CallBase *Allocation = isAllocTightlyCoupled(CI)
+                               ? findTightlyCoupledArrayAllocation(CI)
+                               : nullptr;
 
     return generateArrayCopy(CI, Allocation, ControlBB,
                              jeandle::JBasicType::Object, Src, SrcPos, Dest,
@@ -1532,11 +1536,9 @@ bool expandCopyPseudoCall(CallBase &CI, const CopyFacts &Facts,
                              hasNegativeLengthGuard(CI), nullptr, TTI);
   }
 
-  CallBase *Allocation = nullptr;
-  if (isAllocTightlyCoupled(CI)) {
-    Allocation = findTightlyCoupledArrayAllocation(CI);
-    assert(Allocation != nullptr && "expect allocation");
-  }
+  CallBase *Allocation = isAllocTightlyCoupled(CI)
+                             ? findTightlyCoupledArrayAllocation(CI)
+                             : nullptr;
 
   // Compile time checks.  If any of these checks cannot be verified at compile
   // time, we do not make a fast path for this call.  Instead, we let the call
@@ -1652,10 +1654,42 @@ PreservedAnalyses CopySpecialization::run(Function &F,
   // CFG expansion invalidates DT and LVI, but the element types and clone
   // callback result remain valid for each original call site.
   SmallVector<CopyFacts, 8> Worklist;
-  for (Instruction &I : instructions(F))
-    if (auto *CB = dyn_cast<CallBase>(&I))
-      if (isCopyPseudoCall(*CB))
-        Worklist.push_back(analyzeCopy(*CB, DT, IsNullEdge));
+  for (Instruction &I : instructions(F)) {
+    auto *CB = dyn_cast<CallBase>(&I);
+    if (CB == nullptr || !isCopyPseudoCall(*CB))
+      continue;
+
+    // Validate frontend contracts before scalarization or CFG rewriting. In
+    // particular, losing a fresh allocation must not silently drop its
+    // publication fence in builds without assertions.
+    if (!isPayloadClone(*CB)) {
+      if (!isa<InvokeInst>(CB)) {
+        F.getContext().emitError(
+            CB, "copy-specialization requires an invoke for array copies");
+        return PreservedAnalyses::all();
+      }
+      if (isAllocTightlyCoupled(*CB) &&
+          findTightlyCoupledArrayAllocation(*CB) == nullptr) {
+        F.getContext().emitError(
+            CB, "copy-specialization requires a direct jeandle.new_array "
+                "destination for tightly coupled array copies");
+        return PreservedAnalyses::all();
+      }
+    }
+
+    CopyFacts Facts = analyzeCopy(*CB, DT, IsNullEdge);
+    if (Facts.CloneInstanceInfo.has_value()) {
+      const auto &[Status, Count, Fields] = *Facts.CloneInstanceInfo;
+      if (Status == static_cast<int>(jeandle::CloneInstanceInfoStatus::Ready) &&
+          (Count < 0 || static_cast<size_t>(Count) != Fields.size())) {
+        F.getContext().emitError(
+            CB, "copy-specialization requires a clone-instance field count "
+                "matching its field descriptions");
+        return PreservedAnalyses::all();
+      }
+    }
+    Worklist.push_back(std::move(Facts));
+  }
 
   TargetTransformInfo &TTI = FAM.getResult<TargetIRAnalysis>(F);
   bool Changed = false;

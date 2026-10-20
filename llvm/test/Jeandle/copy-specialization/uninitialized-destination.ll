@@ -1,5 +1,15 @@
 ; RUN: opt -S -verify-each -passes='copy-specialization' -jeandle-vm-callback-log=%S/Inputs/uninitialized-destination.cblog %s | FileCheck %s --check-prefixes=COMMON,UNINIT
 ; RUN: sed 's/@VMOptions.ReduceBulkZeroing = constant i1 true/@VMOptions.ReduceBulkZeroing = constant i1 false/' %s | opt -S -verify-each -passes='copy-specialization' -jeandle-vm-callback-log=%S/Inputs/uninitialized-destination.cblog | FileCheck %s --check-prefixes=COMMON,INIT
+; RUN: sed '/^@Klass.super_check_offset_offset =/d' %s | opt -S -verify-each -passes=copy-specialization -jeandle-vm-callback-log=%S/Inputs/uninitialized-destination.cblog | FileCheck %s --check-prefix=MISSING-OFFSET
+
+; Without the VM layout global, retain the slow invoke and its exception state.
+; MISSING-OFFSET-LABEL: define ptr addrspace(1) @checkcast_fresh(
+; MISSING-OFFSET-NOT: call i32 @StubRoutines_checkcast_arraycopy
+; MISSING-OFFSET: invoke hotspotcc void @SharedRuntime_slow_arraycopy_C
+; MISSING-OFFSET: fence release
+; MISSING-OFFSET-LABEL: define void @checkcast_existing(
+; MISSING-OFFSET-NOT: call i32 @StubRoutines_checkcast_arraycopy
+; MISSING-OFFSET: invoke hotspotcc void @SharedRuntime_slow_arraycopy_C
 
 @VMOptions.ReduceBulkZeroing = constant i1 true
 @VMOptions.ArrayCopyLoadStoreMaxElem = constant i32 0
@@ -106,11 +116,86 @@ exception:
 ; COMMON-NOT: fence
 ; COMMON-NOT: @jeandle.copy
 
+; Without validated-copy, copyOf[Range] must retain store checks and continue
+; from the copied prefix when a checkcast stub fails.
+define ptr addrspace(1) @copyof_checkcast(ptr addrspace(1) %src, ptr %src_klass, ptr %dest_klass) #0 personality ptr @personality {
+entry:
+  %dest = call ptr addrspace(1) @jeandle.new_array(ptr null, i32 8, i32 48, i32 16, i32 1000)
+  invoke void @jeandle.copy(ptr addrspace(1) %src, i64 0, ptr addrspace(1) %dest, i64 0, i64 8, ptr %src_klass, ptr %dest_klass, i64 8, i64 8) #5 [ "deopt"(i32 1) ] to label %normal unwind label %exception
+normal:
+  ret ptr addrspace(1) %dest
+exception:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
+; COMMON-LABEL: define ptr addrspace(1) @copyof_checkcast(
+; UNINIT: call i32 @StubRoutines_checkcast_arraycopy_uninit(
+; INIT: call i32 @StubRoutines_checkcast_arraycopy(
+; COMMON: phi i64 [ 0, %arraycopy.slow_region ], [ {{%.*}}, %arraycopy.checkcast.failure ]
+; COMMON: invoke hotspotcc void @SharedRuntime_slow_arraycopy_C({{.*}}[ "deopt"(i32 1) ]
+; COMMON: arraycopy.result:
+; COMMON-NEXT: fence release
+; COMMON-NOT: @jeandle.copy
+
+define ptr addrspace(1) @copyof_range_checkcast(ptr addrspace(1) %src, ptr %src_klass, ptr %dest_klass) #0 personality ptr @personality {
+entry:
+  %dest = call ptr addrspace(1) @jeandle.new_array(ptr null, i32 8, i32 48, i32 16, i32 1000)
+  invoke void @jeandle.copy(ptr addrspace(1) %src, i64 1, ptr addrspace(1) %dest, i64 0, i64 7, ptr %src_klass, ptr %dest_klass, i64 8, i64 8) #6 [ "deopt"(i32 1) ] to label %normal unwind label %exception
+normal:
+  ret ptr addrspace(1) %dest
+exception:
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
+; COMMON-LABEL: define ptr addrspace(1) @copyof_range_checkcast(
+; UNINIT: call i32 @StubRoutines_checkcast_arraycopy_uninit(
+; INIT: call i32 @StubRoutines_checkcast_arraycopy(
+; COMMON: [[OFFSET:%.*]] = phi i64 [ 0, %arraycopy.slow_region ], [ {{%.*}}, %arraycopy.checkcast.failure ]
+; COMMON: add i64 1, [[OFFSET]]
+; COMMON: sub i64 7, [[OFFSET]]
+; COMMON: invoke hotspotcc void @SharedRuntime_slow_arraycopy_C({{.*}}[ "deopt"(i32 1) ]
+; COMMON: arraycopy.result:
+; COMMON-NEXT: fence release
+; COMMON-NOT: @jeandle.copy
+
+; Analyze both sites before changing the shared exceptional CFG, and retain
+; each destination's publication ordering after expanding both copies.
+define ptr addrspace(1) @two_copies(ptr addrspace(1) %src) #0 personality ptr @personality {
+entry:
+  %first = call ptr addrspace(1) @jeandle.new_array(ptr null, i32 8, i32 48, i32 16, i32 1000)
+  invoke void @jeandle.copy(ptr addrspace(1) %src, i64 0, ptr addrspace(1) %first, i64 0, i64 8, ptr null, ptr null, i64 8, i64 8) #1 [ "deopt"(i32 1) ] to label %second_copy unwind label %exception
+second_copy:
+  %second = call ptr addrspace(1) @jeandle.new_array(ptr null, i32 8, i32 48, i32 16, i32 1000)
+  invoke void @jeandle.copy(ptr addrspace(1) %first, i64 1, ptr addrspace(1) %second, i64 0, i64 7, ptr null, ptr null, i64 8, i64 8) #2 [ "deopt"(i32 1) ] to label %normal unwind label %exception
+normal:
+  ret ptr addrspace(1) %second
+exception:
+  %site = phi i32 [ 1, %entry ], [ 2, %second_copy ]
+  %lp = landingpad i64 cleanup
+  resume i64 %lp
+}
+
+; COMMON-LABEL: define ptr addrspace(1) @two_copies(
+; UNINIT: call void @StubRoutines_arrayof_oop_disjoint_arraycopy_uninit(
+; INIT: call void @StubRoutines_arrayof_oop_disjoint_arraycopy(
+; COMMON: arraycopy.result:
+; COMMON-NEXT: fence release
+; COMMON: second_copy:
+; UNINIT: call void @StubRoutines_oop_disjoint_arraycopy_uninit(
+; INIT: call void @StubRoutines_oop_disjoint_arraycopy(
+; COMMON: arraycopy.result{{[0-9]+}}:
+; COMMON-NEXT: fence release
+; COMMON-NOT: @jeandle.copy
+
 attributes #0 = { "java-method"="0" }
 attributes #1 = { "jeandle.copy.kind"="copyof" "jeandle.copy.validated" "jeandle.copy.negative-length-guard" "jeandle.copy.tightly-coupled-allocation" }
 attributes #2 = { "jeandle.copy.kind"="copyof-range" "jeandle.copy.validated" "jeandle.copy.negative-length-guard" "jeandle.copy.tightly-coupled-allocation" }
 attributes #3 = { "jeandle.copy.kind"="arraycopy" "jeandle.copy.negative-length-guard" "jeandle.copy.tightly-coupled-allocation" }
 attributes #4 = { "jeandle.copy.kind"="arraycopy" "jeandle.copy.negative-length-guard" }
+attributes #5 = { "jeandle.copy.kind"="copyof" "jeandle.copy.negative-length-guard" "jeandle.copy.tightly-coupled-allocation" }
+attributes #6 = { "jeandle.copy.kind"="copyof-range" "jeandle.copy.negative-length-guard" "jeandle.copy.tightly-coupled-allocation" }
 !java-method-compilation = !{}
 !current-thread = !{!0}
 !0 = !{!"r15"}

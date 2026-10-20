@@ -1,5 +1,7 @@
 ; RUN: opt -S -passes="function(copy-specialization),java-operation-lower<phase=1>" -jeandle-vm-callback-log=%S/Inputs/clone-instance.cblog %s 2>&1 | FileCheck %s
 ; RUN: %if aarch64-registered-target %{ opt -S -passes="function(copy-specialization),java-operation-lower<phase=1>" -jeandle-vm-callback-log=%S/Inputs/clone-instance.cblog %s 2>&1 | llc -mtriple=aarch64-linux-gnu -O2 -o - | FileCheck %s --check-prefix=AARCH64 %}
+; RUN: %if x86-registered-target %{ sed 's/!"x28"/!"r15"/' %s | opt -S -verify-each -passes="function(copy-specialization),java-operation-lower<phase=1>" -jeandle-vm-callback-log=%S/Inputs/clone-instance.cblog | llc -mtriple=x86_64-linux-gnu -O2 -o - | FileCheck %s --check-prefix=X86 %}
+; RUN: %if riscv-registered-target %{ sed 's/!"x28"/!"x23"/' %s | opt -S -verify-each -passes="function(copy-specialization),java-operation-lower<phase=1>" -jeandle-vm-callback-log=%S/Inputs/clone-instance.cblog | llc -mtriple=riscv64-linux-gnu -O2 -o - | FileCheck %s --check-prefix=RISCV %}
 
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-p3:32:32:32-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32"
 target triple = "aarch64-unknown-linux-gnu"
@@ -62,9 +64,13 @@ exception:
 ; CHECK: br label %normal
 
 ; AARCH64-LABEL: clone_payload_expansion:
-; AARCH64: add x0, x1, #8
-; AARCH64: add x1, x2, #8
+; AARCH64: add x0, x{{[0-9]+}}, #8
+; AARCH64: add x1, x{{[0-9]+}}, #8
 ; AARCH64: bl StubRoutines_jlong_disjoint_arraycopy
+; X86-LABEL: clone_payload_expansion:
+; X86: callq StubRoutines_jlong_disjoint_arraycopy
+; RISCV-LABEL: clone_payload_expansion:
+; RISCV: call StubRoutines_jlong_disjoint_arraycopy
 
 define hotspotcc void @clone_oop_array_expansion(
     ptr addrspace(1) %src, ptr addrspace(1) %dest, i64 %length,
@@ -111,6 +117,13 @@ exception:
 ; AARCH64: bl StubRoutines_arrayof_oop_disjoint_arraycopy
 ; AARCH64: dmb ish
 ; AARCH64: bl SharedRuntime_slow_arraycopy_C
+; X86-LABEL: clone_oop_array_expansion:
+; X86: callq StubRoutines_arrayof_oop_disjoint_arraycopy
+; X86: callq SharedRuntime_slow_arraycopy_C
+; RISCV-LABEL: clone_oop_array_expansion:
+; RISCV: call StubRoutines_arrayof_oop_disjoint_arraycopy
+; RISCV: fence
+; RISCV: call SharedRuntime_slow_arraycopy_C
 
 define hotspotcc void @clone_oop_array_zero(
     ptr addrspace(1) %src, ptr addrspace(1) %dest, ptr %klass) #0

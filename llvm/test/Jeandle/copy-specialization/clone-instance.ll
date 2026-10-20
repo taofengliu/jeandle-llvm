@@ -3,6 +3,12 @@
 ; RUN: opt -S -passes="function(copy-specialization),java-operation-lower<phase=1>" -jeandle-vm-callback-log=%S/Inputs/clone-instance-gc-barrier.cblog %s 2>&1 | FileCheck %s --check-prefix=BARRIER
 ; RUN: opt -S -passes="function(copy-specialization,insert-gc-barriers),java-operation-lower<phase=1>" -jeandle-vm-callback-log=%S/Inputs/clone-instance.cblog %s 2>&1 | FileCheck %s --check-prefix=GC-BARRIER
 ; RUN: opt -S -verify-each -passes="function(copy-specialization),java-operation-lower<phase=1>" %s | FileCheck %s --check-prefix=NO-CALLBACK
+; RUN: sed 's/(4, 3,/(4, 2,/' %S/Inputs/clone-instance.cblog > %t.cblog
+; RUN: not opt -disable-output -passes=copy-specialization -jeandle-vm-callback-log=%t.cblog %s 2>&1 | FileCheck %s --check-prefix=INVALID-COUNT
+
+; INVALID-COUNT: error: copy-specialization requires a clone-instance field count matching its field descriptions
+; INVALID-COUNT-NOT: Assertion
+; INVALID-COUNT-NOT: PLEASE submit a bug report
 
 target datalayout = "e-m:e-p270:32:32-p271:32:32-p272:64:64-p3:32:32:32-i8:8:32-i16:16:32-i64:64-i128:128-n32:64-S128-Fn32"
 target triple = "aarch64-unknown-linux-gnu"

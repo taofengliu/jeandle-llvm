@@ -68,6 +68,7 @@ exception:
 ; PARTIAL: [[LENGTH:%.*]] = sext i32 %length to i64
 ; PARTIAL: [[BYTES:%.*]] = shl i64 [[LENGTH]], 1
 ; PARTIAL: icmp ule i64 [[BYTES]], 32
+; PARTIAL-NEXT: br i1 {{%.*}}, label %arraycopy.partial.inline, label %arraycopy.partial.stub, !prof [[INLINE_WEIGHTS:![0-9]+]]
 ; PARTIAL: call <16 x i16> @llvm.masked.load
 ; PARTIAL: call void @llvm.masked.store
 ; PARTIAL: call void @StubRoutines_jshort_disjoint_arraycopy
@@ -92,3 +93,5 @@ attributes #3 = { "jeandle.copy.kind"="clone-array" }
 !java-method-compilation = !{}
 !current-thread = !{!0}
 !0 = !{!"r15"}
+
+; PARTIAL: [[INLINE_WEIGHTS]] = !{!"branch_weights", i32 999999, i32 1}

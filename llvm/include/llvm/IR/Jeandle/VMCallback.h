@@ -74,7 +74,8 @@ using CloneInstanceFieldInfo = std::tuple<int, int>;
 
 /// Clone-instance status, C2 clone-instance field count, and all fields needed
 /// by scalarization. The count is kept separately because declined transforms
-/// do not need to materialize the field descriptions.
+/// do not need to materialize the field descriptions. For Ready, the count
+/// must equal the number of field descriptions.
 using CloneInstanceInfoResult =
     std::tuple<int, int, std::vector<CloneInstanceFieldInfo>>;
 
