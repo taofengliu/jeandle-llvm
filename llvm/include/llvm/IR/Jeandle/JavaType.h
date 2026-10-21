@@ -87,7 +87,9 @@ using IsNullEdgeOracle =
 /// Get the Java type of a value.
 ///
 /// When Context is null, performs a context-insensitive query using only
-/// attributes and metadata attached to the value (and PHI incoming values).
+/// attributes and metadata attached to the value and supported dependencies
+/// (PHIs, selects and pointer-identity expressions). Returned arguments and
+/// explicit return attributes constrain the result simultaneously.
 ///
 /// When Context is provided, additionally performs context-sensitive sharpening
 /// with the edge-semantics dataflow engine: guards attached to CFG edges are
@@ -149,8 +151,8 @@ JavaType sharpen(Value *V, Instruction *Context, DominatorTree &DT,
                  BasicBlock *DestBB, IsNullEdgeOracle IsNullEdge);
 
 /// Compute the type union of two Java types. Used when the value could be
-/// either type (PHI, select). Widens positive type to LCA and intersects
-/// ExcludedKlasses (only exclusions common to both survive).
+/// either type (PHI, select). Widens positive type to LCA and keeps exclusions
+/// implied by both operands, explicitly or through positive bounds.
 JavaType typeUnion(JavaType A, JavaType B);
 
 /// Compute the type intersection of two Java types. Used when both constraints
@@ -158,8 +160,10 @@ JavaType typeUnion(JavaType A, JavaType B);
 /// Narrows to the more specific positive type and unions ExcludedKlasses.
 JavaType typeIntersect(JavaType A, JavaType B);
 
-/// Returns true if Klass and OtherKlass are provably incompatible under
-/// Java's single-class inheritance. Requires VM callbacks to be registered.
+/// Returns true if Klass and OtherKlass are provably incompatible, including
+/// Java's interface and array-covariance rules. Requires VM callbacks to be
+/// registered. Missing interface-array classification conservatively prevents
+/// proofs of incompatibility between unrelated non-exact class bounds.
 /// \p KlassExact indicates whether Klass is known to be an exact type.
 bool areKlassesIncompatible(uintptr_t Klass, bool KlassExact,
                             uintptr_t OtherKlass);

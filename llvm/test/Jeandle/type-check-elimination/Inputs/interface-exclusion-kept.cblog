@@ -54,3 +54,5 @@ GetCommonSuperKlass 4 5 = 1
 GetCommonSuperKlass 5 4 = 1
 GetCommonSuperKlass 5 6 = 1
 GetCommonSuperKlass 6 5 = 1
+IsUnverifiedInterface 3 = false
+IsUnverifiedInterface 4 = false

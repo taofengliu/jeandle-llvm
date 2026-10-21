@@ -391,8 +391,9 @@ PreservedAnalyses RecoverTypeInfo::run(Function &F,
         continue;
       ++OopInstCount;
 
-      // Call / invoke with java-klass return attribute.
-      if (isa<CallBase>(&I)) {
+      // Identity intrinsics participate in the forwarder fixpoint. Ordinary
+      // calls and invokes are seeded from their explicit return attributes.
+      if (isa<CallBase>(&I) && !isForwarder(I)) {
         auto *CB2 = cast<CallBase>(&I);
         seed(&I,
              klassFromAttr(CB2->getAttributes(), AttributeList::ReturnIndex));

@@ -20,6 +20,7 @@
 #include "llvm/IR/GlobalAlias.h"
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Jeandle/Attributes.h"
 #include "llvm/IR/Jeandle/JeandleUtils.h"
 #include "llvm/IR/Jeandle/Metadata.h"
@@ -47,6 +48,20 @@ STATISTIC(NumJavaTypeBudgetExhausted,
 /// Prevents infinite recursion on deeply nested or cyclic IR patterns.
 static constexpr unsigned MaxExtractKlassDepth = 16;
 
+/// Pointer wrappers do not establish which definition supplies an interposable
+/// alias. Only aliases with a definitive local target may be followed.
+static Value *stripKlassPointerWrappers(Value *V) {
+  SmallPtrSet<Value *, 8> Visited;
+  while (Visited.insert(V).second) {
+    V = V->stripPointerCasts();
+    auto *Alias = dyn_cast<GlobalAlias>(V);
+    if (!Alias || Alias->isInterposable())
+      return V;
+    V = Alias->getAliasee();
+  }
+  return V;
+}
+
 static uintptr_t extractKlassConstantImpl(Value *V, unsigned Depth) {
   if (Depth > MaxExtractKlassDepth)
     return 0;
@@ -59,7 +74,7 @@ static uintptr_t extractKlassConstantImpl(Value *V, unsigned Depth) {
 
   // Strip pointer casts (bitcast, addrspacecast, zero-index GEP) and
   // aliases to see through wrappers that optimization passes may introduce.
-  V = V->stripPointerCastsAndAliases();
+  V = stripKlassPointerWrappers(V);
 
   // Pattern 1: inttoptr instruction.
   if (auto *I2P = dyn_cast<IntToPtrInst>(V)) {
@@ -116,8 +131,8 @@ static uintptr_t extractKlassConstantImpl(Value *V, unsigned Depth) {
   // Pattern 3: load from a constant global variable (recurse into initializer).
   if (auto *LI = dyn_cast<LoadInst>(V)) {
     if (auto *GV = dyn_cast<GlobalVariable>(
-            LI->getPointerOperand()->stripPointerCastsAndAliases())) {
-      if (GV->isConstant() && GV->hasInitializer())
+            stripKlassPointerWrappers(LI->getPointerOperand()))) {
+      if (GV->isConstant() && GV->hasDefinitiveInitializer())
         return extractKlassConstantImpl(GV->getInitializer(), Depth + 1);
     }
   }
@@ -140,8 +155,15 @@ bool jeandle::areKlassesIncompatible(uintptr_t Klass, bool KlassExact,
   assert(CB && CB->IsSubtype && CB->IsInterface && "VMCallbacks must be set");
   if (CB->IsSubtype(Klass, OtherKlass) || CB->IsInterface(Klass))
     return false;
-  return KlassExact ||
-         (!CB->IsSubtype(OtherKlass, Klass) && !CB->IsInterface(OtherKlass));
+  if (KlassExact)
+    return true;
+  if (CB->IsSubtype(OtherKlass, Klass) || CB->IsInterface(OtherKlass))
+    return false;
+  // Arrays of interfaces can overlap with unrelated array bounds through
+  // covariant element subtypes. The verifier classification includes both
+  // interfaces themselves and arrays with an interface base element.
+  return CB->IsUnverifiedInterface && !CB->IsUnverifiedInterface(Klass) &&
+         !CB->IsUnverifiedInterface(OtherKlass);
 }
 
 /// Return true if F is jeandle.check_instanceof.
@@ -223,11 +245,9 @@ static void unionExcludedKlasses(SmallDenseSet<uintptr_t, 2> &Dst,
 
 /// Enforce ExcludedKlasses invariants:
 /// 1. If Exact, clear ExcludedKlasses (type is fully determined).
-/// 2. If Klass is known, remove excluded classes that are not subtypes of
-///    Klass: a value whose positive type is <: Klass can never be one of them
-///    (single class inheritance). Interface exclusions are kept even when not
-///    related to Klass — a class matching Klass may still implement any
-///    interface, so "is not an implementor of I" stays real information.
+/// 2. Remove exclusions already implied by an incompatible positive bound.
+///    Interfaces and covariant arrays may overlap without either bound being
+///    a subtype of the other, so absence of a subtype relation is insufficient.
 static void normalizeExcludedKlasses(JavaType &T) {
   if (T.ExcludedKlasses.empty())
     return;
@@ -236,11 +256,9 @@ static void normalizeExcludedKlasses(JavaType &T) {
     return;
   }
   if (T.Klass != 0) {
-    const VMCallbacks *CB = getVMCallbacks();
-    assert(CB && CB->IsSubtype && CB->IsInterface && "VMCallbacks must be set");
     SmallVector<uintptr_t, 2> ToRemove;
     for (uintptr_t K : T.ExcludedKlasses) {
-      if (!CB->IsInterface(K) && !CB->IsSubtype(K, T.Klass))
+      if (areKlassesIncompatible(T.Klass, T.Exact, K))
         ToRemove.push_back(K);
     }
     for (uintptr_t K : ToRemove)
@@ -337,10 +355,16 @@ JavaType jeandle::typeUnion(JavaType A, JavaType B) {
       Result.Exact = false;
     }
   }
-  // Intersect exclusions (value could be either A or B).
-  if (!A.ExcludedKlasses.empty() && !B.ExcludedKlasses.empty())
-    Result.ExcludedKlasses =
-        intersectExcludedKlasses(A.ExcludedKlasses, B.ExcludedKlasses);
+  // An exclusion common to both arms can be explicit on one side and implied
+  // by the positive bound on the other. Examine candidates from both arms.
+  auto Excludes = [](const JavaType &T, uintptr_t K) {
+    return isExcludedBy(K, T.ExcludedKlasses) ||
+           (T.isKnown() && areKlassesIncompatible(T.Klass, T.Exact, K));
+  };
+  for (const JavaType *T : {&A, &B})
+    for (uintptr_t K : T->ExcludedKlasses)
+      if (Excludes(A, K) && Excludes(B, K))
+        addExcludedKlass(Result.ExcludedKlasses, K);
   normalizeExcludedKlasses(Result);
   return Result;
 }
@@ -382,12 +406,14 @@ JavaType jeandle::typeIntersect(JavaType A, JavaType B) {
     } else if (CB->IsSubtype(B.Klass, A.Klass)) {
       Result.Klass = B.Klass;
       Result.Exact = B.Exact;
+    } else if (CB->IsInterface(A.Klass) != CB->IsInterface(B.Klass)) {
+      // A concrete class bound and an unrelated interface can both hold for
+      // a subclass. Preserve the class while Interfaces carries the other
+      // constraint independently.
+      Result.Klass = CB->IsInterface(A.Klass) ? B.Klass : A.Klass;
     }
-    // else: neither is a subtype of the other. For two classes this is
-    // contradictory (no live value satisfies both; dead code). A class vs an
-    // unrelated interface is a LIVE combination — e.g. a base type from an
-    // attribute and a guard proving an interface — so the Interfaces union
-    // stays and only Klass is dropped to unknown.
+    // Other unrelated bounds need not have a representable intersection;
+    // retain their common interface constraints without inventing a Klass.
   } else if (A.isKnown()) {
     Result.Klass = A.Klass;
     Result.Exact = A.Exact;
@@ -414,7 +440,8 @@ JavaType jeandle::typeIntersect(JavaType A, JavaType B) {
 using BaseMemo = DenseMap<Value *, JavaType>;
 using DefinedMemo = DenseMap<Value *, bool>;
 
-/// Follow one pointer identity expression without skipping explicit type seeds.
+/// Follow one pointer identity expression. Explicit type seeds are separate
+/// constraints on the result, rather than a reason to discard this dependency.
 static Value *getIdentityInput(Value *V) {
   if (!V->getType()->isPointerTy())
     return nullptr;
@@ -423,8 +450,9 @@ static Value *getIdentityInput(Value *V) {
   if (auto *Alias = dyn_cast<GlobalAlias>(V))
     return Alias->getAliasee();
   if (auto *CB = dyn_cast<CallBase>(V)) {
-    if (CB->getAttributes().hasRetAttr(jeandle::Attribute::JavaKlass))
-      return nullptr;
+    if (CB->getIntrinsicID() == Intrinsic::launder_invariant_group ||
+        CB->getIntrinsicID() == Intrinsic::strip_invariant_group)
+      return CB->getArgOperand(0);
     return CB->getReturnedArgOperand();
   }
   if (Operator::getOpcode(V) == Instruction::BitCast ||
@@ -710,6 +738,7 @@ struct BaseTypeNode {
   unsigned Index;
   bool OnStack = true;
   BaseTypeNode *PendingChild = nullptr;
+  JavaType Seed;
   JavaType Result;
   bool First = true;
 };
@@ -746,8 +775,9 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr,
     auto N = std::make_unique<BaseTypeNode>();
     N->V = Input;
     N->Index = NextIndex++;
+    N->Seed = getBaseJavaTypeLeaf(Input);
     if (!getBaseTypeInputs(Input, N->Inputs, /*SkipVacuousArms=*/true))
-      Cache[Input] = getBaseJavaTypeLeaf(Input);
+      Cache[Input] = N->Seed;
     BaseTypeNode *Raw = N.get();
     Nodes[Input] = std::move(N);
     Frames.push_back(Raw);
@@ -755,39 +785,17 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr,
     Roots.push_back(Raw);
     return Raw;
   };
-  auto CompleteUnknown = [&](Value *Witness) {
-    // Only dependency ancestors of the witness are proved unknown. Cache
-    // them for later roots, without caching unfinished sibling subgraphs.
-    DenseMap<Value *, SmallVector<Value *, 2>> Users;
-    for (const auto &Entry : Nodes)
-      for (Value *Input : Entry.second->Inputs)
-        Users[Input].push_back(Entry.first);
-    SmallVector<Value *, 16> Pending{Witness};
-    SmallPtrSet<Value *, 16> Visited;
-    while (!Pending.empty()) {
-      Value *Unknown = Pending.pop_back_val();
-      if (!Visited.insert(Unknown).second)
-        continue;
-      Cache[Unknown] = {};
-      if (auto It = Users.find(Unknown); It != Users.end())
-        Pending.append(It->second.begin(), It->second.end());
-    }
-  };
   auto JoinInput = [&](BaseTypeNode *N, Value *Input) {
     joinArm(N->Result, N->First, Cache.lookup(Input));
-    if (!N->Result.isUnknown())
-      return false;
-    CompleteUnknown(N->V);
-    return true;
+    // Unknown absorbs the remaining arms. Complete this node locally: an
+    // ancestor may still have an independent return-attribute constraint.
+    if (N->Result.isUnknown())
+      N->NextInput = N->Inputs.size();
   };
   Discover(V);
   while (!Frames.empty()) {
     BaseTypeNode *N = Frames.back();
     if (auto It = Cache.find(N->V); It != Cache.end()) {
-      if (It->second.isUnknown()) {
-        CompleteUnknown(N->V);
-        return {};
-      }
       // Leaves cannot belong to a cycle.
       assert(OpenNodes.back() == N && "leaf must be the last open node");
       assert(Roots.back() == N && "leaf must be its own component root");
@@ -799,21 +807,20 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr,
     }
     if (BaseTypeNode *Child = N->PendingChild) {
       N->PendingChild = nullptr;
-      if (!Child->OnStack && JoinInput(N, Child->V))
-        return {};
+      if (!Child->OnStack)
+        JoinInput(N, Child->V);
     }
     if (N->NextInput != N->Inputs.size()) {
       Value *Input = N->Inputs[N->NextInput++];
       if (Cache.contains(Input)) {
-        if (JoinInput(N, Input))
-          return {};
+        JoinInput(N, Input);
       } else if (auto It = Nodes.find(Input); It != Nodes.end()) {
         BaseTypeNode *InputNode = It->second.get();
         assert(InputNode->OnStack && "completed input must be cached");
         // Merge the component roots joined by this edge, including a cross
         // edge to a completed DFS frame that is still in an open component.
         while (Roots.back()->Index > InputNode->Index)
-          Roots.pop_back_val();
+          Roots.pop_back();
       } else {
         N->PendingChild = Discover(Input);
       }
@@ -833,7 +840,7 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr,
     } while (Member != N);
     bool HasCycle = Members.size() != 1 || llvm::is_contained(N->Inputs, N->V);
     if (!HasCycle) {
-      JavaType Result = std::move(N->Result);
+      JavaType Result = typeIntersect(std::move(N->Result), N->Seed);
       // freeze(x) is x only when x is defined; freezing a possibly-poison
       // reference yields an arbitrary one, so the operand's type cannot be
       // forwarded without a definedness proof.
@@ -843,10 +850,6 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr,
           Result = {};
       }
       Cache[N->V] = Result;
-      if (Result.isUnknown()) {
-        CompleteUnknown(N->V);
-        return {};
-      }
       continue;
     }
     // Every member of a cycle derives its values from the completed inputs
@@ -869,11 +872,44 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr,
           if (auto It = Cache.find(Input); It != Cache.end())
             joinArm(Result, First, It->second);
         }
+    // The external-input join bounds every member. Independent result seeds
+    // can further constrain individual members and propagate around the SCC.
+    // Each update retains its previous bound, so only stronger facts enter
+    // the worklist; intermediate component states are not exposed to users.
     for (BaseTypeNode *M : Members)
-      Cache[M->V] = Result;
-    if (Result.isUnknown()) {
-      CompleteUnknown(N->V);
-      return {};
+      Cache[M->V] = typeIntersect(Result, M->Seed);
+    DenseMap<Value *, SmallVector<BaseTypeNode *, 2>> Users;
+    SmallVector<BaseTypeNode *, 16> Pending;
+    SmallPtrSet<BaseTypeNode *, 32> Queued;
+    for (BaseTypeNode *M : Members) {
+      Pending.push_back(M);
+      Queued.insert(M);
+      for (Value *Input : M->Inputs)
+        Users[Input].push_back(M);
+    }
+    while (!Pending.empty()) {
+      BaseTypeNode *M = Pending.pop_back_val();
+      Queued.erase(M);
+      JavaType Derived;
+      bool FirstInput = true;
+      auto *FI = dyn_cast<FreezeInst>(M->V);
+      if (!FI || isProvenDefined(FI->getOperand(0), DefinedCache))
+        for (Value *Input : M->Inputs)
+          joinArm(Derived, FirstInput, Cache.lookup(Input));
+      Derived = typeIntersect(std::move(Derived), M->Seed);
+      JavaType &Previous = Cache[M->V];
+      JavaType Refined = typeIntersect(Previous, std::move(Derived));
+      // Unrepresentable intersections still satisfy the established bound.
+      if (!Refined.isKnown() && Previous.isKnown()) {
+        Refined.Klass = Previous.Klass;
+        Refined.Exact = Previous.Exact;
+      }
+      if (Refined != Previous) {
+        Previous = std::move(Refined);
+        for (BaseTypeNode *User : Users[M->V])
+          if (Queued.insert(User).second)
+            Pending.push_back(User);
+      }
     }
   }
   return Cache.lookup(V);
@@ -903,6 +939,9 @@ namespace {
 /// instructions mid-pass (ConstantFieldFolding does), where dangling Value*
 /// keys could alias freshly allocated values and return stale facts.
 struct JavaTypeQueryContext {
+  JavaTypeQueryContext(DominatorTree &DT, IsNullEdgeOracle NullOracle)
+      : DT(DT), NullOracle(NullOracle) {}
+
   DominatorTree &DT;
   IsNullEdgeOracle NullOracle;
   /// PHI cycle-detection set for the value dimension (phiValueType): a
@@ -911,6 +950,11 @@ struct JavaTypeQueryContext {
   SmallPtrSet<const PHINode *, 8> PhiVisited;
   /// Complete base-type memo shared across the whole query (see BaseMemo).
   BaseMemo BaseTypes;
+  /// Completed value-dimension results. Nested PHIs can depend on the active
+  /// PHI stack, so only evaluations outside that stack enter this cache.
+  DenseMap<Value *, JavaType> ValueTypes;
+  SmallPtrSet<Value *, 16> ValueVisited;
+  unsigned ValueCycles = 0;
   /// Definedness proofs shared by base typing and CFG identity matching.
   DefinedMemo DefinedValues;
   /// Per-(value, block) evaluation state for the block dimension: absent =
@@ -1997,14 +2041,6 @@ static JavaType phiValueType(PHINode *PN, JavaTypeQueryContext &Q) {
   if (!Q.PhiVisited.insert(PN).second)
     return {}; // Cycle detected — caller will skip this incoming.
   auto StackGuard = make_scope_exit([&]() { Q.PhiVisited.erase(PN); });
-  if (Q.PhiBudget == 0) {
-    ++NumJavaTypeBudgetExhausted;
-    LLVM_DEBUG(dbgs() << "JavaType: per-query PHI budget exhausted entering "
-                      << *PN << "\n");
-    return {}; // PHI frames count against the value dimension's budget.
-  }
-  --Q.PhiBudget;
-
   JavaType Result;
   bool First = true;
   for (unsigned I = 0, E = PN->getNumIncomingValues(); I != E; ++I) {
@@ -2049,13 +2085,48 @@ static JavaType phiValueType(PHINode *PN, JavaTypeQueryContext &Q) {
   return Result;
 }
 
-/// The value dimension of a query: the full type of V itself — the PHI value
-/// dimension for PHI nodes, the context-insensitive base type otherwise
-/// (shared BaseMemo across the whole query).
+/// The value dimension combines independent base constraints with incoming
+/// edge facts for PHIs and definition-point operand facts for forwarders.
+/// Cycles and exhausted budgets fall back to the complete base bound.
 static JavaType valueDimension(Value *V, JavaTypeQueryContext &Q) {
-  if (auto *PN = dyn_cast<PHINode>(V))
-    return phiValueType(PN, Q);
-  return getBaseJavaType(V, &Q.BaseTypes, &Q.DefinedValues);
+  JavaType Base = getBaseJavaType(V, &Q.BaseTypes, &Q.DefinedValues);
+  SmallVector<Value *, 4> Inputs;
+  if (!getBaseTypeInputs(V, Inputs, /*SkipVacuousArms=*/true) || Base.Exact)
+    return Base;
+  if (auto It = Q.ValueTypes.find(V); It != Q.ValueTypes.end())
+    return It->second;
+  if (Q.ValueVisited.contains(V)) {
+    ++Q.ValueCycles;
+    return Base;
+  }
+  if (Q.PhiBudget == 0) {
+    ++NumJavaTypeBudgetExhausted;
+    return Base;
+  }
+  --Q.PhiBudget;
+  bool CanMemoize = Q.PhiVisited.empty();
+  unsigned Cycles = Q.ValueCycles;
+  Q.ValueVisited.insert(V);
+  auto StackGuard = make_scope_exit([&] { Q.ValueVisited.erase(V); });
+  JavaType Derived;
+  if (auto *PN = dyn_cast<PHINode>(V)) {
+    Derived = phiValueType(PN, Q);
+  } else {
+    if (auto *FI = dyn_cast<FreezeInst>(V))
+      if (!isProvenDefined(FI->getOperand(0), Q.DefinedValues))
+        return Base;
+    bool First = true;
+    for (Value *Input : Inputs) {
+      JavaType T = valueDimension(Input, Q);
+      if (auto *I = dyn_cast<Instruction>(V))
+        T = typeIntersect(T, factsAt(Input, I->getParent(), Q));
+      joinArm(Derived, First, std::move(T));
+    }
+  }
+  JavaType Result = typeIntersect(std::move(Base), std::move(Derived));
+  if (CanMemoize && Cycles == Q.ValueCycles)
+    Q.ValueTypes[V] = Result;
+  return Result;
 }
 
 JavaType jeandle::sharpen(Value *V, Instruction *Context, DominatorTree &DT,
@@ -2088,12 +2159,10 @@ JavaType jeandle::getJavaType(Value *V, DominatorTree *DT, Instruction *Context,
          "VMCallbacks must be set");
   if (!DT || !Context) {
     DefinedMemo Defined;
-    V = stripCastsAndFreeze(V, Defined);
     return getBaseJavaType(V, nullptr, &Defined);
   }
 
   JavaTypeQueryContext Q{*DT, IsNullEdge};
-  V = stripCastsAndFreeze(V, Q.DefinedValues);
   JavaType T = valueDimension(V, Q);
   return typeIntersect(T, factsAt(V, Context->getParent(), Q));
 }

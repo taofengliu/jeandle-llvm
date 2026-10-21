@@ -13,6 +13,7 @@
 #include "llvm/Analysis/TargetTransformInfo.h"
 #include "llvm/AsmParser/Parser.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/IR/GlobalAlias.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Jeandle/VMCallback.h"
 #include "llvm/IR/Module.h"
@@ -40,6 +41,7 @@ protected:
   BasicBlock *Loop = nullptr;
   static inline unsigned CommonSuperQueries = 0;
   static inline unsigned InterfaceQueries = 0;
+  static inline unsigned SubtypeQueries = 0;
 
   void SetUp() override {
     CommonSuperQueries = 0;
@@ -50,6 +52,7 @@ protected:
     }
     VMCallbacks CB{};
     CB.IsInterface = [](uintptr_t) { return false; };
+    CB.IsUnverifiedInterface = [](uintptr_t) { return false; };
     CB.IsEffectivelyFinal = [](uintptr_t) { return false; };
     CB.GetSecondarySupers = [](uintptr_t) {
       ++InterfaceQueries;
@@ -1492,6 +1495,267 @@ TEST_F(JavaBaseTypeTest, DeadIncomingArmSkipsTheJoin) {
   // all pass the check, so only the Cat arm reaches the merge.
   DominatorTree DT(*F);
   EXPECT_EQ(queryAt(X, Return, DT), JavaType(22, true));
+}
+
+TEST_F(JavaBaseTypeTest, CovariantInterfaceArraysCanOverlap) {
+  VMCallbacks CB = *getVMCallbacks();
+  CB.IsInterface = [](uintptr_t K) { return K == 7; };
+  CB.IsUnverifiedInterface = [](uintptr_t K) {
+    return K == 7 || K == 70 || K == 700;
+  };
+  CB.IsSubtype = [](uintptr_t A, uintptr_t B) {
+    return A == B || B == 5 || (A == 22 && (B == 9 || B == 7)) ||
+           (A == 220 && (B == 90 || B == 70)) ||
+           (A == 2200 && (B == 900 || B == 700));
+  };
+  registerVMCallbacks(CB);
+  EXPECT_FALSE(areKlassesIncompatible(90, false, 70));
+  EXPECT_FALSE(areKlassesIncompatible(70, false, 90));
+  EXPECT_FALSE(areKlassesIncompatible(900, false, 700));
+  EXPECT_FALSE(areKlassesIncompatible(9, false, 7));
+  EXPECT_TRUE(areKlassesIncompatible(90, true, 70));
+  EXPECT_TRUE(areKlassesIncompatible(80, false, 90));
+  EXPECT_FALSE(areKlassesIncompatible(220, true, 70));
+  CB.IsUnverifiedInterface = nullptr;
+  registerVMCallbacks(CB);
+  EXPECT_FALSE(areKlassesIncompatible(90, false, 70));
+  EXPECT_TRUE(areKlassesIncompatible(90, true, 70));
+}
+
+TEST_F(JavaBaseTypeTest, IntersectRetainsClassAlongsideUnrelatedInterface) {
+  VMCallbacks CB = *getVMCallbacks();
+  CB.IsInterface = [](uintptr_t K) { return K == 7; };
+  CB.IsUnverifiedInterface = CB.IsInterface;
+  registerVMCallbacks(CB);
+  for (JavaType T : {typeIntersect(JavaType(9, false), JavaType(7, false)),
+                     typeIntersect(JavaType(7, false), JavaType(9, false))}) {
+    EXPECT_EQ(T.Klass, 9U);
+    EXPECT_FALSE(T.Exact);
+    EXPECT_TRUE(T.Interfaces.contains(7));
+  }
+}
+
+TEST_F(JavaBaseTypeTest, InterfaceBoundRetainsClassExclusion) {
+  VMCallbacks CB = *getVMCallbacks();
+  CB.IsInterface = [](uintptr_t K) { return K == 7; };
+  CB.IsUnverifiedInterface = CB.IsInterface;
+  registerVMCallbacks(CB);
+  JavaType Negative;
+  Negative.ExcludedKlasses.insert(9);
+  JavaType T = typeIntersect(JavaType(7, false), Negative);
+  EXPECT_EQ(T.Klass, 7U);
+  EXPECT_TRUE(T.ExcludedKlasses.contains(9));
+}
+
+TEST_F(JavaBaseTypeTest, UnionRetainsImplicitAndExplicitExclusion) {
+  VMCallbacks CB = *getVMCallbacks();
+  CB.IsSubtype = [](uintptr_t A, uintptr_t B) {
+    return A == B || B == 5 || (A == 22 && B == 9);
+  };
+  registerVMCallbacks(CB);
+  JavaType Left(9, false);
+  Left.ExcludedKlasses.insert(22);
+  JavaType Right(33, false);
+  EXPECT_TRUE(typeUnion(Left, Right).ExcludedKlasses.contains(22));
+  EXPECT_TRUE(typeUnion(Right, Left).ExcludedKlasses.contains(22));
+  EXPECT_FALSE(typeUnion(Left, JavaType(22, false)).hasExclusions());
+}
+
+TEST_F(JavaBaseTypeTest, KlassLoadsRequireDefinitiveInitializers) {
+  auto *RawPtr = PointerType::get(Context, 0);
+  auto *Klass = ConstantExpr::getIntToPtr(B.getInt64(9), RawPtr);
+  auto MakeLoad = [&](GlobalValue::LinkageTypes Linkage, bool ExternalInit) {
+    auto *GV = new GlobalVariable(M, RawPtr, true, Linkage, Klass, "klass_slot",
+                                  nullptr, GlobalVariable::NotThreadLocal, 0,
+                                  ExternalInit);
+    return B.CreateLoad(RawPtr, GV);
+  };
+  EXPECT_EQ(extractKlassConstant(MakeLoad(GlobalValue::InternalLinkage, false)),
+            9U);
+  EXPECT_EQ(extractKlassConstant(MakeLoad(GlobalValue::WeakODRLinkage, false)),
+            9U);
+  EXPECT_EQ(extractKlassConstant(MakeLoad(GlobalValue::WeakAnyLinkage, false)),
+            0U);
+  EXPECT_EQ(extractKlassConstant(MakeLoad(GlobalValue::ExternalLinkage, true)),
+            0U);
+}
+
+TEST_F(JavaBaseTypeTest, KlassLoadsDoNotFollowInterposableAliases) {
+  auto *RawPtr = PointerType::get(Context, 0);
+  auto *Klass = ConstantExpr::getIntToPtr(B.getInt64(9), RawPtr);
+  auto *Slot = new GlobalVariable(M, RawPtr, true, GlobalValue::InternalLinkage,
+                                  Klass, "klass_slot");
+  auto *Strong = GlobalAlias::create(RawPtr, 0, GlobalValue::InternalLinkage,
+                                     "local_slot", Slot, &M);
+  auto *Weak = GlobalAlias::create(RawPtr, 0, GlobalValue::WeakAnyLinkage,
+                                   "weak_slot", Strong, &M);
+  auto *Nested =
+      GetElementPtrInst::Create(B.getInt8Ty(), Weak, {B.getInt64(0)});
+  B.Insert(Nested);
+  EXPECT_EQ(extractKlassConstant(B.CreateLoad(RawPtr, Strong)), 9U);
+  EXPECT_EQ(extractKlassConstant(B.CreateLoad(RawPtr, Weak)), 0U);
+  EXPECT_EQ(extractKlassConstant(B.CreateLoad(RawPtr, Nested)), 0U);
+  B.CreateRet(F->getArg(0));
+  ASSERT_FALSE(verifyModule(M, &errs()));
+}
+
+TEST_F(JavaBaseTypeTest, ReturnedAttributeAndArgumentConstraintsIntersect) {
+  checkPattern(R"IR(
+    %r = call "java-klass"="5" ptr addrspace(1)
+      @identity(ptr addrspace(1) %a)
+    %s = select i1 %pick, ptr addrspace(1) %r, ptr addrspace(1) %b
+    ret ptr addrspace(1) %s
+  )IR",
+               9);
+  checkPattern(R"IR(
+    %r = call "java-klass"="9" "java-klass-exact" ptr addrspace(1)
+      @identity(ptr addrspace(1) %unknown)
+    ret ptr addrspace(1) %r
+  )IR",
+               9);
+  checkPattern(R"IR(
+    entry:
+      br label %loop
+    loop:
+      %p = phi ptr addrspace(1) [ %a, %entry ], [ %r, %loop ]
+      %r = call "java-klass"="5" ptr addrspace(1)
+        @identity(ptr addrspace(1) %p)
+      br i1 %pick, label %loop, label %exit
+    exit:
+      ret ptr addrspace(1) %r
+  )IR",
+               9);
+}
+
+TEST_F(JavaBaseTypeTest, InvariantGroupIntrinsicsRetainObjectType) {
+  Value *A = seed(0, 9, true);
+  for (Intrinsic::ID ID :
+       {Intrinsic::launder_invariant_group, Intrinsic::strip_invariant_group}) {
+    auto *IntrinsicFn =
+        Intrinsic::getOrInsertDeclaration(&M, ID, {A->getType()});
+    auto *Call = B.CreateCall(IntrinsicFn, {A});
+    auto *S = B.CreateSelect(F->getArg(2), Call, A);
+    EXPECT_EQ(query(Call), JavaType(9, true));
+    EXPECT_EQ(query(S), JavaType(9, true));
+  }
+}
+
+TEST_F(JavaBaseTypeTest, SeededIdentityCycleUsesDependentRefinement) {
+  constexpr unsigned Count = 512;
+  Value *Narrow = seed(0, 9);
+  auto *Hide = Function::Create(
+      FunctionType::get(F->getReturnType(), {F->getReturnType()}, false),
+      GlobalValue::InternalLinkage, "hide_type", M);
+  IRBuilder<> Helper(BasicBlock::Create(Context, "entry", Hide));
+  Helper.CreateRet(Hide->getArg(0));
+  IRBuilder<> EntryBuilder(Entry->getTerminator());
+  auto *Wide = EntryBuilder.CreateCall(Hide, {Narrow});
+  Wide->addRetAttr(Attribute::get(Context, "java-klass", "5"));
+  auto *Null = ConstantPointerNull::get(cast<PointerType>(F->getReturnType()));
+  auto *Left = BasicBlock::Create(Context, "left", F);
+  auto *Right = BasicBlock::Create(Context, "right", F);
+  auto *Exit = BasicBlock::Create(Context, "exit", F);
+  SmallVector<PHINode *, Count> Phis;
+  for (unsigned I = 0; I != Count; ++I)
+    Phis.push_back(B.CreatePHI(F->getReturnType(), 3));
+  auto Identity =
+      M.getOrInsertFunction("identity", F->getReturnType(), F->getReturnType());
+  cast<Function>(Identity.getCallee())->addParamAttr(0, Attribute::Returned);
+  SmallVector<Value *, Count> Calls;
+  for (unsigned I = 0; I != Count; ++I) {
+    Value *Input = I + 1 == Count ? B.CreateSelect(F->getArg(2), Phis[0], Wide)
+                                  : Phis[I + 1];
+    auto *Call = B.CreateCall(Identity, {Input});
+    Call->addRetAttr(Attribute::get(Context, "java-klass", "9"));
+    Calls.push_back(Call);
+  }
+  B.CreateCondBr(F->getArg(2), Left, Right);
+  B.SetInsertPoint(Left);
+  B.CreateBr(Loop);
+  B.SetInsertPoint(Right);
+  B.CreateCondBr(B.CreateICmpEQ(F->getArg(1), Null), Loop, Exit);
+  B.SetInsertPoint(Exit);
+  B.CreateRet(Phis[0]);
+  for (unsigned I = 0; I != Count; ++I) {
+    Phis[I]->addIncoming(Null, Entry);
+    Phis[I]->addIncoming(Calls[I], Left);
+    Phis[I]->addIncoming(I == 0 ? Calls[0] : Phis[I - 1], Right);
+  }
+  ASSERT_FALSE(verifyFunction(*F));
+  VMCallbacks CB = *getVMCallbacks();
+  SubtypeQueries = 0;
+  CB.IsSubtype = [](uintptr_t A, uintptr_t Other) {
+    ++SubtypeQueries;
+    return A == Other || Other == 5;
+  };
+  registerVMCallbacks(CB);
+  EXPECT_EQ(query(Phis[0]), JavaType(9, false));
+  EXPECT_LT(SubtypeQueries, 32 * Count);
+}
+
+TEST_F(JavaBaseTypeTest, FrozenInvariantGroupResultNeedsDefinedResult) {
+  Value *A = seed(0, 9, true);
+  F->getArg(0)->addAttr(Attribute::NoUndef);
+  for (Intrinsic::ID ID :
+       {Intrinsic::launder_invariant_group, Intrinsic::strip_invariant_group}) {
+    auto *Fn = Intrinsic::getOrInsertDeclaration(&M, ID, {A->getType()});
+    auto *Call = B.CreateCall(Fn, {A});
+    Call->addRetAttr(Attribute::NonNull);
+    EXPECT_TRUE(query(B.CreateFreeze(Call)).isUnknown());
+    Call->addRetAttr(Attribute::NoUndef);
+    EXPECT_EQ(query(B.CreateFreeze(Call)), JavaType(9, true));
+  }
+}
+
+TEST_F(JavaBaseTypeTest, ContextTypePropagatesThroughSelectWrappingPhi) {
+  checkPattern(R"IR(
+    entry:
+      %check = call i1 @jeandle.check_instanceof(ptr inttoptr (i64 9 to ptr),
+                                               ptr addrspace(1) %unknown)
+      br i1 %check, label %pass, label %fail
+    pass:
+      br label %merge
+    fail:
+      ret ptr addrspace(1) null
+    merge:
+      %p = phi ptr addrspace(1) [ %unknown, %pass ]
+      %s = select i1 %pick, ptr addrspace(1) %p, ptr addrspace(1) %a
+      ret ptr addrspace(1) %s
+  )IR",
+               0, false, 9, false);
+  checkPattern(R"IR(
+    entry:
+      %check = call i1 @jeandle.check_instanceof(ptr inttoptr (i64 9 to ptr),
+                                               ptr addrspace(1) %unknown)
+      br i1 %check, label %pass, label %fail
+    pass:
+      br label %merge
+    fail:
+      ret ptr addrspace(1) null
+    merge:
+      %p = phi ptr addrspace(1) [ %unknown, %pass ]
+      %r = call ptr addrspace(1) @identity(ptr addrspace(1) %p)
+      %g = getelementptr i8, ptr addrspace(1) %r, i64 0
+      %s = select i1 %pick, ptr addrspace(1) %g, ptr addrspace(1) %a
+      ret ptr addrspace(1) %s
+  )IR",
+               0, false, 9, false);
+  checkPattern(R"IR(
+    entry:
+      %check = call i1 @jeandle.check_instanceof(ptr inttoptr (i64 9 to ptr),
+                                               ptr addrspace(1) %unknown)
+      br i1 %check, label %pass, label %fail
+    pass:
+      br label %merge
+    fail:
+      ret ptr addrspace(1) null
+    merge:
+      %p = phi ptr addrspace(1) [ %unknown, %pass ]
+      %f = freeze ptr addrspace(1) %p
+      %s = select i1 %pick, ptr addrspace(1) %f, ptr addrspace(1) %a
+      ret ptr addrspace(1) %s
+  )IR",
+               0, false, 0, false);
 }
 
 } // namespace
