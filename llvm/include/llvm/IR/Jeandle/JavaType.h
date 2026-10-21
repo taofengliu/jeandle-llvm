@@ -115,12 +115,19 @@ using IsNullEdgeOracle =
 /// - Select instructions (constant and non-constant arms)
 /// - Integer casts: zext, sext, trunc (but not bitcast, fpcast, etc.)
 /// - ICmp comparisons of a check_instanceof result against a constant
+/// - Switch case values of a check_instanceof result
 /// - Direct jeandle.check_exact_klass calls
+/// - Freeze of a traced condition (with a definedness proof)
 /// - And (i1) of two traced conditions
 /// - Or (i1) of two traced conditions
 /// - Xor i1 %a, true: logical NOT
 /// - Direct jeandle.check_instanceof calls
-/// Unrecognized patterns conservatively return unknown ({}).
+///
+/// Widened boolean forms are tracked by their exact value domain, not by an
+/// assumed {0,1}: sext of an i1 check result widens to {0,-1}, and constant
+/// arms equal to neither domain value make the expression check-independent.
+/// And/Or/Xor are matched on i1 only. Unrecognized patterns conservatively
+/// return unknown ({}).
 JavaType getJavaType(Value *V, DominatorTree *DT, Instruction *Context,
                      IsNullEdgeOracle IsNullEdge);
 

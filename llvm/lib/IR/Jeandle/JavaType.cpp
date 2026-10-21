@@ -9,6 +9,7 @@
 //===----------------------------------------------------------------------===//
 
 #include "llvm/IR/Jeandle/JavaType.h"
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/ScopeExit.h"
 #include "llvm/ADT/SmallPtrSet.h"
@@ -149,10 +150,12 @@ static bool isCheckInstanceofFn(const Function *F) {
 }
 
 /// If CB is a call/invoke to jeandle.check_instanceof, return the super klass
-/// and obj.
+/// and obj. The name match alone is not an identity: legal IR may declare a
+/// same-named function with a different signature, so the operand accesses
+/// are guarded by an arity check.
 static bool isCheckInstanceofCall(const CallBase *CB, uintptr_t &Klass,
                                   Value *&Obj) {
-  if (!isCheckInstanceofFn(CB->getCalledFunction()))
+  if (!isCheckInstanceofFn(CB->getCalledFunction()) || CB->arg_size() != 2)
     return false;
   Klass = extractKlassConstant(CB->getArgOperand(0));
   Obj = CB->getArgOperand(1);
@@ -220,8 +223,11 @@ static void unionExcludedKlasses(SmallDenseSet<uintptr_t, 2> &Dst,
 
 /// Enforce ExcludedKlasses invariants:
 /// 1. If Exact, clear ExcludedKlasses (type is fully determined).
-/// 2. If Klass is known, remove excluded klasses that are not subtypes of
-///    Klass (they are already impossible).
+/// 2. If Klass is known, remove excluded classes that are not subtypes of
+///    Klass: a value whose positive type is <: Klass can never be one of them
+///    (single class inheritance). Interface exclusions are kept even when not
+///    related to Klass — a class matching Klass may still implement any
+///    interface, so "is not an implementor of I" stays real information.
 static void normalizeExcludedKlasses(JavaType &T) {
   if (T.ExcludedKlasses.empty())
     return;
@@ -231,10 +237,10 @@ static void normalizeExcludedKlasses(JavaType &T) {
   }
   if (T.Klass != 0) {
     const VMCallbacks *CB = getVMCallbacks();
-    assert(CB && CB->IsSubtype && "VMCallbacks must be set");
+    assert(CB && CB->IsSubtype && CB->IsInterface && "VMCallbacks must be set");
     SmallVector<uintptr_t, 2> ToRemove;
     for (uintptr_t K : T.ExcludedKlasses) {
-      if (!CB->IsSubtype(K, T.Klass))
+      if (!CB->IsInterface(K) && !CB->IsSubtype(K, T.Klass))
         ToRemove.push_back(K);
     }
     for (uintptr_t K : ToRemove)
@@ -319,10 +325,17 @@ JavaType jeandle::typeUnion(JavaType A, JavaType B) {
     const VMCallbacks *CB = getVMCallbacks();
     assert(CB && CB->GetCommonSuperKlass && "VMCallbacks must be set");
     uintptr_t LCA = CB->GetCommonSuperKlass(A.Klass, B.Klass);
-    if (LCA == 0)
-      return {};
-    Result.Klass = LCA;
-    Result.Exact = false;
+    // No common superclass: the positive type is unknown, but the already
+    // computed Interfaces intersection and the exclusion merge below remain
+    // the honest join — they are not discarded. (HotSpot's LCA walk reaches
+    // java.lang.Object from any pair, so this branch is defensive.)
+    if (LCA == 0) {
+      Result.Klass = 0;
+      Result.Exact = false;
+    } else {
+      Result.Klass = LCA;
+      Result.Exact = false;
+    }
   }
   // Intersect exclusions (value could be either A or B).
   if (!A.ExcludedKlasses.empty() && !B.ExcludedKlasses.empty())
@@ -370,8 +383,11 @@ JavaType jeandle::typeIntersect(JavaType A, JavaType B) {
       Result.Klass = B.Klass;
       Result.Exact = B.Exact;
     }
-    // else: neither is a subtype of the other — contradictory constraints
-    // (dead code). Leave Result.Klass = 0 (unknown).
+    // else: neither is a subtype of the other. For two classes this is
+    // contradictory (no live value satisfies both; dead code). A class vs an
+    // unrelated interface is a LIVE combination — e.g. a base type from an
+    // attribute and a guard proving an interface — so the Interfaces union
+    // stays and only Klass is dropped to unknown.
   } else if (A.isKnown()) {
     Result.Klass = A.Klass;
     Result.Exact = A.Exact;
@@ -419,15 +435,33 @@ static Value *getIdentityInput(Value *V) {
 
 /// The inputs whose types bound V. Identity expressions participate in the
 /// same dependency graph as PHIs and selects, including when nested in cycles.
-static bool getBaseTypeInputs(Value *V, SmallVectorImpl<Value *> &Inputs) {
+///
+/// When SkipVacuousArms is set (type queries), literal null and poison PHI and
+/// select arms are skipped: JavaType describes the value only when it is a
+/// non-null oop, so an execution that would select such an arm is outside the
+/// contract and the arm is vacuous. Undef arms are NOT skipped — an undef arm
+/// can materialize an arbitrary oop when reached, so it must stay absorbing.
+/// Definedness queries pass false: a null arm is defined and a poison arm is
+/// not, and both facts matter there.
+static bool getBaseTypeInputs(Value *V, SmallVectorImpl<Value *> &Inputs,
+                              bool SkipVacuousArms) {
+  auto SkipVacuous = [&](Value *Arm) {
+    return SkipVacuousArms && isa<ConstantPointerNull, PoisonValue>(Arm);
+  };
   if (auto *PN = dyn_cast<PHINode>(V)) {
-    Inputs.append(PN->incoming_values().begin(), PN->incoming_values().end());
+    for (Value *Inc : PN->incoming_values())
+      if (!SkipVacuous(Inc))
+        Inputs.push_back(Inc);
   } else if (auto *SI = dyn_cast<SelectInst>(V)) {
-    if (auto *C = dyn_cast<ConstantInt>(SI->getCondition()))
-      Inputs.push_back(C->isZero() ? SI->getFalseValue() : SI->getTrueValue());
-    else {
-      Inputs.push_back(SI->getTrueValue());
-      Inputs.push_back(SI->getFalseValue());
+    if (auto *C = dyn_cast<ConstantInt>(SI->getCondition())) {
+      Value *Arm = C->isZero() ? SI->getFalseValue() : SI->getTrueValue();
+      if (!SkipVacuous(Arm))
+        Inputs.push_back(Arm);
+    } else {
+      if (!SkipVacuous(SI->getTrueValue()))
+        Inputs.push_back(SI->getTrueValue());
+      if (!SkipVacuous(SI->getFalseValue()))
+        Inputs.push_back(SI->getFalseValue());
     }
   } else if (auto *FI = dyn_cast<FreezeInst>(V)) {
     Inputs.push_back(FI->getOperand(0));
@@ -454,10 +488,20 @@ getDefinednessInputs(Value *V, SmallVectorImpl<Value *> &Inputs) {
            Arg->hasAttribute(llvm::Attribute::DereferenceableOrNull);
   // A returned argument does not prove the result defined: parameter or return
   // attributes can introduce poison even when the actual argument is defined.
-  if (auto *CB = dyn_cast<CallBase>(V))
+  if (auto *CB = dyn_cast<CallBase>(V)) {
+    // The Jeandle check helpers return a concrete boolean for every contract-
+    // valid input (their templates compute it from memory reads and
+    // comparisons), so their results are defined without a noundef attribute.
+    // This is the same name-based helper contract the tracing relies on.
+    if (const Function *Callee = CB->getCalledFunction())
+      if (Callee->getName() == "jeandle.check_instanceof" ||
+          Callee->getName() == "jeandle.check_exact_klass" ||
+          Callee->getName() == "jeandle.check_klass_subtype")
+        return true;
     return CB->hasRetAttr(llvm::Attribute::NoUndef) ||
            CB->hasRetAttr(llvm::Attribute::Dereferenceable) ||
            CB->hasRetAttr(llvm::Attribute::DereferenceableOrNull);
+  }
   if (auto *LI = dyn_cast<LoadInst>(V))
     return LI->hasMetadata(LLVMContext::MD_noundef) ||
            LI->hasMetadata(LLVMContext::MD_dereferenceable) ||
@@ -468,11 +512,11 @@ getDefinednessInputs(Value *V, SmallVectorImpl<Value *> &Inputs) {
   if (auto *PN = dyn_cast<PHINode>(V)) {
     if (PN->getNumIncomingValues() == 0)
       return false;
-    getBaseTypeInputs(V, Inputs);
+    getBaseTypeInputs(V, Inputs, /*SkipVacuousArms=*/false);
     return std::nullopt;
   }
   if (auto *SI = dyn_cast<SelectInst>(V)) {
-    getBaseTypeInputs(V, Inputs);
+    getBaseTypeInputs(V, Inputs, /*SkipVacuousArms=*/false);
     Inputs.push_back(SI->getCondition());
     return std::nullopt;
   }
@@ -592,6 +636,8 @@ static JavaType getBaseJavaTypeLeaf(Value *V) {
         bool Exact = AL.hasParamAttr(Idx, jeandle::Attribute::JavaKlassExact);
         return {Klass, Exact};
       }
+      LLVM_DEBUG(dbgs() << "JavaType: malformed java-klass parameter attribute "
+                        << KlassStr << " on " << *Arg << "\n");
     }
     return {};
   }
@@ -608,6 +654,8 @@ static JavaType getBaseJavaTypeLeaf(Value *V) {
         bool Exact = AL.hasRetAttr(jeandle::Attribute::JavaKlassExact);
         return {Klass, Exact};
       }
+      LLVM_DEBUG(dbgs() << "JavaType: malformed java-klass return attribute "
+                        << KlassStr << " on " << *CB << "\n");
     }
     return {};
   }
@@ -627,6 +675,8 @@ static JavaType getBaseJavaTypeLeaf(Value *V) {
           }
         }
       }
+      LLVM_DEBUG(dbgs() << "JavaType: malformed !java-klass metadata on " << *LI
+                        << "\n");
     }
 
     // Constant oop: the frontend emits a compile-time-known object reference
@@ -635,11 +685,13 @@ static JavaType getBaseJavaTypeLeaf(Value *V) {
     // Exact is sound because a constant oop is a single, fixed instance, so the
     // returned klass is the value's exact dynamic type (the actual subclass is
     // attributed directly, not a declared supertype).
-    if (std::optional<int> Id = getOopHandleId(LI->getPointerOperand())) {
-      const VMCallbacks *CB = getVMCallbacks();
-      if (CB && CB->GetOopKlass) {
-        if (uintptr_t Klass = CB->GetOopKlass(*Id); Klass != 0) {
-          return {Klass, /*Exact=*/true};
+    if (isJavaOopType(LI->getType())) {
+      if (std::optional<int> Id = getOopHandleId(LI->getPointerOperand())) {
+        const VMCallbacks *CB = getVMCallbacks();
+        if (CB && CB->GetOopKlass) {
+          if (uintptr_t Klass = CB->GetOopKlass(*Id); Klass != 0) {
+            return {Klass, /*Exact=*/true};
+          }
         }
       }
     }
@@ -677,7 +729,7 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr,
   if (auto It = Cache.find(V); It != Cache.end())
     return It->second;
   SmallVector<Value *, 2> Inputs;
-  if (!getBaseTypeInputs(V, Inputs)) {
+  if (!getBaseTypeInputs(V, Inputs, /*SkipVacuousArms=*/true)) {
     JavaType Result = getBaseJavaTypeLeaf(V);
     Cache[V] = Result;
     return Result;
@@ -694,7 +746,7 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr,
     auto N = std::make_unique<BaseTypeNode>();
     N->V = Input;
     N->Index = NextIndex++;
-    if (!getBaseTypeInputs(Input, N->Inputs))
+    if (!getBaseTypeInputs(Input, N->Inputs, /*SkipVacuousArms=*/true))
       Cache[Input] = getBaseJavaTypeLeaf(Input);
     BaseTypeNode *Raw = N.get();
     Nodes[Input] = std::move(N);
@@ -827,6 +879,116 @@ static JavaType getBaseJavaType(Value *V, BaseMemo *Memo = nullptr,
   return Cache.lookup(V);
 }
 
+/// Maximum number of joined blocks per top-level query, per dimension (the
+/// block dimension and the PHI-value dimension each get their own allowance,
+/// so consuming one does not silently starve the other). Bounds compile time;
+/// exceeding frames contribute an empty (unknown) fact and are not memoized.
+/// Hidden tuning knob: large methods with joins deeper than the default lose
+/// check-derived sharpening (sound, precision-only) and can raise this.
+static cl::opt<unsigned> MaxFactsJoinBlocks(
+    "jeandle-max-facts-join-blocks", cl::init(128), cl::Hidden,
+    cl::desc("Maximum joined blocks per JavaType query dimension"));
+
+namespace {
+
+/// Per-query evaluation state. Facts depend only on the CFG, branch
+/// conditions, the null-edge oracle and VM callbacks, so they are constant
+/// for the lifetime of one query and safely memoized here.
+///
+/// The memo's lifetime is deliberately one top-level query, not one pass:
+/// within a query it turns the exponential path join into a linear one, while
+/// consumers amortize across queries with their own result caches
+/// (RecoverTypeInfo's per-load and per-edge caches). A pass-scoped memo would
+/// additionally need invalidation discipline for every consumer that erases
+/// instructions mid-pass (ConstantFieldFolding does), where dangling Value*
+/// keys could alias freshly allocated values and return stale facts.
+struct JavaTypeQueryContext {
+  DominatorTree &DT;
+  IsNullEdgeOracle NullOracle;
+  /// PHI cycle-detection set for the value dimension (phiValueType): a
+  /// re-encountered PHI contributes nothing. Base-type queries detect
+  /// cycles with their own SCC state and do not use this set.
+  SmallPtrSet<const PHINode *, 8> PhiVisited;
+  /// Complete base-type memo shared across the whole query (see BaseMemo).
+  BaseMemo BaseTypes;
+  /// Definedness proofs shared by base typing and CFG identity matching.
+  DefinedMemo DefinedValues;
+  /// Per-(value, block) evaluation state for the block dimension: absent =
+  /// not yet evaluated, nullopt = currently on the evaluation stack (a cycle
+  /// the back-edge rule cannot cut), engaged = the completed join. One
+  /// container for both memoization and cycle detection keeps the two from
+  /// drifting apart across exit paths.
+  DenseMap<std::pair<Value *, BasicBlock *>, std::optional<JavaType>> Processed;
+  unsigned FactsBudget = MaxFactsJoinBlocks;
+  unsigned PhiBudget = MaxFactsJoinBlocks;
+};
+
+} // namespace
+
+/// Check if IncomingBB is reached only when Obj is null.
+/// Walks up the dominator tree from IncomingBB looking for a conditional branch
+/// on `icmp eq/ne Obj, null` where IncomingBB is dominated by the "Obj is null"
+/// successor. Using the dominator tree handles all CFG shapes (diamonds, etc.),
+/// not just single-predecessor chains. Only branches are recognized: switch
+/// case values must be constant integers, so a switch can never test a
+/// pointer against null.
+static bool isNullCheckPath(BasicBlock *IncomingBB, Value *Obj,
+                            DominatorTree &DT) {
+  Obj = Obj->stripPointerCastsAndAliases();
+  for (auto *Node = DT.getNode(IncomingBB); Node; Node = Node->getIDom()) {
+    BasicBlock *BB = Node->getBlock();
+
+    if (auto *BI = dyn_cast<BranchInst>(BB->getTerminator())) {
+      if (!BI->isConditional())
+        continue;
+      auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition());
+      if (!Cmp)
+        continue;
+      ICmpInst::Predicate Pred = Cmp->getPredicate();
+      if (Pred != ICmpInst::ICMP_EQ && Pred != ICmpInst::ICMP_NE)
+        continue;
+      Value *Op0 = Cmp->getOperand(0);
+      Value *Op1 = Cmp->getOperand(1);
+      Value *Tested = isa<ConstantPointerNull>(Op0)   ? Op1
+                      : isa<ConstantPointerNull>(Op1) ? Op0
+                                                      : nullptr;
+      if (!Tested || Tested->stripPointerCastsAndAliases() != Obj)
+        continue;
+      // icmp eq Obj, null -> true successor is the null path;
+      // icmp ne Obj, null -> false successor is the null path.
+      BasicBlock *NullBB =
+          Pred == ICmpInst::ICMP_EQ ? BI->getSuccessor(0) : BI->getSuccessor(1);
+      BasicBlock *OtherBB =
+          Pred == ICmpInst::ICMP_EQ ? BI->getSuccessor(1) : BI->getSuccessor(0);
+      if (NullBB == OtherBB)
+        continue;
+      // IncomingBB must be dominated by the null-path edge.
+      if (DT.dominates(BasicBlockEdge(BB, NullBB), IncomingBB))
+        return true;
+    }
+  }
+  return false;
+}
+
+/// Positive proof that V is null on edge From -> To, answered by the query's
+/// null-edge oracle (the LazyValueInfo-backed implementation recognizes null
+/// tests directly on the edge's branch as well as threaded/indirect forms),
+/// with a structural fallback for threaded shapes the oracle misses: null
+/// tests on casted pointers and with the null constant on either operand
+/// side. When in doubt the answer is false — keeping an edge is always sound.
+static bool isNullEdge(Value *V, BasicBlock *From, BasicBlock *To,
+                       const JavaTypeQueryContext &Q) {
+  if (!Q.DT.isReachableFromEntry(From))
+    return false; // Lattice reasoning is undefined for unreachable blocks;
+                  // keep the edge (the conservative answer).
+  if (Q.NullOracle && Q.NullOracle(V, From, To))
+    return true;
+  // Null at the top of From (a dominating null-check edge) means null on
+  // every edge out of From, including this one: V is an SSA value, so its
+  // null-ness cannot change inside the block.
+  return isNullCheckPath(From, V, Q.DT);
+}
+
 // Condition tracing: trace from a branch condition to a check_instanceof call
 // =============================================================================
 
@@ -857,6 +1019,24 @@ namespace {
 /// De Morgan duality (And of negated checks) is handled automatically:
 /// ICmp swaps True/False before And merges, so And(NOT A, NOT B) correctly
 /// produces TrueExclusions = {A, B} (both checks failed on true-branch).
+///
+/// Value domain. The traced expression is an integer whose value must encode
+/// the check outcome. The trace tracks the exact pair of values the expression
+/// can take — FailedValue when every matched check failed, PassedValue when
+/// the outcome side held — with the invariant:
+///
+///   domain(E) ⊆ {FailedValue, PassedValue}, and
+///   E == PassedValue ⟹ True* constraints hold,
+///   E == FailedValue ⟹ False* constraints hold.
+///
+/// The check base sets {0, 1}; zext/sext/trunc map the pair through the cast
+/// (so `sext i1 %check to i8` widens the domain to {0, -1}, NOT {0, 1}); And/
+/// Or/Xor are matched only on i1, where the type system itself pins the
+/// domain to {0, 1}; PHI and select arms must all share one pair, and a
+/// constant arm is classified against that pair (a constant equal to neither
+/// pair value makes the expression's value independent of the checks, so the
+/// trace bails). Consumers evaluate discriminating tests (icmp against a
+/// constant, switch case values) at the pair, never at an assumed {0, 1}.
 struct TraceResult {
   uintptr_t TrueKlass = 0;
   SmallDenseSet<uintptr_t, 2> TrueInterfaces;
@@ -864,6 +1044,8 @@ struct TraceResult {
   uintptr_t FalseKlass = 0;
   SmallDenseSet<uintptr_t, 2> FalseInterfaces;
   SmallDenseSet<uintptr_t, 2> FalseExclusions;
+  APInt FailedValue{1, 0};
+  APInt PassedValue{1, 1};
 
   bool matched() const {
     return TrueKlass != 0 || !TrueInterfaces.empty() ||
@@ -872,30 +1054,67 @@ struct TraceResult {
   }
 };
 
+/// Restore the canonical i1 pairing. Branch and switch consumers map value 1
+/// to the True* side and value 0 to the False* side, so an i1 result whose
+/// pair came out inverted (FailedValue==1) must swap its constraint sides
+/// together with the pair values. Wide results keep their mapped pair: they
+/// are only consumed through discriminating tests (icmp/switch), which
+/// evaluate at the pair and are orientation-independent.
+static void canonicalizeI1Pair(TraceResult &R) {
+  if (R.FailedValue.getBitWidth() != 1 || R.FailedValue.isZero())
+    return;
+  std::swap(R.TrueKlass, R.FalseKlass);
+  std::swap(R.TrueInterfaces, R.FalseInterfaces);
+  std::swap(R.TrueExclusions, R.FalseExclusions);
+  std::swap(R.FailedValue, R.PassedValue);
+}
+
 } // anonymous namespace
+
+/// Canonicalize identity expressions for matching CFG facts. A freeze shares
+/// its operand's identity only when that operand is proven defined.
+static Value *stripCastsAndFreeze(Value *V, DefinedMemo &Defined) {
+  SmallPtrSet<Value *, 8> Visited;
+  while (Visited.insert(V).second) {
+    if (auto *FI = dyn_cast<FreezeInst>(V)) {
+      if (!isProvenDefined(FI->getOperand(0), Defined))
+        break;
+      V = FI->getOperand(0);
+    } else if (Value *Input = getIdentityInput(V)) {
+      V = Input;
+    } else
+      break;
+  }
+  return V;
+}
 
 /// Match `jeandle.check_exact_klass(ExpectedKlass, ActualKlass)`, where
 /// one argument is loaded directly from `QueryObj` by `jeandle.load_klass`.
 /// The intrinsic arguments are treated symmetrically because IR rewrites may
-/// place the loaded Klass in either position.
-static bool isLoadKlassOf(Value *ValueToCheck, Value *QueryObj) {
-  auto *Load = dyn_cast<CallBase>(ValueToCheck->stripPointerCastsAndAliases());
+/// place the loaded Klass in either position. Both sides are canonicalized
+/// with the definedness-aware freeze/identity stripping so wrappers added by
+/// later passes (freeze of the oop, returned-argument calls) still match.
+static bool isLoadKlassOf(Value *ValueToCheck, Value *QueryObj,
+                          DefinedMemo &Defined) {
+  Value *Stripped = stripCastsAndFreeze(ValueToCheck, Defined);
+  auto *Load = dyn_cast<CallBase>(Stripped);
   return Load && Load->getCalledFunction() &&
          Load->getCalledFunction()->getName() == "jeandle.load_klass" &&
          Load->arg_size() == 1 &&
-         Load->getArgOperand(0)->stripPointerCastsAndAliases() ==
-             QueryObj->stripPointerCastsAndAliases();
+         stripCastsAndFreeze(Load->getArgOperand(0), Defined) ==
+             stripCastsAndFreeze(QueryObj, Defined);
 }
 
-static uintptr_t traceExactKlassGuard(Value *Cond, Value *QueryObj) {
-  auto *CB = dyn_cast<CallBase>(Cond);
+static uintptr_t traceExactKlassGuard(Value *Cond, Value *QueryObj,
+                                      DefinedMemo &Defined) {
+  auto *CB = dyn_cast<CallBase>(stripCastsAndFreeze(Cond, Defined));
   Function *Callee = CB ? CB->getCalledFunction() : nullptr;
   if (!Callee || Callee->getName() != "jeandle.check_exact_klass" ||
       CB->arg_size() != 2)
     return 0;
 
-  bool FirstIsActual = isLoadKlassOf(CB->getArgOperand(0), QueryObj);
-  bool SecondIsActual = isLoadKlassOf(CB->getArgOperand(1), QueryObj);
+  bool FirstIsActual = isLoadKlassOf(CB->getArgOperand(0), QueryObj, Defined);
+  bool SecondIsActual = isLoadKlassOf(CB->getArgOperand(1), QueryObj, Defined);
   if (FirstIsActual == SecondIsActual)
     return 0;
 
@@ -958,79 +1177,27 @@ combinedInterfaces(const SmallDenseSet<uintptr_t, 2> &A,
   return Result;
 }
 
-/// Canonicalize identity expressions for matching CFG facts. A freeze shares
-/// its operand's identity only when that operand is proven defined.
-static Value *stripCastsAndFreeze(Value *V, DefinedMemo &Defined) {
-  SmallPtrSet<Value *, 8> Visited;
-  while (Visited.insert(V).second) {
-    if (auto *FI = dyn_cast<FreezeInst>(V)) {
-      if (!isProvenDefined(FI->getOperand(0), Defined))
-        break;
-      V = FI->getOperand(0);
-    } else if (Value *Input = getIdentityInput(V)) {
-      V = Input;
-    } else
-      break;
-  }
-  return V;
-}
-
-/// Check if IncomingBB is reached only when Obj is null.
-/// Walks up the dominator tree from IncomingBB looking for a conditional branch
-/// on `icmp eq/ne Obj, null` where IncomingBB is dominated by the "Obj is null"
-/// successor. Using the dominator tree handles all CFG shapes (diamonds, etc.),
-/// not just single-predecessor chains. Only branches are recognized: switch
-/// case values must be constant integers, so a switch can never test a
-/// pointer against null.
-static bool isNullCheckPath(BasicBlock *IncomingBB, Value *Obj,
-                            DominatorTree &DT) {
-  Obj = Obj->stripPointerCastsAndAliases();
-  for (auto *Node = DT.getNode(IncomingBB); Node; Node = Node->getIDom()) {
-    BasicBlock *BB = Node->getBlock();
-
-    if (auto *BI = dyn_cast<BranchInst>(BB->getTerminator())) {
-      if (!BI->isConditional())
-        continue;
-      auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition());
-      if (!Cmp)
-        continue;
-      ICmpInst::Predicate Pred = Cmp->getPredicate();
-      if (Pred != ICmpInst::ICMP_EQ && Pred != ICmpInst::ICMP_NE)
-        continue;
-      Value *Op0 = Cmp->getOperand(0);
-      Value *Op1 = Cmp->getOperand(1);
-      Value *Tested = isa<ConstantPointerNull>(Op0)   ? Op1
-                      : isa<ConstantPointerNull>(Op1) ? Op0
-                                                      : nullptr;
-      if (!Tested || Tested->stripPointerCastsAndAliases() != Obj)
-        continue;
-      // icmp eq Obj, null -> true successor is the null path;
-      // icmp ne Obj, null -> false successor is the null path.
-      BasicBlock *NullBB =
-          Pred == ICmpInst::ICMP_EQ ? BI->getSuccessor(0) : BI->getSuccessor(1);
-      BasicBlock *OtherBB =
-          Pred == ICmpInst::ICMP_EQ ? BI->getSuccessor(1) : BI->getSuccessor(0);
-      if (NullBB == OtherBB)
-        continue;
-      // IncomingBB must be dominated by the null-path edge.
-      if (DT.dominates(BasicBlockEdge(BB, NullBB), IncomingBB))
-        return true;
-    }
-  }
-  return false;
-}
-
 /// Recursively trace a branch condition back to a jeandle.check_instanceof
 /// call on QueryObj. Returns a matched TraceResult if successful, or an
 /// unmatched TraceResult ({Klass=0}) if the condition cannot be linked to a
-/// check_instanceof on QueryObj.
+/// check_instanceof on QueryObj. See TraceResult for the value-domain
+/// invariant maintained alongside the constraint fields.
 static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
                                           SmallPtrSetImpl<Value *> &Visited,
-                                          DominatorTree &DT) {
+                                          JavaTypeQueryContext &Q) {
   QueryObj = QueryObj->stripPointerCastsAndAliases();
   // Avoid infinite recursion on cyclic value graphs.
   if (!Visited.insert(Cond).second)
     return {}; // Already visited — no match on this path.
+
+  // --- Freeze: transparent only with a definedness proof ---
+  // freeze(x) equals x unless x is poison, in which case freeze materializes
+  // an arbitrary value and the edge outcome says nothing about the checks.
+  if (auto *FI = dyn_cast<FreezeInst>(Cond)) {
+    if (!isProvenDefined(FI->getOperand(0), Q.DefinedValues))
+      return {};
+    return traceToCheckInstanceof(FI->getOperand(0), QueryObj, Visited, Q);
+  }
 
   // --- Base case: direct call/invoke to jeandle.check_instanceof ---
   if (auto *CB = dyn_cast<CallBase>(Cond)) {
@@ -1042,6 +1209,8 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
       R.TrueKlass = Klass; // check passed → obj IS Klass
       R.TrueInterfaces = getFullInterfaces(Klass, {});
       R.FalseExclusions.insert(Klass); // check failed → obj IS NOT Klass
+      R.FailedValue = APInt(1, 0);
+      R.PassedValue = APInt(1, 1);
       return R;
     }
     return {}; // Not a check_instanceof on QueryObj.
@@ -1049,36 +1218,22 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
 
   // --- ICmp: comparisons that test the result of a type check ---
   //
-  // The value being compared ultimately derives from a check_instanceof, which
-  // returns i1 (0 or 1). It may have been widened (e.g., zext i1 to i32), but
-  // the only meaningful values are 0 (check failed) and 1 (check passed).
+  // The value being compared ultimately derives from a check_instanceof, but
+  // it may have been widened or narrowed (zext, sext, trunc) and merged with
+  // constants (phi, select). Rather than assuming a {0,1} domain, trace the
+  // non-constant operand first: a successful trace reports the exact pair of
+  // values the expression can take (see TraceResult). Evaluating the
+  // predicate at that pair — instead of at an assumed {0,1} — is what keeps
+  // widened forms honest:
   //
-  // Rather than matching specific predicates (eq, ne) against specific
-  // constants (0, 1), we use a general approach: evaluate what the comparison
-  // returns for each possible input (0 and 1), then determine whether it
-  // discriminates between "check passed" and "check failed".
+  //   `%s = sext i1 %check to i8; icmp sle i8 %s, 0`:
+  //     The real domain is {0, -1}; sle(0,0) and sle(-1,0) are both true, so
+  //     the comparison is constant — no match (an assumed {0,1} domain would
+  //     wrongly read it as "true ⟺ check failed").
   //
-  // Examples of how this works:
-  //
-  //   `icmp ne i32 %val, 0`:
-  //     val=0 → ne(0,0) → false    val=1 → ne(1,0) → true
-  //     Discriminating: true when check passed → not negated.
-  //
-  //   `icmp eq i32 %val, 0`:
-  //     val=0 → eq(0,0) → true     val=1 → eq(1,0) → false
-  //     Discriminating: true when check failed → negated.
-  //
-  //   `icmp sgt i32 %val, 0`:
-  //     val=0 → sgt(0,0) → false   val=1 → sgt(1,0) → true
-  //     Discriminating: true when check passed → not negated.
-  //
-  //   `icmp uge i32 %val, 1`:
-  //     val=0 → uge(0,1) → false   val=1 → uge(1,1) → true
-  //     Discriminating: true when check passed → not negated.
-  //
-  //   `icmp sge i32 %val, 0`:
-  //     val=0 → sge(0,0) → true    val=1 → sge(1,0) → true
-  //     Both true → always true, not discriminating → no match.
+  //   `icmp ne i32 %zext_val, 0` (domain {0, 1}):
+  //     ne(0,0) → false, ne(1,0) → true — discriminating, true when the
+  //     check passed → not negated.
   //
   if (auto *Cmp = dyn_cast<ICmpInst>(Cond)) {
     Value *LHS = Cmp->getOperand(0);
@@ -1095,57 +1250,144 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
       Pred = ICmpInst::getSwappedPredicate(Pred);
     }
     if (C) {
-      // Evaluate `icmp Pred %val, C` for the two possible boolean inputs.
-      unsigned BitWidth = C->getType()->getIntegerBitWidth();
-      APInt ZeroVal(BitWidth, 0);
-      APInt OneVal(BitWidth, 1);
-      bool ResultForZero = ICmpInst::compare(ZeroVal, C->getValue(), Pred);
-      bool ResultForOne = ICmpInst::compare(OneVal, C->getValue(), Pred);
-
-      if (ResultForZero != ResultForOne) {
-        // The comparison discriminates between 0 and 1 — it tells us whether
-        // the underlying check_instanceof passed or failed. Now trace the
-        // non-constant operand to find that check_instanceof.
-        TraceResult R = traceToCheckInstanceof(Val, QueryObj, Visited, DT);
-        if (!R.matched())
-          return {}; // Val doesn't trace to a check — no match.
-        if (ResultForOne)
-          // The comparison returns true when val=1 (check passed).
-          // True/False constraints are unchanged.
-          return R;
-        else {
-          // The comparison returns true when val=0 (check failed).
-          // Swap True ↔ False constraints.
+      TraceResult R = traceToCheckInstanceof(Val, QueryObj, Visited, Q);
+      if (!R.matched())
+        return {}; // Val doesn't trace to a check — no match.
+      // Evaluate `icmp Pred %val, C` at the traced value pair. The pair's
+      // width matches the icmp operand type by construction.
+      assert(R.FailedValue.getBitWidth() ==
+                 C->getType()->getIntegerBitWidth() &&
+             "traced value pair must match the compared type");
+      bool ResultForFailed =
+          ICmpInst::compare(R.FailedValue, C->getValue(), Pred);
+      bool ResultForPassed =
+          ICmpInst::compare(R.PassedValue, C->getValue(), Pred);
+      if (ResultForFailed != ResultForPassed) {
+        // The icmp result is i1 and is true exactly on one side's value, so
+        // its own domain pair is {0, 1} regardless of the operand's width.
+        APInt Failed(1, 0), Passed(1, 1);
+        if (!ResultForPassed) {
+          // The comparison returns true exactly on the failed value.
+          // Swap True ↔ False constraints to match the swapped pairing.
           std::swap(R.TrueKlass, R.FalseKlass);
           std::swap(R.TrueInterfaces, R.FalseInterfaces);
           std::swap(R.TrueExclusions, R.FalseExclusions);
-          return R;
         }
+        R.FailedValue = std::move(Failed);
+        R.PassedValue = std::move(Passed);
+        return R;
       }
-      // ResultForZero == ResultForOne: the comparison is always true or always
-      // false regardless of the check result (e.g., `sge %val, 0` is always
-      // true for {0,1}). It provides no type information.
+      // ResultForFailed == ResultForPassed: the comparison is always true or
+      // always false over the traced domain. It provides no type information.
     }
     return {}; // No constant operand, or not discriminating — no match.
   }
 
-  // --- ZExt / SExt / Trunc: transparent casts, trace through to source ---
-  // (e.g., `zext i1 %check_instanceof_result to i32`)
+  // --- ZExt / SExt / Trunc: cast the traced value pair through to the
+  // result's width (e.g., `zext i1 %check_instanceof_result to i32` maps
+  // {0,1} to {0,1}; `sext i1 ... to i8` maps it to {0,-1}). Casts that
+  // preserve neither the pair nor the checks' semantics (bitcast, fpcast,
+  // ...) are not meaningful here.
   if (auto *Cast = dyn_cast<CastInst>(Cond)) {
-    if (isa<ZExtInst>(Cast) || isa<SExtInst>(Cast) || isa<TruncInst>(Cast))
-      return traceToCheckInstanceof(Cast->getOperand(0), QueryObj, Visited, DT);
-    return {}; // Other casts (bitcast, fpcast, ...) — not meaningful here.
+    if (isa<ZExtInst>(Cast) || isa<SExtInst>(Cast) || isa<TruncInst>(Cast)) {
+      TraceResult R =
+          traceToCheckInstanceof(Cast->getOperand(0), QueryObj, Visited, Q);
+      if (!R.matched())
+        return {};
+      unsigned Width = Cast->getType()->getIntegerBitWidth();
+      if (isa<ZExtInst>(Cast)) {
+        R.FailedValue = R.FailedValue.zext(Width);
+        R.PassedValue = R.PassedValue.zext(Width);
+      } else if (isa<SExtInst>(Cast)) {
+        R.FailedValue = R.FailedValue.sext(Width);
+        R.PassedValue = R.PassedValue.sext(Width);
+      } else {
+        R.FailedValue = R.FailedValue.trunc(Width);
+        R.PassedValue = R.PassedValue.trunc(Width);
+      }
+      canonicalizeI1Pair(R);
+      return R;
+    }
+    return {};
   }
 
-  // --- And i1 %a, %b ---
-  // True-branch: both operands are true → AllOf (both constraints hold).
-  // False-branch: at least one is false → OneOf (don't know which failed).
+  // --- Boolean operators: matched on i1 only, plus constant pair mappings ---
+  //
+  // On i1 the type system pins the value domain to {0,1}, so the boolean
+  // semantics below are exact and compose with the value-pair invariant. On
+  // wider integers an operand's contribution is only its bit 0 (zext/sext of
+  // an i1 preserve bit 0), which is not enough to justify the full-value
+  // merges used here — e.g. `or i8 %zext_check, (select i1 ..., 2)` can be 3
+  // no matter which way the checks went — so wider And/Or/Xor of two traced
+  // values are conservatively unmatched. The common widened forms are still
+  // recovered: InstCombine canonicalizes `or (zext a), (zext b)` to
+  // `zext (or i1 a, b)`, which traces fine, and a bitwise op with a CONSTANT
+  // is a deterministic function of the single traced operand, so the value
+  // pair maps through it exactly (`xor i8 %zext_check, 1` keeps inverting;
+  // `sub i1 0, %check` is the NOT before that canonicalization).
   if (auto *BO = dyn_cast<BinaryOperator>(Cond)) {
+    if (BO->getOpcode() == Instruction::And ||
+        BO->getOpcode() == Instruction::Or ||
+        BO->getOpcode() == Instruction::Xor ||
+        BO->getOpcode() == Instruction::Sub) {
+      auto *LHSC = dyn_cast<ConstantInt>(BO->getOperand(0));
+      auto *RHSC = dyn_cast<ConstantInt>(BO->getOperand(1));
+      if ((LHSC == nullptr) != (RHSC == nullptr)) {
+        // Exactly one constant operand: map the traced operand's pair through
+        // the constant. The result is a deterministic function of that
+        // operand, so its value domain is exactly the mapped pair and the
+        // constraint sides carry over unchanged. Sub is order-sensitive:
+        // C-Other and Other-C map the pair differently.
+        Value *Other = LHSC ? BO->getOperand(1) : BO->getOperand(0);
+        const APInt &C = (LHSC ? LHSC : RHSC)->getValue();
+        TraceResult R = traceToCheckInstanceof(Other, QueryObj, Visited, Q);
+        if (!R.matched())
+          return {};
+        assert(R.FailedValue.getBitWidth() == C.getBitWidth() &&
+               "traced value pair must match the operand type");
+        switch (BO->getOpcode()) {
+        case Instruction::And:
+          R.FailedValue &= C;
+          R.PassedValue &= C;
+          break;
+        case Instruction::Or:
+          R.FailedValue |= C;
+          R.PassedValue |= C;
+          break;
+        case Instruction::Xor:
+          R.FailedValue ^= C;
+          R.PassedValue ^= C;
+          break;
+        case Instruction::Sub:
+          if (LHSC) {
+            R.FailedValue = C - R.FailedValue;
+            R.PassedValue = C - R.PassedValue;
+          } else {
+            R.FailedValue = R.FailedValue - C;
+            R.PassedValue = R.PassedValue - C;
+          }
+          break;
+        default:
+          llvm_unreachable("covered above");
+        }
+        if (R.FailedValue == R.PassedValue)
+          return {}; // Constant w.r.t. the check outcome — no discrimination.
+        // xor (and an inverted sub) flips the value-outcome correspondence;
+        // an i1 result must re-pair its constraint sides with it.
+        canonicalizeI1Pair(R);
+        return R;
+      }
+      if (!BO->getType()->isIntegerTy(1))
+        return {};
+    }
+    // --- And i1 %a, %b ---
+    // True-branch: both operands are true → AllOf (both constraints hold).
+    // False-branch: at least one is false → OneOf (don't know which failed).
     if (BO->getOpcode() == Instruction::And) {
       TraceResult L =
-          traceToCheckInstanceof(BO->getOperand(0), QueryObj, Visited, DT);
+          traceToCheckInstanceof(BO->getOperand(0), QueryObj, Visited, Q);
       TraceResult R =
-          traceToCheckInstanceof(BO->getOperand(1), QueryObj, Visited, DT);
+          traceToCheckInstanceof(BO->getOperand(1), QueryObj, Visited, Q);
       if (L.matched() && R.matched()) {
         TraceResult M;
         // True-branch: both L and R are true → AllOf.
@@ -1187,9 +1429,9 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
     // False-branch: both operands are false → AllOf (both constraints hold).
     if (BO->getOpcode() == Instruction::Or) {
       TraceResult L =
-          traceToCheckInstanceof(BO->getOperand(0), QueryObj, Visited, DT);
+          traceToCheckInstanceof(BO->getOperand(0), QueryObj, Visited, Q);
       TraceResult R =
-          traceToCheckInstanceof(BO->getOperand(1), QueryObj, Visited, DT);
+          traceToCheckInstanceof(BO->getOperand(1), QueryObj, Visited, Q);
       if (L.matched() && R.matched()) {
         TraceResult M;
         // True-branch: at least one of L, R is true → OneOf.
@@ -1245,10 +1487,12 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
 
       if (NonConstVal) {
         TraceResult R =
-            traceToCheckInstanceof(NonConstVal, QueryObj, Visited, DT);
+            traceToCheckInstanceof(NonConstVal, QueryObj, Visited, Q);
         if (!R.matched())
           return {};
-        // xor with true inverts the condition → swap True/False.
+        // xor with true inverts the condition → swap True/False. The result
+        // is i1, so its value pair stays {0,1}: value 1 now corresponds to
+        // the operand's failed execution, which is the swapped-True side.
         std::swap(R.TrueKlass, R.FalseKlass);
         std::swap(R.TrueInterfaces, R.FalseInterfaces);
         std::swap(R.TrueExclusions, R.FalseExclusions);
@@ -1262,59 +1506,80 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
 
   // --- Select: the result is one of two values, we don't know which ---
   // Both branches use OneOf semantics: LCA for klass, intersect for exclusions.
-  // Special case: if one arm is a constant, the other arm's constraints can
-  // be used directly on the branch where the constant could not contribute.
-  //   - Constant false arm: on true-branch, this arm can't be selected →
-  //     other arm was selected and is true → use other arm's True constraints.
-  //   - Constant true arm: on false-branch, this arm can't be selected →
-  //     other arm was selected and is false → use other arm's False
-  //     constraints.
+  // Constant arms are classified against the traced value pair, never against
+  // an assumed {0,1}: a constant equal to one pair value behaves like that
+  // side arriving without a check, and any other constant makes the result
+  // independent of the checks (no match).
   if (auto *SI = dyn_cast<SelectInst>(Cond)) {
     Value *TrueVal = SI->getTrueValue();
     Value *FalseVal = SI->getFalseValue();
     auto *TrueConst = dyn_cast<ConstantInt>(TrueVal);
     auto *FalseConst = dyn_cast<ConstantInt>(FalseVal);
 
-    // Both constant → no check_instanceof involved.
-    if (TrueConst && FalseConst)
-      return {};
+    // Both arms constant: the select maps the condition onto the constant
+    // pair — the result equals TrueConst exactly when the condition is true.
+    // Trace the condition and rebase the value pair onto the constants.
+    if (TrueConst && FalseConst) {
+      if (TrueConst->getValue() == FalseConst->getValue())
+        return {}; // Constant result — independent of any check.
+      TraceResult R =
+          traceToCheckInstanceof(SI->getCondition(), QueryObj, Visited, Q);
+      if (!R.matched())
+        return {};
+      R.FailedValue = FalseConst->getValue();
+      R.PassedValue = TrueConst->getValue();
+      canonicalizeI1Pair(R);
+      return R;
+    }
 
     // One arm is constant.
     if (TrueConst || FalseConst) {
-      bool IsZero = TrueConst ? TrueConst->isZero() : FalseConst->isZero();
       Value *NonConstVal = TrueConst ? FalseVal : TrueVal;
-      TraceResult R =
-          traceToCheckInstanceof(NonConstVal, QueryObj, Visited, DT);
+      TraceResult R = traceToCheckInstanceof(NonConstVal, QueryObj, Visited, Q);
       if (!R.matched())
         return {};
+      // The constant arm contributes its value without any check. It must be
+      // one of the pair values; which one decides which select outcome is
+      // check-independent and must be dropped.
+      const APInt &ConstVal =
+          TrueConst ? TrueConst->getValue() : FalseConst->getValue();
+      bool ConstIsFailed = ConstVal == R.FailedValue;
+      bool ConstIsPassed = ConstVal == R.PassedValue;
+      if (!ConstIsFailed && !ConstIsPassed)
+        return {}; // Third value: the result is check-independent.
       TraceResult M;
-      if (IsZero) {
-        // Constant false: on the select's true-branch, the constant arm can't
-        // be selected → the non-constant arm was selected and is true.
+      if (ConstIsFailed) {
+        // Constant at the failed value: a result at the passed value can only
+        // come from the non-constant arm — its passed side holds.
         M.TrueKlass = R.TrueKlass;
         M.TrueInterfaces = R.TrueInterfaces;
         M.TrueExclusions = R.TrueExclusions;
-        // False-branch: could be constant false or R false → no useful info.
+        // Failed outcome: could be the constant arm or R failing → no info.
       } else {
-        // Constant true: on the select's false-branch, the constant arm can't
-        // be selected → the non-constant arm was selected and is false.
+        // Constant at the passed value: a result at the failed value can only
+        // come from the non-constant arm — its failed side holds.
         M.FalseKlass = R.FalseKlass;
         M.FalseInterfaces = R.FalseInterfaces;
         M.FalseExclusions = R.FalseExclusions;
-        // True-branch: could be constant true or R true → no useful info.
+        // Passed outcome: could be the constant arm or R passing → no info.
       }
       if (!M.matched())
         return {};
+      M.FailedValue = R.FailedValue;
+      M.PassedValue = R.PassedValue;
       return M;
     }
 
-    // Both non-constant: OneOf merge.
-    TraceResult T = traceToCheckInstanceof(TrueVal, QueryObj, Visited, DT);
+    // Both non-constant: OneOf merge. The arms must share one value pair for
+    // the merged result to have a well-defined domain.
+    TraceResult T = traceToCheckInstanceof(TrueVal, QueryObj, Visited, Q);
     if (!T.matched())
       return {}; // True arm doesn't trace — no match.
-    TraceResult F = traceToCheckInstanceof(FalseVal, QueryObj, Visited, DT);
+    TraceResult F = traceToCheckInstanceof(FalseVal, QueryObj, Visited, Q);
     if (!F.matched())
       return {}; // False arm doesn't trace — no match.
+    if (T.FailedValue != F.FailedValue || T.PassedValue != F.PassedValue)
+      return {}; // Different pairs — no common value semantics.
     TraceResult M;
     M.TrueKlass = computeLCA(T.TrueKlass, F.TrueKlass);
     M.TrueInterfaces = commonInterfaces(T.TrueInterfaces, F.TrueInterfaces);
@@ -1326,17 +1591,22 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
         intersectExcludedKlasses(T.FalseExclusions, F.FalseExclusions);
     if (!M.matched())
       return {};
+    M.FailedValue = T.FailedValue;
+    M.PassedValue = T.PassedValue;
     return M;
   }
 
   // --- PHI: merge non-constant incomings with OneOf semantics ---
   // Don't know which incoming was selected → LCA for klass, intersect for
-  // exclusions, on both branches.
+  // exclusions, on both branches. Constant incomings are classified against
+  // the traced value pair after the non-constant arms establish it: a
+  // constant equal to a pair value makes that outcome check-independent, and
+  // any other constant makes the whole phi's value check-independent (the
+  // phi could hold a value the checks can never produce, on either outcome).
   if (auto *PN = dyn_cast<PHINode>(Cond)) {
     TraceResult M;
     bool HaveMatch = false;
-    bool HasConstantFalse = false;
-    bool HasConstantTrue = false;
+    SmallVector<ConstantInt *, 2> ConstantArms;
 
     for (unsigned I = 0, E = PN->getNumIncomingValues(); I != E; ++I) {
       Value *Inc = PN->getIncomingValue(I);
@@ -1344,32 +1614,29 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
       // If the incoming block is dominated by a null-check edge (obj IS null
       // there), the arm is only live for the null execution, where type
       // facts conditioned on non-null are meaningless — skip it regardless
-      // of whether the incoming is a constant.
-      if (isNullCheckPath(PN->getIncomingBlock(I), QueryObj, DT))
+      // of whether the incoming is a constant. This stays on the structural
+      // dominator walk only: the null-edge oracle (LazyValueInfo) may only
+      // be queried with values that dominate the edge, which is not
+      // guaranteed between a traced condition's PHI arms and QueryObj.
+      BasicBlock *IncBB = PN->getIncomingBlock(I);
+      if (isNullCheckPath(IncBB, QueryObj, Q.DT))
         continue;
 
       if (auto *CI = dyn_cast<ConstantInt>(Inc)) {
-        if (CI->isZero()) {
-          // Constant false from non-null-check origin: on the true-branch
-          // this path can't be taken (safe to skip), but on the false-branch
-          // it could have been taken without any type check.
-          HasConstantFalse = true;
-          continue;
-        }
-        // Constant true from non-null-check origin: on the false-branch
-        // this path can't be taken (safe to skip), but on the true-branch
-        // it could have been taken without any type check.
-        HasConstantTrue = true;
+        ConstantArms.push_back(CI);
         continue;
       }
 
       // Non-constant incoming: must trace to a check_instanceof.
-      TraceResult R = traceToCheckInstanceof(Inc, QueryObj, Visited, DT);
+      TraceResult R = traceToCheckInstanceof(Inc, QueryObj, Visited, Q);
       if (!R.matched())
         return {}; // This incoming doesn't trace to a check — no match.
       if (!HaveMatch) {
         M = R;
         HaveMatch = true;
+      } else if (M.FailedValue != R.FailedValue ||
+                 M.PassedValue != R.PassedValue) {
+        return {}; // Arms with different value pairs — no common semantics.
       } else {
         // OneOf merge: LCA for klass, intersect for exclusions.
         M.TrueKlass = computeLCA(M.TrueKlass, R.TrueKlass);
@@ -1383,24 +1650,34 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
             intersectExcludedKlasses(M.FalseExclusions, R.FalseExclusions);
       }
     }
+    if (!HaveMatch)
+      return {}; // No non-constant incomings (all were skipped) — no match.
 
-    // Invalidate branch info that is unsound due to constant incomings
-    // from non-null-check paths.
-    if (HaveMatch) {
-      if (HasConstantFalse) {
-        M.FalseKlass = 0;
-        M.FalseInterfaces.clear();
-        M.FalseExclusions.clear();
-      }
-      if (HasConstantTrue) {
-        M.TrueKlass = 0;
-        M.TrueInterfaces.clear();
-        M.TrueExclusions.clear();
-      }
+    // Classify the constant arms against the merged value pair and drop the
+    // outcomes they can reach without a check.
+    bool HasConstantFailed = false;
+    bool HasConstantPassed = false;
+    for (ConstantInt *CI : ConstantArms) {
+      if (CI->getValue() == M.FailedValue)
+        HasConstantFailed = true;
+      else if (CI->getValue() == M.PassedValue)
+        HasConstantPassed = true;
+      else
+        return {}; // A value outside the pair — check-independent phi.
     }
-    if (HaveMatch && M.matched())
+    if (HasConstantFailed) {
+      M.FalseKlass = 0;
+      M.FalseInterfaces.clear();
+      M.FalseExclusions.clear();
+    }
+    if (HasConstantPassed) {
+      M.TrueKlass = 0;
+      M.TrueInterfaces.clear();
+      M.TrueExclusions.clear();
+    }
+    if (M.matched())
       return M;
-    return {}; // No non-constant incomings (all were skipped) — no match.
+    return {};
   }
 
   return {}; // Unrecognized value kind — no match.
@@ -1448,10 +1725,14 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
 //   null-edge oracle (backed by LazyValueInfo in CFG-stable passes) for
 //   threaded/indirect forms.
 //
-// The seed cut at V's definition block is exact too: a branch condition
-// referencing V is dominated by V's definition, so an edge into the definition
-// block carrying facts about V would come from a dominated predecessor — a
-// back edge, which is skipped anyway.
+// The seed cut at V's definition block is exact in reducible CFGs: a branch
+// condition referencing V is dominated by V's definition, so an edge into the
+// definition block carrying facts about V would come from a dominated
+// predecessor — a back edge, which is skipped anyway. In an irreducible CFG a
+// reference can also reach the definition block without such a dominator
+// chain (an indirect reference through a PHI of V); the cut still returns
+// only unknown, which is sound — the cost is precision, and only for
+// irreducible loops.
 //
 // Precision: a guard whose outgoing edge dominates the context block lies on
 // every path from the function entry to the context, hence inside every path
@@ -1474,52 +1755,6 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
 // per-query join budget (deeper single-predecessor chains conservatively
 // return unknown).
 
-/// Maximum number of joined blocks per top-level query, per dimension (the
-/// block dimension and the PHI-value dimension each get their own allowance,
-/// so consuming one does not silently starve the other). Bounds compile time;
-/// exceeding frames contribute an empty (unknown) fact and are not memoized.
-/// Hidden tuning knob: large methods with joins deeper than the default lose
-/// check-derived sharpening (sound, precision-only) and can raise this.
-static cl::opt<unsigned> MaxFactsJoinBlocks(
-    "jeandle-max-facts-join-blocks", cl::init(128), cl::Hidden,
-    cl::desc("Maximum joined blocks per JavaType query dimension"));
-
-namespace {
-
-/// Per-query evaluation state. Facts depend only on the CFG, branch
-/// conditions, the null-edge oracle and VM callbacks, so they are constant
-/// for the lifetime of one query and safely memoized here.
-///
-/// The memo's lifetime is deliberately one top-level query, not one pass:
-/// within a query it turns the exponential path join into a linear one, while
-/// consumers amortize across queries with their own result caches
-/// (RecoverTypeInfo's per-load and per-edge caches). A pass-scoped memo would
-/// additionally need invalidation discipline for every consumer that erases
-/// instructions mid-pass (ConstantFieldFolding does), where dangling Value*
-/// keys could alias freshly allocated values and return stale facts.
-struct JavaTypeQueryContext {
-  DominatorTree &DT;
-  IsNullEdgeOracle NullOracle;
-  /// PHI cycle-detection set for the value dimension (phiValueType): a
-  /// re-encountered PHI contributes nothing. Base-type queries detect
-  /// cycles with their own SCC state and do not use this set.
-  SmallPtrSet<const PHINode *, 8> PhiVisited;
-  /// Complete base-type memo shared across the whole query (see BaseMemo).
-  BaseMemo BaseTypes;
-  /// Definedness proofs shared by base typing and CFG identity matching.
-  DefinedMemo DefinedValues;
-  /// Per-(value, block) evaluation state for the block dimension: absent =
-  /// not yet evaluated, nullopt = currently on the evaluation stack (a cycle
-  /// the back-edge rule cannot cut), engaged = the completed join. One
-  /// container for both memoization and cycle detection keeps the two from
-  /// drifting apart across exit paths.
-  DenseMap<std::pair<Value *, BasicBlock *>, std::optional<JavaType>> Processed;
-  unsigned FactsBudget = MaxFactsJoinBlocks;
-  unsigned PhiBudget = MaxFactsJoinBlocks;
-};
-
-} // namespace
-
 /// Narrow-only path composition: merge guard facts G into the accumulated path
 /// facts Acc. A more specific positive klass replaces the accumulated one; an
 /// unrelated or less specific one is dropped (never widened into an LCA — two
@@ -1532,6 +1767,8 @@ struct JavaTypeQueryContext {
 /// klass, one-side-exact, subtype narrowing) — the two must stay consistent
 /// in the cases they share.
 static void mergePathFacts(JavaType &Acc, const JavaType &G) {
+  assert(getVMCallbacks() && getVMCallbacks()->IsSubtype &&
+         "VMCallbacks must be set");
   if (G.Klass != 0) {
     if (!Acc.isKnown()) {
       Acc.Klass = G.Klass;
@@ -1543,8 +1780,13 @@ static void mergePathFacts(JavaType &Acc, const JavaType &G) {
       // metadata, constant oop) when a guard only proves instanceof(K).
       Acc.Exact = Acc.Exact || G.Exact;
     } else if (getVMCallbacks()->IsSubtype(G.Klass, Acc.Klass)) {
+      // G is the narrower constraint and replaces the accumulated klass.
+      // Exactness stays disjunctive, mirroring typeIntersect's ladder: a
+      // exact claim on either side pins the dynamic type (an accumulated
+      // exact klass with a narrower instanceof guard only coexist on dead
+      // paths, where keeping exact is vacuously sound).
       Acc.Klass = G.Klass;
-      Acc.Exact = G.Exact;
+      Acc.Exact = Acc.Exact || G.Exact;
     }
   }
   Acc.Interfaces.insert(G.Interfaces.begin(), G.Interfaces.end());
@@ -1568,61 +1810,119 @@ traceSideToFacts(uintptr_t Klass, const SmallDenseSet<uintptr_t, 2> &Interfaces,
   return Facts;
 }
 
-/// The guard that edge From -> To implies about V: if exactly one successor of
-/// From's conditional branch is To, that outcome's constraints held along the
-/// edge. A duplicate edge (both successors are To) carries no outcome
-/// information. Non-branch terminators carry no guard.
+/// The guard that edge From -> To implies about V. For a conditional branch,
+/// if exactly one successor is To, that outcome's constraints held along the
+/// edge; a duplicate edge (both successors are To) carries no outcome
+/// information. For a switch, an edge reached through exactly one case value
+/// (or through the default when exactly one pair value is cased elsewhere)
+/// pins the condition to that value. Other terminators carry no guard.
 static JavaType edgeGuard(BasicBlock *From, BasicBlock *To, Value *V,
-                          DominatorTree &DT) {
-  auto *BI = dyn_cast<BranchInst>(From->getTerminator());
-  if (!BI || !BI->isConditional())
-    return {};
-
+                          JavaTypeQueryContext &Q) {
   V = V->stripPointerCastsAndAliases();
-  BasicBlock *TrueBB = BI->getSuccessor(0);
-  BasicBlock *FalseBB = BI->getSuccessor(1);
-  bool TrueIsTo = (TrueBB == To);
-  bool FalseIsTo = (FalseBB == To);
-  if (TrueIsTo == FalseIsTo)
-    return {};
+  auto *BI = dyn_cast<BranchInst>(From->getTerminator());
+  auto *SW = dyn_cast<SwitchInst>(From->getTerminator());
+  Value *Cond = nullptr;
+  if (SW)
+    Cond = SW->getCondition();
+  else if (BI && BI->isConditional())
+    Cond = BI->getCondition();
+  if (!Cond)
+    return {}; // Unconditional branch, switch-free terminator, or no outcome.
+  // The condition side gets the same definedness-aware canonicalization as
+  // the object side, so a frozen or identity-wrapped condition still traces.
+  Cond = stripCastsAndFreeze(Cond, Q.DefinedValues);
 
-  // Exact-klass guard fast path. A failed exact-class guard does not imply
-  // that the object is not an instance of the guarded class: it may still be
-  // a subclass, so the false side contributes nothing.
-  if (uintptr_t Exact = traceExactKlassGuard(BI->getCondition(), V)) {
-    if (TrueIsTo) {
-      LLVM_DEBUG(dbgs() << "JavaType: edge guard " << From->getName() << " -> "
-                        << To->getName() << " proves exact klass " << Exact
-                        << " for " << *V << "\n");
-      return JavaType(Exact, /*Exact=*/true);
+  if (BI) {
+    BasicBlock *TrueBB = BI->getSuccessor(0);
+    BasicBlock *FalseBB = BI->getSuccessor(1);
+    bool TrueIsTo = (TrueBB == To);
+    bool FalseIsTo = (FalseBB == To);
+    if (TrueIsTo == FalseIsTo)
+      return {};
+
+    // Exact-klass guard fast path. A failed exact-class guard does not imply
+    // that the object is not an instance of the guarded class: it may still be
+    // a subclass, so the false side contributes nothing.
+    if (uintptr_t Exact = traceExactKlassGuard(Cond, V, Q.DefinedValues)) {
+      if (TrueIsTo) {
+        LLVM_DEBUG(dbgs() << "JavaType: edge guard " << From->getName()
+                          << " -> " << To->getName() << " proves exact klass "
+                          << Exact << " for " << *V << "\n");
+        return JavaType(Exact, /*Exact=*/true);
+      }
+      return {};
     }
-    return {};
+
+    SmallPtrSet<Value *, 16> TraceVisited;
+    TraceResult TR = traceToCheckInstanceof(Cond, V, TraceVisited, Q);
+    if (!TR.matched())
+      return {};
+
+    LLVM_DEBUG(dbgs() << "JavaType: edge guard " << From->getName() << " -> "
+                      << To->getName() << " constrains " << *V << "\n");
+    if (TrueIsTo)
+      return traceSideToFacts(TR.TrueKlass, TR.TrueInterfaces,
+                              TR.TrueExclusions);
+    return traceSideToFacts(TR.FalseKlass, TR.FalseInterfaces,
+                            TR.FalseExclusions);
   }
 
-  SmallPtrSet<Value *, 16> TraceVisited;
-  TraceResult TR =
-      traceToCheckInstanceof(BI->getCondition(), V, TraceVisited, DT);
-  if (!TR.matched())
-    return {};
+  // --- Switch: an edge's case values pin the condition's value ---
+  {
+    SmallVector<ConstantInt *, 2> CasesToDest;
+    bool DefaultIsDest = SW->getDefaultDest() == To;
+    for (auto &Case : SW->cases())
+      if (Case.getCaseSuccessor() == To)
+        CasesToDest.push_back(Case.getCaseValue());
 
-  LLVM_DEBUG(dbgs() << "JavaType: edge guard " << From->getName() << " -> "
-                    << To->getName() << " constrains " << *V << "\n");
-  if (TrueIsTo)
-    return traceSideToFacts(TR.TrueKlass, TR.TrueInterfaces, TR.TrueExclusions);
-  return traceSideToFacts(TR.FalseKlass, TR.FalseInterfaces,
-                          TR.FalseExclusions);
-}
+    // The value the condition is pinned to on this edge, if any.
+    std::optional<APInt> PinnedValue;
+    if (!DefaultIsDest && CasesToDest.size() == 1) {
+      PinnedValue = CasesToDest.front()->getValue();
+    } else if (DefaultIsDest && CasesToDest.empty()) {
+      // Default edge: the value is anything not cased elsewhere. If exactly
+      // one of the traced pair values is cased (to some other block), the
+      // default edge pins the other one; if both or neither are cased, the
+      // edge carries no check-outcome information.
+      // Computed below against the traced pair.
+      PinnedValue = std::nullopt;
+    } else {
+      return {}; // Mixed or multi-case destination — no single value.
+    }
 
-/// Positive proof that V is null on edge From -> To, answered by the query's
-/// null-edge oracle (the LazyValueInfo-backed implementation recognizes null
-/// tests directly on the edge's branch as well as threaded/indirect forms).
-/// When in doubt the oracle answers false — keeping an edge is always sound.
-static bool isNullEdge(Value *V, BasicBlock *From, BasicBlock *To,
-                       const JavaTypeQueryContext &Q) {
-  if (!Q.DT.isReachableFromEntry(From))
-    return false; // Lattice reasoning is undefined for unreachable blocks;
-                  // keep the edge (the conservative answer).
-  return Q.NullOracle && Q.NullOracle(V, From, To);
+    SmallPtrSet<Value *, 16> TraceVisited;
+    TraceResult TR = traceToCheckInstanceof(Cond, V, TraceVisited, Q);
+    if (!TR.matched())
+      return {};
+
+    if (!PinnedValue) {
+      bool FailedCased = false, PassedCased = false;
+      for (auto &Case : SW->cases()) {
+        if (Case.getCaseSuccessor() == To)
+          continue;
+        if (Case.getCaseValue()->getValue() == TR.FailedValue)
+          FailedCased = true;
+        if (Case.getCaseValue()->getValue() == TR.PassedValue)
+          PassedCased = true;
+      }
+      if (FailedCased == PassedCased)
+        return {}; // Both or neither cased — no discrimination.
+      PinnedValue = FailedCased ? TR.PassedValue : TR.FailedValue;
+    }
+
+    LLVM_DEBUG(dbgs() << "JavaType: switch edge " << From->getName() << " -> "
+                      << To->getName() << " pins the condition for " << *V
+                      << "\n");
+    if (*PinnedValue == TR.PassedValue)
+      return traceSideToFacts(TR.TrueKlass, TR.TrueInterfaces,
+                              TR.TrueExclusions);
+    if (*PinnedValue == TR.FailedValue)
+      return traceSideToFacts(TR.FalseKlass, TR.FalseInterfaces,
+                              TR.FalseExclusions);
+    return {}; // A case value outside the traced pair — a dead edge.
+  }
+
+  return {};
 }
 
 /// Facts holding about V at the top of BB: the join over non-skipped incoming
@@ -1665,7 +1965,7 @@ static JavaType factsAt(Value *V, BasicBlock *BB, JavaTypeQueryContext &Q) {
     if (isNullEdge(V, P, BB, Q))
       continue; // Null edge (exact, see the design comment).
     JavaType E = factsAt(V, P, Q);
-    mergePathFacts(E, edgeGuard(P, BB, V, Q.DT));
+    mergePathFacts(E, edgeGuard(P, BB, V, Q));
     joinArm(Joined, First, std::move(E));
   }
 
@@ -1715,9 +2015,25 @@ static JavaType phiValueType(PHINode *PN, JavaTypeQueryContext &Q) {
     if (isNullEdge(Inc, IncBB, PN->getParent(), Q))
       continue;
 
+    // Literal null and poison incomings are vacuous under the non-null
+    // contract (see getBaseTypeInputs) — same rule as the base engine, so a
+    // lazy-initialization phi keeps its typed arm even without an oracle.
+    if (isa<ConstantPointerNull, PoisonValue>(Inc))
+      continue;
+
     JavaType T = valueDimension(Inc, Q);
-    T = typeIntersect(T, factsAt(Inc, IncBB, Q));
-    mergePathFacts(T, edgeGuard(IncBB, PN->getParent(), Inc, Q.DT));
+    JavaType EdgeFacts = factsAt(Inc, IncBB, Q);
+    JavaType GuardFacts = edgeGuard(IncBB, PN->getParent(), Inc, Q);
+    // Dead incoming arm: the incoming's base type contradicts a failed check
+    // on this edge, so the incoming has no non-null execution here (its only
+    // live value is null). Under the non-null contract the arm is vacuous,
+    // exactly like a proven-null edge, and is skipped instead of polluting
+    // the join through the contradiction.
+    if (T.isKnown() && (isExcludedBy(T.Klass, EdgeFacts.ExcludedKlasses) ||
+                        isExcludedBy(T.Klass, GuardFacts.ExcludedKlasses)))
+      continue;
+    T = typeIntersect(T, EdgeFacts);
+    mergePathFacts(T, GuardFacts);
     if (T.isUnknown())
       return {};
     joinArm(Result, First, std::move(T));
@@ -1740,11 +2056,18 @@ JavaType jeandle::sharpen(Value *V, Instruction *Context, DominatorTree &DT,
                           BasicBlock *DestBB, IsNullEdgeOracle IsNullEdge) {
   assert(getVMCallbacks() && getVMCallbacks()->IsSubtype &&
          "VMCallbacks must be set");
+  // Contract (see JavaType.h): Context is the terminator of a PHI incoming
+  // block and DestBB that PHI's parent. DestBB may equal Context's block for
+  // a self-referencing PHI arm (a loop-header back edge); the guard on such
+  // an edge is then conservatively empty (duplicate-edge rule in edgeGuard).
+  assert(Context && Context->isTerminator() &&
+         "sharpen requires the incoming block's terminator");
+  assert(DestBB && "sharpen requires the PHI parent block");
 
   JavaTypeQueryContext Q{DT, IsNullEdge};
   V = stripCastsAndFreeze(V, Q.DefinedValues);
   JavaType Facts = factsAt(V, Context->getParent(), Q);
-  mergePathFacts(Facts, edgeGuard(Context->getParent(), DestBB, V, DT));
+  mergePathFacts(Facts, edgeGuard(Context->getParent(), DestBB, V, Q));
   normalizeExcludedKlasses(Facts);
   return Facts;
 }
@@ -1755,6 +2078,8 @@ JavaType jeandle::sharpen(Value *V, Instruction *Context, DominatorTree &DT,
 
 JavaType jeandle::getJavaType(Value *V, DominatorTree *DT, Instruction *Context,
                               IsNullEdgeOracle IsNullEdge) {
+  assert(getVMCallbacks() && getVMCallbacks()->IsSubtype &&
+         "VMCallbacks must be set");
   if (!DT || !Context) {
     DefinedMemo Defined;
     V = stripCastsAndFreeze(V, Defined);

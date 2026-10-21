@@ -522,6 +522,36 @@ bool LVINullEdgeOracle::operator()(Value *V, BasicBlock *FromBB,
   auto *PT = dyn_cast<PointerType>(V->getType());
   if (!PT)
     return false;
+
+  // Structural fast path for the edge's own terminator: a conditional branch
+  // on `icmp eq/ne TESTED, null` answers the query directly, for either
+  // operand order and through pointer casts on the tested value — forms the
+  // LVI query below does not reliably recover. A conclusive answer on the
+  // tested edge is also final: the non-null side of a direct null test can
+  // never be a null edge.
+  if (auto *BI = dyn_cast<BranchInst>(FromBB->getTerminator()))
+    if (BI->isConditional() && BI->getSuccessor(0) != BI->getSuccessor(1))
+      if (auto *Cmp = dyn_cast<ICmpInst>(BI->getCondition()))
+        if (Cmp->getPredicate() == ICmpInst::ICMP_EQ ||
+            Cmp->getPredicate() == ICmpInst::ICMP_NE) {
+          Value *Op0 = Cmp->getOperand(0);
+          Value *Op1 = Cmp->getOperand(1);
+          Value *Tested =
+              isa<ConstantPointerNull>(Op0->stripPointerCastsAndAliases())
+                  ? Op1
+                  : (isa<ConstantPointerNull>(
+                         Op1->stripPointerCastsAndAliases())
+                         ? Op0
+                         : nullptr);
+          if (Tested && Tested->stripPointerCastsAndAliases() == V) {
+            // eq: the true successor is the null side; ne: the false one.
+            BasicBlock *NullBB = Cmp->getPredicate() == ICmpInst::ICMP_EQ
+                                     ? BI->getSuccessor(0)
+                                     : BI->getSuccessor(1);
+            return NullBB == ToBB;
+          }
+        }
+
   Constant *C = LVI.getPredicateOnEdge(
       ICmpInst::ICMP_EQ, V, ConstantPointerNull::get(PT), FromBB, ToBB);
   return C && C->isOneValue();

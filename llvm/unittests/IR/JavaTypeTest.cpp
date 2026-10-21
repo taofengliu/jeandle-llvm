@@ -248,14 +248,17 @@ TEST_F(JavaBaseTypeTest, UnknownArmMustNotBeDropped) {
   P->addIncoming(P, Loop);
   P->addIncoming(F->getArg(1), Loop);
   EXPECT_TRUE(query(P).isUnknown());
-  for (Value *Unknown :
-       {static_cast<Value *>(
-            ConstantPointerNull::get(cast<PointerType>(F->getReturnType()))),
-        static_cast<Value *>(PoisonValue::get(F->getReturnType())),
-        static_cast<Value *>(UndefValue::get(F->getReturnType()))}) {
-    P->setIncomingValue(2, Unknown);
-    EXPECT_TRUE(query(P).isUnknown());
-  }
+  // A genuinely unknown arm absorbs the join. Literal null and poison arms
+  // are different: under the non-null oop contract they are vacuous (the
+  // value cannot be a non-null oop on those executions), so the typed arm
+  // survives. Undef can materialize an arbitrary oop and stays absorbing.
+  P->setIncomingValue(
+      2, ConstantPointerNull::get(cast<PointerType>(F->getReturnType())));
+  EXPECT_EQ(query(P), JavaType(9, true));
+  P->setIncomingValue(2, PoisonValue::get(F->getReturnType()));
+  EXPECT_EQ(query(P), JavaType(9, true));
+  P->setIncomingValue(2, UndefValue::get(F->getReturnType()));
+  EXPECT_TRUE(query(P).isUnknown());
 }
 
 TEST_F(JavaBaseTypeTest, UnknownSelectArmShortCircuits) {
@@ -1334,6 +1337,161 @@ TEST_F(JavaBaseTypeTest, DeepDefinedChainThroughFreezeRetainsType) {
   EXPECT_EQ(T.Klass, 5U);
   EXPECT_FALSE(T.Exact);
   EXPECT_LE(CommonSuperQueries, Depth + 4);
+}
+
+TEST_F(JavaBaseTypeTest, WidenedGuardsUseTheRealValueDomain) {
+  // sext i1 -> i8 has domain {0,-1}: `sle %s, 0` is always true, so the exit
+  // edge carries no check outcome and must stay unknown. An assumed {0,1}
+  // domain would wrongly install a failed-check exclusion on the exit edge.
+  checkPattern(R"IR(
+    entry:
+      %check = call i1 @jeandle.check_instanceof(ptr inttoptr (i64 9 to ptr),
+                                                ptr addrspace(1) %unknown)
+      %s = sext i1 %check to i8
+      %t = icmp sle i8 %s, 0
+      br i1 %t, label %always, label %exit
+    always:
+      ret ptr addrspace(1) null
+    exit:
+      ret ptr addrspace(1) %unknown
+  )IR",
+               0, false, 0, false);
+  // The discriminating form still reads correctly: on the eq-zero false edge
+  // the check passed, so the klass is recovered there.
+  checkPattern(R"IR(
+    entry:
+      %check = call i1 @jeandle.check_instanceof(ptr inttoptr (i64 9 to ptr),
+                                                ptr addrspace(1) %unknown)
+      %z = zext i1 %check to i32
+      %t = icmp eq i32 %z, 0
+      br i1 %t, label %zero, label %exit
+    zero:
+      ret ptr addrspace(1) null
+    exit:
+      ret ptr addrspace(1) %unknown
+  )IR",
+               0, false, 9, false);
+  // A constant phi arm outside the traced pair makes the phi check-independent
+  // on both outcomes: the no-edge must carry no exclusion.
+  checkPattern(R"IR(
+    entry:
+      %check = call i1 @jeandle.check_instanceof(ptr inttoptr (i64 9 to ptr),
+                                                ptr addrspace(1) %unknown)
+      %z = zext i1 %check to i8
+      br i1 %pick, label %left, label %right
+    left:
+      br label %merge
+    right:
+      br label %merge
+    merge:
+      %p = phi i8 [ %z, %left ], [ 2, %right ]
+      %t = icmp eq i8 %p, 1
+      br i1 %t, label %yes, label %no
+    yes:
+      ret ptr addrspace(1) null
+    no:
+      ret ptr addrspace(1) %unknown
+  )IR",
+               0, false, 0, false);
+}
+
+TEST_F(JavaBaseTypeTest, TypeIntersectKeepsInterfaceExclusions) {
+  VMCallbacks CB = *getVMCallbacks();
+  CB.IsInterface = [](uintptr_t K) { return K == 7; };
+  CB.GetSecondarySupers = [](uintptr_t) { return std::vector<uintptr_t>{}; };
+  registerVMCallbacks(CB);
+  JavaType Known; // Positive klass without interface knowledge.
+  Known.Klass = 9;
+  JavaType Guarded; // Failed check against interface 7.
+  Guarded.ExcludedKlasses.insert(7);
+  JavaType T = typeIntersect(Known, Guarded);
+  EXPECT_EQ(T.Klass, 9U);
+  EXPECT_TRUE(T.ExcludedKlasses.contains(7));
+  // A class exclusion unrelated to the positive klass stays droppable: a
+  // value of klass 9 can never be an unrelated class.
+  JavaType ClassGuarded;
+  ClassGuarded.ExcludedKlasses.insert(22);
+  JavaType T2 = typeIntersect(Known, ClassGuarded);
+  EXPECT_FALSE(T2.ExcludedKlasses.contains(22));
+}
+
+TEST_F(JavaBaseTypeTest, NullAndPoisonArmsAreVacuousUnderTheNonNullContract) {
+  auto *Null = ConstantPointerNull::get(cast<PointerType>(F->getReturnType()));
+  auto *Exit = BasicBlock::Create(Context, "exit", F);
+  auto *P = B.CreatePHI(F->getReturnType(), 2);
+  P->addIncoming(Null, Entry);
+  P->addIncoming(seed(0, 9, true), Loop);
+  B.CreateCondBr(F->getArg(2), Loop, Exit);
+  B.SetInsertPoint(Exit);
+  B.CreateRet(P);
+  ASSERT_FALSE(verifyFunction(*F));
+  // The null arm only executes when the value IS null, which the non-null
+  // contract excludes: the base query keeps the typed arm.
+  EXPECT_EQ(query(P), JavaType(9, true));
+
+  auto *PoisonArm = SelectInst::Create(F->getArg(2), seed(1, 9, true),
+                                       PoisonValue::get(F->getReturnType()));
+  PoisonArm->insertBefore(Entry->getTerminator());
+  EXPECT_EQ(query(PoisonArm), JavaType(9, true));
+
+  // Undef can materialize an arbitrary oop when selected: still absorbing.
+  auto *UndefArm = SelectInst::Create(F->getArg(2), seed(3, 9, true),
+                                      UndefValue::get(F->getReturnType()));
+  UndefArm->insertBefore(Entry->getTerminator());
+  EXPECT_TRUE(query(UndefArm).isUnknown());
+}
+
+TEST_F(JavaBaseTypeTest, DeadIncomingArmSkipsTheJoin) {
+  // The classic lazy-null pattern: y = phi [exact Dog, null] keeps an exact
+  // type once null arms are vacuous; the failed instanceof then contradicts
+  // that type on the else edge, so y's only live value there is null and the
+  // arm is dead for the outer join — x is exactly the other arm's class.
+  Value *Dog = seed(0, 9, true);
+  Value *Cat = seed(1, 22, true);
+  auto *Null =
+      ConstantPointerNull::get(cast<PointerType>(F->getReturnType()));
+  auto *RawPtr = PointerType::get(Context, 0);
+  FunctionCallee Check = M.getOrInsertFunction(
+      "jeandle.check_instanceof", B.getInt1Ty(), RawPtr, F->getReturnType());
+  auto *Klass = ConstantExpr::getIntToPtr(B.getInt64(9), RawPtr);
+
+  auto *DogArm = BasicBlock::Create(Context, "dogarm", F);
+  auto *NullArm = BasicBlock::Create(Context, "nullarm", F);
+  auto *YMerge = BasicBlock::Create(Context, "ymerge", F);
+  auto *Passed = BasicBlock::Create(Context, "passed", F);
+  auto *ElseArm = BasicBlock::Create(Context, "elsearm", F);
+  auto *CatArm = BasicBlock::Create(Context, "catarm", F);
+  auto *XMerge = BasicBlock::Create(Context, "xmerge", F);
+  B.CreateCondBr(F->getArg(2), DogArm, NullArm);
+  B.SetInsertPoint(DogArm);
+  B.CreateBr(YMerge);
+  B.SetInsertPoint(NullArm);
+  B.CreateBr(YMerge);
+  B.SetInsertPoint(YMerge);
+  auto *Y = B.CreatePHI(F->getReturnType(), 2, "y");
+  Y->addIncoming(Dog, DogArm);
+  Y->addIncoming(Null, NullArm);
+  auto *Chk = B.CreateCall(Check, {Klass, Y});
+  B.CreateCondBr(Chk, Passed, ElseArm);
+  B.SetInsertPoint(Passed);
+  B.CreateRet(Null);
+  B.SetInsertPoint(ElseArm);
+  B.CreateCondBr(F->getArg(2), CatArm, XMerge);
+  B.SetInsertPoint(CatArm);
+  B.CreateBr(XMerge);
+  B.SetInsertPoint(XMerge);
+  auto *X = B.CreatePHI(F->getReturnType(), 2, "x");
+  X->addIncoming(Cat, CatArm);
+  X->addIncoming(Y, ElseArm);
+  auto *Return = B.CreateRet(X);
+  ASSERT_FALSE(verifyFunction(*F));
+
+  // The context-insensitive base still joins both arms: LCA(Dog, Cat).
+  EXPECT_EQ(query(X), JavaType(5, false));
+  // The context query sees the dead arm skipped: y's non-null executions
+  // all pass the check, so only the Cat arm reaches the merge.
+  DominatorTree DT(*F);
+  EXPECT_EQ(queryAt(X, Return, DT), JavaType(22, true));
 }
 
 } // namespace
