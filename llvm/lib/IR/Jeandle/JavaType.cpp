@@ -447,8 +447,12 @@ static Value *getIdentityInput(Value *V) {
     return nullptr;
   if (auto *GEP = dyn_cast<GEPOperator>(V))
     return GEP->hasAllZeroIndices() ? GEP->getPointerOperand() : nullptr;
-  if (auto *Alias = dyn_cast<GlobalAlias>(V))
-    return Alias->getAliasee();
+  if (auto *Alias = dyn_cast<GlobalAlias>(V)) {
+    // Pointer wrappers do not establish which definition supplies an
+    // interposable alias (same rule as stripKlassPointerWrappers): only an
+    // alias with a definitive target may forward the aliasee's type.
+    return Alias->isInterposable() ? nullptr : Alias->getAliasee();
+  }
   if (auto *CB = dyn_cast<CallBase>(V)) {
     if (CB->getIntrinsicID() == Intrinsic::launder_invariant_group ||
         CB->getIntrinsicID() == Intrinsic::strip_invariant_group)
@@ -636,6 +640,11 @@ static bool isProvenDefined(Value *V, DefinedMemo &Memo) {
   for (Value *Current : Visited)
     Memo[Current] = !NotDefined.contains(Current);
   return Memo.lookup(V);
+}
+
+bool jeandle::isProvenDefined(Value *V) {
+  DefinedMemo Memo;
+  return ::isProvenDefined(V, Memo);
 }
 
 /// Join one more arm into an accumulator where the first arm seeds it:
@@ -1229,7 +1238,11 @@ combinedInterfaces(const SmallDenseSet<uintptr_t, 2> &A,
 static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
                                           SmallPtrSetImpl<Value *> &Visited,
                                           JavaTypeQueryContext &Q) {
-  QueryObj = QueryObj->stripPointerCastsAndAliases();
+  // Canonicalize the queried object with the same definedness-aware strip the
+  // per-arm matching below uses, so a frozen or identity-wrapped oop matches
+  // its checks regardless of which side introduced the wrapper.
+  QueryObj = stripCastsAndFreeze(QueryObj->stripPointerCastsAndAliases(),
+                                 Q.DefinedValues);
   // Avoid infinite recursion on cyclic value graphs.
   if (!Visited.insert(Cond).second)
     return {}; // Already visited — no match on this path.
@@ -1248,7 +1261,7 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
     uintptr_t Klass = 0;
     Value *Obj = nullptr;
     if (isCheckInstanceofCall(CB, Klass, Obj) &&
-        Obj->stripPointerCastsAndAliases() == QueryObj) {
+        stripCastsAndFreeze(Obj, Q.DefinedValues) == QueryObj) {
       TraceResult R;
       R.TrueKlass = Klass; // check passed → obj IS Klass
       R.TrueInterfaces = getFullInterfaces(Klass, {});
@@ -1547,6 +1560,50 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
         std::swap(R.TrueInterfaces, R.FalseInterfaces);
         std::swap(R.TrueExclusions, R.FalseExclusions);
         return R;
+      }
+
+      // --- Xor i1 %a, %b: true ⟺ exactly one operand is true ---
+      // True side = OneOf(AllOf(a passed, b failed), AllOf(b passed, a
+      // failed)); false side = OneOf(AllOf(both passed), AllOf(both failed))
+      // — the operands agree. An AllOf arm whose merged facts contradict each
+      // other describes a dead outcome; joining it anyway can only weaken the
+      // result, never falsify it. With only one operand matched no constraint
+      // is implied by the xor outcome (either operand may take either value),
+      // so that case stays unmatched.
+      TraceResult L = traceToCheckInstanceof(LHS, QueryObj, Visited, Q);
+      TraceResult R = traceToCheckInstanceof(RHS, QueryObj, Visited, Q);
+      if (L.matched() && R.matched()) {
+        auto AllOfSide = [](const TraceResult &A, bool ATrue,
+                            const TraceResult &B, bool BTrue) {
+          TraceResult Out;
+          Out.TrueKlass = pickMostSpecific(ATrue ? A.TrueKlass : A.FalseKlass,
+                                           BTrue ? B.TrueKlass : B.FalseKlass);
+          Out.TrueInterfaces = ATrue ? A.TrueInterfaces : A.FalseInterfaces;
+          Out.TrueInterfaces = combinedInterfaces(
+              Out.TrueInterfaces, BTrue ? B.TrueInterfaces : B.FalseInterfaces);
+          Out.TrueExclusions = ATrue ? A.TrueExclusions : A.FalseExclusions;
+          unionExcludedKlasses(Out.TrueExclusions,
+                               BTrue ? B.TrueExclusions : B.FalseExclusions);
+          return Out;
+        };
+        TraceResult PassedFailed = AllOfSide(L, true, R, false);
+        TraceResult FailedPassed = AllOfSide(R, true, L, false);
+        TraceResult PassedPassed = AllOfSide(L, true, R, true);
+        TraceResult FailedFailed = AllOfSide(L, false, R, false);
+        TraceResult M;
+        M.TrueKlass =
+            computeLCA(PassedFailed.TrueKlass, FailedPassed.TrueKlass);
+        M.TrueInterfaces = commonInterfaces(PassedFailed.TrueInterfaces,
+                                            FailedPassed.TrueInterfaces);
+        M.TrueExclusions = intersectExcludedKlasses(
+            PassedFailed.TrueExclusions, FailedPassed.TrueExclusions);
+        M.FalseKlass =
+            computeLCA(PassedPassed.TrueKlass, FailedFailed.TrueKlass);
+        M.FalseInterfaces = commonInterfaces(PassedPassed.TrueInterfaces,
+                                             FailedFailed.TrueInterfaces);
+        M.FalseExclusions = intersectExcludedKlasses(
+            PassedPassed.TrueExclusions, FailedFailed.TrueExclusions);
+        return M;
       }
       return {};
     }
@@ -1868,7 +1925,9 @@ traceSideToFacts(uintptr_t Klass, const SmallDenseSet<uintptr_t, 2> &Interfaces,
 /// pins the condition to that value. Other terminators carry no guard.
 static JavaType edgeGuard(BasicBlock *From, BasicBlock *To, Value *V,
                           JavaTypeQueryContext &Q) {
-  V = V->stripPointerCastsAndAliases();
+  // Same canonicalization as the trace entry, so a guard on a frozen or
+  // identity-wrapped oop constrains the underlying object's type query.
+  V = stripCastsAndFreeze(V->stripPointerCastsAndAliases(), Q.DefinedValues);
   auto *BI = dyn_cast<BranchInst>(From->getTerminator());
   auto *SW = dyn_cast<SwitchInst>(From->getTerminator());
   Value *Cond = nullptr;

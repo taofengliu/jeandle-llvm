@@ -178,6 +178,19 @@ bool areKlassesIncompatible(uintptr_t Klass, bool KlassExact,
 /// Returns 0 if the value does not encode a constant klass pointer.
 uintptr_t extractKlassConstant(Value *V);
 
+/// Prove that V is defined (never poison) at its definition, without
+/// context. Recognized as defined: freeze/alloca results, constants,
+/// arguments and call results carrying noundef/dereferenceable attributes,
+/// loads with the matching metadata, and the jeandle check helpers (their
+/// templates compute a concrete boolean for every contract-valid input), plus
+/// a closed set of pure operators over defined inputs. Anything else —
+/// including operations with poison-generating flags and addrspacecast — is
+/// conservatively not proven. This is the proof JavaType itself requires
+/// before forwarding type facts through a freeze; passes that mirror the
+/// freeze/definedness discipline (e.g. RecoverTypeInfo's lattice) should use
+/// the same predicate rather than re-deriving one.
+bool isProvenDefined(Value *V);
+
 } // namespace jeandle
 } // namespace llvm
 
