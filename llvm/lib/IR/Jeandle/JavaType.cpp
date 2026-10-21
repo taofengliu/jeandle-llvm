@@ -1305,6 +1305,12 @@ static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
         R.FailedValue = R.FailedValue.trunc(Width);
         R.PassedValue = R.PassedValue.trunc(Width);
       }
+      // zext/sext are injective and keep a distinct pair distinct, but trunc
+      // can collapse it (i8 {0,2} -> i1 is {0,0}). The cast result is then
+      // constant w.r.t. the check outcome, so no edge fact may survive — the
+      // same invariant the constant bitwise-op mapping enforces below.
+      if (R.FailedValue == R.PassedValue)
+        return {};
       canonicalizeI1Pair(R);
       return R;
     }
