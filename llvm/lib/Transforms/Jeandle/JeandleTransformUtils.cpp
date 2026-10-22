@@ -15,6 +15,7 @@
 #include "llvm/IR/GlobalVariable.h"
 #include "llvm/IR/Jeandle/Deoptimization.h"
 #include "llvm/IR/Jeandle/GCStrategy.h"
+#include "llvm/IR/Jeandle/JavaType.h"
 #include "llvm/IR/Jeandle/Metadata.h"
 #include "llvm/IR/Jeandle/VMCallback.h"
 #include "llvm/IR/Module.h"
@@ -504,16 +505,16 @@ unsigned getDeoptScopeVOInsertPos(const CallBase &CB) {
 /// LazyValueInfo-backed null-edge oracle. This fork's getPredicateOnEdge
 /// returns a Constant*: the constant result of the comparison, or nullptr when
 /// unknown. Unknown answers false (the edge is kept) — only positive proof may
-/// skip an edge. V is stripped of pointer casts, aliases and freeze wrappers
-/// (the same canonicalization the engine uses) so a null test on the
-/// underlying oop is still recognized when the query value carries a wrapper
-/// (freeze(x) equals x unless x is poison, and branching on poison is
-/// undefined, so null proofs transfer).
+/// skip an edge. Pointer casts and aliases are stripped; a freeze is stripped
+/// only when its operand is proven defined, so null proofs describe the
+/// queried value even when it is produced by freezing poison.
 bool LVINullEdgeOracle::operator()(Value *V, BasicBlock *FromBB,
                                    BasicBlock *ToBB) const {
   while (true) {
     V = V->stripPointerCastsAndAliases();
     if (auto *FI = dyn_cast<FreezeInst>(V)) {
+      if (!jeandle::isProvenDefined(FI->getOperand(0)))
+        break;
       V = FI->getOperand(0);
       continue;
     }

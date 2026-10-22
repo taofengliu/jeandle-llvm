@@ -150,23 +150,18 @@ struct Lattice {
 };
 
 // =============================================================================
-// Forwarders — oop-typed instructions whose klass is determined by their
+// Forwarders — pointer instructions whose klass is determined by their
 // operands (so they start at Top and are pulled down by the worklist). Loads
 // are handled separately (as seeds or field loads), and non-zero-offset GEPs
 // are NOT forwarders (they produce interior pointers, not object references).
+// Raw pointer wrappers are tracked so casts can carry an oop's type through
+// an intermediate address space.
 // =============================================================================
 bool isForwarder(Instruction &I) {
-  if (!isJavaOopType(I.getType()))
+  if (!I.getType()->isPointerTy())
     return false;
-  if (isa<PHINode>(I) || isa<SelectInst>(I) || isa<BitCastInst>(I) ||
-      isa<AddrSpaceCastInst>(I) || isa<FreezeInst>(I))
-    return true;
-  if (auto *GEP = dyn_cast<GetElementPtrInst>(&I))
-    return GEP->hasAllZeroIndices();
-  if (auto *II = dyn_cast<IntrinsicInst>(&I))
-    return II->getIntrinsicID() == Intrinsic::launder_invariant_group ||
-           II->getIntrinsicID() == Intrinsic::strip_invariant_group;
-  return false;
+  return isa<PHINode, SelectInst, FreezeInst>(I) ||
+         jeandle::getJavaIdentityInput(&I);
 }
 
 } // namespace
@@ -331,15 +326,33 @@ PreservedAnalyses RecoverTypeInfo::run(Function &F,
 
   // Strip a load pointer to (base, constant offset). Returns nullopt offset if
   // the offset does not fit in an int (e.g. huge/variable composite that
-  // accumulated past int range). Uses stripAndAccumulateConstantOffsets so the
-  // base is reached across nested constant GEPs, bitcasts, addrspacecasts and
-  // invariant-group intrinsics.
+  // accumulated past int range). Accumulate each GEP using its own address
+  // space's index width. Calls with independent result bounds remain bases;
+  // unannotated identity calls can wrap field addresses and forward offsets.
   auto stripBaseOffset =
       [&](Value *Ptr) -> std::pair<Value *, std::optional<int>> {
     unsigned IdxBits = DL.getIndexTypeSizeInBits(Ptr->getType());
     APInt Off(IdxBits, 0, /*isSigned=*/true);
-    Value *Base = Ptr->stripAndAccumulateConstantOffsets(
-        DL, Off, /*AllowNonInbounds=*/true, /*AllowInvariantGroup=*/true);
+    Value *Base = Ptr;
+    SmallPtrSet<Value *, 8> Visited;
+    while (Visited.insert(Base).second) {
+      if (auto *Call = dyn_cast<CallBase>(Base))
+        if (klassFromAttr(Call->getAttributes(), AttributeList::ReturnIndex)
+                .isKnown())
+          break;
+      if (auto *GEP = dyn_cast<GEPOperator>(Base)) {
+        APInt Delta(DL.getIndexTypeSizeInBits(Base->getType()), 0);
+        if (!GEP->accumulateConstantOffset(DL, Delta) ||
+            Delta.getSignificantBits() > IdxBits)
+          break;
+        Off += Delta.sextOrTrunc(IdxBits);
+        Base = GEP->getPointerOperand();
+      } else if (Value *Input = jeandle::getJavaIdentityInput(Base)) {
+        Base = Input;
+      } else {
+        break;
+      }
+    }
     if (!Off.isSignedIntN(sizeof(int) * CHAR_BIT))
       return {Base, std::nullopt};
     return {Base, static_cast<int>(Off.getSExtValue())};
@@ -349,6 +362,8 @@ PreservedAnalyses RecoverTypeInfo::run(Function &F,
   // State
   // ---------------------------------------------------------------------------
   DenseMap<Value *, Lattice> States;
+  // Returned calls forward an input and may independently constrain the result.
+  DenseMap<Instruction *, Lattice> ResultSeeds;
   // A tracked typed load: an oop-typed load whose result klass can be derived
   // from the klass of the object being loaded from.
   struct LoadInfo {
@@ -389,19 +404,23 @@ PreservedAnalyses RecoverTypeInfo::run(Function &F,
                              Arg.getArgNo() + AttributeList::FirstArgIndex));
   }
 
-  unsigned OopInstCount = 0;
+  unsigned TrackedInstCount = 0;
   for (BasicBlock &BB : F) {
     for (Instruction &I : BB) {
-      if (!isJavaOopType(I.getType()))
+      if (!isJavaOopType(I.getType()) && !isForwarder(I))
         continue;
-      ++OopInstCount;
+      ++TrackedInstCount;
 
-      // Identity intrinsics participate in the forwarder fixpoint. Ordinary
-      // calls and invokes are seeded from their explicit return attributes.
-      if (isa<CallBase>(&I) && !isForwarder(I)) {
-        auto *CB2 = cast<CallBase>(&I);
-        seed(&I,
-             klassFromAttr(CB2->getAttributes(), AttributeList::ReturnIndex));
+      if (auto *Call = dyn_cast<CallBase>(&I)) {
+        Lattice S =
+            klassFromAttr(Call->getAttributes(), AttributeList::ReturnIndex);
+        if (isForwarder(I)) {
+          seed(&I, Lattice::top());
+          if (S.isKnown())
+            ResultSeeds[&I] = S;
+        } else {
+          seed(&I, S);
+        }
         continue;
       }
 
@@ -436,9 +455,11 @@ PreservedAnalyses RecoverTypeInfo::run(Function &F,
           QueryBase = stripBaseOffset(GEP->getPointerOperand()).first;
           HasVariableIndex = true;
         }
+        auto *BaseInst = dyn_cast<Instruction>(QueryBase);
         bool TrackedBase =
             (isa<Instruction>(QueryBase) || isa<Argument>(QueryBase)) &&
-            isJavaOopType(QueryBase->getType()) &&
+            (isJavaOopType(QueryBase->getType()) ||
+             (BaseInst && isForwarder(*BaseInst))) &&
             (HasVariableIndex || OffOpt.has_value());
         if (!TrackedBase) {
           // Loading from a stack slot / non-Java-heap address, or not from a
@@ -595,6 +616,9 @@ PreservedAnalyses RecoverTypeInfo::run(Function &F,
       return R;
     }
     if (auto *SI = dyn_cast<SelectInst>(&I)) {
+      if (auto *C = dyn_cast<ConstantInt>(SI->getCondition()))
+        return getLattice(C->isZero() ? SI->getFalseValue()
+                                      : SI->getTrueValue());
       // Null and poison arms are vacuous under the non-null contract, so a
       // lazy-initialization select keeps its typed arm instead of meeting to
       // Bottom (undef arms still meet — see the PHI case).
@@ -617,17 +641,24 @@ PreservedAnalyses RecoverTypeInfo::run(Function &F,
       return isFrozenOperandDefined(FI) ? getLattice(I.getOperand(0))
                                         : Lattice::bottom();
     }
-    if (isa<BitCastInst>(&I) || isa<AddrSpaceCastInst>(&I))
-      return getLattice(I.getOperand(0));
-    if (auto *GEP = dyn_cast<GetElementPtrInst>(&I)) {
-      assert(GEP->hasAllZeroIndices() && "non-zero GEP is not a forwarder");
-      return getLattice(GEP->getPointerOperand());
-    }
-    if (auto *II = dyn_cast<IntrinsicInst>(&I)) {
-      assert((II->getIntrinsicID() == Intrinsic::launder_invariant_group ||
-              II->getIntrinsicID() == Intrinsic::strip_invariant_group) &&
-             "unexpected intrinsic forwarder");
-      return getLattice(II->getArgOperand(0));
+    if (Value *Input = jeandle::getJavaIdentityInput(&I)) {
+      Lattice L = getLattice(Input);
+      auto It = ResultSeeds.find(&I);
+      if (It == ResultSeeds.end())
+        return L;
+      const Lattice &S = It->second;
+      // Keep an unresolved cycle edge as the join identity. An independent
+      // bound can refine a resolved input without widening pending loop facts.
+      if (L.isTop())
+        return L;
+      if (!L.isKnown())
+        return S;
+      jeandle::JavaType Combined =
+          jeandle::typeIntersect(jeandle::JavaType{L.Klass, L.Exact},
+                                 jeandle::JavaType{S.Klass, S.Exact});
+      // Either bound remains valid when their intersection is unrepresentable.
+      return Combined.isKnown() ? Lattice::known(Combined.Klass, Combined.Exact)
+                                : S;
     }
     llvm_unreachable("transferForwarder on non-forwarder");
   };
@@ -717,7 +748,7 @@ PreservedAnalyses RecoverTypeInfo::run(Function &F,
       if (getLattice(&I).isTop())
         Dynamic.push_back(&I);
 
-  unsigned Cap = 64 * (OopInstCount + 16) + 1024;
+  unsigned Cap = 64 * (TrackedInstCount + 16) + 1024;
   unsigned Round = 0;
   bool SweepChanged = true;
   while (SweepChanged) {

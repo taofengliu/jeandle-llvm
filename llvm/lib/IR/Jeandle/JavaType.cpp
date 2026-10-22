@@ -66,11 +66,11 @@ static uintptr_t extractKlassConstantImpl(Value *V, unsigned Depth) {
   if (Depth > MaxExtractKlassDepth)
     return 0;
 
-  // Pattern A: freeze — LLVM may insert freeze for poison safety.
-  // freeze ptr %klass has the same klass constant as %klass.
-  // stripPointerCastsAndAliases does not look through FreezeInst.
+  // A freeze preserves its operand's Klass only when the operand is defined.
   if (auto *FI = dyn_cast<FreezeInst>(V))
-    return extractKlassConstantImpl(FI->getOperand(0), Depth + 1);
+    return isProvenDefined(FI->getOperand(0))
+               ? extractKlassConstantImpl(FI->getOperand(0), Depth + 1)
+               : 0;
 
   // Strip pointer casts (bitcast, addrspacecast, zero-index GEP) and
   // aliases to see through wrappers that optimization passes may introduce.
@@ -442,7 +442,7 @@ using DefinedMemo = DenseMap<Value *, bool>;
 
 /// Follow one pointer identity expression. Explicit type seeds are separate
 /// constraints on the result, rather than a reason to discard this dependency.
-static Value *getIdentityInput(Value *V) {
+Value *jeandle::getJavaIdentityInput(Value *V) {
   if (!V->getType()->isPointerTy())
     return nullptr;
   if (auto *GEP = dyn_cast<GEPOperator>(V))
@@ -497,7 +497,7 @@ static bool getBaseTypeInputs(Value *V, SmallVectorImpl<Value *> &Inputs,
     }
   } else if (auto *FI = dyn_cast<FreezeInst>(V)) {
     Inputs.push_back(FI->getOperand(0));
-  } else if (Value *Input = getIdentityInput(V)) {
+  } else if (Value *Input = getJavaIdentityInput(V)) {
     Inputs.push_back(Input);
   } else {
     return false;
@@ -974,6 +974,7 @@ struct JavaTypeQueryContext {
   DenseMap<std::pair<Value *, BasicBlock *>, std::optional<JavaType>> Processed;
   unsigned FactsBudget = MaxFactsJoinBlocks;
   unsigned PhiBudget = MaxFactsJoinBlocks;
+  unsigned ConditionDepth = 0;
 };
 
 } // namespace
@@ -1133,7 +1134,7 @@ static Value *stripCastsAndFreeze(Value *V, DefinedMemo &Defined) {
       if (!isProvenDefined(FI->getOperand(0), Defined))
         break;
       V = FI->getOperand(0);
-    } else if (Value *Input = getIdentityInput(V)) {
+    } else if (Value *Input = getJavaIdentityInput(V)) {
       V = Input;
     } else
       break;
@@ -1238,6 +1239,14 @@ combinedInterfaces(const SmallDenseSet<uintptr_t, 2> &A,
 static TraceResult traceToCheckInstanceof(Value *Cond, Value *QueryObj,
                                           SmallPtrSetImpl<Value *> &Visited,
                                           JavaTypeQueryContext &Q) {
+  // Condition expressions can be deep even in a single basic block. Bound
+  // their call-stack use independently of the CFG and PHI query budgets.
+  static constexpr unsigned MaxConditionDepth = 32;
+  if (Q.ConditionDepth == MaxConditionDepth)
+    return {};
+  ++Q.ConditionDepth;
+  auto DepthGuard = make_scope_exit([&] { --Q.ConditionDepth; });
+
   // Canonicalize the queried object with the same definedness-aware strip the
   // per-arm matching below uses, so a frozen or identity-wrapped oop matches
   // its checks regardless of which side introduced the wrapper.
