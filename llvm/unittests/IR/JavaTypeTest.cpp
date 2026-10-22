@@ -1451,8 +1451,7 @@ TEST_F(JavaBaseTypeTest, DeadIncomingArmSkipsTheJoin) {
   // arm is dead for the outer join — x is exactly the other arm's class.
   Value *Dog = seed(0, 9, true);
   Value *Cat = seed(1, 22, true);
-  auto *Null =
-      ConstantPointerNull::get(cast<PointerType>(F->getReturnType()));
+  auto *Null = ConstantPointerNull::get(cast<PointerType>(F->getReturnType()));
   auto *RawPtr = PointerType::get(Context, 0);
   FunctionCallee Check = M.getOrInsertFunction(
       "jeandle.check_instanceof", B.getInt1Ty(), RawPtr, F->getReturnType());
