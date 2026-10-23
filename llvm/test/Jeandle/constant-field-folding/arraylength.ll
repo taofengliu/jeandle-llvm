@@ -133,9 +133,29 @@ define i32 @derived() {
 ; CHECK-LABEL: @same_identity(
 ; CHECK-NOT: call
 ; CHECK: ret i32 3
-define i32 @same_identity(i1 %condition, ptr addrspace(1) %external) {
-  %a = load ptr addrspace(1), ptr @oop_handle_Array_0
+define i32 @same_identity(i1 noundef %condition, ptr addrspace(1) %external) {
+  %a = load ptr addrspace(1), ptr @oop_handle_Array_0, !noundef !0
   %b = load ptr addrspace(1), ptr @oop_handle_Other_7
+  %selected = select i1 %condition, ptr addrspace(1) %a, ptr addrspace(1) %a
+  %f = freeze ptr addrspace(1) %selected
+  %n = call hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) %f)
+  ret i32 %n
+}
+
+; CHECK-LABEL: @frozen_unproven_identity(
+; CHECK: call hotspotcc i32 @jeandle.arraylength
+define i32 @frozen_unproven_identity(i1 noundef %condition) {
+  %a = load ptr addrspace(1), ptr @oop_handle_Array_0
+  %selected = select i1 %condition, ptr addrspace(1) %a, ptr addrspace(1) %a
+  %f = freeze ptr addrspace(1) %selected
+  %n = call hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) %f)
+  ret i32 %n
+}
+
+; CHECK-LABEL: @frozen_unproven_condition(
+; CHECK: call hotspotcc i32 @jeandle.arraylength
+define i32 @frozen_unproven_condition(i1 %condition) {
+  %a = load ptr addrspace(1), ptr @oop_handle_Array_0, !noundef !0
   %selected = select i1 %condition, ptr addrspace(1) %a, ptr addrspace(1) %a
   %f = freeze ptr addrspace(1) %selected
   %n = call hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) %f)
@@ -144,9 +164,9 @@ define i32 @same_identity(i1 %condition, ptr addrspace(1) %external) {
 
 ; CHECK-LABEL: @different_identity(
 ; CHECK: call hotspotcc i32 @jeandle.arraylength
-define i32 @different_identity(i1 %condition, ptr addrspace(1) %external) {
-  %a = load ptr addrspace(1), ptr @oop_handle_Array_0
-  %b = load ptr addrspace(1), ptr @oop_handle_Other_7
+define i32 @different_identity(i1 noundef %condition, ptr addrspace(1) %external) {
+  %a = load ptr addrspace(1), ptr @oop_handle_Array_0, !noundef !0
+  %b = load ptr addrspace(1), ptr @oop_handle_Other_7, !noundef !0
   %selected = select i1 %condition, ptr addrspace(1) %a, ptr addrspace(1) %b
   %f = freeze ptr addrspace(1) %selected
   %n = call hotspotcc i32 @jeandle.arraylength(ptr addrspace(1) %f)
@@ -261,3 +281,4 @@ exception:
   resume { ptr, i32 } %lp
 }
 !java-method-compilation = !{}
+!0 = !{}

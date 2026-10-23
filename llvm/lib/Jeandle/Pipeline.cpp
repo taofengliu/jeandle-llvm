@@ -13,8 +13,8 @@
 #include "llvm/Support/CommandLine.h"
 #include "llvm/Transforms/IPO/GlobalDCE.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
-#include "llvm/Transforms/Jeandle/ArrayCopySpecialization.h"
 #include "llvm/Transforms/Jeandle/CHADevirtualization.h"
+#include "llvm/Transforms/Jeandle/CopySpecialization.h"
 #include "llvm/Transforms/Jeandle/ExpandNarrowOopCast.h"
 #include "llvm/Transforms/Jeandle/InsertGCBarriers.h"
 #include "llvm/Transforms/Jeandle/JavaOpLengthFolding.h"
@@ -305,7 +305,7 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   PM.addPass(createModuleToFunctionPassAdaptor(RecoverTypeInfo()));
   PM.addPass(createModuleToFunctionPassAdaptor(TypeCheckElimination()));
   PM.addPass(createModuleToFunctionPassAdaptor(RepeatedConstantFolding()));
-  PM.addPass(createModuleToFunctionPassAdaptor(ArrayCopySpecialization()));
+  PM.addPass(createModuleToFunctionPassAdaptor(CopySpecialization()));
   PM.addPass(createModuleToFunctionPassAdaptor(TypeCheckElimination()));
 
   const bool StripMiningEnabled = isStripMiningEnabled();
