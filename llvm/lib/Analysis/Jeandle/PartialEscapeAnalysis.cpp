@@ -122,6 +122,8 @@ STATISTIC(JeandlePEAMaterializedNested,
 STATISTIC(JeandlePEADeadLoopNests,
           "Loop nests published dead without a body traversal (no live "
           "forward edge into the header)");
+STATISTIC(JeandlePEACopyFolds,
+          "jeandle.copy pseudo calls folded into virtual field state");
 
 // When set, dump per-function PEA classification stats
 // on errs() after commit(). The line is prefixed with `;; PEA stats` so it
@@ -139,6 +141,16 @@ static llvm::cl::opt<bool> JeandlePEAEliminateLocks(
     "jeandle-pea-eliminate-locks", llvm::cl::init(true), llvm::cl::Hidden,
     llvm::cl::desc("PEA: eliminate balanced monitor enter/exit pairs on "
                    "virtual (non-escaping) receivers."));
+
+// Fold jeandle.copy pseudo calls whose destination resolves to a virtual
+// array (virtual-to-virtual entry transfer, or per-element typed loads from a
+// concrete source) instead of materializing both operands at the call. There
+// is no JDK-side switch; opt users and tests can disable the fold to isolate
+// regressions or attribute allocations.
+static llvm::cl::opt<bool> JeandlePEAFoldCopy(
+    "jeandle-pea-fold-copy", llvm::cl::init(true), llvm::cl::Hidden,
+    llvm::cl::desc("PEA: fold jeandle.copy pseudo calls with a virtual "
+                   "destination into field state instead of materializing."));
 
 // Cascade other still-locked virtuals at materialization when the target uses
 // HotSpot's lightweight locking (LM_LIGHTWEIGHT requires strict lock nesting).
@@ -630,6 +642,7 @@ struct PEAAttemptStatistics {
   uint64_t MaterializedCascade = 0;
   uint64_t MaterializedNested = 0;
   uint64_t DeadLoopNests = 0;
+  uint64_t CopyFolds = 0;
 
   void publish() const {
     JeandlePEAVirtualized += Virtualized;
@@ -645,6 +658,7 @@ struct PEAAttemptStatistics {
     JeandlePEAMaterializedCascade += MaterializedCascade;
     JeandlePEAMaterializedNested += MaterializedNested;
     JeandlePEADeadLoopNests += DeadLoopNests;
+    JeandlePEACopyFolds += CopyFolds;
   }
 };
 
@@ -1283,6 +1297,40 @@ private:
   std::unordered_map<SemanticOopCastKey, WeakTrackingVH, SemanticOopCastKeyHash>
       SemanticOopCastCache;
 
+  // Cache the per-element load chains of a concrete-source jeandle.copy fold
+  // by (copy site, source byte offset). Loop-fixpoint revisits must reuse
+  // the same Value*s — FieldState convergence compares Scalar entries by
+  // Value* identity, so per-visit fresh loads would never converge (the same
+  // rationale as LoopFieldPhiCache). The instructions live in
+  // PEAResult::OwnedCopyLoads, which survives every rollback, while the
+  // per-visit PlaceInstructionEffects do NOT (restoreLoopSnapshot truncates
+  // the block's effect list) — so every visit re-emits the Place effects for
+  // the cached chain (the same re-emit pattern as the AllocSiteToVO
+  // cache-hit path in processAllocation). Scoped to this Analyzer:
+  // PartialEscapeIterative builds a fresh Analyzer per outer round.
+  struct CopyElementLoadKey {
+    CallBase *Copy;
+    int64_t ByteOffset;
+    bool operator==(const CopyElementLoadKey &O) const {
+      return Copy == O.Copy && ByteOffset == O.ByteOffset;
+    }
+  };
+  struct CopyElementLoadKeyHash {
+    size_t operator()(const CopyElementLoadKey &K) const {
+      return static_cast<size_t>(
+          hash_combine(hash_value(K.Copy), hash_value(K.ByteOffset)));
+    }
+  };
+  struct CopyElementLoadChain {
+    WeakTrackingVH Addr;
+    WeakTrackingVH Load;
+    // Null for non-narrow element types.
+    WeakTrackingVH NarrowCast;
+  };
+  std::unordered_map<CopyElementLoadKey, CopyElementLoadChain,
+                     CopyElementLoadKeyHash>
+      CopyElementLoadCache;
+
   // Per-VO record of LLVM pointer-PHIs that processBlockPhis
   // aliased via Case-B (every incoming agrees on the same ObjectID).
   // commit() consults this to schedule explicit PHI erasures for VOs
@@ -1862,6 +1910,28 @@ private:
   bool foldGetClass(CallBase *CB);
   bool foldCheckCast(CallBase *CB);
   bool foldInstanceOf(CallBase *CB);
+  // Fold a jeandle.copy pseudo call whose destination is an eligible virtual
+  // array (Jeandle counterpart of Graal BasicArrayCopyNode::virtualize):
+  // virtual-to-virtual copies transfer field-state entries (same-VO overlap
+  // with destPos > srcPos transfers in reverse); a concrete source folds to
+  // per-element typed loads placed at the call. All fold preconditions are
+  // checked read-only first; any failure returns false so the caller takes
+  // the generic escape path (both operands materialize at the call).
+  bool processCopyCall(CallBase *CB);
+  // Extract a non-negative-foldable i64 copy operand: chase scalar aliases,
+  // peel one sext/zext wrapper, and require a ConstantInt. Returns nullopt
+  // for non-constant or negative-looking shapes (callers treat them as bail).
+  std::optional<int64_t> getCopyConstantI64(Value *V);
+  // Create (or reuse from CopyElementLoadCache) the unparented element load
+  // for a concrete-source copy fold: a GEP to the source element plus an
+  // unordered atomic load of ElemTy; narrow-oop elements additionally get an
+  // AS3 -> AS1 addrspacecast so the semantic value follows the AS1 field
+  // representation. Returns the semantic (AS1) chain tail. Every instruction
+  // is registered in PEAResult::OwnedCopyLoads and placed immediately before
+  // the copy by its own PlaceInstructionEffect, inheriting the call's full
+  // control context (validated guards, null checks) for bounds/type safety.
+  Value *getOrCreateCopyElementSemanticLoad(CallBase *Copy, Value *ConcreteSrc,
+                                            Type *ElemTy, int64_t SrcOff);
   // Fold a monitorenter on an eligible virtual receiver into lock-state
   // tracking and a ReplaceCall elision. Returns false otherwise; an
   // ineligible (already-abandoned) receiver first cascades still-locked
@@ -5372,10 +5442,12 @@ void Analyzer::processInstruction(Instruction *I) {
     }
     // TODO(deferred-virtualizers): deferred virtualization handlers — NOT WIRED
     // yet:
-    //   - TODO: processArrayCopy / processMemSet — llvm.memcpy/memmove
-    //     (System.arraycopy) and llvm.memset (Arrays.fill). The only
-    //     llvm.memset producer today is jeandle.new_instance's lower-phase=1
-    //     template, inlined AFTER PEA, so neither shape reaches PEA yet.
+    //   - processCopyCall folds the jeandle.copy pseudo call (the pre-PEA
+    //     shape of System.arraycopy / Arrays.copyOf[Range] / reference-array
+    //     clone). llvm.memcpy/memmove/memset shapes would need their own
+    //     handler; the only llvm.memset producer today is
+    //     jeandle.new_instance's lower-phase=1 template, inlined AFTER PEA,
+    //     so neither shape reaches PEA yet.
     //   - TODO: llvm.reachability_fence — upstream LLVM this fork tracks
     //     does not define Intrinsic::reachability_fence, and the frontend
     //     emits no analogue.
@@ -5441,6 +5513,16 @@ void Analyzer::processInstruction(Instruction *I) {
         // fold survives, the rewrite no-ops at apply (the bundle died with
         // the call). No foldable JavaOp carries a deopt bundle, so this path
         // is latent.
+        recordDeoptBundleMappings(CB);
+        return;
+      }
+      // A jeandle.copy pseudo call with a virtual destination folds into
+      // field state (processCopyCall) instead of escaping. Unlike the JavaOp
+      // folds above, a copy call ALWAYS carries a deopt bundle (the frontend
+      // attaches one to every GC-visible pseudo call), so recording the
+      // bundle mappings here is the live path: describable operands stay
+      // virtual when the fold is later dropped and the call survives.
+      if (processCopyCall(CB)) {
         recordDeoptBundleMappings(CB);
         return;
       }
@@ -7280,6 +7362,332 @@ bool Analyzer::processJavaOp(CallBase *CB) {
   if (isJeandleRegisterFinalizerIfNeeded(CB))
     return foldRegisterFinalizerIfNeeded(CB);
   return false;
+}
+
+std::optional<int64_t> Analyzer::getCopyConstantI64(Value *V) {
+  // A folded jeandle.arraylength leaves its result only as a scalar alias;
+  // chase the alias chain before inspecting the value itself.
+  while (Value *Alias = Aliases.getScalarAlias(V))
+    V = Alias;
+  // The frontend sign-extends the Java int operands to i64 at the lowering
+  // boundary; peel one extension wrapper to recover the underlying constant
+  // (a zext'd negative int still folds back to its negative i32 constant,
+  // which the caller's sign checks then reject).
+  if (auto *Cast = dyn_cast<CastInst>(V))
+    if (Cast->getOpcode() == Instruction::SExt ||
+        Cast->getOpcode() == Instruction::ZExt)
+      V = Cast->getOperand(0);
+  auto *CI = dyn_cast<ConstantInt>(V);
+  if (!CI)
+    return std::nullopt;
+  return CI->getValue().trySExtValue();
+}
+
+// Fold a jeandle.copy pseudo call into virtual field state — the Jeandle
+// counterpart of Graal BasicArrayCopyNode::virtualize(). The destination must
+// be an eligible virtual array; positions and length must be constants with
+// provable bounds and element-type compatibility. A virtual source transfers
+// field-state entries element-by-element (a same-VO overlap with
+// destPos > srcPos transfers in reverse so no element is read after being
+// overwritten, matching Java's overlapping-copy semantics); a concrete source
+// is deferred to the element-load machinery. Everything is validated read-only
+// first; only then are field states mutated, the call's ReplaceCall elision
+// recorded (mutation owner = destination VO, so dropEffectsForIneligible
+// revives the call — and its memory write — if the destination later turns
+// ineligible), and the caller proceeds to recordDeoptBundleMappings. Any
+// failure returns false and the generic escape path materializes both
+// operands at the call, exactly as before this fold existed.
+bool Analyzer::processCopyCall(CallBase *CB) {
+  using namespace jeandle::pea;
+  if (!JeandlePEAFoldCopy || !isJeandleCopyPseudoCall(CB))
+    return false;
+
+  JeandleCopyPseudoKind Kind = classifyJeandleCopyPseudo(CB);
+  if (!isElementIndexedCopyKind(Kind))
+    // Byte-offset payload clones (clone-instance / clone-array) and
+    // unclassified sites stay conservative.
+    return false;
+
+  // --- Phase 1: read-only validation. ---
+  VirtualIdentityResult DestIdentity =
+      resolveVirtualIdentity(CB->getArgOperand(2), CurrentState, Aliases, DL,
+                             VirtualIdentityMode::WholeObject);
+  if (!DestIdentity.isDefined())
+    return false;
+  jeandle::ObjectID DestID = DestIdentity.getObjectID();
+  if (!Eligible.lookup(DestID))
+    return false;
+  jeandle::VirtualObject &Dest = *Result.VirtualObjects[DestID];
+  if (!Dest.isArray() || Dest.ArrayElementType == nullptr ||
+      Dest.ArrayIndexScale == 0)
+    return false;
+
+  std::optional<int64_t> SrcPos = getCopyConstantI64(CB->getArgOperand(1));
+  std::optional<int64_t> DestPos = getCopyConstantI64(CB->getArgOperand(3));
+  std::optional<int64_t> Len = getCopyConstantI64(CB->getArgOperand(4));
+  if (!SrcPos || !DestPos || !Len)
+    return false;
+  // Negative positions/lengths carry the Java exception shapes; they must
+  // reach the surviving call, not a fold.
+  if (*SrcPos < 0 || *DestPos < 0 || *Len < 0)
+    return false;
+
+  // Destination bounds: a virtual array's length is a compile-time constant.
+  std::optional<int64_t> DestEnd = checkedOffsetAdd(*DestPos, *Len);
+  if (!DestEnd || *DestEnd > static_cast<int64_t>(Dest.ArrayLength))
+    return false;
+
+  VirtualIdentityResult SrcIdentity =
+      resolveVirtualIdentity(CB->getArgOperand(0), CurrentState, Aliases, DL,
+                             VirtualIdentityMode::WholeObject);
+  const bool SrcVirtual = SrcIdentity.isDefined();
+  const jeandle::VirtualObject *Src = nullptr;
+  if (SrcVirtual) {
+    jeandle::ObjectID SrcID = SrcIdentity.getObjectID();
+    if (!Eligible.lookup(SrcID))
+      return false;
+    Src = Result.VirtualObjects[SrcID].get();
+    if (!Src->isArray())
+      return false;
+    // Element representation (the type carries the address space, so
+    // compressed and wide oop arrays already differ here), scale, and header
+    // size must all agree.
+    if (Src->ArrayElementType != Dest.ArrayElementType ||
+        Src->ArrayIndexScale != Dest.ArrayIndexScale ||
+        Src->ArrayBaseOffset != Dest.ArrayBaseOffset)
+      return false;
+    // Reference-array entries are replayed/stored into the destination
+    // without a runtime store check, so element assignability must hold.
+    // Identical (non-zero) klasses settle it statically; otherwise rely only
+    // on the frontend guards that deoptimize before the call when the
+    // runtime klasses are incompatible — copyOf/copyOfRange always guard,
+    // and a validated arraycopy proved source-assignable-to-destination.
+    if (Dest.ArrayElementType->isPointerTy() && Src->Klass != Dest.Klass &&
+        !(Src->Klass != 0 && (Kind == JeandleCopyPseudoKind::CopyOf ||
+                              Kind == JeandleCopyPseudoKind::CopyOfRange ||
+                              (Kind == JeandleCopyPseudoKind::ArrayCopy &&
+                               isCopyPseudoValidated(CB)))))
+      return false;
+    // Source bounds are another compile-time constant comparison.
+    std::optional<int64_t> SrcEnd = checkedOffsetAdd(*SrcPos, *Len);
+    if (!SrcEnd || *SrcEnd > static_cast<int64_t>(Src->ArrayLength))
+      return false;
+  } else {
+    // Concrete source: fold to per-element typed loads placed at the call.
+    // The static element type must be provable — a load of the wrong element
+    // kind would both misread memory and silently drop the
+    // ArrayStoreException the real copy raises on mismatched primitive /
+    // incompatible reference arrays.
+    Value *ConcreteSrc = CB->getArgOperand(0);
+    jeandle::JavaType SrcJT =
+        jeandle::getJavaType(ConcreteSrc, nullptr, nullptr, nullptr);
+    if (!SrcJT.isKnown())
+      return false;
+    jeandle::JBasicType SrcElem =
+        jeandle::elementTypeForArrayKlass(SrcJT.Klass);
+    if (SrcElem == jeandle::JBasicType::Count)
+      return false;
+    if (VMConsts.elementSizeFor(SrcElem) != Dest.ArrayIndexScale ||
+        VMConsts.arrayBaseOffsetFor(SrcElem) != Dest.ArrayBaseOffset)
+      return false;
+    // Same representation check as the allocation path: the load reads
+    // Dest.ArrayElementType, so the source kind must map onto exactly that
+    // type (compressed oop object arrays map to the narrow pointer).
+    Type *SrcElemTy = jeandle::pea::llvmElementTypeFor(SrcElem, F.getContext());
+    if (SrcElem == jeandle::JBasicType::Object && VMConsts.UseCompressedOops &&
+        DL.getPointerSize(jeandle::AddrSpace::NarrowOopAddrSpace) !=
+            DL.getPointerSize(jeandle::AddrSpace::JavaHeapAddrSpace))
+      SrcElemTy = PointerType::get(F.getContext(),
+                                   jeandle::AddrSpace::NarrowOopAddrSpace);
+    if (SrcElemTy != Dest.ArrayElementType)
+      return false;
+    // Reference elements are replayed into the destination without a runtime
+    // store check: the source array klass must be statically assignable to
+    // the destination's, or the frontend's subtype guard must have proved it
+    // on the executed path (copyOf/copyOfRange always guard; a validated
+    // arraycopy guards src != dest).
+    if (SrcElem == jeandle::JBasicType::Object) {
+      const bool GuardProven = Kind == JeandleCopyPseudoKind::CopyOf ||
+                               Kind == JeandleCopyPseudoKind::CopyOfRange ||
+                               (Kind == JeandleCopyPseudoKind::ArrayCopy &&
+                                isCopyPseudoValidated(CB));
+      if (!(Dest.Klass != 0 && SrcJT.Klass == Dest.Klass) && !GuardProven)
+        return false;
+      if (Dest.Klass != 0 && SrcJT.Klass != Dest.Klass) {
+        std::optional<bool> Sub = evalSubtypeRelation(SrcJT.Klass, Dest.Klass);
+        if (!Sub || !*Sub)
+          return false;
+      }
+    }
+    // Source bounds: the analyzer cannot see the concrete array's length, so
+    // the proof must come from the call shape — a constant srcLength operand,
+    // the clone identity (arg4 IS the source length, srcPos == 0), or the
+    // validated arraycopy limit guard that dominates the call. The element
+    // loads are placed at the call, inherring exactly that control context.
+    bool BoundsProven = *Len == 0;
+    if (!BoundsProven)
+      if (std::optional<int64_t> SrcLen =
+              getCopyConstantI64(CB->getArgOperand(7)))
+        if (std::optional<int64_t> SrcEnd = checkedOffsetAdd(*SrcPos, *Len))
+          BoundsProven = *SrcEnd <= *SrcLen;
+    if (!BoundsProven && *SrcPos == 0 &&
+        CB->getArgOperand(4) == CB->getArgOperand(7))
+      BoundsProven = true;
+    if (!BoundsProven && Kind == JeandleCopyPseudoKind::ArrayCopy &&
+        isCopyPseudoValidated(CB))
+      BoundsProven = true;
+    if (!BoundsProven)
+      return false;
+  }
+
+  // Pre-scan the transfer window: offsets must stay representable, source
+  // entries must be transferable values, and the destination slots must
+  // accept the element type. getOrCreateFieldIndex may insert an inert
+  // FieldDesc on the validation path — same accepted pattern as processStore
+  // (replay is FieldStates-keyed, and a bail here materializes the
+  // destination immediately).
+  const bool SameVO = SrcVirtual && SrcIdentity.getObjectID() == DestID;
+  const bool Reverse = SameVO && *DestPos > *SrcPos;
+  SmallVector<std::pair<int64_t, int64_t>, 16> Offsets;
+  Offsets.reserve(*Len);
+  for (int64_t K = 0; K < *Len; ++K) {
+    int64_t I = Reverse ? (*Len - 1 - K) : K;
+    std::optional<int64_t> Idx = checkedOffsetAdd(*SrcPos, I);
+    std::optional<int64_t> SrcOff =
+        Idx ? checkedArrayElementOffset(Dest.ArrayBaseOffset, *Idx,
+                                        Dest.ArrayIndexScale)
+            : std::nullopt;
+    std::optional<int64_t> DestIdx = checkedOffsetAdd(*DestPos, I);
+    std::optional<int64_t> DestOff =
+        DestIdx ? checkedArrayElementOffset(Dest.ArrayBaseOffset, *DestIdx,
+                                            Dest.ArrayIndexScale)
+                : std::nullopt;
+    if (!SrcOff || !DestOff || !isUsableFieldOffset(*SrcOff) ||
+        !isUsableFieldOffset(*DestOff))
+      return false;
+    if (SrcVirtual) {
+      const auto SrcFieldsIt = FieldStates.find(SrcIdentity.getObjectID());
+      if (SrcFieldsIt != FieldStates.end()) {
+        auto It = SrcFieldsIt->second.find(*SrcOff);
+        if (It != SrcFieldsIt->second.end()) {
+          const jeandle::FieldValue &FV = It->second;
+          if (FV.isUnknown())
+            return false;
+          if (FV.isVirtualRef() && !Eligible.lookup(FV.getVirtualRef()))
+            return false;
+        }
+      }
+    }
+    if (Dest.getOrCreateFieldIndex(*DestOff, Dest.ArrayElementType, DL) < 0)
+      return false;
+    Offsets.emplace_back(*SrcOff, *DestOff);
+  }
+
+  // --- Phase 2: commit. No failure paths beyond this point. ---
+  auto &DestFields = FieldStates[DestID];
+  for (auto [SrcOff, DestOff] : Offsets) {
+    if (SrcVirtual) {
+      auto &SrcFields = FieldStates[SrcIdentity.getObjectID()];
+      auto It = SrcFields.find(SrcOff);
+      if (It != SrcFields.end()) {
+        // Copy the FieldValue by value first: for a same-VO copy the two
+        // maps are the same object and a rehash on insert would invalidate
+        // It.
+        jeandle::FieldValue FV = It->second;
+        DestFields[DestOff] = FV;
+      } else {
+        // No source entry means Java's default value; a stale destination
+        // entry from an earlier store must not survive the copy.
+        DestFields.erase(DestOff);
+      }
+    } else {
+      Value *Load = getOrCreateCopyElementSemanticLoad(
+          CB, CB->getArgOperand(0), Dest.ArrayElementType, SrcOff);
+      DestFields[DestOff] = jeandle::FieldValue::scalar(Load);
+    }
+  }
+  emitReplaceCall(CB, /*Replacement=*/nullptr, DestID);
+  ++AttemptStats.CopyFolds;
+  return true;
+}
+
+Value *Analyzer::getOrCreateCopyElementSemanticLoad(CallBase *Copy,
+                                                    Value *ConcreteSrc,
+                                                    Type *ElemTy,
+                                                    int64_t SrcOff) {
+  // Registration order fixes the physical order: each instruction's
+  // PlaceInstructionEffect inserts it immediately before the copy, so
+  // ascending SeqNos land as Addr, Load, Cast.
+  auto Place = [&](Instruction *I) {
+    auto E = std::make_unique<jeandle::PlaceInstructionEffect>();
+    E->Block = Copy->getParent();
+    E->Target = Copy;
+    E->InstructionToPlace = I;
+    E->SeqNo = Result.nextSeqNo();
+    Result.addBlockEffect(std::move(E));
+  };
+
+  const bool NeedsNarrowCast =
+      ElemTy->isPointerTy() && cast<PointerType>(ElemTy)->getAddressSpace() ==
+                                   jeandle::AddrSpace::NarrowOopAddrSpace;
+
+  CopyElementLoadKey Key{Copy, SrcOff};
+  auto It = CopyElementLoadCache.find(Key);
+  if (It != CopyElementLoadCache.end() && (Value *)It->second.Addr &&
+      (Value *)It->second.Load &&
+      (!NeedsNarrowCast || (Value *)It->second.NarrowCast)) {
+    // Cache hit: the chain's instructions survive rollback in
+    // OwnedCopyLoads, but the block's Place effects do not — re-emit them.
+    Place(cast<Instruction>((Value *)It->second.Addr));
+    Place(cast<Instruction>((Value *)It->second.Load));
+    if (NeedsNarrowCast)
+      Place(cast<Instruction>((Value *)It->second.NarrowCast));
+    return NeedsNarrowCast ? (Value *)It->second.NarrowCast
+                           : (Value *)It->second.Load;
+  }
+
+  // Build the chain unparented: GEP to the element, unordered atomic load of
+  // the element type, and — for narrow-oop elements — the AS3 -> AS1
+  // addrspacecast that restores the semantic field representation (a bare
+  // narrow value must not cross a safepoint; RS4GC tracks AS1 only).
+  LLVMContext &Ctx = F.getContext();
+  Type *I8 = Type::getInt8Ty(Ctx);
+  Type *I64 = Type::getInt64Ty(Ctx);
+  auto *Addr = GetElementPtrInst::Create(
+      I8, ConcreteSrc, {ConstantInt::get(I64, SrcOff)}, "pea.copy.elem.addr",
+      /*InsertBefore=*/static_cast<Instruction *>(nullptr));
+  Addr->setIsInBounds(true);
+  Addr->setDebugLoc(Copy->getDebugLoc());
+  // Construct with an explicit alignment: the alignment-defaulting LoadInst
+  // constructors derive the ABI alignment from the insertion position's
+  // module, which an unparented instruction has none of.
+  auto *Load = new LoadInst(ElemTy, Addr, "pea.copy.elem",
+                            /*IsVolatile=*/false,
+                            llvm::Align(DL.getTypeAllocSize(ElemTy)),
+                            static_cast<Instruction *>(nullptr));
+  Load->setAtomic(AtomicOrdering::Unordered);
+  Load->setDebugLoc(Copy->getDebugLoc());
+  Result.OwnedCopyLoads.emplace_back(Addr);
+  Result.OwnedCopyLoads.emplace_back(Load);
+  Place(Addr);
+  Place(Load);
+
+  Value *Semantic = Load;
+  WeakTrackingVH CastVH;
+  if (NeedsNarrowCast) {
+    auto *Cast = CastInst::Create(
+        Instruction::AddrSpaceCast, Load,
+        PointerType::get(Ctx, jeandle::AddrSpace::JavaHeapAddrSpace),
+        "pea.copy.elem.oop");
+    Cast->setDebugLoc(Copy->getDebugLoc());
+    Result.OwnedCopyLoads.emplace_back(Cast);
+    Place(Cast);
+    Semantic = Cast;
+    CastVH = Cast;
+  }
+  CopyElementLoadCache.insert_or_assign(
+      Key, CopyElementLoadChain{Addr, Load, CastVH});
+  return Semantic;
 }
 
 void Analyzer::propagatePointerAlias(Instruction *I) {
@@ -9869,7 +10277,8 @@ void Analyzer::publishAttemptOutputs() {
     llvm::errs() << ";; PEA stats @" << F.getName()
                  << ": NeverEscapes=" << NeverEsc
                  << " PartiallyEscapes=" << PartialEsc
-                 << " AlwaysEscapes=" << AlwaysEsc << "\n";
+                 << " AlwaysEscapes=" << AlwaysEsc
+                 << " CopyFolds=" << AttemptStats.CopyFolds << "\n";
   }
 }
 

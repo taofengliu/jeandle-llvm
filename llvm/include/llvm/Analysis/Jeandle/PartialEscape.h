@@ -1160,6 +1160,16 @@ public:
   // OwnedPhis.
   SmallVector<WeakTrackingVH, 4> OwnedLoopFieldPhis;
 
+  // Element loads (and their narrow-oop AS3 -> AS1 casts) created unparented
+  // by the analyzer for concrete-source jeandle.copy folds, keyed by the
+  // per-site CopyElementLoadCache. Stored separately from OwnedInsts for the
+  // same reason as OwnedLoopFieldPhis: the loop fixpoint re-processes a copy
+  // inside a loop and the convergence comparison is by Value* identity, so
+  // the cached instructions must survive every analyzer rollback (they never
+  // enter truncateOwnedTo). Only the per-visit PlaceInstructionEffect is
+  // rebuilt. Lifecycle otherwise identical to OwnedInsts.
+  SmallVector<WeakTrackingVH, 4> OwnedCopyLoads;
+
   // AS1 replay-identity PHIs for compressed Case-C synthetics. Their shells
   // are referenced by VirtualObject::SyntheticReplayPhi and by monotonic
   // BlockEffects across ordinary merge retries, and possibly by cached

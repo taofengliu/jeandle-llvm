@@ -726,7 +726,8 @@ void PEAResult::computeEscapePointLocks() {
 static void destroyUnparentedOwnedInstructions(
     ArrayRef<WeakTrackingVH> Phis, ArrayRef<WeakTrackingVH> Insts,
     ArrayRef<WeakTrackingVH> LoopFieldPhis = {},
-    ArrayRef<WeakTrackingVH> SyntheticReplayPhis = {}) {
+    ArrayRef<WeakTrackingVH> SyntheticReplayPhis = {},
+    ArrayRef<WeakTrackingVH> CopyLoads = {}) {
   SmallPtrSet<Instruction *, 16> Seen;
   SmallVector<Instruction *, 16> ToDelete;
   auto Collect = [&](ArrayRef<WeakTrackingVH> Values) {
@@ -738,6 +739,7 @@ static void destroyUnparentedOwnedInstructions(
 
   Collect(LoopFieldPhis);
   Collect(SyntheticReplayPhis);
+  Collect(CopyLoads);
   Collect(Phis);
   Collect(Insts);
 
@@ -755,7 +757,7 @@ PEAResult::~PEAResult() {
   // that block's ilist owns it. WeakTrackingVH also auto-nulls when an
   // unrelated cleanup path has already deleted the value.
   destroyUnparentedOwnedInstructions(OwnedPhis, OwnedInsts, OwnedLoopFieldPhis,
-                                     OwnedSyntheticReplayPhis);
+                                     OwnedSyntheticReplayPhis, OwnedCopyLoads);
 }
 
 void PEAResult::truncateOwnedTo(size_t PhisMark, size_t InstsMark) {
