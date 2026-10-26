@@ -1918,6 +1918,16 @@ private:
   // checked read-only first; any failure returns false so the caller takes
   // the generic escape path (both operands materialize at the call).
   bool processCopyCall(CallBase *CB);
+  // Element-kind compatibility gate for a copy fold: distinct array klasses
+  // are acceptable only with a proof — the frontend's ValidatedCopy marker
+  // (the exact "guards were emitted" signal; copyOf/copyOfRange do NOT
+  // always guard — too_many_traps suppresses the subtype check) for
+  // reference arrays, or a statically proven subtype relation. Distinct
+  // same-representation primitive kinds (byte/boolean, short/char) never
+  // pass: an unvalidated copy between them must keep raising
+  // ArrayStoreException instead of folding.
+  bool copyElementKindsCompatible(uintptr_t SrcKlass, uintptr_t DestKlass,
+                                  bool ElementsAreRefs, const CallBase *CB);
   // Extract a non-negative-foldable i64 copy operand: chase scalar aliases,
   // peel one sext/zext wrapper, and require a ConstantInt. Returns nullopt
   // for non-constant or negative-looking shapes (callers treat them as bail).
@@ -5558,6 +5568,21 @@ void Analyzer::processInstruction(Instruction *I) {
     recordDeoptBundleMappings(CB);
 }
 
+// The LLVM storage type of one array element for an element kind, adjusted
+// to the narrow pointer when compressed oops shrink reference elements.
+// Shared by allocation virtualization and the copy fold's concrete-source
+// typing so the two can never disagree.
+static Type *arrayElementStorageType(jeandle::JBasicType Kind,
+                                     bool UseCompressedOops,
+                                     const DataLayout &DL, LLVMContext &Ctx) {
+  Type *ElemTy = jeandle::pea::llvmElementTypeFor(Kind, Ctx);
+  if (Kind == jeandle::JBasicType::Object && UseCompressedOops &&
+      DL.getPointerSize(jeandle::AddrSpace::NarrowOopAddrSpace) !=
+          DL.getPointerSize(jeandle::AddrSpace::JavaHeapAddrSpace))
+    ElemTy = PointerType::get(Ctx, jeandle::AddrSpace::NarrowOopAddrSpace);
+  return ElemTy;
+}
+
 // Allocation virtualization. Virtualize a jeandle.new_instance /
 // jeandle.new_array site: build the VirtualObject, install a virtual
 // ObjectState (a presence marker; per-field values live in FieldStates), add
@@ -5777,13 +5802,8 @@ void Analyzer::processAllocation(CallBase *CB) {
     if (Kind != jeandle::JBasicType::Count) {
       VO->ArrayBaseOffset =
           static_cast<uint32_t>(VMConsts.arrayBaseOffsetFor(Kind));
-      if (Type *ElemTy =
-              jeandle::pea::llvmElementTypeFor(Kind, F.getContext())) {
-        if (Kind == jeandle::JBasicType::Object && VMConsts.UseCompressedOops &&
-            DL.getPointerSize(jeandle::AddrSpace::NarrowOopAddrSpace) !=
-                DL.getPointerSize(jeandle::AddrSpace::JavaHeapAddrSpace))
-          ElemTy = PointerType::get(F.getContext(),
-                                    jeandle::AddrSpace::NarrowOopAddrSpace);
+      if (Type *ElemTy = arrayElementStorageType(
+              Kind, VMConsts.UseCompressedOops, DL, F.getContext())) {
         VO->ArrayElementType = ElemTy;
         VO->ArrayIndexScale =
             static_cast<uint32_t>(VMConsts.elementSizeFor(Kind));
@@ -7364,6 +7384,27 @@ bool Analyzer::processJavaOp(CallBase *CB) {
   return false;
 }
 
+bool Analyzer::copyElementKindsCompatible(uintptr_t SrcKlass,
+                                          uintptr_t DestKlass,
+                                          bool ElementsAreRefs,
+                                          const CallBase *CB) {
+  // A VO's klass is never zero (extractAllocationKlass refuses zero), so
+  // equality is equality of two concrete klasses.
+  if (SrcKlass == DestKlass)
+    return true;
+  if (ElementsAreRefs) {
+    // Validated: the frontend's guards deoptimize before the call when the
+    // runtime klasses are incompatible, so assignability holds on every
+    // executed path. Without validation, a statically proven subtype
+    // relation is the remaining sound proof.
+    if (jeandle::pea::isCopyPseudoValidated(CB))
+      return true;
+    std::optional<bool> Sub = evalSubtypeRelation(SrcKlass, DestKlass);
+    return Sub && *Sub;
+  }
+  return false;
+}
+
 std::optional<int64_t> Analyzer::getCopyConstantI64(Value *V) {
   // A folded jeandle.arraylength leaves its result only as a scalar alias;
   // chase the alias chain before inspecting the value itself.
@@ -7456,17 +7497,8 @@ bool Analyzer::processCopyCall(CallBase *CB) {
         Src->ArrayIndexScale != Dest.ArrayIndexScale ||
         Src->ArrayBaseOffset != Dest.ArrayBaseOffset)
       return false;
-    // Reference-array entries are replayed/stored into the destination
-    // without a runtime store check, so element assignability must hold.
-    // Identical (non-zero) klasses settle it statically; otherwise rely only
-    // on the frontend guards that deoptimize before the call when the
-    // runtime klasses are incompatible — copyOf/copyOfRange always guard,
-    // and a validated arraycopy proved source-assignable-to-destination.
-    if (Dest.ArrayElementType->isPointerTy() && Src->Klass != Dest.Klass &&
-        !(Src->Klass != 0 && (Kind == JeandleCopyPseudoKind::CopyOf ||
-                              Kind == JeandleCopyPseudoKind::CopyOfRange ||
-                              (Kind == JeandleCopyPseudoKind::ArrayCopy &&
-                               isCopyPseudoValidated(CB)))))
+    if (!copyElementKindsCompatible(Src->Klass, Dest.Klass,
+                                    Dest.ArrayElementType->isPointerTy(), CB))
       return false;
     // Source bounds are another compile-time constant comparison.
     std::optional<int64_t> SrcEnd = checkedOffsetAdd(*SrcPos, *Len);
@@ -7493,32 +7525,13 @@ bool Analyzer::processCopyCall(CallBase *CB) {
     // Same representation check as the allocation path: the load reads
     // Dest.ArrayElementType, so the source kind must map onto exactly that
     // type (compressed oop object arrays map to the narrow pointer).
-    Type *SrcElemTy = jeandle::pea::llvmElementTypeFor(SrcElem, F.getContext());
-    if (SrcElem == jeandle::JBasicType::Object && VMConsts.UseCompressedOops &&
-        DL.getPointerSize(jeandle::AddrSpace::NarrowOopAddrSpace) !=
-            DL.getPointerSize(jeandle::AddrSpace::JavaHeapAddrSpace))
-      SrcElemTy = PointerType::get(F.getContext(),
-                                   jeandle::AddrSpace::NarrowOopAddrSpace);
+    Type *SrcElemTy = arrayElementStorageType(
+        SrcElem, VMConsts.UseCompressedOops, DL, F.getContext());
     if (SrcElemTy != Dest.ArrayElementType)
       return false;
-    // Reference elements are replayed into the destination without a runtime
-    // store check: the source array klass must be statically assignable to
-    // the destination's, or the frontend's subtype guard must have proved it
-    // on the executed path (copyOf/copyOfRange always guard; a validated
-    // arraycopy guards src != dest).
-    if (SrcElem == jeandle::JBasicType::Object) {
-      const bool GuardProven = Kind == JeandleCopyPseudoKind::CopyOf ||
-                               Kind == JeandleCopyPseudoKind::CopyOfRange ||
-                               (Kind == JeandleCopyPseudoKind::ArrayCopy &&
-                                isCopyPseudoValidated(CB));
-      if (!(Dest.Klass != 0 && SrcJT.Klass == Dest.Klass) && !GuardProven)
-        return false;
-      if (Dest.Klass != 0 && SrcJT.Klass != Dest.Klass) {
-        std::optional<bool> Sub = evalSubtypeRelation(SrcJT.Klass, Dest.Klass);
-        if (!Sub || !*Sub)
-          return false;
-      }
-    }
+    if (!copyElementKindsCompatible(SrcJT.Klass, Dest.Klass,
+                                    SrcElem == jeandle::JBasicType::Object, CB))
+      return false;
     // Source bounds: the analyzer cannot see the concrete array's length, so
     // the proof must come from the call shape — a constant srcLength operand,
     // the clone identity (arg4 IS the source length, srcPos == 0), or the
@@ -7584,6 +7597,12 @@ bool Analyzer::processCopyCall(CallBase *CB) {
   }
 
   // --- Phase 2: commit. No failure paths beyond this point. ---
+  // Materialize the source's field-map entry BEFORE taking DestFields: the
+  // FieldStates[SrcID] lookup inside the loop inserts lazily, and an insert
+  // can rehash the OUTER DenseMap, which would dangle a DestFields reference
+  // taken earlier.
+  if (SrcVirtual)
+    (void)FieldStates[SrcIdentity.getObjectID()];
   auto &DestFields = FieldStates[DestID];
   for (auto [SrcOff, DestOff] : Offsets) {
     if (SrcVirtual) {
@@ -7607,6 +7626,9 @@ bool Analyzer::processCopyCall(CallBase *CB) {
     }
   }
   emitReplaceCall(CB, /*Replacement=*/nullptr, DestID);
+  // Counted per analyzer visit: a copy inside a loop fixpoint re-folds on
+  // every body pass, so the number counts (site, round) pairs, not distinct
+  // call sites.
   ++AttemptStats.CopyFolds;
   return true;
 }
