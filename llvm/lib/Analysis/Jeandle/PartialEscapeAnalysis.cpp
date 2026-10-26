@@ -152,6 +152,17 @@ static llvm::cl::opt<bool> JeandlePEAFoldCopy(
     llvm::cl::desc("PEA: fold jeandle.copy pseudo calls with a virtual "
                    "destination into field state instead of materializing."));
 
+// Element-count cap for the copy fold. Above the cap the surviving bulk copy
+// (an optimized stub) beats per-element scalar state: JMH on
+// JeandleScalarizedCopy shows the fold winning at small counts (3.4x at 1,
+// 1.02-1.15x at 8) and losing beyond it (0.77x at 16, 0.70x at 64), matching
+// C2's ArrayCopyLoadStoreMaxElem semantics for eliminating arraycopy with a
+// tightly coupled allocation. Default 8, like C2.
+static llvm::cl::opt<unsigned> JeandlePEACopyFoldMaxCount(
+    "jeandle-pea-copy-fold-max-count", llvm::cl::init(8), llvm::cl::Hidden,
+    llvm::cl::desc("PEA: maximum element count for which a jeandle.copy "
+                   "fold replaces the bulk copy with scalar state."));
+
 // Cascade other still-locked virtuals at materialization when the target uses
 // HotSpot's lightweight locking (LM_LIGHTWEIGHT requires strict lock nesting).
 // Resolved per-run by resolveStrictLockOrder(): explicit cl override wins,
@@ -7471,6 +7482,10 @@ bool Analyzer::processCopyCall(CallBase *CB) {
   // Negative positions/lengths carry the Java exception shapes; they must
   // reach the surviving call, not a fold.
   if (*SrcPos < 0 || *DestPos < 0 || *Len < 0)
+    return false;
+  // Past the element-count cap the surviving bulk copy is faster than
+  // per-element scalar state (see JeandlePEACopyFoldMaxCount).
+  if (*Len > static_cast<int64_t>(JeandlePEACopyFoldMaxCount))
     return false;
 
   // Destination bounds: a virtual array's length is a compile-time constant.
