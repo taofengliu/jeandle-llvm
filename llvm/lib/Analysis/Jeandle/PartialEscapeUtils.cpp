@@ -68,6 +68,20 @@ bool isJeandleAllocation(const CallBase *CB) {
   return isJeandleNewInstance(CB) || isJeandleNewArray(CB);
 }
 
+bool isJeandleNewArrayCall(const CallBase *CB) {
+  // Five operands are (klass, length, size, header, limit); the extended
+  // form appends i1 uninitialized / deferred-publication flags requested by
+  // a tightly coupled initializer. The shared prefix fixes every consumer's
+  // operand index, so both shapes expose the same fields.
+  return isJeandleNewArray(CB) && (CB->arg_size() == 5 || CB->arg_size() == 7);
+}
+
+Value *getJeandleNewArrayLength(const CallBase *CB) {
+  if (!isJeandleNewArrayCall(CB))
+    return nullptr;
+  return CB->getArgOperand(1);
+}
+
 bool isJeandleArrayLength(const CallBase *CB) {
   return isJeandleCallNamed(CB, "jeandle.arraylength");
 }
@@ -901,9 +915,10 @@ std::optional<uint32_t> extractInstanceSize(const CallBase *NewInstance) {
 }
 
 std::optional<uint32_t> extractArrayLength(const CallBase *NewArray) {
-  if (!isJeandleNewArray(NewArray) || NewArray->arg_size() != 5)
+  Value *Length = getJeandleNewArrayLength(NewArray);
+  if (!Length)
     return std::nullopt;
-  auto *CI = dyn_cast<ConstantInt>(NewArray->getArgOperand(1));
+  auto *CI = dyn_cast<ConstantInt>(Length);
   if (!CI)
     return std::nullopt;
   return static_cast<uint32_t>(CI->getZExtValue());
