@@ -7455,9 +7455,11 @@ bool Analyzer::processCopyCall(CallBase *CB) {
     return false;
 
   JeandleCopyPseudoKind Kind = classifyJeandleCopyPseudo(CB);
-  if (!isElementIndexedCopyKind(Kind))
-    // Byte-offset payload clones (clone-instance / clone-array) and
-    // unclassified sites stay conservative.
+  const bool ElementIndexed = isElementIndexedCopyKind(Kind);
+  const bool BytePayload = Kind == JeandleCopyPseudoKind::CloneInstance ||
+                           Kind == JeandleCopyPseudoKind::CloneArray;
+  if (!ElementIndexed && !BytePayload)
+    // Unclassified sites stay conservative.
     return false;
 
   // --- Phase 1: read-only validation. ---
@@ -7470,19 +7472,139 @@ bool Analyzer::processCopyCall(CallBase *CB) {
   if (!Eligible.lookup(DestID))
     return false;
   jeandle::VirtualObject &Dest = *Result.VirtualObjects[DestID];
+
+  // A clone-instance copies the instance payload as raw bytes: fold it by
+  // transferring every source field entry inside the payload window to the
+  // fresh clone VO (virtual source only — building per-field loads for a
+  // concrete source needs a field-enumeration query the callback set does
+  // not offer).
+  if (Kind == JeandleCopyPseudoKind::CloneInstance) {
+    if (!Dest.isInstance())
+      return false;
+    std::optional<int64_t> BaseOff = getCopyConstantI64(CB->getArgOperand(1));
+    std::optional<int64_t> DestOff = getCopyConstantI64(CB->getArgOperand(3));
+    std::optional<int64_t> Words = getCopyConstantI64(CB->getArgOperand(4));
+    if (!BaseOff || !DestOff || !Words || *BaseOff != *DestOff || *Words < 0 ||
+        *BaseOff < 0)
+      return false;
+    std::optional<int64_t> PayloadEnd =
+        checkedArrayElementOffset(*BaseOff, *Words, 8);
+    if (!PayloadEnd)
+      return false;
+    // Coverage: the payload must start at or before the first field (extra
+    // leading header bytes — the frontend's clone starts at the klass slot —
+    // are a semantic no-op) and reach the end of the instance, or uncovered
+    // fields would keep their defaults instead of the source's values.
+    if (*BaseOff > VMConsts.instanceBaseOffset() ||
+        *PayloadEnd < static_cast<int64_t>(Dest.SizeInBytes))
+      return false;
+    VirtualIdentityResult SrcIdentity =
+        resolveVirtualIdentity(CB->getArgOperand(0), CurrentState, Aliases, DL,
+                               VirtualIdentityMode::WholeObject);
+    if (!SrcIdentity.isDefined())
+      return false;
+    jeandle::ObjectID SrcID = SrcIdentity.getObjectID();
+    if (!Eligible.lookup(SrcID))
+      return false;
+    const jeandle::VirtualObject &Src = *Result.VirtualObjects[SrcID];
+    if (!Src.isInstance() || Src.Klass != Dest.Klass)
+      return false;
+    // The destination is the fresh clone allocation, so src and dest are
+    // distinct VOs; a same-VO shape is malformed IR and would alias the two
+    // field maps below.
+    if (SrcID == DestID)
+      return false;
+
+    // Pre-scan: entries in the window must be transferable, and each offset
+    // needs an established source FieldDesc for the destination's slot
+    // typing (entries without one cannot be typed soundly for replay).
+    // getOrCreateFieldIndex may insert an inert FieldDesc on the validation
+    // path — the accepted processStore pattern; a bail here materializes
+    // the destination immediately.
+    auto SrcFieldsIt = FieldStates.find(SrcID);
+    if (SrcFieldsIt != FieldStates.end()) {
+      for (const auto &[Off, FV] : SrcFieldsIt->second) {
+        if (Off < *BaseOff || Off >= *PayloadEnd)
+          continue;
+        const jeandle::VirtualObject::FieldDesc *FD = Src.findField(Off);
+        if (!FD || FV.isUnknown())
+          return false;
+        if (FV.isVirtualRef() && !Eligible.lookup(FV.getVirtualRef()))
+          return false;
+        if (Dest.getOrCreateFieldIndex(Off, FD->LLVMType, DL) < 0)
+          return false;
+      }
+    }
+    // Commit: materialize both outer-map entries BEFORE taking any reference
+    // (an operator[] insert can rehash the outer DenseMap and would dangle a
+    // reference taken earlier), transfer the window's entries, then erase
+    // stale destination entries the full-coverage clone overwrites with
+    // source defaults.
+    if (!FieldStates.count(SrcID))
+      (void)FieldStates[SrcID];
+    if (!FieldStates.count(DestID))
+      (void)FieldStates[DestID];
+    auto &SrcFields = FieldStates[SrcID];
+    auto &DestFields = FieldStates[DestID];
+    for (const auto &[Off, FV] : SrcFields) {
+      if (Off < *BaseOff || Off >= *PayloadEnd)
+        continue;
+      DestFields[Off] = FV;
+    }
+    SmallVector<int64_t, 8> Stale;
+    for (const auto &[Off, FV] : DestFields)
+      if (Off >= *BaseOff && Off < *PayloadEnd && !SrcFields.count(Off))
+        Stale.push_back(Off);
+    for (int64_t Off : Stale)
+      DestFields.erase(Off);
+    emitReplaceCall(CB, /*Replacement=*/nullptr, DestID);
+    ++AttemptStats.CopyFolds;
+    return true;
+  }
+
   if (!Dest.isArray() || Dest.ArrayElementType == nullptr ||
       Dest.ArrayIndexScale == 0)
     return false;
 
-  std::optional<int64_t> SrcPos = getCopyConstantI64(CB->getArgOperand(1));
-  std::optional<int64_t> DestPos = getCopyConstantI64(CB->getArgOperand(3));
-  std::optional<int64_t> Len = getCopyConstantI64(CB->getArgOperand(4));
-  if (!SrcPos || !DestPos || !Len)
-    return false;
-  // Negative positions/lengths carry the Java exception shapes; they must
-  // reach the surviving call, not a fold.
-  if (*SrcPos < 0 || *DestPos < 0 || *Len < 0)
-    return false;
+  std::optional<int64_t> SrcPos;
+  std::optional<int64_t> DestPos;
+  std::optional<int64_t> Len;
+  if (ElementIndexed) {
+    SrcPos = getCopyConstantI64(CB->getArgOperand(1));
+    DestPos = getCopyConstantI64(CB->getArgOperand(3));
+    Len = getCopyConstantI64(CB->getArgOperand(4));
+    if (!SrcPos || !DestPos || !Len)
+      return false;
+    // Negative positions/lengths carry the Java exception shapes; they must
+    // reach the surviving call, not a fold.
+    if (*SrcPos < 0 || *DestPos < 0 || *Len < 0)
+      return false;
+  } else {
+    // A clone-array's operands are a byte offset and an 8-byte word count,
+    // not element indices. Recover the element window from the destination
+    // VO and validate that the payload covers every element (leading header
+    // bytes and trailing alignment padding inside the window are semantic
+    // no-ops); the reads stay within the bytes the original bulk copy
+    // touched, so coverage is also the bounds proof.
+    std::optional<int64_t> BaseOff = getCopyConstantI64(CB->getArgOperand(1));
+    std::optional<int64_t> DestOff = getCopyConstantI64(CB->getArgOperand(3));
+    std::optional<int64_t> Words = getCopyConstantI64(CB->getArgOperand(4));
+    if (!BaseOff || !DestOff || !Words || *BaseOff != *DestOff || *Words < 0)
+      return false;
+    std::optional<int64_t> PayloadEnd =
+        checkedArrayElementOffset(*BaseOff, *Words, 8);
+    if (!PayloadEnd)
+      return false;
+    std::optional<int64_t> DataEnd =
+        checkedArrayElementOffset(static_cast<int64_t>(Dest.ArrayBaseOffset),
+                                  Dest.ArrayLength, Dest.ArrayIndexScale);
+    if (!DataEnd || *BaseOff > static_cast<int64_t>(Dest.ArrayBaseOffset) ||
+        *PayloadEnd < *DataEnd)
+      return false;
+    SrcPos = 0;
+    DestPos = 0;
+    Len = static_cast<int64_t>(Dest.ArrayLength);
+  }
   // Past the element-count cap the surviving bulk copy is faster than
   // per-element scalar state (see JeandlePEACopyFoldMaxCount).
   if (*Len > static_cast<int64_t>(JeandlePEACopyFoldMaxCount))
@@ -7552,20 +7674,24 @@ bool Analyzer::processCopyCall(CallBase *CB) {
     // the clone identity (arg4 IS the source length, srcPos == 0), or the
     // validated arraycopy limit guard that dominates the call. The element
     // loads are placed at the call, inherring exactly that control context.
-    bool BoundsProven = *Len == 0;
-    if (!BoundsProven)
-      if (std::optional<int64_t> SrcLen =
-              getCopyConstantI64(CB->getArgOperand(7)))
-        if (std::optional<int64_t> SrcEnd = checkedOffsetAdd(*SrcPos, *Len))
-          BoundsProven = *SrcEnd <= *SrcLen;
-    if (!BoundsProven && *SrcPos == 0 &&
-        CB->getArgOperand(4) == CB->getArgOperand(7))
-      BoundsProven = true;
-    if (!BoundsProven && Kind == JeandleCopyPseudoKind::ArrayCopy &&
-        isCopyPseudoValidated(CB))
-      BoundsProven = true;
-    if (!BoundsProven)
-      return false;
+    // A byte-payload clone needs none of these: its coverage check already
+    // proved the reads stay inside the bytes the bulk copy touched.
+    if (!BytePayload) {
+      bool BoundsProven = *Len == 0;
+      if (!BoundsProven)
+        if (std::optional<int64_t> SrcLen =
+                getCopyConstantI64(CB->getArgOperand(7)))
+          if (std::optional<int64_t> SrcEnd = checkedOffsetAdd(*SrcPos, *Len))
+            BoundsProven = *SrcEnd <= *SrcLen;
+      if (!BoundsProven && *SrcPos == 0 &&
+          CB->getArgOperand(4) == CB->getArgOperand(7))
+        BoundsProven = true;
+      if (!BoundsProven && Kind == JeandleCopyPseudoKind::ArrayCopy &&
+          isCopyPseudoValidated(CB))
+        BoundsProven = true;
+      if (!BoundsProven)
+        return false;
+    }
   }
 
   // Pre-scan the transfer window: offsets must stay representable, source
