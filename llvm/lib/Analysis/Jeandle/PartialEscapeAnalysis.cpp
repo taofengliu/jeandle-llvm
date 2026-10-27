@@ -7720,6 +7720,26 @@ bool Analyzer::processCopyCall(CallBase *CB) {
         !isUsableFieldOffset(*DestOff))
       return false;
     if (SrcVirtual) {
+      // An element may intersect a packed store that starts at another
+      // offset. Only transfer whole slots in the array's physical element
+      // representation; all other overlaps require the real memory copy.
+      std::optional<int64_t> SrcElemEnd =
+          checkedOffsetAdd(*SrcOff, Src->ArrayIndexScale);
+      if (!SrcElemEnd)
+        return false;
+      for (const auto &FD : Src->Fields) {
+        std::optional<int64_t> FieldEnd =
+            checkedOffsetAdd(FD.Offset, FD.ByteSize);
+        if (!FieldEnd)
+          return false;
+        if (*FieldEnd <= *SrcOff)
+          continue;
+        if (FD.Offset >= *SrcElemEnd)
+          break;
+        if (FD.Offset != *SrcOff || FD.ByteSize != Src->ArrayIndexScale ||
+            FD.LLVMType != Src->ArrayElementType)
+          return false;
+      }
       const auto SrcFieldsIt = FieldStates.find(SrcIdentity.getObjectID());
       if (SrcFieldsIt != FieldStates.end()) {
         auto It = SrcFieldsIt->second.find(*SrcOff);
