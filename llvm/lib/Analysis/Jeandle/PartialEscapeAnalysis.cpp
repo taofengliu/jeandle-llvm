@@ -3839,52 +3839,6 @@ void Analyzer::processBlockPhis(BasicBlock *BB, jeandle::EffectList &Out) {
         Found = BaseIdentity.getObjectID();
         if (!WholeIdentity.isDefined() || WholeIdentity.getObjectID() != *Found)
           AnyDerived = true;
-      } else {
-        // Loop-carried self-reference: the incoming value peels (through
-        // offset-0 casts / zero-index GEPs / freeze) back to this PHI
-        // itself. The virtual alias that would resolve it may not have been
-        // registered yet in the current traversal. A self-carry denotes this
-        // PHI itself, so it agrees with
-        // whatever object the remaining incomings resolve to (verified
-        // against the consensus below). A NON-ZERO / non-constant offset on
-        // the carry changes the value per iteration — that is a derived
-        // carry, not an identity carry.
-        int64_t Off = 0;
-        bool NonConst = false;
-        Value *Base =
-            jeandle::pea::stripPointerCastsAndOffsets(V, DL, &Off, &NonConst);
-        if (Base == &Phi) {
-          SelfCarry.set(I);
-          if (NonConst || Off != 0)
-            AnyDerived = true;
-        }
-      }
-      // During an ordinary loop body pass, an incoming of the loop-header PHI
-      // whose predecessor is inside the loop but has not yet been processed in
-      // this pass cannot be trusted as a divergence. First try to re-resolve
-      // the incoming through the phi-keyed Case-C cache. If the memo does not
-      // cover this slot, the incoming is unknown and the post-body merge
-      // re-derives the decision with complete latch data. Restricted to the
-      // loop header: non-header blocks get no post-body re-merge, so an
-      // optimistic decision there could never be corrected. SelfCarry keeps
-      // precedence because it is structural and needs no alias.
-      if (!Found && !PoisonWildcard.test(I) && !SelfCarry.test(I) &&
-          ActiveBodyPassLoop && BB == ActiveBodyPassLoop->getHeader() &&
-          ActiveBodyPassLoop->contains(Pred) &&
-          !BodyPassProcessed.count(Pred)) {
-        auto MemoIt = CaseCVOCache.find(&Phi);
-        if (MemoIt != CaseCVOCache.end() && Eligible.lookup(MemoIt->second)) {
-          const jeandle::VirtualObject &MemoVO =
-              *Result.VirtualObjects[MemoIt->second];
-          if (MemoVO.IsSynthetic && I < MemoVO.SyntheticSourceIDs.size()) {
-            jeandle::ObjectID Cand = MemoVO.SyntheticSourceIDs[I];
-            if (Cand != jeandle::InvalidObjectID && Eligible.lookup(Cand) &&
-                PredED->Virtuals.count(Cand))
-              Found = Cand;
-          }
-        }
-        if (!Found)
-          Unresolved.set(I);
       }
       InIDs.push_back(Found);
       if (Found)
@@ -4605,16 +4559,6 @@ bool Analyzer::synthesizeCaseC(BasicBlock *BB, PHINode *Phi,
             S[k].BytecodeDepth != RefStack[k].BytecodeDepth)
           return false;
     }
-  }
-
-  // Early-bail if any incoming of Phi equals Phi itself (a
-  // back-edge self-reference on a loop-header PHI). A self-loop incoming
-  // means the per-pred VO this slot resolves to is one that we're about
-  // to synthesise *into* — there is no per-pred independent allocation
-  // and the identity check cannot meaningfully proceed.
-  for (unsigned OriginalIndex : PerPredOriginalIndices) {
-    if (Phi->getIncomingValue(OriginalIndex) == Phi)
-      return false;
   }
 
   // Every VO has identity. Case C replaces each source identity with the
