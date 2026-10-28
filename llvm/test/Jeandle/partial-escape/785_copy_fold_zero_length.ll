@@ -1,8 +1,8 @@
 ; RUN: opt -S -passes="require<partial-escape-analysis>,partial-escape-transform" -jeandle-vm-callback-log=%S/Inputs/785_copy_fold_zero_length.cblog %s | FileCheck %s
 
 ; Zero-length copy: the fold degenerates to deleting the call (no entries to
-; transfer) — the source length proof and element compatibility are trivial,
-; and the destination never escapes.
+; transfer). Source bounds and element compatibility are proven even for
+; an empty copy, and the destination never escapes.
 
 declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
 declare void @jeandle.copy(ptr addrspace(1), i64, ptr addrspace(1), i64, i64, ptr, ptr, i64, i64)
