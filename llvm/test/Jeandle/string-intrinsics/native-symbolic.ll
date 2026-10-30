@@ -2,7 +2,7 @@
 ; RUN: sed 's/e-p:64/E-p:64/' %s | opt -S -passes='string-intrinsic-specialization,require<partial-escape-analysis>,partial-escape-transform,instcombine,simplifycfg' -jeandle-vm-callback-log=%S/Inputs/layout.cblog -verify-each | FileCheck %s --check-prefix=BE
 
 target datalayout = "e-p:64:64-p1:64:64"
-declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
+declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32, i1, i1)
 declare i32 @__gxx_personality_v0(...)
 declare void @jeandle.string_copy_utf16(ptr addrspace(1), i32, ptr addrspace(1), i32, i32, i1)
 
@@ -29,9 +29,9 @@ declare void @jeandle.string_copy_utf16(ptr addrspace(1), i32, ptr addrspace(1),
 ; BE: ret i32 %[[RESULT]]
  define i32 @symbolic_halves(i8 %first, i8 %second) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
- %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100) to label %next unwind label %u
+ %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %next unwind label %u
 next:
- %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10002 to ptr), i32 1, i32 24, i32 16, i32 100) to label %work unwind label %u
+ %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10002 to ptr), i32 1, i32 24, i32 16, i32 100, i1 false, i1 false) to label %work unwind label %u
 work:
  %p0 = getelementptr i8, ptr addrspace(1) %a, i64 16
  %p1 = getelementptr i8, ptr addrspace(1) %a, i64 17

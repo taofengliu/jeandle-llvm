@@ -69,11 +69,12 @@ bool isJeandleAllocation(const CallBase *CB) {
 }
 
 bool isJeandleNewArrayCall(const CallBase *CB) {
-  // Five operands are (klass, length, size, header, limit); the extended
-  // form appends i1 uninitialized / deferred-publication flags requested by
-  // a tightly coupled initializer. The shared prefix fixes every consumer's
-  // operand index, so both shapes expose the same fields.
-  return isJeandleNewArray(CB) && (CB->arg_size() == 5 || CB->arg_size() == 7);
+  // Operands are (klass, length, size, header, limit, uninitialized,
+  // deferred-publication): the trailing i1 flags are set by a tightly
+  // coupled initializer that overwrites the payload before the array
+  // escapes; plain allocations pass false for both. The shared prefix
+  // fixes every consumer's operand index.
+  return isJeandleNewArray(CB) && CB->arg_size() == 7;
 }
 
 Value *getJeandleNewArrayLength(const CallBase *CB) {

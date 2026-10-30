@@ -1,7 +1,7 @@
 ; RUN: opt -S -passes='require<partial-escape-analysis>,partial-escape-transform,instcombine,simplifycfg' -jeandle-vm-callback-log=%S/Inputs/layout.cblog -verify-each %s | FileCheck %s
 
 target datalayout = "e-p:64:64-p1:64:64"
-declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
+declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32, i1, i1)
 declare i32 @__gxx_personality_v0(...)
 declare void @observe_exception()
 declare i32 @jeandle.string_compare(ptr addrspace(1), i32, ptr addrspace(1), i32, i32)
@@ -24,9 +24,9 @@ declare void @jeandle.string_copy_utf16(ptr addrspace(1), i32, ptr addrspace(1),
 ; CHECK: ret i32
  define i32 @rollback(i16 %unknown) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
- %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10002 to ptr), i32 2, i32 24, i32 16, i32 100) to label %next unwind label %u
+ %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10002 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %next unwind label %u
 next:
- %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100) to label %work unwind label %u
+ %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %work unwind label %u
 work:
  %p0 = getelementptr i8, ptr addrspace(1) %a, i64 16
  %p1 = getelementptr i8, ptr addrspace(1) %a, i64 18
@@ -51,9 +51,9 @@ u:
 ; CHECK: landingpad
  define i32 @aliases(i1 %cond, i32 %n) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
- %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100) to label %next unwind label %u
+ %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %next unwind label %u
 next:
- %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100) to label %work unwind label %u
+ %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %work unwind label %u
 work:
  %az = getelementptr i8, ptr addrspace(1) %a, i64 0
  %af = freeze ptr addrspace(1) %az
@@ -76,9 +76,9 @@ u:
 ; CHECK: ret i32
  define i32 @wrong_layout() gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
- %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10002 to ptr), i32 2, i32 24, i32 16, i32 100) to label %next unwind label %u
+ %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10002 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %next unwind label %u
 next:
- %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100) to label %work unwind label %u
+ %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %work unwind label %u
 work:
  %r = call i32 @jeandle.string_equals(ptr addrspace(1) %a, ptr addrspace(1) %b, i32 2)
  ret i32 %r
@@ -100,9 +100,9 @@ u:
 ; CHECK: ret ptr addrspace(1)
  define ptr addrspace(1) @destination_materialization() gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
- %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10002 to ptr), i32 2, i32 24, i32 16, i32 100) to label %next unwind label %u
+ %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10002 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %next unwind label %u
 next:
- %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100) to label %work unwind label %u
+ %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %work unwind label %u
 work:
  %ap = getelementptr i8, ptr addrspace(1) %a, i64 16
  store atomic i16 65, ptr addrspace(1) %ap unordered, align 2
@@ -126,7 +126,7 @@ declare void @jeandle.safepoint_poll()
 ; CHECK: ret ptr addrspace(1)
  define ptr addrspace(1) @loop_identity(i1 %again) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
- %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100) to label %loop unwind label %u
+ %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %loop unwind label %u
 loop:
  %p = phi ptr addrspace(1) [ %a, %entry ], [ %p, %loop ]
  call void @jeandle.safepoint_poll()
@@ -147,9 +147,9 @@ u:
 ; CHECK: ret i32
  define i32 @derived(i1 %cond) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
- %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100) to label %next unwind label %u
+ %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %next unwind label %u
 next:
- %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100) to label %work unwind label %u
+ %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %work unwind label %u
 work:
  %x = getelementptr i8, ptr addrspace(1) %a, i64 1
  %r = call i32 @jeandle.string_equals(ptr addrspace(1) %x, ptr addrspace(1) %b, i32 1)
@@ -166,9 +166,9 @@ u:
 ; CHECK: ret i32
  define i32 @poison_arm(i1 %cond) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
- %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100) to label %next unwind label %u
+ %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %next unwind label %u
 next:
- %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100) to label %work unwind label %u
+ %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %work unwind label %u
 work:
  %s = select i1 %cond, ptr addrspace(1) %a, ptr addrspace(1) poison
  %x = freeze ptr addrspace(1) %s

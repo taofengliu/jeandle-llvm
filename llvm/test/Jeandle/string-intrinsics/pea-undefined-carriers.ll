@@ -4,7 +4,7 @@
 ; independently fold these expressions, but string content proofs must take
 ; the conservative path when an explicit undefined input feeds a carrier.
 target datalayout = "e-p:64:64-p1:64:64"
-declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32)
+declare hotspotcc ptr addrspace(1) @jeandle.new_array(ptr, i32, i32, i32, i32, i1, i1)
 declare i32 @__gxx_personality_v0(...)
 declare i32 @jeandle.string_equals(ptr addrspace(1), ptr addrspace(1), i32)
 
@@ -15,9 +15,9 @@ declare i32 @jeandle.string_equals(ptr addrspace(1), ptr addrspace(1), i32)
 ; CHECK: ret i32 %r
 define i32 @poison_xor(i1 %flag, i32 %n) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
- %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100) to label %next unwind label %u
+ %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %next unwind label %u
 next:
- %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100) to label %work unwind label %u
+ %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %work unwind label %u
 work:
  %c = xor i1 %flag, poison
  %s = select i1 %c, ptr addrspace(1) %a, ptr addrspace(1) %a
@@ -36,9 +36,9 @@ u:
 ; CHECK: ret i32 %r
 define i32 @poison_compare(i1 %flag, i32 %n) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
- %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100) to label %next unwind label %u
+ %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %next unwind label %u
 next:
- %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100) to label %work unwind label %u
+ %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %work unwind label %u
 work:
  %sum = add i32 %n, poison
  %c = icmp eq i32 %sum, 0
@@ -58,9 +58,9 @@ u:
 ; CHECK: ret i32 %r
 define i32 @poison_shift(i1 %flag, i32 %n) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
- %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100) to label %next unwind label %u
+ %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %next unwind label %u
 next:
- %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100) to label %work unwind label %u
+ %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %work unwind label %u
 work:
  %shift = shl i32 %n, poison
  %c = trunc i32 %shift to i1
@@ -80,9 +80,9 @@ u:
 ; CHECK: ret i32 %r
 define i32 @poison_extract(i1 %flag, i32 %n) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
- %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100) to label %next unwind label %u
+ %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %next unwind label %u
 next:
- %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100) to label %work unwind label %u
+ %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %work unwind label %u
 work:
  %c = extractelement <2 x i1> <i1 false, i1 poison>, i32 1
  %s = select i1 %c, ptr addrspace(1) %a, ptr addrspace(1) %a
@@ -101,9 +101,9 @@ u:
 ; CHECK: ret i32 %r
 define i32 @undef_arithmetic(i1 %flag, i32 %n) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
- %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100) to label %next unwind label %u
+ %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %next unwind label %u
 next:
- %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100) to label %work unwind label %u
+ %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %work unwind label %u
 work:
  %bits = and i32 %n, undef
  %c = icmp ne i32 %bits, 0
@@ -122,9 +122,9 @@ u:
 ; CHECK: ret i32 1
 define i32 @valid_condition(i1 %flag, i32 %n) gc "hotspotgc" personality ptr @__gxx_personality_v0 {
 entry:
- %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100) to label %next unwind label %u
+ %a = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %next unwind label %u
 next:
- %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100) to label %work unwind label %u
+ %b = invoke hotspotcc ptr addrspace(1) @jeandle.new_array(ptr inttoptr (i64 10001 to ptr), i32 2, i32 24, i32 16, i32 100, i1 false, i1 false) to label %work unwind label %u
 work:
  %sum = add i32 %n, 1
  %c = icmp ne i32 %sum, 0
