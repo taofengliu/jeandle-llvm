@@ -7251,10 +7251,6 @@ bool Analyzer::foldICmpEquality(ICmpInst *ICmp) {
   return true;
 }
 
-// Dispatch a recognized JavaOp on a virtual receiver to its fold. Returns
-// true iff the call was handled — folded to a constant / deleted, or a
-// known-safe non-escaping shape needing no transform; false routes the call
-// to the generic escape path.
 bool Analyzer::foldStringIntrinsic(CallBase *CB) {
   using namespace jeandle;
   using namespace jeandle::pea;
@@ -7511,6 +7507,10 @@ bool Analyzer::foldStringIntrinsic(CallBase *CB) {
   return Finish(Return, *Right);
 }
 
+// Dispatch a recognized JavaOp on a virtual receiver to its fold. Returns
+// true iff the call was handled — folded to a constant / deleted, or a
+// known-safe non-escaping shape needing no transform; false routes the call
+// to the generic escape path.
 bool Analyzer::processJavaOp(CallBase *CB) {
   if (jeandle::decodeStringIntrinsic(*CB))
     return foldStringIntrinsic(CB);
