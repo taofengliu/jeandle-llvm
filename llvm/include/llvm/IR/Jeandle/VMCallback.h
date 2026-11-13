@@ -84,6 +84,10 @@ using CloneInstanceInfoResult =
 /// known-null Klass field of a primitive Class mirror.
 inline constexpr uintptr_t MirrorKlassUnavailable = ~uintptr_t{0};
 
+/// Written class flags and the immutable hidden-class bit. Other VM-private
+/// access flags may change and cannot be folded from a compilation snapshot.
+inline constexpr uint32_t ClassQueryAccessFlagsMask = 0x04007fff;
+
 /// Result reported for an inline attempt after LLVM starts processing it.
 /// Keep the numeric values stable because the JVM records them.
 enum class JeandleInlineReason : int {
@@ -232,6 +236,18 @@ enum class JeandleInlineReason : int {
       (uintptr_t a1), (a1),                                                      \
       (VMCallbackValueType::Uintptr), 1)                                         \
   def(GetMirrorKlass, uintptr_t, Uintptr,                                        \
+      (int a1), (a1),                                                            \
+      (VMCallbackValueType::Int), 1)                                             \
+  def(GetKlassModifiers, int, Int,                                              \
+      (uintptr_t a1), (a1),                                                      \
+      (VMCallbackValueType::Uintptr), 1)                                         \
+  def(GetKlassAccessFlags, int64_t, Long,                                        \
+      (uintptr_t a1, int a2), (a1, a2),                                         \
+      (VMCallbackValueType::Uintptr, VMCallbackValueType::Int), 2)               \
+  def(GetSuperKlass, uintptr_t, Uintptr,                                         \
+      (uintptr_t a1), (a1),                                                      \
+      (VMCallbackValueType::Uintptr), 1)                                         \
+  def(GetCallerClass, int, Int,                                                 \
       (int a1), (a1),                                                            \
       (VMCallbackValueType::Int), 1)                                             \
   def(GetKlassLayoutHelper, int, Int,                                            \

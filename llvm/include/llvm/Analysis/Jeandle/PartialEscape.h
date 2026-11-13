@@ -678,6 +678,10 @@ public:
   // a module-level GlobalVariable during analysis, so it defers to the
   // transform. -1 means "use Replacement as-is" (the normal path).
   int OopHandleId = -1;
+  // When nonzero, build a subtype call using this allocation Klass and the
+  // target check's dynamic super Klass. Defer call construction until apply:
+  // even an unparented call would add a user to its module-level callee.
+  uintptr_t KlassSubtype = 0;
 
   Kind getKind() const override { return Kind::ReplaceCall; }
   static bool classof(const Effect *E) {

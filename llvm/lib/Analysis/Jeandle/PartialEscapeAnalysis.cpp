@@ -6528,10 +6528,11 @@ bool Analyzer::foldCheckInstanceOf(CallBase *CB) {
   // Phase-0 lowering expands checkcast and instanceof into null checks and
   // this phase-1 subtype query. Virtual receivers are non-null and have an
   // exact allocation klass.
-  if (CB->arg_size() < 2)
-    return false;
-  uintptr_t SuperK = jeandle::extractKlassConstant(CB->getArgOperand(0));
-  if (SuperK == 0)
+  LLVMContext &Ctx = F.getContext();
+  Type *KlassTy = PointerType::get(Ctx, 0);
+  FunctionType *CheckTy = FunctionType::get(
+      Type::getInt1Ty(Ctx), {KlassTy, PointerType::get(Ctx, 1)}, false);
+  if (CB->getFunctionType() != CheckTy)
     return false;
   auto BaseID = jeandle::pea::resolveVirtualRef(CB->getArgOperand(1),
                                                 CurrentState, Aliases, DL);
@@ -6542,6 +6543,40 @@ bool Analyzer::foldCheckInstanceOf(CallBase *CB) {
   jeandle::VirtualObject &VObj = *Result.VirtualObjects[*BaseID];
   if (VObj.Klass == 0)
     return false;
+  Value *Super = CB->getArgOperand(0);
+  uintptr_t SuperK = jeandle::extractKlassConstant(Super);
+  if (SuperK == 0) {
+    // The subtype helper is a non-throwing leaf, so inspecting a virtual
+    // allocation needs no object header or additional frame state. Retain
+    // unusual call forms and unknown constant relations conservatively.
+    auto *Call = dyn_cast<CallInst>(CB);
+    if (!Call || Call->isMustTailCall() || CB->hasOperandBundles() ||
+        isa<Constant>(Super))
+      return false;
+    auto Identity = jeandle::pea::resolveVirtualIdentity(
+        CB->getArgOperand(1), CurrentState, Aliases, DL,
+        jeandle::pea::VirtualIdentityMode::WholeObject);
+    if (!Identity.isDefined() || Aliases.getVirtualAlias(Super))
+      return false;
+    Function *Subtype =
+        F.getParent()->getFunction("jeandle.check_klass_subtype");
+    FunctionType *SubtypeTy =
+        FunctionType::get(Type::getInt1Ty(Ctx), {KlassTy, KlassTy}, false);
+    if (!Subtype || Subtype->getFunctionType() != SubtypeTy ||
+        Subtype->getCallingConv() != CB->getCallingConv() ||
+        !Subtype->doesNotThrow() ||
+        !Subtype->hasFnAttribute("gc-leaf-function"))
+      return false;
+
+    auto E = std::make_unique<jeandle::ReplaceCallEffect>();
+    E->Block = CB->getParent();
+    E->Target = CB;
+    E->KlassSubtype = VObj.Klass;
+    E->SeqNo = Result.nextSeqNo();
+    E->setMutationOwner(*BaseID);
+    Result.addBlockEffect(std::move(E));
+    return true;
+  }
   auto Folded = evalSubtypeRelation(VObj.Klass, SuperK);
   if (!Folded)
     return false;
@@ -9619,6 +9654,12 @@ void Analyzer::validateFinalDeoptObligations() {
       const auto *CallRE = cast<jeandle::ReplaceCallEffect>(E);
       if (CallRE->OopHandleId >= 0)
         return {FinalValue::DependencyFreeOopHandle, nullptr};
+      if (CallRE->KlassSubtype != 0) {
+        // The transform preserves this result with a Klass-only query.
+        // Its only SSA dependency is the dynamic super, not the receiver.
+        Current = cast<CallBase>(Target)->getArgOperand(0);
+        continue;
+      }
       if (!CallRE->Replacement)
         return {FinalValue::Deleted, nullptr};
       Current = CallRE->Replacement;
