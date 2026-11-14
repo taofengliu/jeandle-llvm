@@ -27,6 +27,7 @@
 #include "llvm/IR/InstrTypes.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/IntrinsicInst.h"
+#include "llvm/IR/Jeandle/Attributes.h"
 #include "llvm/IR/Jeandle/JavaType.h"
 #include "llvm/IR/Jeandle/Metadata.h"
 #include "llvm/IR/Operator.h"
@@ -86,6 +87,21 @@ bool isJeandleAllocation(const CallBase *CB) {
   return isJeandleNewInstance(CB) || isJeandleNewArray(CB);
 }
 
+bool isJeandleNewArrayCall(const CallBase *CB) {
+  // Operands are (klass, length, size, header, limit, uninitialized,
+  // deferred-publication): the trailing i1 flags are set by a tightly
+  // coupled initializer that overwrites the payload before the array
+  // escapes; plain allocations pass false for both. The shared prefix
+  // fixes every consumer's operand index.
+  return isJeandleNewArray(CB) && CB->arg_size() == 7;
+}
+
+Value *getJeandleNewArrayLength(const CallBase *CB) {
+  if (!isJeandleNewArrayCall(CB))
+    return nullptr;
+  return CB->getArgOperand(1);
+}
+
 bool isJeandleArrayLength(const CallBase *CB) {
   return isJeandleCallNamed(CB, "jeandle.arraylength");
 }
@@ -125,6 +141,55 @@ bool isJeandleMonitorExit(const CallBase *CB) {
 
 bool isJeandleRegisterFinalizerIfNeeded(const CallBase *CB) {
   return isJeandleCallNamed(CB, "jeandle.register_finalizer_if_needed");
+}
+
+bool isJeandleCopyPseudoCall(const CallBase *CB) {
+  // Same recognition contract as CopySpecialization's isCopyPseudoCall: the
+  // callee name plus the canonical 9-operand shape. The kind attribute is
+  // deliberately not part of recognition so analysis and expansion agree on
+  // the exact same set of sites.
+  return isJeandleCallNamed(CB, "jeandle.copy") && CB->arg_size() == 9;
+}
+
+JeandleCopyPseudoKind classifyJeandleCopyPseudo(const CallBase *CB) {
+  if (!isJeandleCopyPseudoCall(CB))
+    return JeandleCopyPseudoKind::Unknown;
+  llvm::Attribute KindAttr = CB->getFnAttr(jeandle::Attribute::CopyKind);
+  if (!KindAttr.isValid())
+    return JeandleCopyPseudoKind::Unknown;
+  StringRef Kind = KindAttr.getValueAsString();
+  if (Kind == jeandle::Attribute::CopyKindArrayCopy)
+    return JeandleCopyPseudoKind::ArrayCopy;
+  if (Kind == jeandle::Attribute::CopyKindCopyOf)
+    return JeandleCopyPseudoKind::CopyOf;
+  if (Kind == jeandle::Attribute::CopyKindCopyOfRange)
+    return JeandleCopyPseudoKind::CopyOfRange;
+  if (Kind == jeandle::Attribute::CopyKindCloneInstance)
+    return JeandleCopyPseudoKind::CloneInstance;
+  if (Kind == jeandle::Attribute::CopyKindCloneArray)
+    return JeandleCopyPseudoKind::CloneArray;
+  if (Kind == jeandle::Attribute::CopyKindCloneReferenceArray)
+    return JeandleCopyPseudoKind::CloneReferenceArray;
+  return JeandleCopyPseudoKind::Unknown;
+}
+
+bool isElementIndexedCopyKind(JeandleCopyPseudoKind Kind) {
+  switch (Kind) {
+  case JeandleCopyPseudoKind::ArrayCopy:
+  case JeandleCopyPseudoKind::CopyOf:
+  case JeandleCopyPseudoKind::CopyOfRange:
+  case JeandleCopyPseudoKind::CloneReferenceArray:
+    return true;
+  case JeandleCopyPseudoKind::CloneInstance:
+  case JeandleCopyPseudoKind::CloneArray:
+  case JeandleCopyPseudoKind::Unknown:
+    return false;
+  }
+  return false;
+}
+
+bool isCopyPseudoValidated(const CallBase *CB) {
+  return CB->hasFnAttr(jeandle::Attribute::ValidatedCopy);
 }
 
 bool isPEAHandledNonEscapingIntrinsic(const IntrinsicInst *II) {
@@ -908,9 +973,10 @@ std::optional<uint32_t> extractInstanceSize(const CallBase *NewInstance) {
 }
 
 std::optional<uint32_t> extractArrayLength(const CallBase *NewArray) {
-  if (!isJeandleNewArray(NewArray) || NewArray->arg_size() != 5)
+  Value *Length = getJeandleNewArrayLength(NewArray);
+  if (!Length)
     return std::nullopt;
-  auto *CI = dyn_cast<ConstantInt>(NewArray->getArgOperand(1));
+  auto *CI = dyn_cast<ConstantInt>(Length);
   if (!CI)
     return std::nullopt;
   return static_cast<uint32_t>(CI->getZExtValue());

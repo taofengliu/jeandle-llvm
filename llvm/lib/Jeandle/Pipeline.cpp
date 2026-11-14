@@ -11,6 +11,7 @@
 #include "llvm/Jeandle/Pipeline.h"
 #include "llvm/IR/PassManager.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Transforms/IPO/GlobalDCE.h"
 #include "llvm/Transforms/InstCombine/InstCombine.h"
 #include "llvm/Transforms/Jeandle/CHADevirtualization.h"
 #include "llvm/Transforms/Jeandle/CopySpecialization.h"
@@ -23,13 +24,16 @@
 #include "llvm/Transforms/Jeandle/JeandleNarrowOopMarker.h"
 #include "llvm/Transforms/Jeandle/PartialEscapeIterative.h"
 #include "llvm/Transforms/Jeandle/PartialEscapeTransform.h"
+#include "llvm/Transforms/Jeandle/PrePEAAllocationUnrollHints.h"
 #include "llvm/Transforms/Jeandle/ProfileDevirtualization.h"
 #include "llvm/Transforms/Jeandle/RecoverTypeInfo.h"
 #include "llvm/Transforms/Jeandle/RepeatedConstantFolding.h"
 #include "llvm/Transforms/Jeandle/SafepointCoverageVerifier.h"
 #include "llvm/Transforms/Jeandle/SafepointPollElimination.h"
+#include "llvm/Transforms/Jeandle/SafepointPollNormalization.h"
 #include "llvm/Transforms/Jeandle/SafepointStripMining.h"
 #include "llvm/Transforms/Jeandle/SafepointUtils.h"
+#include "llvm/Transforms/Jeandle/StringIntrinsicSpecialization.h"
 #include "llvm/Transforms/Jeandle/TLSPointerRewrite.h"
 #include "llvm/Transforms/Jeandle/TypeCheckElimination.h"
 #include "llvm/Transforms/Scalar/ADCE.h"
@@ -45,20 +49,11 @@
 #include "llvm/Transforms/Scalar/RewriteStatepointsForGC.h"
 #include "llvm/Transforms/Scalar/SimpleLoopUnswitch.h"
 #include "llvm/Transforms/Scalar/SimplifyCFG.h"
+#include "llvm/Transforms/Utils/BreakCriticalEdges.h"
 #include "llvm/Transforms/Utils/LCSSA.h"
 #include "llvm/Transforms/Utils/LoopSimplify.h"
 
 namespace llvm::jeandle {
-
-// Trip-count cap for the pre-PEA full-unroll pass. Aligned with
-// -jeandle-pea-max-array-length (default 128): loops bounded by a
-// virtualizable array's length should fully unroll so PEA sees
-// straight-line, constant-offset element accesses.
-static cl::opt<unsigned> JeandlePrePEAFullUnrollMaxCount(
-    "jeandle-pre-pea-full-unroll-max-count", cl::init(128), cl::Hidden,
-    cl::desc("Pre-PEA: max trip count eligible for full unrolling in the "
-             "high-tier cluster. Default 128, matching "
-             "-jeandle-pea-max-array-length."));
 
 namespace {
 
@@ -181,6 +176,14 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
       break;
     }
   }
+  FunctionPassManager PostInlinePollCleanup;
+  PostInlinePollCleanup.addPass(SafepointPollNormalization());
+  PostInlinePollCleanup.addPass(SimplifyCFGPass());
+  PM.addPass(
+      createModuleToFunctionPassAdaptor(std::move(PostInlinePollCleanup)));
+  PM.addPass(
+      createModuleToFunctionPassAdaptor(StringIntrinsicSpecialization()));
+  PM.addPass(createModuleToFunctionPassAdaptor(RepeatedConstantFolding()));
   // ==== PEA segment ====
   // Everything below up to InsertGCBarriers exists to serve PEA: the
   // high-tier loop-optimization cluster that exposes virtualization
@@ -202,9 +205,21 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
     // new precision).
     FunctionPassManager PrePEAHighTier;
     PrePEAHighTier.addPass(JavaOpLengthFolding());
+    // Newly folded array lengths expose bounded String operations involving
+    // a local array and a material operand. Expand them before PEA decides
+    // whether the local array escapes.
+    PrePEAHighTier.addPass(StringIntrinsicSpecialization());
+    // Fold the comparisons exposed by known lengths before the unroller
+    // estimates body cost; dead bounds-check blocks can otherwise hide a
+    // profitable full unroll from the high-tier cluster.
+    PrePEAHighTier.addPass(InstCombinePass());
+    PrePEAHighTier.addPass(SimplifyCFGPass());
     // Re-establish the canonical loop form; the inline driver may have
     // introduced loops that are not in simplified form.
     PrePEAHighTier.addPass(LoopSimplifyPass());
+    // Separate invoke backedges from multi-predecessor headers so rotation
+    // exposes ordinary branch latches to the full unroller.
+    PrePEAHighTier.addPass(BreakCriticalEdgesPass());
     {
       // Loop-canonicalization pipeline: rotation makes loops do-while
       // shaped, indvars rewrites induction variables into a form SCEV can
@@ -221,12 +236,13 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
     // runtime, and upper-bound unrolling are disabled; peeling stays at the
     // default policy (it peels a few iterations off loops that resist full
     // unrolling, exposing straight-line allocations to PEA).
+    PrePEAHighTier.addPass(PrePEAAllocationUnrollHints());
     PrePEAHighTier.addPass(LoopUnrollPass(
         LoopUnrollOptions(/*OptLevel=*/3)
             .setPartial(false)
             .setRuntime(false)
             .setUpperBound(false)
-            .setFullUnrollMaxCount(JeandlePrePEAFullUnrollMaxCount)));
+            .setFullUnrollMaxCount(getPrePEAFullUnrollMaxCount())));
     PrePEAHighTier.addPass(createFunctionToLoopPassAdaptor(
         SimpleLoopUnswitchPass(/*NonTrivial=*/true)));
     PrePEAHighTier.addPass(InstCombinePass());
@@ -298,6 +314,12 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   PM.addPass(createModuleToFunctionPassAdaptor(RecoverTypeInfo()));
   PM.addPass(createModuleToFunctionPassAdaptor(TypeCheckElimination()));
   PM.addPass(createModuleToFunctionPassAdaptor(RepeatedConstantFolding()));
+  // PEA can expose stable array references whose lengths become constant only
+  // in the cleanup above. Specialize their String operations before lowering,
+  // then let the VM-authorized folder consume any newly exposed cells.
+  PM.addPass(
+      createModuleToFunctionPassAdaptor(StringIntrinsicSpecialization()));
+  PM.addPass(createModuleToFunctionPassAdaptor(RepeatedConstantFolding()));
   PM.addPass(createModuleToFunctionPassAdaptor(CopySpecialization()));
   PM.addPass(createModuleToFunctionPassAdaptor(TypeCheckElimination()));
 
@@ -344,6 +366,10 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
         SafepointPollEliminationMode::LoopDeletionPrep)));
   }
 
+  // High-tier passes resolve runtime declarations and layout constants by
+  // name. Once those passes finish, prune unused private kernels before
+  // expanding their bodies; late GC operations remain rooted by llvm.used.
+  PM.addPass(GlobalDCEPass());
   PM.addPass(JavaOperationLower(1));
   PM.addPass(std::move(PB.buildPerModuleDefaultPipeline(Level)));
   PM.addPass(ExpandNarrowOopCast());

@@ -1,5 +1,6 @@
 add_llvm_component_library(LLVMJeandleTransforms
   CopySpecialization.cpp
+  StringIntrinsicSpecialization.cpp
   CHADevirtualization.cpp
   ConstantFieldFolding.cpp
   ExpandNarrowOopCast.cpp
@@ -9,6 +10,7 @@ add_llvm_component_library(LLVMJeandleTransforms
   JavaOpLengthFolding.cpp
   PartialEscapeIterative.cpp
   PartialEscapeTransform.cpp
+  PrePEAAllocationUnrollHints.cpp
   JeandleNarrowOopMarker.cpp
   JeandleInlineDriver.cpp
   JeandleInliner.cpp
@@ -17,6 +19,7 @@ add_llvm_component_library(LLVMJeandleTransforms
   RepeatedConstantFolding.cpp
   SafepointCoverageVerifier.cpp
   SafepointPollElimination.cpp
+  SafepointPollNormalization.cpp
   SafepointStripMining.cpp
   SafepointUtils.cpp
   TLSPointerRewrite.cpp
