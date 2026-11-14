@@ -6530,8 +6530,13 @@ bool Analyzer::foldCheckInstanceOf(CallBase *CB) {
   // exact allocation klass.
   LLVMContext &Ctx = F.getContext();
   Type *KlassTy = PointerType::get(Ctx, 0);
-  FunctionType *CheckTy = FunctionType::get(
-      Type::getInt1Ty(Ctx), {KlassTy, PointerType::get(Ctx, 1)}, false);
+  bool WithOffset = CB->getCalledFunction()->getName() ==
+                    "jeandle.checkcast_nonnull_with_offset";
+  SmallVector<Type *, 3> Params{KlassTy, PointerType::get(Ctx, 1)};
+  if (WithOffset)
+    Params.push_back(Type::getInt32Ty(Ctx));
+  FunctionType *CheckTy =
+      FunctionType::get(Type::getInt1Ty(Ctx), Params, false);
   if (CB->getFunctionType() != CheckTy)
     return false;
   auto BaseID = jeandle::pea::resolveVirtualRef(CB->getArgOperand(1),
@@ -6550,8 +6555,8 @@ bool Analyzer::foldCheckInstanceOf(CallBase *CB) {
     // allocation needs no object header or additional frame state. Retain
     // unusual call forms and unknown constant relations conservatively.
     auto *Call = dyn_cast<CallInst>(CB);
-    if (!Call || Call->isMustTailCall() || CB->hasOperandBundles() ||
-        isa<Constant>(Super))
+    if (WithOffset || !Call || Call->isMustTailCall() ||
+        CB->hasOperandBundles() || isa<Constant>(Super))
       return false;
     auto Identity = jeandle::pea::resolveVirtualIdentity(
         CB->getArgOperand(1), CurrentState, Aliases, DL,

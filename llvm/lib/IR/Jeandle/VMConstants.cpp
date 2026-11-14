@@ -162,6 +162,19 @@ VMConstants VMConstants::fromModule(const Module &M) {
   if (auto V = readGlobalInt(M, "VMOptions.ArrayCopyLoadStoreMaxElem"))
     C.ArrayCopyLoadStoreMaxElem = *V;
 
+  if (auto V = readGlobalInt(M, "JVM_ACC_PUBLIC"))
+    C.JVMAccPublic = static_cast<uint32_t>(*V);
+  if (auto V = readGlobalInt(M, "JVM_ACC_FINAL"))
+    C.JVMAccFinal = static_cast<uint32_t>(*V);
+  if (auto V = readGlobalInt(M, "JVM_ACC_ABSTRACT"))
+    C.JVMAccAbstract = static_cast<uint32_t>(*V);
+  if (auto V = readGlobalInt(M, "JVM_ACC_INTERFACE"))
+    C.JVMAccInterface = static_cast<uint32_t>(*V);
+  if (auto V = readGlobalInt(M, "JVM_ACC_IS_HIDDEN_CLASS"))
+    C.JVMAccHiddenClass = static_cast<uint32_t>(*V);
+  if (auto V = readGlobalInt(M, "JVM_ACC_WRITTEN_FLAGS"))
+    C.JVMAccWrittenFlags = static_cast<uint32_t>(*V);
+
   return C;
 }
 

@@ -15,6 +15,7 @@
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/ADT/StringSwitch.h"
 #include "llvm/Analysis/LazyValueInfo.h"
 #include "llvm/Analysis/SimplifyQuery.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -57,6 +58,9 @@ STATISTIC(NumKlassLayoutHelpersFolded,
 STATISTIC(NumKlassInitializedFolded,
           "Number of jeandle.klass_is_initialized calls folded");
 STATISTIC(NumKlassQueriesFolded, "Number of semantic Klass queries folded");
+STATISTIC(NumClassChecksSpecialized,
+          "Number of primary-super checks specialized");
+STATISTIC(NumClassQueriesFolded, "Number of Class property queries folded");
 STATISTIC(NumRounds, "Number of folding rounds");
 STATISTIC(NumOopChains, "Number of oop chains followed");
 
@@ -424,6 +428,220 @@ bool isGetClassCall(CallInst *CI) {
   Function *Callee = CI ? CI->getCalledFunction() : nullptr;
   return Callee && Callee->getName() == "jeandle.get_class" &&
          CI->arg_size() == 1;
+}
+
+// Preserve the canonical dynamic check. Only expose a preloaded offset once
+// propagation has proved the target Klass constant.
+bool specializeConstantClassCheck(CallInst *CI,
+                                  const jeandle::VMCallbacks &CB) {
+  Function *Callee = CI->getCalledFunction();
+  if (!Callee || Callee->getName() != "jeandle.check_instanceof" ||
+      CI->getFunctionType() != Callee->getFunctionType() ||
+      CI->getCallingConv() != Callee->getCallingConv() ||
+      CI->getFunctionType()->isVarArg() || CI->hasOperandBundles() ||
+      CI->isMustTailCall() || !CB.GetSuperCheckOffset || CI->arg_size() != 2 ||
+      CI->getArgOperand(0)->getType() !=
+          PointerType::get(CI->getContext(), 0) ||
+      !CI->getType()->isIntegerTy(1))
+    return false;
+  uintptr_t Klass = jeandle::extractKlassConstant(CI->getArgOperand(0));
+  Function *WithOffset =
+      CI->getModule()->getFunction("jeandle.checkcast_nonnull_with_offset");
+  if (!Klass || Klass == jeandle::MirrorKlassUnavailable || !WithOffset ||
+      WithOffset->getCallingConv() != CI->getCallingConv() ||
+      WithOffset->isVarArg() || WithOffset->arg_size() != 3 ||
+      WithOffset->getReturnType() != CI->getType() ||
+      !isWideOopType(CI->getArgOperand(1)->getType()) ||
+      WithOffset->getFunctionType()->getParamType(0) !=
+          CI->getArgOperand(0)->getType() ||
+      WithOffset->getFunctionType()->getParamType(1) !=
+          CI->getArgOperand(1)->getType() ||
+      !WithOffset->getFunctionType()->getParamType(2)->isIntegerTy(32))
+    return false;
+  // Only specialize primary-super checks, where the constant offset also
+  // removes the secondary-super branch. Preserve the canonical secondary path.
+  GlobalVariable *SecondaryOffset = CI->getModule()->getGlobalVariable(
+      "Klass.secondary_super_cache_offset", true);
+  auto *Secondary =
+      SecondaryOffset && SecondaryOffset->isConstant() &&
+              SecondaryOffset->hasInitializer()
+          ? dyn_cast<ConstantInt>(SecondaryOffset->getInitializer())
+          : nullptr;
+  int Offset = CB.GetSuperCheckOffset(Klass);
+  if (Offset < 0 || !Secondary || !Secondary->getType()->isIntegerTy(32) ||
+      Secondary->getValue().getLimitedValue() == static_cast<uint32_t>(Offset))
+    return false;
+  IRBuilder<> Builder(CI);
+  SmallVector<OperandBundleDef, 1> Bundles;
+  CI->getOperandBundlesAsDefs(Bundles);
+  CallInst *Check = Builder.CreateCall(
+      WithOffset,
+      {CI->getArgOperand(0), CI->getArgOperand(1), Builder.getInt32(Offset)},
+      Bundles);
+  Check->setCallingConv(CI->getCallingConv());
+  Check->setAttributes(CI->getAttributes());
+  Check->copyMetadata(*CI);
+  Check->setDebugLoc(CI->getDebugLoc());
+  CI->replaceAllUsesWith(Check);
+  CI->eraseFromParent();
+  return true;
+}
+
+enum class ClassQueryKind {
+  IsArray,
+  IsInterface,
+  IsPrimitive,
+  IsHidden,
+  GetModifiers,
+  GetAccessFlags
+};
+
+std::optional<ClassQueryKind> getClassQueryKind(CallInst *CI) {
+  Function *Callee = CI->getCalledFunction();
+  if (!Callee || CI->getFunctionType() != Callee->getFunctionType() ||
+      CI->getCallingConv() != Callee->getCallingConv() ||
+      CI->getFunctionType()->isVarArg() || CI->hasOperandBundles() ||
+      CI->isMustTailCall() || CI->arg_size() != 1 ||
+      !isWideOopType(CI->getArgOperand(0)->getType()) ||
+      !CI->getType()->isIntegerTy(32))
+    return std::nullopt;
+  return StringSwitch<std::optional<ClassQueryKind>>(Callee->getName())
+      .Case("jeandle.class_is_array", ClassQueryKind::IsArray)
+      .Case("jeandle.class_is_interface", ClassQueryKind::IsInterface)
+      .Case("jeandle.class_is_primitive", ClassQueryKind::IsPrimitive)
+      .Case("jeandle.class_is_hidden", ClassQueryKind::IsHidden)
+      .Case("jeandle.class_get_modifiers", ClassQueryKind::GetModifiers)
+      .Case("jeandle.class_get_access_flags", ClassQueryKind::GetAccessFlags)
+      .Default(std::nullopt);
+}
+
+std::optional<int>
+classQueryForConstantMirror(int OopId, ClassQueryKind Kind,
+                            const jeandle::VMCallbacks &CB,
+                            const jeandle::VMConstants &VMC) {
+  uintptr_t Klass = CB.GetMirrorKlass(OopId);
+  if (Klass == jeandle::MirrorKlassUnavailable)
+    return std::nullopt;
+  if (!Klass) {
+    if (Kind == ClassQueryKind::IsPrimitive)
+      return 1;
+    if (Kind == ClassQueryKind::GetModifiers ||
+        Kind == ClassQueryKind::GetAccessFlags)
+      return VMC.jvmAccPublic() | VMC.jvmAccFinal() | VMC.jvmAccAbstract();
+    return 0;
+  }
+  switch (Kind) {
+  case ClassQueryKind::IsArray: {
+    if (!CB.GetKlassLayoutHelper)
+      return std::nullopt;
+    int Layout = CB.GetKlassLayoutHelper(Klass);
+    return Layout ? std::optional<int>(Layout < 0) : std::nullopt;
+  }
+  case ClassQueryKind::IsPrimitive:
+    return 0;
+  case ClassQueryKind::GetModifiers: {
+    if (!CB.GetKlassModifiers)
+      return std::nullopt;
+    int Modifiers = CB.GetKlassModifiers(Klass);
+    return Modifiers >= 0 ? std::optional<int>(Modifiers) : std::nullopt;
+  }
+  case ClassQueryKind::IsInterface:
+  case ClassQueryKind::IsHidden:
+  case ClassQueryKind::GetAccessFlags: {
+    if (!CB.GetKlassAccessFlags)
+      return std::nullopt;
+    uint32_t Mask = Kind == ClassQueryKind::IsInterface ? VMC.jvmAccInterface()
+                    : Kind == ClassQueryKind::IsHidden
+                        ? VMC.jvmAccHiddenClass()
+                        : VMC.jvmAccWrittenFlags();
+    if (Mask & ~jeandle::ClassQueryAccessFlagsMask)
+      return std::nullopt;
+    int64_t Flags = CB.GetKlassAccessFlags(Klass, Mask);
+    if (Flags < 0 || Flags > UINT32_MAX)
+      return std::nullopt;
+    Flags &= Mask;
+    return Kind == ClassQueryKind::GetAccessFlags ? Flags : Flags != 0;
+  }
+  }
+  llvm_unreachable("unknown Class query kind");
+}
+
+// Different constant mirrors can have the same queried property even when the
+// ConstOop lattice cannot retain a single identity. Cache both known and
+// unknown results per query. An empty entry also breaks cycles conservatively.
+// Count every operand visit, including cache hits, so wide PHIs have a bounded
+// cost.
+std::optional<int> classQueryForMirror(
+    Value *Mirror, ClassQueryKind Kind, const jeandle::VMCallbacks &CB,
+    const jeandle::VMConstants &VMC, const DenseMap<Value *, int> &ConstOops,
+    DenseMap<Value *, std::optional<int>> &Results, unsigned &RemainingVisits,
+    unsigned Depth = 0) {
+  if (RemainingVisits == 0)
+    return std::nullopt;
+  --RemainingVisits;
+  auto It = Results.find(Mirror);
+  if (It != Results.end())
+    return It->second;
+  if (Depth >= 32)
+    return std::nullopt;
+
+  Results.try_emplace(Mirror, std::nullopt);
+  std::optional<int> Result;
+  if (std::optional<int> OopId = lookupConstOop(Mirror, ConstOops)) {
+    Result = classQueryForConstantMirror(*OopId, Kind, CB, VMC);
+  } else if (auto *SI = dyn_cast<SelectInst>(Mirror)) {
+    std::optional<int> True =
+        classQueryForMirror(SI->getTrueValue(), Kind, CB, VMC, ConstOops,
+                            Results, RemainingVisits, Depth + 1);
+    if (True) {
+      std::optional<int> False =
+          classQueryForMirror(SI->getFalseValue(), Kind, CB, VMC, ConstOops,
+                              Results, RemainingVisits, Depth + 1);
+      if (False && *True == *False)
+        Result = *True;
+    }
+  } else if (auto *PN = dyn_cast<PHINode>(Mirror)) {
+    for (Value *Incoming : PN->incoming_values()) {
+      std::optional<int> Next =
+          classQueryForMirror(Incoming, Kind, CB, VMC, ConstOops, Results,
+                              RemainingVisits, Depth + 1);
+      if (!Next || (Result && *Result != *Next)) {
+        Result = std::nullopt;
+        break;
+      }
+      Result = *Next;
+    }
+  } else if (auto *FI = dyn_cast<FreezeInst>(Mirror)) {
+    if (jeandle::isProvenDefined(FI->getOperand(0)))
+      Result = classQueryForMirror(FI->getOperand(0), Kind, CB, VMC, ConstOops,
+                                   Results, RemainingVisits, Depth + 1);
+  } else if (isa<BitCastInst>(Mirror) || isa<AddrSpaceCastInst>(Mirror)) {
+    Result = classQueryForMirror(cast<Instruction>(Mirror)->getOperand(0), Kind,
+                                 CB, VMC, ConstOops, Results, RemainingVisits,
+                                 Depth + 1);
+  }
+
+  Results[Mirror] = Result;
+  return Result;
+}
+
+bool foldClassQueryCall(CallInst *CI, ClassQueryKind Kind,
+                        const jeandle::VMCallbacks &CB,
+                        const jeandle::VMConstants &VMC,
+                        const DenseMap<Value *, int> &ConstOops) {
+  if (!CB.GetMirrorKlass)
+    return false;
+
+  DenseMap<Value *, std::optional<int>> Results;
+  unsigned RemainingVisits = 256;
+  std::optional<int> Result = classQueryForMirror(
+      CI->getArgOperand(0), Kind, CB, VMC, ConstOops, Results, RemainingVisits);
+  if (!Result)
+    return false;
+
+  CI->replaceAllUsesWith(ConstantInt::get(CI->getType(), *Result));
+  CI->eraseFromParent();
+  return true;
 }
 
 enum class KlassQueryKind { Modifiers, AccessFlags, Super, Mirror };
@@ -925,8 +1143,10 @@ PreservedAnalyses ConstantFieldFolding::run(Function &F,
     SmallVector<CallInst *, 16> LoadKlassCalls;
     SmallVector<CallInst *, 16> LoadMirrorKlassCalls;
     SmallVector<CallInst *, 16> GetClassCalls;
+    SmallVector<CallInst *, 16> ClassChecks;
     SmallVector<CallInst *, 16> LayoutHelperCalls;
     SmallVector<CallInst *, 16> KlassInitializedCalls;
+    SmallVector<std::pair<CallInst *, ClassQueryKind>, 16> ClassQueryCalls;
     SmallVector<std::pair<CallInst *, KlassQueryKind>, 16> KlassQueryCalls;
     SmallVector<LoadInst *, 16> Loads;
     for (BasicBlock *BB : RPOT) {
@@ -940,12 +1160,17 @@ PreservedAnalyses ConstantFieldFolding::run(Function &F,
             LoadKlassCalls.push_back(CI);
           if (isLoadMirrorKlassCall(CI))
             LoadMirrorKlassCalls.push_back(CI);
+          if (CI->getCalledFunction() &&
+              CI->getCalledFunction()->getName() == "jeandle.check_instanceof")
+            ClassChecks.push_back(CI);
           if (isGetClassCall(CI))
             GetClassCalls.push_back(CI);
           if (isLayoutHelperCall(CI))
             LayoutHelperCalls.push_back(CI);
           if (isKlassInitializedCall(CI))
             KlassInitializedCalls.push_back(CI);
+          if (auto Kind = getClassQueryKind(CI))
+            ClassQueryCalls.emplace_back(CI, *Kind);
           if (std::optional<KlassQueryKind> Kind = getKlassQueryKind(CI))
             KlassQueryCalls.emplace_back(CI, *Kind);
         }
@@ -1017,6 +1242,22 @@ PreservedAnalyses ConstantFieldFolding::run(Function &F,
         continue;
       if (foldKlassInitializedCall(CI, *CB)) {
         ++NumKlassInitializedFolded;
+        RoundChanged = true;
+        Changed = true;
+      }
+    }
+
+    for (CallInst *CI : ClassChecks) {
+      if (specializeConstantClassCheck(CI, *CB)) {
+        ++NumClassChecksSpecialized;
+        RoundChanged = true;
+        Changed = true;
+      }
+    }
+
+    for (auto [CI, Kind] : ClassQueryCalls) {
+      if (foldClassQueryCall(CI, Kind, *CB, VMConsts, ConstOops)) {
+        ++NumClassQueriesFolded;
         RoundChanged = true;
         Changed = true;
       }

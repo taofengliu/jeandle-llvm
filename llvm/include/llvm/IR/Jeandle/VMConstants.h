@@ -113,6 +113,13 @@ struct VMConstants {
   int64_t ArrayOperationPartialInlineSize = 0;
   int64_t ArrayCopyLoadStoreMaxElem = 8;
 
+  uint32_t JVMAccPublic = 0x1;
+  uint32_t JVMAccFinal = 0x10;
+  uint32_t JVMAccAbstract = 0x400;
+  uint32_t JVMAccInterface = 0x200;
+  uint32_t JVMAccHiddenClass = 0x4000000;
+  uint32_t JVMAccWrittenFlags = 0x7fff;
+
   // Convenience accessors.
   int64_t arrayLengthOffset() const { return ArrayLengthOffset; }
   int64_t klassOffset() const { return KlassOffset; }
@@ -127,6 +134,13 @@ struct VMConstants {
   }
   bool reduceBulkZeroing() const { return ReduceBulkZeroing; }
   bool reduceInitialCardMarks() const { return ReduceInitialCardMarks; }
+
+  uint32_t jvmAccPublic() const { return JVMAccPublic; }
+  uint32_t jvmAccFinal() const { return JVMAccFinal; }
+  uint32_t jvmAccAbstract() const { return JVMAccAbstract; }
+  uint32_t jvmAccInterface() const { return JVMAccInterface; }
+  uint32_t jvmAccHiddenClass() const { return JVMAccHiddenClass; }
+  uint32_t jvmAccWrittenFlags() const { return JVMAccWrittenFlags; }
 
   // Returns the array base offset for an element type. Returns -1 if Ty is not
   // a recognised Jeandle element type.

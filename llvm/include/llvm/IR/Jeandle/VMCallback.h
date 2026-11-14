@@ -238,6 +238,9 @@ enum class JeandleInlineReason : int {
   def(GetMirrorKlass, uintptr_t, Uintptr,                                        \
       (int a1), (a1),                                                            \
       (VMCallbackValueType::Int), 1)                                             \
+  def(GetSuperCheckOffset, int, Int,                                            \
+      (uintptr_t a1), (a1),                                                      \
+      (VMCallbackValueType::Uintptr), 1)                                         \
   def(GetKlassModifiers, int, Int,                                              \
       (uintptr_t a1), (a1),                                                      \
       (VMCallbackValueType::Uintptr), 1)                                         \
