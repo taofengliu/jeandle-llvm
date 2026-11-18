@@ -65,7 +65,7 @@ attributes #0 = { "lower-phase"="1" "noinline" }
 ; STATEPOINT:         %[[SUM:[^ ]+]] = phi i64
 ; STATEPOINT:         %[[IV:[^ ]+]] = phi i64
 ; STATEPOINT:         %[[SUM_NEXT:[^ ]+]] = add i64 %[[SUM]], %[[IV]]
-; STATEPOINT:         %[[IV_NEXT:[^ ]+]] = add i64 %[[IV]], 1
+; STATEPOINT:         %[[IV_NEXT:[^ ]+]] = add nsw i64 %[[IV]], 1
 ; STATEPOINT:       body.outer:
 ; STATEPOINT:         %[[OBJ:[^ ]+]] = phi ptr addrspace(1) [ %obj, %body.outer.ph ], [ %[[RELOCATED:[^, ]+]], %body.outer.latch ]
 ; STATEPOINT:       body.outer.latch:

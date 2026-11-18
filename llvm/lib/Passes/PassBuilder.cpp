@@ -287,6 +287,7 @@
 #include "llvm/Transforms/Jeandle/ProfileDevirtualization.h"
 #include "llvm/Transforms/Jeandle/RecoverTypeInfo.h"
 #include "llvm/Transforms/Jeandle/RepeatedConstantFolding.h"
+#include "llvm/Transforms/Jeandle/SafepointBudgetStripMining.h"
 #include "llvm/Transforms/Jeandle/SafepointCoverageVerifier.h"
 #include "llvm/Transforms/Jeandle/SafepointPollElimination.h"
 #include "llvm/Transforms/Jeandle/SafepointPollNormalization.h"

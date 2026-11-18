@@ -12,6 +12,7 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/Analysis/MemorySSA.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/ValueTracking.h"
@@ -19,6 +20,7 @@
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Jeandle/Attributes.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/CommandLine.h"
@@ -39,6 +41,40 @@ static cl::opt<bool> EnableInclusiveLoopVersioning(
     "jeandle-enable-inclusive-loop-versioning", cl::init(true),
     cl::desc("Clone supported runtime-risk inclusive loops behind a no-wrap "
              "guard so the safe version can be strip-mined."));
+
+static cl::opt<uint64_t> SafepointMaxWork(
+    "jeandle-safepoint-max-work", cl::Hidden, cl::init(1000000),
+    cl::desc("Total safepoint analysis work per function pass invocation."));
+static cl::opt<unsigned> SafepointMaxDepth(
+    "jeandle-safepoint-max-depth", cl::Hidden, cl::init(64),
+    cl::desc("Maximum loop depth for safepoint transformations."));
+
+jeandle::SafepointWorkBudget::SafepointWorkBudget()
+    : Remaining(SafepointMaxWork) {}
+
+bool jeandle::SafepointWorkBudget::spend(uint64_t Work) {
+  if (Exhausted || Work > Remaining) {
+    Exhausted = true;
+    return false;
+  }
+  Remaining -= Work;
+  return true;
+}
+
+bool jeandle::SafepointWorkBudget::checkDepth(Loop &L) {
+  unsigned Depth = 0;
+  for (Loop *P = &L; P; P = P->getParentLoop()) {
+    if (++Depth > SafepointMaxDepth || !spend()) {
+      Exhausted = true;
+      return false;
+    }
+  }
+  return true;
+}
+
+bool jeandle::SafepointLoopAnalysis::checkLoop(Loop &L) {
+  return Work.checkDepth(L) && Work.spend(L.getNumBlocks());
+}
 
 uint64_t llvm::jeandle::getLoopStripMiningIter() { return LoopStripMiningIter; }
 
@@ -88,7 +124,7 @@ bool llvm::jeandle::canProveExclusiveNoWrap(const SCEVAddRecExpr *AR,
                                             ScalarEvolution &SE) {
   if (Step.abs().isOne())
     return true;
-  if (Signed ? AR->hasNoSignedWrap() : AR->hasNoUnsignedWrap())
+  if (Signed ? AR->hasNoSignedWrap() : Increasing && AR->hasNoUnsignedWrap())
     return true;
 
   unsigned BW = AR->getType()->getIntegerBitWidth();
@@ -119,7 +155,7 @@ bool llvm::jeandle::canProveInclusiveNoWrap(const SCEVAddRecExpr *AR,
                                             ScalarEvolution &SE) {
   if (!isGuaranteedNotToBeUndefOrPoison(Limit))
     return false;
-  if (Signed ? AR->hasNoSignedWrap() : AR->hasNoUnsignedWrap())
+  if (Signed ? AR->hasNoSignedWrap() : Increasing && AR->hasNoUnsignedWrap())
     return true;
 
   unsigned BW = AR->getType()->getIntegerBitWidth();
@@ -205,6 +241,265 @@ bool llvm::jeandle::backedgeCountProvablyLessThan(Loop &L,
   return Value.ult(APInt(Value.getBitWidth(), ExclusiveLimit));
 }
 
+// A defined no-wrap add/sub gives a mathematical distance from Start. For
+// unsigned clamps, a min/max of a saturating batch end and the source limit
+// can only shorten that distance.
+static bool hasNonWrappingUpdate(Value *V, bool Signed, bool Increasing) {
+  auto *BO = dyn_cast<BinaryOperator>(V);
+  if (!BO || (BO->getOpcode() != Instruction::Add &&
+              BO->getOpcode() != Instruction::Sub))
+    return false;
+  if (Signed)
+    return BO->hasNoSignedWrap();
+  if (!BO->hasNoUnsignedWrap())
+    return false;
+  auto *C = dyn_cast<ConstantInt>(BO->getOperand(1));
+  if (Increasing && BO->getOpcode() == Instruction::Add) {
+    if (!C)
+      C = dyn_cast<ConstantInt>(BO->getOperand(0));
+  } else if (Increasing || BO->getOpcode() != Instruction::Sub) {
+    return false;
+  }
+  return C && !C->isNegative();
+}
+
+static bool
+isProgressFromImpl(Value *V, Value *Base, bool Signed, bool Increasing,
+                   ScalarEvolution &SE, unsigned Depth,
+                   DenseMap<std::pair<Value *, unsigned>, bool> &Cache) {
+  if (V == Base)
+    return true;
+  if (Depth == 8)
+    return false;
+  auto Key = std::make_pair(V, Depth);
+  auto [It, Inserted] = Cache.try_emplace(Key, false);
+  if (!Inserted)
+    return It->second;
+  // Cache failures as well as successes: merged PHI paths can otherwise
+  // repeatedly traverse the same value graph.
+
+  bool Result = [&]() {
+    if (const auto *AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(V))) {
+      const auto *Step = dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE));
+      if (AR->isAffine() && AR->getStart() == SE.getSCEV(Base) && Step &&
+          !Step->getAPInt().isZero() &&
+          Step->getAPInt().isNegative() != Increasing) {
+        bool NoWrap = Signed ? AR->hasNoSignedWrap()
+                             : Increasing && AR->hasNoUnsignedWrap();
+        if (auto *Phi = dyn_cast<PHINode>(V)) {
+          if (Phi->getParent() == AR->getLoop()->getHeader())
+            if (BasicBlock *Latch = AR->getLoop()->getLoopLatch())
+              NoWrap |= hasNonWrappingUpdate(
+                  Phi->getIncomingValueForBlock(Latch), Signed, Increasing);
+        }
+        if (NoWrap)
+          return true;
+      }
+    }
+    if (auto *Phi = dyn_cast<PHINode>(V))
+      return llvm::all_of(Phi->incoming_values(), [&](Value *Incoming) {
+        return isProgressFromImpl(Incoming, Base, Signed, Increasing, SE,
+                                  Depth + 1, Cache);
+      });
+    if (auto *BO = dyn_cast<BinaryOperator>(V)) {
+      if (BO->getOpcode() != Instruction::Add &&
+          BO->getOpcode() != Instruction::Sub)
+        return false;
+      auto *C = dyn_cast<ConstantInt>(BO->getOperand(1));
+      bool NoWrap = Signed ? BO->hasNoSignedWrap() : BO->hasNoUnsignedWrap();
+      if (!C || !NoWrap || (!Signed && C->isNegative()))
+        return false;
+      bool Forward = BO->getOpcode() == Instruction::Add
+                         ? C->getValue().isNegative() != Increasing
+                         : BO->getOpcode() == Instruction::Sub &&
+                               C->getValue().isNegative() == Increasing;
+      return Forward && isProgressFromImpl(BO->getOperand(0), Base, Signed,
+                                           Increasing, SE, Depth + 1, Cache);
+    }
+    return false;
+  }();
+  Cache[Key] = Result;
+  return Result;
+}
+
+static bool isProgressFrom(Value *V, Value *Base, bool Signed, bool Increasing,
+                           ScalarEvolution &SE) {
+  DenseMap<std::pair<Value *, unsigned>, bool> Cache;
+  return isProgressFromImpl(V, Base, Signed, Increasing, SE, 0, Cache);
+}
+
+static Value *getClampedDistance(Value *Limit, Value *Start, bool Signed,
+                                 bool Increasing, ScalarEvolution &SE) {
+  if (auto *BO = dyn_cast<BinaryOperator>(Limit)) {
+    bool NoWrap = (BO->getOpcode() == Instruction::Add ||
+                   BO->getOpcode() == Instruction::Sub) &&
+                  (Signed ? BO->hasNoSignedWrap() : BO->hasNoUnsignedWrap());
+    if (!NoWrap)
+      return nullptr;
+    if (Increasing && BO->getOpcode() == Instruction::Add) {
+      if (isProgressFrom(Start, BO->getOperand(0), Signed, Increasing, SE))
+        return BO->getOperand(1);
+      if (isProgressFrom(Start, BO->getOperand(1), Signed, Increasing, SE))
+        return BO->getOperand(0);
+    }
+    if (!Increasing && BO->getOpcode() == Instruction::Sub &&
+        isProgressFrom(Start, BO->getOperand(0), Signed, Increasing, SE))
+      return BO->getOperand(1);
+  }
+  if (Signed)
+    return nullptr;
+  auto *Sel = dyn_cast<SelectInst>(Limit);
+  if (!Sel)
+    return nullptr;
+  auto *Cmp = dyn_cast<ICmpInst>(Sel->getCondition());
+  if (!Cmp)
+    return nullptr;
+  Value *Cap = Sel->getTrueValue();
+  Value *Other = Sel->getFalseValue();
+  auto Pred = Cmp->getPredicate();
+  if (Cmp->getOperand(0) == Other && Cmp->getOperand(1) == Cap)
+    Pred = CmpInst::getSwappedPredicate(Pred);
+  else if (Cmp->getOperand(0) != Cap || Cmp->getOperand(1) != Other)
+    return nullptr;
+  if (Increasing ? (Pred != ICmpInst::ICMP_ULT && Pred != ICmpInst::ICMP_ULE)
+                 : (Pred != ICmpInst::ICMP_UGT && Pred != ICmpInst::ICMP_UGE))
+    return nullptr;
+  auto *Sat = dyn_cast<IntrinsicInst>(Cap);
+  if (!Sat ||
+      Sat->getIntrinsicID() !=
+          (Increasing ? Intrinsic::uadd_sat : Intrinsic::usub_sat) ||
+      !isProgressFrom(Start, Sat->getArgOperand(0), Signed, Increasing, SE))
+    return nullptr;
+  return Sat->getArgOperand(1);
+}
+
+bool llvm::jeandle::isBoundedStripMinedInner(Loop &L, ScalarEvolution &SE,
+                                             DominatorTree &DT) {
+  uint64_t Budget = getLoopStripMiningIter();
+  if (!Budget || !L.isInnermost() || !isMarkedStripMinedInner(L))
+    return false;
+  if (backedgeCountProvablyLessThan(L, Budget, SE))
+    return true;
+  BasicBlock *Latch = L.getLoopLatch();
+  BasicBlock *Preheader = L.getLoopPreheader();
+  if (!Latch || !Preheader)
+    return false;
+  SmallVector<BasicBlock *, 4> Exiting;
+  L.getExitingBlocks(Exiting);
+  for (BasicBlock *BB : Exiting) {
+    auto *Br = dyn_cast<BranchInst>(BB->getTerminator());
+    if (!Br || !Br->isConditional() || !DT.dominates(BB, Latch))
+      continue;
+    auto *Cmp = dyn_cast<ICmpInst>(Br->getCondition());
+    if (!Cmp)
+      continue;
+    auto Pred = Cmp->getPredicate();
+    if (!L.contains(Br->getSuccessor(0)))
+      Pred = CmpInst::getInversePredicate(Pred);
+    for (PHINode &Phi : L.getHeader()->phis()) {
+      if (!Phi.getType()->isIntegerTy())
+        continue;
+      const auto *AR = dyn_cast<SCEVAddRecExpr>(SE.getSCEV(&Phi));
+      if (!AR || AR->getLoop() != &L || !AR->isAffine())
+        continue;
+      const auto *Step = dyn_cast<SCEVConstant>(AR->getStepRecurrence(SE));
+      if (!Step || Step->getAPInt().isZero() ||
+          Step->getAPInt().isMinSignedValue())
+        continue;
+      Value *Checked = Cmp->getOperand(0);
+      Value *Limit = Cmp->getOperand(1);
+      auto ContinuePred = Pred;
+      auto IsChecked = [&](Value *V) {
+        return V == &Phi || V == Phi.getIncomingValueForBlock(Latch);
+      };
+      if (!IsChecked(Checked)) {
+        std::swap(Checked, Limit);
+        ContinuePred = CmpInst::getSwappedPredicate(ContinuePred);
+      }
+      if (!IsChecked(Checked) || !L.isLoopInvariant(Limit))
+        continue;
+      // A next value must really be one step of this recurrence. Cyclic PHIs
+      // and arbitrary latch-carried expressions are not induction proofs.
+      unsigned Offset = Checked != &Phi;
+      if (SE.getSCEV(Checked) != (Offset ? SE.getAddExpr(AR, Step) : AR))
+        continue;
+      bool Signed = ICmpInst::isSigned(ContinuePred);
+      bool Increasing = !Step->getAPInt().isNegative();
+      bool Inclusive;
+      switch (ContinuePred) {
+      case ICmpInst::ICMP_SLT:
+      case ICmpInst::ICMP_ULT:
+        if (!Increasing)
+          continue;
+        Inclusive = false;
+        break;
+      case ICmpInst::ICMP_SLE:
+      case ICmpInst::ICMP_ULE:
+        if (!Increasing)
+          continue;
+        Inclusive = true;
+        break;
+      case ICmpInst::ICMP_SGT:
+      case ICmpInst::ICMP_UGT:
+        if (Increasing)
+          continue;
+        Inclusive = false;
+        break;
+      case ICmpInst::ICMP_SGE:
+      case ICmpInst::ICMP_UGE:
+        if (Increasing)
+          continue;
+        Inclusive = true;
+        break;
+      default:
+        continue;
+      }
+      Value *Start = Phi.getIncomingValueForBlock(Preheader);
+      bool NoWrap = Signed ? AR->hasNoSignedWrap()
+                           : Increasing && AR->hasNoUnsignedWrap();
+      NoWrap |= hasNonWrappingUpdate(Phi.getIncomingValueForBlock(Latch),
+                                     Signed, Increasing);
+      // A modular add of a negative stride cannot carry LLVM's nuw flag.
+      // For an unsigned countdown, prove no borrow directly: the first
+      // update starts at or above |step|, and a continuation cannot take the
+      // recurrence below the predicate's no-borrow margin.
+      if (!NoWrap && !Signed && !Increasing) {
+        const SCEV *Magnitude = SE.getConstant(Step->getAPInt().abs());
+        const SCEV *Margin =
+            SE.getConstant(Step->getAPInt().abs() - !Inclusive);
+        NoWrap =
+            SE.isLoopEntryGuardedByCond(&L, ICmpInst::ICMP_UGE,
+                                        SE.getSCEV(Start), Magnitude) &&
+            SE.isKnownPredicate(ICmpInst::ICMP_UGE, SE.getSCEV(Limit), Margin);
+      }
+      if (!NoWrap)
+        continue;
+      Value *Distance =
+          getClampedDistance(Limit, Start, Signed, Increasing, SE);
+      if (!Distance)
+        continue;
+      const SCEV *Dist = SE.getSCEV(Distance);
+      if (Signed && SE.getSignedRangeMin(Dist).isNegative())
+        continue;
+      // At most N-1 true continuation tests. Use a wider type for the
+      // multiplication so extreme budgets cannot truncate the proof.
+      unsigned Width = Step->getAPInt().getBitWidth() + 65;
+      APInt Allowed = Step->getAPInt().abs().zext(Width) *
+                      APInt(Width, Budget - 1 + Offset);
+      if (Inclusive) {
+        if (Allowed.isZero())
+          continue;
+        --Allowed;
+      }
+      APInt Max =
+          Signed ? SE.getSignedRangeMax(Dist) : SE.getUnsignedRangeMax(Dist);
+      if (Max.zext(Width).ule(Allowed))
+        return true;
+    }
+  }
+  return false;
+}
+
 llvm::jeandle::LoopSafepointFacts
 llvm::jeandle::LoopSafepointFacts::get(Loop &L, ScalarEvolution &SE) {
   LoopSafepointFacts Facts;
@@ -214,217 +509,142 @@ llvm::jeandle::LoopSafepointFacts::get(Loop &L, ScalarEvolution &SE) {
   // This numerical approximation accepts loops whose maximum backedge count
   // is strictly below INT_MAX. It intentionally does not infer countedness
   // from the induction-variable type or loop shape.
-  Facts.IsIntCountedEquivalent = backedgeCountProvablyLessThan(L, INT_MAX, SE);
+  Facts.IsWithinIntBackedgeLimit =
+      backedgeCountProvablyLessThan(L, INT_MAX, SE);
   return Facts;
 }
-
-bool llvm::jeandle::hasGuaranteedCallCoverage(Loop &L, DominatorTree &DT) {
-  BasicBlock *Latch = L.getLoopLatch();
-  if (!Latch)
-    return false;
-  for (BasicBlock *BB : L.blocks())
-    if (DT.dominates(BB, Latch) && llvm::any_of(*BB, [](Instruction &I) {
-          return isSafepoint(I) && !isSafepointPoll(I);
-        }))
-      return true;
-  return false;
-}
-
-llvm::jeandle::LoopSafepointFacts
-llvm::jeandle::LoopSafepointFacts::get(Loop &L, LoopInfo &LI, DominatorTree &DT,
-                                       ScalarEvolution &SE) {
-  LoopSafepointFacts Facts = get(L, SE);
-  BasicBlock *Latch = L.getLoopLatch();
-  if (!Latch)
-    return Facts;
-
-  for (BasicBlock *BB : L.blocks()) {
-    if (!DT.dominates(BB, Latch))
-      continue;
-    for (Instruction &I : *BB) {
-      Facts.HasGuaranteedCallCoverage |= isSafepoint(I) && !isSafepointPoll(I);
-      Facts.HasOwnDominatingPoll |=
-          LI.getLoopFor(BB) == &L && isSafepointPoll(I);
-    }
-  }
-  return Facts;
-}
-
-bool jeandle::AncestorPollRequirements::isRequired(const CallInst &Poll,
-                                                   DominatorTree &DT) const {
-  if (AnyLatchlessUncoveredAncestor)
-    return true;
-  return llvm::any_of(Latches, [&](BasicBlock *Latch) {
-    return DT.dominates(Poll.getParent(), Latch);
-  });
-}
-
-llvm::jeandle::AncestorPollRequirements
-llvm::jeandle::computeAncestorPollRequirements(Loop &L, LoopInfo &LI,
-                                               DominatorTree &DT,
-                                               ScalarEvolution &SE) {
-  AncestorPollRequirements Requirements;
-  for (Loop *Ancestor = L.getParentLoop(); Ancestor;
-       Ancestor = Ancestor->getParentLoop()) {
-    LoopSafepointFacts Facts = LoopSafepointFacts::get(*Ancestor, LI, DT, SE);
-    // A maximum backedge count strictly below INT_MAX exempts an ancestor only
-    // when strip mining is disabled, matching deleteLoopPolls and the coverage
-    // verifier: only then does the loop drop all its own polls, so it need not
-    // depend on descendant polls either. With strip mining enabled such a loop
-    // still keeps (or receives) a poll, and exempting it could let a relocated
-    // descendant poll leave its backedge path uncovered.
-    if (Facts.IsWithinBudget ||
-        (!isStripMiningEnabled() && Facts.IsIntCountedEquivalent) ||
-        Facts.HasGuaranteedCallCoverage || Facts.HasOwnDominatingPoll)
-      continue;
-
-    BasicBlock *Latch = Ancestor->getLoopLatch();
-    if (!Latch) {
-      Requirements.AnyLatchlessUncoveredAncestor = true;
-      break;
-    }
-    Requirements.Latches.push_back(Latch);
-  }
-  return Requirements;
-}
-
-// ===--------------------------------------------------------------------===//
-// Loop coverage analysis (C2 PhaseIdealLoop::check_safepts /
-// remove_safepoints). Pure analysis: computes each loop's coverage state
-// without mutating the IR.
-// ===--------------------------------------------------------------------===//
 
 namespace {
 
-BasicBlock *getIDomBlock(DominatorTree &DT, BasicBlock *BB) {
-  auto *IDom = DT.getNode(BB)->getIDom();
-  return IDom ? IDom->getBlock() : nullptr;
-}
-
-// A genuine (guaranteed-safepoint) call in BB covers a loop whose latch it
-// dominates. Deopt-bundle leaf/alloc/lock fast paths are excluded (they carry
-// deopt STATE but never reach a VM safepoint); the explicit poll is separate.
-bool blockHasDeoptCall(BasicBlock *BB) {
-  return llvm::any_of(*BB, [](Instruction &I) {
-    return jeandle::isSafepoint(I) && !jeandle::isSafepointPoll(I);
-  });
-}
-
-CallInst *firstPollInBlock(BasicBlock *BB) {
-  for (Instruction &I : *BB)
-    if (jeandle::isSafepointPoll(I))
-      return cast<CallInst>(&I);
-  return nullptr;
-}
-
-// C2 allpaths_check_safepts fallback: when the idom-path scan finds no call, no
-// local poll, and no sub-loop poll, walk every backward path from the latch
-// over in-loop predecessors, terminating each path at the first safepoint, and
-// tag the closest-to-latch sub-loop poll on each path required.
-void allpathsMarkRequired(Loop &L, LoopInfo &LI,
-                          jeandle::RequiredPolls &Required) {
-  BasicBlock *Latch = L.getLoopLatch();
-  if (!Latch)
-    return;
-  SmallVector<BasicBlock *, 8> Stack;
-  SmallPtrSet<BasicBlock *, 16> Visited;
-  Stack.push_back(Latch);
-  Visited.insert(Latch);
-  while (!Stack.empty()) {
-    BasicBlock *BB = Stack.pop_back_val();
-    if (blockHasDeoptCall(BB))
-      continue; // a call safepoint terminates this path
-    if (CallInst *P = firstPollInBlock(BB)) {
-      // Any poll terminates the path; a sub-loop poll is one this loop depends
-      // on and must keep.
-      if (LI.getLoopFor(BB) != &L)
-        Required.insert(P);
+// Cut the reverse search at a safepoint, and never cross the header into a
+// previous iteration. A visited block is shared by all latches, so merged
+// backedges and nested cycles do not multiply the work.
+bool scanBackedgePaths(Loop &L, bool CallsOnly,
+                       jeandle::SafepointWorkBudget &Work,
+                       jeandle::RequiredPolls *Polls = nullptr) {
+  SmallVector<BasicBlock *, 8> Worklist;
+  L.getLoopLatches(Worklist);
+  if (Worklist.empty())
+    return false;
+  SmallPtrSet<BasicBlock *, 32> Visited;
+  bool Covered = true;
+  while (!Worklist.empty()) {
+    BasicBlock *BB = Worklist.pop_back_val();
+    if (!Visited.insert(BB).second)
+      continue;
+    if (!Work.spend(BB->size() + pred_size(BB) + 1))
+      return false;
+    if (llvm::any_of(*BB, jeandle::isGuaranteedSafepointCall))
+      continue;
+    if (!CallsOnly) {
+      CallInst *Poll = nullptr;
+      for (Instruction &I : llvm::reverse(*BB))
+        if (jeandle::isSafepointPoll(I)) {
+          Poll = cast<CallInst>(&I);
+          break;
+        }
+      if (Poll) {
+        if (Polls)
+          Polls->insert(Poll);
+        continue;
+      }
+    }
+    if (BB == L.getHeader()) {
+      Covered = false;
       continue;
     }
-    for (BasicBlock *Pred : predecessors(BB))
-      if (L.contains(Pred) && Visited.insert(Pred).second)
-        Stack.push_back(Pred);
+    for (BasicBlock *Pred : predecessors(BB)) {
+      if (L.contains(Pred))
+        Worklist.push_back(Pred);
+      else
+        Covered = false;
+    }
   }
+  return Covered;
+}
+
+BasicBlock *getIDomBlock(DominatorTree &DT, BasicBlock *BB) {
+  auto *Node = DT.getNode(BB);
+  auto *IDom = Node ? Node->getIDom() : nullptr;
+  return IDom ? IDom->getBlock() : nullptr;
 }
 
 } // namespace
 
-// Phase 1 (C2 IdealLoopTree::check_safepts). Scan the dominator chain from the
-// latch up through the header. A deopt-call on that spine (site A), or a
-// sub-loop already proven covered (site B), means the loop reaches a safepoint
-// every iteration (HasSfpt). A local poll on the spine is recorded as the
-// keep-one keeper, but the scan continues past it: a guaranteed-safepoint call
-// further up still dominates the latch, so it covers the loop (C2 _has_call ⇒
-// keep_one=false) and the loop can drop all of its deleteable polls. Otherwise
-// a sub-loop poll on the spine is one this loop may depend on — tag it required
-// so the sub-loop keeps it. A sub-loop poll alone never sets HasSfpt on the
-// outer loop (it is protected, not used as delete-all coverage), exactly as in
-// C2.
-void llvm::jeandle::analyzeLoop(Loop &L, LoopInfo &LI, DominatorTree &DT,
-                                SmallPtrSetImpl<Loop *> &HasSfpt,
-                                RequiredPolls &Required) {
-  BasicBlock *Latch = L.getLoopLatch();
-  if (!Latch) {
-    // A multi-latch loop cannot select one keeper that covers every backedge.
-    // Its own polls are never deleted, and conservatively protecting every
-    // descendant poll prevents an inner finite loop from removing coverage that
-    // one of those backedges depends on.
-    for (BasicBlock *BB : L.blocks()) {
-      if (LI.getLoopFor(BB) == &L)
-        continue;
-      for (Instruction &I : *BB)
-        if (jeandle::isSafepointPoll(I))
-          Required.insert(cast<CallInst>(&I));
-    }
-    return;
+jeandle::SafepointLoopAnalysis::Coverage &
+jeandle::SafepointLoopAnalysis::getCoverage(Loop &L) {
+  auto [It, Inserted] = CoverageCache.try_emplace(&L);
+  if (Inserted && checkLoop(L)) {
+    It->second.Calls = scanBackedgePaths(L, true, Work);
+    It->second.Covered = It->second.Calls ||
+                         scanBackedgePaths(L, false, Work, &It->second.Polls);
   }
-  bool HasCall = false;
-  bool HasLocal = false;
-  CallInst *NonlocalPoll = nullptr;
-  // Walk the dominator chain from latch up through the header (an LLVM header,
-  // unlike C2's head node, can itself hold a poll). C2's check_safepts walks
-  // tail..head-exclusive; we include the header so a header poll counts as this
-  // loop's local keeper.
-  for (BasicBlock *BB = Latch; BB && L.contains(BB);
-       BB = getIDomBlock(DT, BB)) {
-    if (blockHasDeoptCall(BB)) { // site A: call coverage
-      HasCall = true;
-      break;
-    }
-    if (CallInst *P = firstPollInBlock(BB)) {
-      if (LI.getLoopFor(BB) == &L) {
-        // A local poll — this loop's, the closest to the latch on the dom chain
-        // — is the keep-one keeper. Unlike C2's check_safepts, which sets
-        // has_local_ncsfpt and breaks, keep walking toward the header: a
-        // guaranteed-safepoint call further up the spine also dominates the
-        // latch, so it runs every iteration and covers the loop regardless of
-        // this poll.
-        HasLocal = true;
-        continue;
-      }
-      if (!NonlocalPoll)
-        NonlocalPoll = P; // sub-loop poll on the spine
+  return It->second;
+}
+
+bool jeandle::SafepointLoopAnalysis::hasCoverage(Loop &L, bool CallsOnly) {
+  auto &C = getCoverage(L);
+  return !Work.exhausted() && (CallsOnly ? C.Calls : C.Covered);
+}
+
+const jeandle::RequiredPolls &
+jeandle::SafepointLoopAnalysis::requiredPolls(Loop &L) {
+  return getCoverage(L).Polls;
+}
+
+jeandle::LoopSafepointFacts jeandle::SafepointLoopAnalysis::getFacts(Loop &L) {
+  auto [It, Inserted] = FactsCache.try_emplace(&L);
+  if (Inserted && checkLoop(L)) {
+    It->second = LoopSafepointFacts::get(L, SE);
+    It->second.HasGuaranteedCallCoverage = hasCoverage(L, true);
+    RequiredPolls Empty;
+    It->second.HasOwnDominatingPoll = findKeepOne(L, LI, DT, Empty) != nullptr;
+  }
+  return It->second;
+}
+
+bool jeandle::AncestorPollRequirements::isRequired(const CallInst &Poll,
+                                                   DominatorTree &DT) const {
+  return !Complete || Polls.contains(&Poll);
+}
+
+jeandle::AncestorPollRequirements
+jeandle::computeAncestorPollRequirements(Loop &L, SafepointLoopAnalysis &A) {
+  AncestorPollRequirements Requirements;
+  if (!A.checkLoop(L)) {
+    Requirements.Complete = false;
+    return Requirements;
+  }
+  for (Loop *Ancestor = L.getParentLoop(); Ancestor;
+       Ancestor = Ancestor->getParentLoop()) {
+    auto Facts = A.getFacts(*Ancestor);
+    if ((Ancestor->isInnermost() && Facts.IsWithinBudget) ||
+        (!isStripMiningEnabled() && Facts.IsWithinIntBackedgeLimit) ||
+        Facts.HasGuaranteedCallCoverage || Facts.HasOwnDominatingPoll)
       continue;
+    const RequiredPolls &Polls = A.requiredPolls(*Ancestor);
+    if (!A.Work.spend(Polls.size())) {
+      Requirements.Complete = false;
+      return Requirements;
     }
-    // site B: a sub-loop on the spine that is already covered propagates
-    // coverage up (ultimately traces to a call). Checked only on blocks that
-    // hold no safepoint of their own, matching C2's else-branch.
-    Loop *Sub = LI.getLoopFor(BB);
-    if (Sub != &L && Sub->getLoopLatch() == BB && HasSfpt.contains(Sub)) {
-      HasCall = true;
-      break;
-    }
+    for (CallInst *Poll : Polls)
+      Requirements.Polls.insert(Poll);
   }
-  if (HasCall) {
+  Requirements.Complete = !A.Work.exhausted();
+  return Requirements;
+}
+
+void jeandle::analyzeLoop(Loop &L, SafepointLoopAnalysis &A,
+                          SmallPtrSetImpl<Loop *> &HasSfpt,
+                          RequiredPolls &Required) {
+  if (A.hasCoverage(L, true)) {
     HasSfpt.insert(&L);
     return;
   }
-  if (!L.getSubLoops().empty() && !HasLocal) {
-    if (NonlocalPoll)
-      Required.insert(NonlocalPoll);
-    else
-      allpathsMarkRequired(L, LI, Required);
-  }
+  if (A.getFacts(L).HasOwnDominatingPoll)
+    return;
+  for (CallInst *Poll : A.requiredPolls(L))
+    Required.insert(Poll);
 }
 
 // Phase 2 keeper selection (C2 remove_safepoints keep_one idom-path keeper).
@@ -455,4 +675,79 @@ CallInst *llvm::jeandle::findKeepOne(Loop &L, LoopInfo &LI, DominatorTree &DT,
     }
   }
   return nullptr;
+}
+
+static bool memoryStateMatchesBackedge(CallInst *Poll, Loop *L,
+                                       BasicBlock *Header, BasicBlock *Latch,
+                                       MemorySSA &MSSA) {
+  MemoryAccess *PollAccess = MSSA.getMemoryAccess(Poll);
+  if (!PollAccess)
+    return false;
+
+  assert(isa<MemoryDef>(PollAccess) && "safepoint poll must be a MemoryDef");
+
+  MemoryPhi *HeaderMemory = MSSA.getMemoryAccess(Header);
+  if (HeaderMemory) {
+    if (HeaderMemory->getBasicBlockIndex(Latch) < 0)
+      return false;
+    return HeaderMemory->getIncomingValueForBlock(Latch) == PollAccess;
+  }
+
+  // With no loop-header MemoryPhi, only a MemoryUse can be loop-invariant.
+  return false;
+}
+
+static bool isUnmodeledRelocationHazard(const Instruction &I, MemorySSA &MSSA) {
+  if (I.isDebugOrPseudoInst() || I.isLifetimeStartOrEnd())
+    return false;
+  return I.mayHaveSideEffects() && !MSSA.getMemoryAccess(&I);
+}
+
+// Walk backward from the latch and stop at the poll block. Since the poll block
+// dominates the latch, this visits exactly the current-iteration paths that can
+// still reach the backedge and ignores side-exit-only paths.
+static bool hasNoUnmodeledRelocationHazardAfterPoll(CallInst *Poll, Loop *L,
+                                                    BasicBlock *Latch,
+                                                    MemorySSA &MSSA) {
+  BasicBlock *PollBB = Poll->getParent();
+  SmallVector<BasicBlock *, 8> Worklist{Latch};
+  SmallPtrSet<BasicBlock *, 16> Visited;
+  bool ReachedPoll = false;
+
+  while (!Worklist.empty()) {
+    BasicBlock *BB = Worklist.pop_back_val();
+    if (!Visited.insert(BB).second)
+      continue;
+    if (!L->contains(BB))
+      return false;
+
+    if (BB == PollBB) {
+      ReachedPoll = true;
+      for (auto It = std::next(Poll->getIterator()), End = BB->end(); It != End;
+           ++It)
+        if (isUnmodeledRelocationHazard(*It, MSSA))
+          return false;
+      continue;
+    }
+
+    for (Instruction &I : *BB)
+      if (isUnmodeledRelocationHazard(I, MSSA))
+        return false;
+
+    for (BasicBlock *Pred : predecessors(BB)) {
+      if (!L->contains(Pred))
+        return false;
+      Worklist.push_back(Pred);
+    }
+  }
+  return ReachedPoll;
+}
+
+bool llvm::jeandle::canRelocateSafepointPoll(CallInst &Poll, Loop &L,
+                                             MemorySSA &MSSA) {
+  BasicBlock *Latch = L.getLoopLatch();
+  return Latch && L.contains(Poll.getParent()) &&
+         MSSA.getDomTree().dominates(&Poll, Latch->getTerminator()) &&
+         memoryStateMatchesBackedge(&Poll, &L, L.getHeader(), Latch, MSSA) &&
+         hasNoUnmodeledRelocationHazardAfterPoll(&Poll, &L, Latch, MSSA);
 }

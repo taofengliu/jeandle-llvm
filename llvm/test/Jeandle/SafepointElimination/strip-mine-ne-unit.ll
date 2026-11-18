@@ -38,7 +38,7 @@ return:
 
 ; CHECK-LABEL: @header_ne_inc(
 ; CHECK:       latch:
-; CHECK:         %cond = icmp ne i64 %iv.next, %outer.inner.limit
+; CHECK:         %cond = icmp slt i64 %iv.next, %outer.inner.limit
 ; CHECK:         br i1 %cond, label %body, label %body.outer.latch
 ; CHECK:       body.outer:
 ; CHECK:         %outer.cond = icmp slt i64 %outer.iv, %n
@@ -73,7 +73,7 @@ return:
 
 ; CHECK-LABEL: @header_eq_exit_on_true(
 ; CHECK:       latch:
-; CHECK:         %done = icmp eq i64 %iv.next, %outer.inner.limit
+; CHECK:         %done = icmp sge i64 %iv.next, %outer.inner.limit
 ; CHECK:         br i1 %done, label %body.outer.latch, label %body
 ; CHECK:       body.outer:
 ; CHECK:         %outer.cond = icmp slt i64 %outer.iv, %n
@@ -106,7 +106,7 @@ return:
 ; CHECK-LABEL: @latch_ne_inc(
 ; CHECK:       latch:
 ; CHECK-NOT:     call hotspotcc void @jeandle.safepoint_poll
-; CHECK:         %cond = icmp ne i64 %iv.next, %outer.inner.limit
+; CHECK:         %cond = icmp slt i64 %iv.next, %outer.inner.limit
 ; CHECK:         br i1 %cond, label %header, label %header.outer.latch
 ; CHECK:       header.outer:
 ; CHECK:         %outer.cond = icmp slt i64 %outer.iv, %n
@@ -141,7 +141,7 @@ return:
 
 ; CHECK-LABEL: @header_ne_dec(
 ; CHECK:       latch:
-; CHECK:         %cond = icmp ne i64 %iv.next, %outer.inner.limit
+; CHECK:         %cond = icmp sgt i64 %iv.next, %outer.inner.limit
 ; CHECK:       body.outer:
 ; CHECK:         %outer.cond = icmp sgt i64 %outer.iv, %n
 ; CHECK:         %outer.batch.dist = sub nsw i128
@@ -178,7 +178,7 @@ return:
 
 ; CHECK-LABEL: @header_ne_swapped(
 ; CHECK:       latch:
-; CHECK:         %cond = icmp ne i64 %outer.inner.limit, %iv.next
+; CHECK:         %cond = icmp sgt i64 %outer.inner.limit, %iv.next
 ; CHECK:       body.outer:
 ; CHECK:         %outer.cond = icmp slt i64 %outer.iv, %n
 
@@ -210,7 +210,7 @@ return:
 ; CHECK-LABEL: @latch_ne_dec(
 ; CHECK:       latch:
 ; CHECK-NOT:     call hotspotcc void @jeandle.safepoint_poll
-; CHECK:         %cond = icmp ne i64 %iv.next, %outer.inner.limit
+; CHECK:         %cond = icmp sgt i64 %iv.next, %outer.inner.limit
 ; CHECK:         br i1 %cond, label %header, label %header.outer.latch
 ; CHECK:       header.outer:
 ; CHECK:         %outer.cond = icmp sgt i64 %outer.iv, %n

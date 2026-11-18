@@ -32,6 +32,7 @@
 #include "llvm/Transforms/Jeandle/ProfileDevirtualization.h"
 #include "llvm/Transforms/Jeandle/RecoverTypeInfo.h"
 #include "llvm/Transforms/Jeandle/RepeatedConstantFolding.h"
+#include "llvm/Transforms/Jeandle/SafepointBudgetStripMining.h"
 #include "llvm/Transforms/Jeandle/SafepointCoverageVerifier.h"
 #include "llvm/Transforms/Jeandle/SafepointPollElimination.h"
 #include "llvm/Transforms/Jeandle/SafepointPollNormalization.h"
@@ -136,6 +137,8 @@ static void addStripMiningPasses(ModulePassManager &PM,
                              DeferEmptyLoopDeletion)));
   PM.addPass(createModuleToFunctionPassAdaptor(SafepointStripMining(
       SafepointStripMiningMode::StripMining, DeferEmptyLoopDeletion)));
+  PM.addPass(createModuleToFunctionPassAdaptor(
+      SafepointBudgetStripMining(DeferEmptyLoopDeletion)));
   PM.addPass(createModuleToFunctionPassAdaptor(SafepointPollElimination(
       SafepointPollEliminationMode::AfterStripMining, DeferEmptyLoopDeletion)));
   addCoverageVerifier(PM);
@@ -352,7 +355,7 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
   // strip-mining-OFF path, IndVarSimplify also strengthens SCEV no-wrap flags
   // on the frontend's bare (flagless) IV increments, so Early can prove that a
   // loop's maximum backedge count is strictly below INT_MAX
-  // (IsIntCountedEquivalent) and drop all of its polls.
+  // (IsWithinIntBackedgeLimit) and drop all of its polls.
   if (StripMiningEnabled) {
     addPreparationForStripMining(PM);
   } else {
@@ -385,6 +388,7 @@ ModulePassManager Pipeline::buildJeandlePipeline(PassBuilder &PB,
     PM.addPass(createModuleToFunctionPassAdaptor(LCSSAPass()));
     PM.addPass(createModuleToFunctionPassAdaptor(SafepointPollElimination(
         SafepointPollEliminationMode::LoopDeletionPrep)));
+    addCoverageVerifier(PM);
   }
 
   // High-tier passes resolve runtime declarations and layout constants by

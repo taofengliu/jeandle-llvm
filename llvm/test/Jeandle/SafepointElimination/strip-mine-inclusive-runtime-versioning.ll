@@ -504,9 +504,12 @@ attributes #0 = { "statepoint-id"="7" }
 ; CHECK-DAG:   loop.outer.latch:
 
 ; CHECK-LABEL: @runtime_inclusive_current_phi_deopt(
-; CHECK-NOT:   inclusive.no_wrap
-; CHECK-NOT:   inclusive.slow
-; CHECK:       call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 %iv) ]
+; CHECK:       inclusive.no_wrap
+; CHECK:       loop.inclusive.slow:
+; CHECK:       call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 %iv.inclusive.slow) ]
+; CHECK:       loop.outer.latch:
+; CHECK:       %iv.poll.state = phi i32 [ %iv, %loop ]
+; CHECK:       call hotspotcc void @jeandle.safepoint_poll() #{{[0-9]+}} [ "deopt"(i32 %iv.poll.state) ]
 
 ; CHECK-LABEL: @runtime_inclusive_noduplicate(
 ; CHECK-NOT:   inclusive.no_wrap
@@ -598,7 +601,9 @@ attributes #0 = { "statepoint-id"="7" }
 ; PIPELINE-DAG:   loop.outer:
 
 ; PIPELINE-LABEL: @runtime_inclusive_current_phi_deopt(
-; PIPELINE-NOT:   inclusive.no_wrap
+; PIPELINE:       inclusive.no_wrap
+; PIPELINE:       loop.outer.latch:
+; PIPELINE:       %iv.poll.state = phi i32 [ %iv, %loop ]
 ; PIPELINE:       call hotspotcc void @jeandle.safepoint_poll()
 
 ; PIPELINE-LABEL: @runtime_inclusive_noduplicate(

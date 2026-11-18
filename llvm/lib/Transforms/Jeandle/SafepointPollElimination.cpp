@@ -152,7 +152,7 @@ static bool deleteLoopPolls(Loop &L, LoopInfo &LI, DominatorTree &DT,
     return false;
 
   BasicBlock *Latch = L.getLoopLatch();
-  if (!Latch) {
+  if (!Latch && !HasSfpt.contains(&L)) {
     LLVM_DEBUG(dbgs() << "  poll-elimination<" << modeName(Mode) << "> loop "
                       << L.getHeader()->getName()
                       << ": keep-all (multi-latch loop)\n");
@@ -163,13 +163,13 @@ static bool deleteLoopPolls(Loop &L, LoopInfo &LI, DominatorTree &DT,
 
   jeandle::LoopSafepointFacts Facts = jeandle::LoopSafepointFacts::get(L, SE);
   const char *Reason = nullptr;
-  if (jeandle::isMarkedStripMinedInner(L))
-    Reason = "strip-mined-inner"; // poll attribute: poll-free, bounded
+  if (jeandle::isBoundedStripMinedInner(L, SE, DT))
+    Reason = "strip-mined-inner";
   else if (L.isInnermost() && Facts.IsWithinBudget)
     Reason = "within-budget"; // short loop: trip count bounds time-to-safepoint
   else if (HasSfpt.contains(&L))
     Reason = "call-covered"; // call/sub-loop coverage reaches a safepoint
-  else if (!jeandle::isStripMiningEnabled() && Facts.IsIntCountedEquivalent)
+  else if (!jeandle::isStripMiningEnabled() && Facts.IsWithinIntBackedgeLimit)
     Reason = "int-counted-no-strip-mining"; // bounded trip => C2 T_INT
   bool DeleteAll = Reason != nullptr;
 
@@ -285,8 +285,9 @@ bool hasOnlyDeoptStateUses(Value *V, Loop &L, SmallPtrSetImpl<Value *> &Visited,
 // out of scope even when LLVM could otherwise prove them dead.
 std::optional<EmptyLoopPollRemovalPlan>
 buildEmptyLoopPollRemovalPlan(Loop *L, LoopInfo &LI, DominatorTree &DT,
-                              ScalarEvolution &SE) {
-  if (!L->isLCSSAForm(DT) || !L->hasDedicatedExits())
+                              ScalarEvolution &SE,
+                              jeandle::SafepointLoopAnalysis &A) {
+  if (!A.checkLoop(*L) || !L->isLCSSAForm(DT) || !L->hasDedicatedExits())
     return std::nullopt;
 
   BasicBlock *Preheader = L->getLoopPreheader();
@@ -325,7 +326,7 @@ buildEmptyLoopPollRemovalPlan(Loop *L, LoopInfo &LI, DominatorTree &DT,
   // Only ancestors outside the deleted nest can require one of its polls. An
   // ancestor inside the nest disappears in the same transaction.
   jeandle::AncestorPollRequirements AncestorRequirements =
-      jeandle::computeAncestorPollRequirements(*L, LI, DT, SE);
+      jeandle::computeAncestorPollRequirements(*L, A);
   for (CallInst *P : Polls)
     if (AncestorRequirements.isRequired(*P, DT))
       return std::nullopt;
@@ -424,13 +425,15 @@ static bool completeLoopPollDeletion(Function &F, LoopInfo &LI,
                                      DominatorTree &DT, ScalarEvolution &SE,
                                      SafepointPollEliminationMode Mode,
                                      bool DeferEmptyLoopDeletion) {
+  jeandle::SafepointWorkBudget Work;
+  jeandle::SafepointLoopAnalysis A(LI, DT, SE, Work);
   SmallVector<Loop *, 8> Loops(LI.getLoopsInPreorder());
   SmallPtrSet<Loop *, 8> DeferredEmptyLoops;
   if (DeferEmptyLoopDeletion) {
     for (Loop *L : Loops) {
       if (DeferredEmptyLoops.contains(L))
         continue;
-      if (!buildEmptyLoopPollRemovalPlan(L, LI, DT, SE))
+      if (!buildEmptyLoopPollRemovalPlan(L, LI, DT, SE, A))
         continue;
       for (Loop *Nested : L->getLoopsInPreorder())
         DeferredEmptyLoops.insert(Nested);
@@ -440,7 +443,9 @@ static bool completeLoopPollDeletion(Function &F, LoopInfo &LI,
   SmallPtrSet<Loop *, 8> HasSfpt;
   RequiredPolls Required;
   for (Loop *L : llvm::reverse(Loops))
-    analyzeLoop(*L, LI, DT, HasSfpt, Required);
+    analyzeLoop(*L, A, HasSfpt, Required);
+  if (Work.exhausted())
+    return false;
 
   bool Changed = false;
   for (Loop *L : llvm::reverse(Loops)) {
@@ -453,10 +458,12 @@ static bool completeLoopPollDeletion(Function &F, LoopInfo &LI,
 
 } // namespace
 
-bool llvm::jeandle::isEmptyLoopPollDeletionCandidate(Loop &L, LoopInfo &LI,
-                                                     DominatorTree &DT,
-                                                     ScalarEvolution &SE) {
-  return buildEmptyLoopPollRemovalPlan(&L, LI, DT, SE).has_value();
+bool jeandle::SafepointLoopAnalysis::isEmptyLoopCandidate(Loop &L) {
+  auto [It, Inserted] = EmptyCache.try_emplace(&L);
+  if (Inserted)
+    It->second =
+        buildEmptyLoopPollRemovalPlan(&L, LI, DT, SE, *this).has_value();
+  return It->second;
 }
 
 void SafepointPollElimination::printPipeline(
@@ -504,23 +511,27 @@ PreservedAnalyses SafepointPollElimination::run(Function &F,
     auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
     // Deleting one empty region can expose another empty region in its parent.
     // Iterate to a fixpoint; each application strictly removes a loop nest.
+    jeandle::SafepointWorkBudget Work;
     bool Changed = false;
     bool LocalChanged = true;
     while (LocalChanged) {
       LocalChanged = false;
+      jeandle::SafepointLoopAnalysis A(LI, DT, SE, Work);
       SmallVector<Loop *, 8> Loops(LI.getLoopsInPreorder());
       SmallVector<EmptyLoopPollRemovalPlan, 4> Plans;
       SmallPtrSet<Loop *, 8> PlannedLoops;
       for (Loop *L : Loops) {
         if (PlannedLoops.contains(L))
           continue;
-        if (auto Plan = buildEmptyLoopPollRemovalPlan(L, LI, DT, SE)) {
+        if (auto Plan = buildEmptyLoopPollRemovalPlan(L, LI, DT, SE, A)) {
           for (Loop *Nested : L->getLoopsInPreorder())
             PlannedLoops.insert(Nested);
           Plans.push_back(std::move(*Plan));
         }
       }
 
+      if (Work.exhausted())
+        break;
       for (EmptyLoopPollRemovalPlan &Plan : Plans) {
         if (!Plan.stillStructurallyValid(LI, DT))
           continue;

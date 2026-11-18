@@ -73,12 +73,9 @@ constexpr StringRef InclusiveSlowPathMD = jeandle::Metadata::InclusiveSlowPath;
 // vectorize / LICM / widen its IV) and a single poll on the outer back-edge
 // keeps time-to-safepoint bounded to N inner iterations.
 //
-// The poll is relocated, never synthesized: the inner back-edge poll is
-// cloned onto the outer latch with its deopt bundle carried over and the
-// loop-carried operands remapped to the outer recurrences. A poll whose deopt
-// state can't be remapped — it references a value that is neither the IV, a
-// header recurrence, nor loop-invariant — makes the loop ineligible; we keep
-// it as-is rather than emit a safepoint with wrong deopt state.
+// The poll is cloned onto the outer latch. Its actual source SSA operands
+// are carried through boundary PHIs, preserving current, next and derived
+// values without reconstructing their expressions.
 // ===--------------------------------------------------------------------===//
 
 struct IVInfo {
@@ -353,159 +350,6 @@ PHINode *getHeaderPhiForLatchValue(Value *V, BasicBlock *Header,
   return nullptr;
 }
 
-bool isHeaderPhiLatchValue(Value *V, BasicBlock *Header, BasicBlock *Latch) {
-  return getHeaderPhiForLatchValue(V, Header, Latch) != nullptr;
-}
-
-// Frontends may keep an unchanged local (notably `this`) live across a loop as
-// a syntactic self recurrence. It is semantically invariant, so its preheader
-// value is the value observed at every batch boundary.
-Value *getLoopInvariantSelfRecurrenceInitial(PHINode *Phi, Loop *L,
-                                             BasicBlock *Header,
-                                             BasicBlock *Latch) {
-  if (Phi->getParent() != Header || Phi->getIncomingValueForBlock(Latch) != Phi)
-    return nullptr;
-  BasicBlock *Preheader = L->getLoopPreheader();
-  Value *Initial =
-      Preheader ? Phi->getIncomingValueForBlock(Preheader) : nullptr;
-  return Initial && L->isLoopInvariant(Initial) ? Initial : nullptr;
-}
-
-struct DeoptBoundaryValue {
-  Value *Original;
-  // The value reached by walking Casts from Original. Null means Original is
-  // defined outside the loop and can be reused directly.
-  Value *OriginalRoot;
-  // The value from which the outer-boundary expression is rebuilt. This is the
-  // root itself for an invariant/latch-carried root, or the preheader value for
-  // an invariant self recurrence.
-  Value *BoundaryBase;
-  Value *LatchValue;
-  // Outermost-to-innermost casts from Original down to OriginalRoot. Applying
-  // the plan walks this list in reverse and memoizes each rebuilt cast.
-  SmallVector<CastInst *, 2> Casts;
-};
-
-// The relocated poll represents the next iteration at a batch boundary. A raw
-// header phi is normally current-iteration state, even when it also happens to
-// be the latch input of another copy/swap recurrence. The one safe exception is
-// an invariant self recurrence. Other operands must either be loop-invariant,
-// a latch-carried next value, or a pure cast chain rooted at such a next value.
-// The returned plans are consumed verbatim during relocation, keeping the
-// eligibility proof and materialization behavior in sync.
-std::optional<SmallVector<DeoptBoundaryValue, 8>>
-analyzeDeoptBoundaryValues(CallInst *P, Loop *L, BasicBlock *Header,
-                           BasicBlock *Latch) {
-  SmallVector<DeoptBoundaryValue, 8> Plans;
-  auto OB = P->getOperandBundle(LLVMContext::OB_deopt);
-  if (!OB)
-    return Plans;
-  for (const Use &U : OB->Inputs) {
-    Value *V = U.get();
-    if (L->isLoopInvariant(V)) {
-      Plans.push_back({V, nullptr, nullptr, nullptr, {}});
-      continue;
-    }
-    if (auto *Phi = dyn_cast<PHINode>(V); Phi && Phi->getParent() == Header) {
-      if (Value *Initial =
-              getLoopInvariantSelfRecurrenceInitial(Phi, L, Header, Latch)) {
-        Plans.push_back({V, V, Initial, nullptr, {}});
-        continue;
-      }
-      return std::nullopt;
-    }
-
-    SmallVector<CastInst *, 2> Casts;
-    Value *Root = V;
-    while (auto *Cast = dyn_cast<CastInst>(Root)) {
-      Casts.push_back(Cast);
-      Root = Cast->getOperand(0);
-    }
-    if (L->isLoopInvariant(Root)) {
-      Plans.push_back({V, Root, Root, nullptr, std::move(Casts)});
-      continue;
-    }
-    if (auto *Phi = dyn_cast<PHINode>(Root);
-        Phi && Phi->getParent() == Header) {
-      if (Value *Initial =
-              getLoopInvariantSelfRecurrenceInitial(Phi, L, Header, Latch)) {
-        Plans.push_back({V, Root, Initial, nullptr, std::move(Casts)});
-        continue;
-      }
-      return std::nullopt;
-    }
-    if (!isHeaderPhiLatchValue(Root, Header, Latch))
-      return std::nullopt;
-    Plans.push_back({V, Root, Root, Root, std::move(Casts)});
-  }
-  return Plans;
-}
-
-bool memoryStateMatchesBackedge(CallInst *Poll, Loop *L, BasicBlock *Header,
-                                BasicBlock *Latch, MemorySSA &MSSA) {
-  MemoryAccess *PollAccess = MSSA.getMemoryAccess(Poll);
-  if (!PollAccess)
-    return false;
-
-  assert(isa<MemoryDef>(PollAccess) && "safepoint poll must be a MemoryDef");
-
-  MemoryPhi *HeaderMemory = MSSA.getMemoryAccess(Header);
-  if (HeaderMemory) {
-    if (HeaderMemory->getBasicBlockIndex(Latch) < 0)
-      return false;
-    return HeaderMemory->getIncomingValueForBlock(Latch) == PollAccess;
-  }
-
-  // With no loop-header MemoryPhi, only a MemoryUse can be loop-invariant.
-  return false;
-}
-
-bool isUnmodeledRelocationHazard(const Instruction &I, MemorySSA &MSSA) {
-  if (I.isDebugOrPseudoInst() || I.isLifetimeStartOrEnd())
-    return false;
-  return I.mayHaveSideEffects() && !MSSA.getMemoryAccess(&I);
-}
-
-// Walk backward from the latch and stop at the poll block. Since the poll block
-// dominates the latch, this visits exactly the current-iteration paths that can
-// still reach the backedge and ignores side-exit-only paths.
-bool hasNoUnmodeledRelocationHazardAfterPoll(CallInst *Poll, Loop *L,
-                                             BasicBlock *Latch,
-                                             MemorySSA &MSSA) {
-  BasicBlock *PollBB = Poll->getParent();
-  SmallVector<BasicBlock *, 8> Worklist{Latch};
-  SmallPtrSet<BasicBlock *, 16> Visited;
-  bool ReachedPoll = false;
-
-  while (!Worklist.empty()) {
-    BasicBlock *BB = Worklist.pop_back_val();
-    if (!Visited.insert(BB).second)
-      continue;
-    if (!L->contains(BB))
-      return false;
-
-    if (BB == PollBB) {
-      ReachedPoll = true;
-      for (auto It = std::next(Poll->getIterator()), End = BB->end(); It != End;
-           ++It)
-        if (isUnmodeledRelocationHazard(*It, MSSA))
-          return false;
-      continue;
-    }
-
-    for (Instruction &I : *BB)
-      if (isUnmodeledRelocationHazard(I, MSSA))
-        return false;
-
-    for (BasicBlock *Pred : predecessors(BB)) {
-      if (!L->contains(Pred))
-        return false;
-      Worklist.push_back(Pred);
-    }
-  }
-  return ReachedPoll;
-}
-
 struct HeaderPhiState {
   PHINode *Phi;
   Value *PreheaderValue;
@@ -549,7 +393,6 @@ struct StripMinePlan {
   SmallVector<PHINode *, 4> LiftedHeaderPhis;
   SmallVector<HeaderPhiState, 4> HeaderPhis;
   SmallVector<PrimaryExitPhiState, 4> PrimaryExitPhis;
-  SmallVector<DeoptBoundaryValue, 8> DeoptBoundaryValues;
   std::optional<InclusiveRuntimeGuard> RuntimeGuard;
   APInt AbsStepN;
   bool IsSigned;
@@ -557,13 +400,7 @@ struct StripMinePlan {
   Value *InitVal;
   Value *Limit;
 
-  /// Pre-condition re-check queued before applying: this plan still matches the
-  /// IR (loop/header/latch/exiting/exit identity, exit-branch wiring, poll
-  /// parents, the IV-phi/limit/exit-cmp the relocation gates on, and the
-  /// primary/runtime-guard exit-phi incomings). Sibling-plan application can
-  /// invalidate a queued plan; each plan validates itself before it applies
-  /// (C2's two-phase analyze-then-mutate pattern, guarded here against
-  /// interference).
+  // Check the complete structural contract before applying the plan.
   bool stillStructurallyValid(LoopInfo &LI, DominatorTree &DT) const;
 };
 
@@ -609,25 +446,17 @@ buildStripMinePlanWithIV(Loop *L, const IVInfo &IV, ICmpInst *ExitCmp,
   }
   StripMineShape Shape = *MaybeShape;
 
-  if (!memoryStateMatchesBackedge(PollToMove, L, Shape.Header, Shape.Latch,
-                                  MSSA)) {
+  if (!jeandle::canRelocateSafepointPoll(*PollToMove, *L, MSSA)) {
     LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
-                      << ": poll is not the backedge memory state\n");
+                      << ": poll is not a movable backedge state\n");
     return std::nullopt;
   }
-  if (!hasNoUnmodeledRelocationHazardAfterPoll(PollToMove, L, Shape.Latch,
-                                               MSSA)) {
-    LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
-                      << ": unmodeled relocation hazard after poll\n");
+  if (!PollToMove->arg_empty())
     return std::nullopt;
-  }
-  auto DeoptBoundaryValues =
-      analyzeDeoptBoundaryValues(PollToMove, L, Shape.Header, Shape.Latch);
-  if (!DeoptBoundaryValues) {
-    LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
-                      << ": deopt state is not a batch boundary\n");
-    return std::nullopt;
-  }
+  for (unsigned I = 0; I != PollToMove->getNumOperandBundles(); ++I)
+    for (const Use &U : PollToMove->getOperandBundleAt(I).Inputs)
+      if (U->getType()->isTokenTy())
+        return std::nullopt;
 
   uint64_t N = jeandle::getLoopStripMiningIter();
   if (N < 2) {
@@ -668,7 +497,8 @@ buildStripMinePlanWithIV(Loop *L, const IVInfo &IV, ICmpInst *ExitCmp,
   const SCEV *LimitS = SE.getSCEV(Limit);
   const Instruction *LoopEntryCtx = Shape.Header->getTerminator();
   bool HasRecurrenceNoWrap =
-      IsSigned ? IV.AR->hasNoSignedWrap() : IV.AR->hasNoUnsignedWrap();
+      IsSigned ? IV.AR->hasNoSignedWrap()
+               : Shape.Increasing && IV.AR->hasNoUnsignedWrap();
   std::optional<InclusiveRuntimeGuard> RuntimeGuard;
   if (!Shape.Inclusive) {
     bool HasStableInit = isGuaranteedNotToBeUndefOrPoison(InitVal);
@@ -755,6 +585,51 @@ buildStripMinePlanWithIV(Loop *L, const IVInfo &IV, ICmpInst *ExitCmp,
     }
   }
 
+  // Header AddRec flags constrain values that reach the next header. A
+  // side-exiting iteration can still execute a wrapping update and expose it
+  // before leaving the loop. Establish the instruction's range separately.
+  auto *Update = dyn_cast<BinaryOperator>(Shape.ResumeIV);
+  if (!RuntimeGuard) {
+    bool SafeUpdate =
+        Update && (IsSigned ? Update->hasNoSignedWrap()
+                            : Shape.Increasing && Update->hasNoUnsignedWrap());
+    if (!SafeUpdate && Update) {
+      unsigned BW = IV.Step.getBitWidth();
+      APInt Bound = Shape.Increasing ? (IsSigned ? APInt::getSignedMaxValue(BW)
+                                                 : APInt::getMaxValue(BW)) -
+                                           IV.Step
+                                     : (IsSigned ? APInt::getSignedMinValue(BW)
+                                                 : APInt::getMinValue(BW)) +
+                                           IV.Step.abs();
+      auto Pred = Shape.Increasing
+                      ? (IsSigned ? ICmpInst::ICMP_SLE : ICmpInst::ICMP_ULE)
+                      : (IsSigned ? ICmpInst::ICMP_SGE : ICmpInst::ICMP_UGE);
+      SafeUpdate = SE.isKnownPredicateAt(Pred, SE.getSCEV(IV.Phi),
+                                         SE.getConstant(Bound), Update);
+      // Induction over executed updates: the first operand is safe, and
+      // every later header value satisfied the source continuation test.
+      // This also covers the final update even when a side exit follows it.
+      if (!SafeUpdate) {
+        APInt LimitBound = Bound;
+        if (!Shape.Inclusive)
+          LimitBound += Shape.Increasing ? 1 : -1;
+        bool SafeLimit = SE.isKnownPredicateAt(
+            Pred, LimitS, SE.getConstant(LimitBound), Update);
+        bool SafeStart = SE.isKnownPredicateAt(
+            Pred, SE.getSCEV(InitVal), SE.getConstant(Bound),
+            Shape.Preheader->getTerminator());
+        if (!SafeStart && Shape.FirstIterationGuaranteed)
+          SafeStart = SafeLimit;
+        SafeUpdate = SafeStart && SafeLimit;
+      }
+    }
+    if (!SafeUpdate) {
+      LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
+                        << ": source update may wrap on a side exit\n");
+      return std::nullopt;
+    }
+  }
+
   // Every non-IV header phi is a recurrence that must continue across batches,
   // so all of them are threaded through the outer loop — not only those that
   // leak out via an exit phi.
@@ -818,7 +693,6 @@ buildStripMinePlanWithIV(Loop *L, const IVInfo &IV, ICmpInst *ExitCmp,
                        std::move(LiftedHeaderPhis),
                        std::move(HeaderPhis),
                        std::move(PrimaryExitPhis),
-                       std::move(*DeoptBoundaryValues),
                        std::move(RuntimeGuard),
                        AbsStepN,
                        IsSigned,
@@ -830,6 +704,7 @@ buildStripMinePlanWithIV(Loop *L, const IVInfo &IV, ICmpInst *ExitCmp,
 std::optional<StripMinePlan>
 buildStripMinePlan(Loop *L, LoopInfo &LI, DominatorTree &DT,
                    ScalarEvolution &SE, MemorySSA &MSSA,
+                   jeandle::SafepointLoopAnalysis &A,
                    bool AllowRuntimeVersioning = false) {
   if (!L->isInnermost()) {
     LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
@@ -856,7 +731,7 @@ buildStripMinePlan(Loop *L, LoopInfo &LI, DominatorTree &DT,
   // (is_counted_loop's !loop->_has_call) and just drops the back-edge poll.
   // Skip the wrap here and let the following deletion pass erase the poll as
   // call-covered.
-  if (jeandle::hasGuaranteedCallCoverage(*L, DT)) {
+  if (A.hasCoverage(*L, true)) {
     LLVM_DEBUG(
         dbgs() << "  reject " << L->getHeader()->getName()
                << ": loop already reaches a guaranteed-safepoint call\n");
@@ -870,7 +745,7 @@ buildStripMinePlan(Loop *L, LoopInfo &LI, DominatorTree &DT,
     return std::nullopt;
   }
   jeandle::AncestorPollRequirements AncestorRequirements =
-      jeandle::computeAncestorPollRequirements(*L, LI, DT, SE);
+      jeandle::computeAncestorPollRequirements(*L, A);
   for (CallInst *P : Polls)
     if (AncestorRequirements.isRequired(*P, DT)) {
       LLVM_DEBUG(dbgs() << "  reject " << L->getHeader()->getName()
@@ -972,49 +847,6 @@ bool StripMinePlan::stillStructurallyValid(LoopInfo &LI,
         return false;
       break;
     }
-  }
-  auto OB = PollToMove->getOperandBundle(LLVMContext::OB_deopt);
-  if (OB) {
-    if (OB->Inputs.size() != DeoptBoundaryValues.size())
-      return false;
-    for (size_t I = 0; I < DeoptBoundaryValues.size(); ++I) {
-      if (OB->Inputs[I].get() != DeoptBoundaryValues[I].Original)
-        return false;
-      const DeoptBoundaryValue &Boundary = DeoptBoundaryValues[I];
-      if (!Boundary.OriginalRoot) {
-        if (Boundary.BoundaryBase || Boundary.LatchValue ||
-            !Boundary.Casts.empty())
-          return false;
-        continue;
-      }
-      Value *Root = Boundary.Original;
-      for (CastInst *Cast : Boundary.Casts) {
-        if (Root != Cast)
-          return false;
-        Root = Cast->getOperand(0);
-      }
-      if (Root != Boundary.OriginalRoot)
-        return false;
-      if (Boundary.LatchValue) {
-        if (Boundary.BoundaryBase != Boundary.LatchValue ||
-            Root != Boundary.LatchValue ||
-            !isHeaderPhiLatchValue(Root, Shape.Header, Shape.Latch))
-          return false;
-        continue;
-      }
-      if (Root == Boundary.BoundaryBase) {
-        if (!L->isLoopInvariant(Root))
-          return false;
-        continue;
-      }
-      auto *Phi = dyn_cast<PHINode>(Root);
-      if (!Phi || getLoopInvariantSelfRecurrenceInitial(Phi, L, Shape.Header,
-                                                        Shape.Latch) !=
-                      Boundary.BoundaryBase)
-        return false;
-    }
-  } else if (!DeoptBoundaryValues.empty()) {
-    return false;
   }
   if (RuntimeGuard) {
     if (!isSafeToVersionInclusiveLoop(L) || !L->hasDedicatedExits())
@@ -1245,19 +1077,9 @@ static Loop *reparentAsOuterLoop(Loop *L, BasicBlock *OuterPH,
   return OuterL;
 }
 
-// Relocate the planned back-edge poll onto the outer back-edge, immediately
-// before OuterBr: clone it with the deopt operands remapped to the outer
-// recurrences, and tag the clone as the strip-mined poll. Latch-carried next
-// values are remapped to the outer PHIs; optimizer-introduced cast chains are
-// rebuilt from those outer values and cached in Remap. A loop-invariant latch
-// value (e.g. a phi whose latch operand is a constant) is skipped: it needs no
-// remap, and keying Remap on it would spuriously rewrite an unrelated but equal
-// constant elsewhere in the deopt bundle. The bci/frame layout in the deopt
-// bundle is carried over verbatim — no LLVM pass may synthesize a poll, only
-// relocate one. The strip-mined-poll attribute is the contract the coverage
-// verifier trusts without re-deriving the bound, and the marker the
-// after-strip-mining poll elimination keys on; marking the poll itself means
-// the marker cannot outlive the coverage it certifies.
+// Preserve exact source values at the batch boundary. Existing outer
+// recurrence PHIs can be reused; any other in-loop operand is carried through
+// its own LCSSA PHI instead of being recomputed or interpreted as a next value.
 static void relocatePollToOuterLatch(StripMinePlan &Plan, Value *OuterIVNext,
                                      ArrayRef<PHINode *> OuterReducNext,
                                      BranchInst *OuterBr) {
@@ -1276,37 +1098,28 @@ static void relocatePollToOuterLatch(StripMinePlan &Plan, Value *OuterIVNext,
     addRemap(LiftedHeaderPhis[I]->getIncomingValueForBlock(Shape.Latch),
              OuterReducNext[I]);
   SmallVector<OperandBundleDef, 1> Bundles;
-  if (auto OB = PollToMove->getOperandBundle(LLVMContext::OB_deopt)) {
-    assert(OB->Inputs.size() == Plan.DeoptBoundaryValues.size() &&
-           "deopt boundary plan no longer matches the poll bundle");
+  for (unsigned I = 0; I != PollToMove->getNumOperandBundles(); ++I) {
+    auto OB = PollToMove->getOperandBundleAt(I);
     SmallVector<Value *, 8> Args;
-    for (const DeoptBoundaryValue &Boundary : Plan.DeoptBoundaryValues) {
-      if (!Boundary.OriginalRoot) {
-        Args.push_back(Boundary.Original);
+    for (const Use &U : OB.Inputs) {
+      Value *Original = U.get();
+      if (L->isLoopInvariant(Original)) {
+        Args.push_back(Original);
         continue;
       }
-
-      Value *Remapped = Boundary.BoundaryBase;
-      if (auto It = Remap.find(Boundary.BoundaryBase); It != Remap.end())
-        Remapped = It->second;
-      else
-        assert(L->isLoopInvariant(Boundary.BoundaryBase) &&
-               "planned boundary base has no outer value");
-      for (CastInst *Cast : llvm::reverse(Boundary.Casts)) {
-        if (auto Cached = Remap.find(Cast); Cached != Remap.end()) {
-          Remapped = Cached->second;
-          continue;
-        }
-        auto *OuterCast = cast<CastInst>(Cast->clone());
-        OuterCast->setOperand(0, Remapped);
-        OuterCast->setName(Cast->getName() + ".outer");
-        OuterCast->insertBefore(OuterBr->getIterator());
-        Remapped = OuterCast;
-        Remap[Cast] = OuterCast;
+      auto It = Remap.find(Original);
+      if (It == Remap.end()) {
+        // Carry the value from the last executed source iteration. The poll
+        // dominates this exit, so its operand is available on this edge.
+        auto *Boundary = PHINode::Create(Original->getType(), 1,
+                                         Original->getName() + ".poll.state",
+                                         OuterBr->getParent()->begin());
+        Boundary->addIncoming(Original, Shape.ExitingBB);
+        It = Remap.insert({Original, Boundary}).first;
       }
-      Args.push_back(Remapped);
+      Args.push_back(It->second);
     }
-    Bundles.emplace_back("deopt", Args);
+    Bundles.emplace_back(OB.getTagName().str(), Args);
   }
   auto *RelocatedPoll =
       CallBase::Create(PollToMove, Bundles, OuterBr->getIterator());
@@ -1480,6 +1293,12 @@ static void rewireInnerHeaderForBatch(StripMinePlan &Plan,
   }
 
   Plan.ExitCmp->setOperand(Shape.LimitOperandIdx, Frame.InnerLimit);
+  auto Pred = Shape.ContinuePredicate;
+  if (Shape.LimitOperandIdx == 0)
+    Pred = CmpInst::getSwappedPredicate(Pred);
+  if (Shape.ExitSuccessorIdx == 0)
+    Pred = CmpInst::getInversePredicate(Pred);
+  Plan.ExitCmp->setPredicate(Pred);
   Shape.ExitingBr->setSuccessor(Shape.ExitSuccessorIdx, Frame.OuterLatch);
 }
 
@@ -1539,6 +1358,16 @@ void applyStripMinePlan(StripMinePlan &Plan, LoopInfo &LI, DominatorTree &DT,
   }
 
   OuterLoopFrame Frame;
+  // The update-specific range proof covers every executed update,
+  // including the final side-exiting iteration. Preserve that fact in IR so
+  // fresh analyses can revalidate the bounded inner recurrence without relying
+  // on a poll attribute.
+  if (auto *Update = dyn_cast<BinaryOperator>(Shape.ResumeIV)) {
+    if (Plan.IsSigned)
+      Update->setHasNoSignedWrap();
+    else if (Shape.Increasing || Update->getOpcode() == Instruction::Sub)
+      Update->setHasNoUnsignedWrap();
+  }
   createOuterSkeleton(Plan, F, Ty, InitVal, Limit, Frame);
   clampInnerLimit(Plan, Ty, Limit, Frame);
   rewireInnerHeaderForBatch(Plan, Frame);
@@ -1565,8 +1394,8 @@ void applyStripMinePlan(StripMinePlan &Plan, LoopInfo &LI, DominatorTree &DT,
   // OuterL -> L, add the new blocks, then rebuild DT and drop stale SCEV. The
   // outer loop is not in this run's loop snapshot, so it is not revisited; its
   // poll carries the coverage marker against later passes.
-  Loop *OuterL = reparentAsOuterLoop(L, Frame.OuterPH, Frame.OuterHeader,
-                                     Frame.InnerEntry, Frame.OuterLatch, LI);
+  reparentAsOuterLoop(L, Frame.OuterPH, Frame.OuterHeader, Frame.InnerEntry,
+                      Frame.OuterLatch, LI);
 
   DT.recalculate(*F);
   SE.forgetLoop(L);
@@ -1617,62 +1446,55 @@ PreservedAnalyses SafepointStripMining::run(Function &F,
   LLVM_DEBUG(dbgs() << "strip-mining<" << modeName(Mode) << "> running on "
                     << F.getName() << "\n");
 
-  auto &LI = AM.getResult<LoopAnalysis>(F);
-  ReversePostOrderTraversal<const Function *> RPOT(&F);
-  if (containsIrreducibleCFG<const BasicBlock *>(RPOT, LI)) {
-    LLVM_DEBUG(dbgs() << "strip-mining<" << modeName(Mode)
-                      << ">: irreducible CFG in " << F.getName()
-                      << ", all polls preserved\n");
-    return PreservedAnalyses::all();
-  }
-
-  auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
-  auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
-  auto &MSSA = AM.getResult<MemorySSAAnalysis>(F).getMSSA();
-  SmallVector<Loop *, 8> Loops(LI.getLoopsInPreorder());
-  SmallVector<StripMinePlan, 4> Plans;
-  SmallPtrSet<BasicBlock *, 32> PlannedBlocks;
-
   bool Versioning = Mode == SafepointStripMiningMode::InclusiveLoopVersioning;
-  SmallPtrSet<Loop *, 8> DeferredEmptyLoops;
-  if (DeferEmptyLoopDeletion) {
-    for (Loop *L : Loops) {
-      if (DeferredEmptyLoops.contains(L))
-        continue;
-      if (!jeandle::isEmptyLoopPollDeletionCandidate(*L, LI, DT, SE))
-        continue;
-      for (Loop *Nested : L->getLoopsInPreorder())
-        DeferredEmptyLoops.insert(Nested);
-    }
-  }
-  for (Loop *L : llvm::reverse(Loops)) {
-    if (DeferredEmptyLoops.contains(L)) {
-      LLVM_DEBUG(dbgs() << "  strip-mining: skip " << L->getHeader()->getName()
-                        << ": empty-loop deletion candidate\n");
-      continue;
-    }
-    auto Plan = buildStripMinePlan(L, LI, DT, SE, MSSA, Versioning);
-    if (!Plan)
-      continue;
-    bool Overlaps = llvm::any_of(L->blocks(), [&](BasicBlock *BB) {
-      return PlannedBlocks.contains(BB);
-    });
-    if (Overlaps)
-      continue;
-    for (BasicBlock *BB : L->blocks())
-      PlannedBlocks.insert(BB);
-    Plans.push_back(std::move(*Plan));
-  }
-
+  jeandle::SafepointWorkBudget Work;
   bool Changed = false;
-  for (StripMinePlan &Plan : Plans) {
-    if (!Plan.stillStructurallyValid(LI, DT))
+  SmallPtrSet<BasicBlock *, 16> Examined;
+  while (!Work.exhausted()) {
+    if (!Work.spend(F.getInstructionCount()))
+      break;
+    auto &LI = AM.getResult<LoopAnalysis>(F);
+    ReversePostOrderTraversal<const Function *> RPOT(&F);
+    if (containsIrreducibleCFG<const BasicBlock *>(RPOT, LI))
+      break;
+    auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
+    auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
+    auto &MSSA = AM.getResult<MemorySSAAnalysis>(F).getMSSA();
+    jeandle::SafepointLoopAnalysis A(LI, DT, SE, Work);
+    SmallVector<Loop *, 8> Loops(LI.getLoopsInPreorder());
+    std::optional<StripMinePlan> Plan;
+    for (Loop *L : llvm::reverse(Loops)) {
+      if (!Examined.insert(L->getHeader()).second)
+        continue;
+      if (!A.checkLoop(*L))
+        break;
+      if (DeferEmptyLoopDeletion) {
+        bool Deferred = false;
+        for (Loop *Ancestor = L; Ancestor; Ancestor = Ancestor->getParentLoop())
+          Deferred |= A.isEmptyLoopCandidate(*Ancestor);
+        if (Deferred) {
+          LLVM_DEBUG(dbgs()
+                     << "  strip-mining: skip " << L->getHeader()->getName()
+                     << ": empty-loop deletion candidate\n");
+          continue;
+        }
+      }
+      Plan = buildStripMinePlan(L, LI, DT, SE, MSSA, A, Versioning);
+      if (Plan)
+        break;
+    }
+    if (!Plan || Work.exhausted())
+      break;
+    if (!Plan->stillStructurallyValid(LI, DT))
       continue;
     if (Versioning)
-      applyInclusiveLoopVersioningPlan(Plan, LI, DT);
+      applyInclusiveLoopVersioningPlan(*Plan, LI, DT);
     else
-      applyStripMinePlan(Plan, LI, DT, SE);
+      applyStripMinePlan(*Plan, LI, DT, SE);
     Changed = true;
+    // Shared exits and memory state can couple otherwise disjoint siblings.
+    // Rebuild before the next plan, rather than reusing pre-mutation proofs.
+    AM.invalidate(F, PreservedAnalyses::none());
   }
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }

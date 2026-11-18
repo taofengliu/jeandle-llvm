@@ -10,10 +10,8 @@
 ///
 /// Verifies that every natural loop either reaches a safepoint on every
 /// backedge path or has a SCEV-provable finite bound accepted by the poll
-/// elimination policy. Strip-mined inner loops are accepted via the
-/// "jeandle.strip-mined-poll" attribute on the poll relocated onto the outer
-/// back-edge: this verifier is adjacent to SafepointStripMining in the
-/// pipeline, so the marker is always fresh and trusted.
+/// elimination policy. Strip-mined inner loops require a current numerical
+/// or counted-clamp proof as well as a poll on their outer backedge.
 ///
 //===----------------------------------------------------------------------===//
 
@@ -26,6 +24,7 @@
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/IR/CFG.h"
+#include "llvm/IR/Dominators.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Jeandle/JeandleUtils.h"
@@ -43,37 +42,6 @@ using jeandle::SafepointCoverageCheck;
 
 namespace {
 
-static bool blockHasSafepoint(BasicBlock *BB) {
-  return llvm::any_of(*BB, jeandle::isSafepoint);
-}
-
-// Walking backwards from a latch and cutting the search at every safepoint
-// proves coverage by disjoint branch arms as well as single-block dominance.
-// Reaching the header without crossing a safepoint exposes an uncovered
-// backedge path.
-static bool allPathsToLatchReachSafepoint(Loop &L, BasicBlock *Latch) {
-  SmallVector<BasicBlock *, 8> Worklist{Latch};
-  SmallPtrSet<BasicBlock *, 16> Visited;
-  while (!Worklist.empty()) {
-    BasicBlock *BB = Worklist.pop_back_val();
-    if (!Visited.insert(BB).second || blockHasSafepoint(BB))
-      continue;
-    if (BB == L.getHeader())
-      return false;
-
-    bool HasLoopPredecessor = false;
-    for (BasicBlock *Pred : predecessors(BB)) {
-      if (!L.contains(Pred))
-        return false;
-      HasLoopPredecessor = true;
-      Worklist.push_back(Pred);
-    }
-    if (!HasLoopPredecessor)
-      return false;
-  }
-  return true;
-}
-
 static cl::opt<SafepointCoverageCheck> CoverageCheck(
     "jeandle-verify-safepoint-coverage",
     cl::values(clEnumValN(SafepointCoverageCheck::Off, "off",
@@ -89,27 +57,25 @@ static cl::opt<SafepointCoverageCheck> CoverageCheck(
 #endif
     cl::desc("Safepoint coverage verifier mode."));
 
-static bool isLoopCovered(Loop &L, ScalarEvolution &SE) {
+static bool isLoopCovered(Loop &L, ScalarEvolution &SE, DominatorTree &DT,
+                          jeandle::SafepointLoopAnalysis &A) {
   SmallVector<BasicBlock *, 4> Latches;
   L.getLoopLatches(Latches);
   if (Latches.empty())
     return false;
 
-  if (Latches.size() == 1 && jeandle::isMarkedStripMinedInner(L))
+  if (jeandle::isBoundedStripMinedInner(L, SE, DT))
     return true;
 
-  bool AllLatchesCovered = llvm::all_of(Latches, [&](BasicBlock *Latch) {
-    return allPathsToLatchReachSafepoint(L, Latch);
-  });
-  if (AllLatchesCovered)
+  if (A.hasCoverage(L))
     return true;
 
   jeandle::LoopSafepointFacts Facts = jeandle::LoopSafepointFacts::get(L, SE);
   if (!jeandle::isMarkedStripMinedInner(L) &&
-      !jeandle::isStripMiningEnabled() && Facts.IsIntCountedEquivalent)
+      !jeandle::isStripMiningEnabled() && Facts.IsWithinIntBackedgeLimit)
     return true;
 
-  return Facts.IsWithinBudget;
+  return L.isInnermost() && Facts.IsWithinBudget;
 }
 
 } // namespace
@@ -141,10 +107,19 @@ PreservedAnalyses SafepointCoverageVerifier::run(Function &F,
   }
 
   auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
+  auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
 
+  jeandle::SafepointWorkBudget Work;
+  jeandle::SafepointLoopAnalysis A(LI, DT, SE, Work);
   bool Broken = false;
   for (Loop *L : LI.getLoopsInPreorder()) {
-    if (isLoopCovered(*L, SE)) {
+    bool Covered = A.checkLoop(*L) && isLoopCovered(*L, SE, DT, A);
+    if (Work.exhausted()) {
+      errs() << "SafepointCoverageVerifier: coverage not verified for '"
+             << F.getName() << "': analysis budget exhausted\n";
+      break;
+    }
+    if (Covered) {
       LLVM_DEBUG(dbgs() << "  covered: loop " << L->getHeader()->getName()
                         << " in " << F.getName() << "\n");
       continue;

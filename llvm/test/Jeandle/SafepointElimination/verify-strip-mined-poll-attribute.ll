@@ -5,21 +5,17 @@
 ; RUN:   -jeandle-verify-safepoint-coverage=fatal -disable-output < %s 2>&1 \
 ; RUN:   | FileCheck %s --check-prefix=ABORT
 
-; A strip-mined nest is identified by the "jeandle.strip-mined-poll" call-site
-; attribute on the poll that SafepointStripMining relocated onto the outer
-; back-edge. The marker IS the relocated poll, so it cannot outlive the
-; coverage it certifies. SafepointPollElimination<after-strip-mining> and this
-; verifier are adjacent to strip mining in the pipeline and trust the
-; attribute; without it, a poll-free inner loop is reported uncovered.
+; A marker locates a candidate but cannot prove an opaque inner bound.
+; Revalidate each loop, including unrelated siblings of a marked poll.
 
 declare hotspotcc void @jeandle.safepoint_poll()
 declare void @some.helper()
 declare i64 @llvm.sadd.sat.i64(i64, i64)
 
 ; The pass-produced shape: inner loop poll-free with a SCEV-opaque clamped
-; limit, outer latch carries the relocated poll with the attribute. Accepted
-; without any structural re-derivation.
-define void @accepts_attributed_nest(i64 %n) "java-method" {
+; limit, outer latch carries a poll with the attribute. The saturating
+; expression is deliberately opaque to the current bound proof.
+define void @rejects_opaque_attributed_nest(i64 %n) "java-method" {
 entry:
   br label %outer.ph
 
@@ -171,11 +167,11 @@ exit:
 
 attributes #0 = { "jeandle.strip-mined-poll" }
 
-; WARN-NOT:  accepts_attributed_nest
+; WARN:      'inner.header' in function 'rejects_opaque_attributed_nest'
 ; WARN:      'inner.header' in function 'rejects_unattributed_nest'
 ; WARN-NEXT: SafepointCoverageVerifier: loop with header 'inner.header' in function 'rejects_attribute_on_outer_header'
 ; WARN-NEXT: SafepointCoverageVerifier: loop with header 'outer.header' in function 'rejects_attribute_on_non_poll'
 ; WARN-NEXT: SafepointCoverageVerifier: loop with header 'inner.header' in function 'rejects_attribute_on_non_poll'
 
-; ABORT-NOT: accepts_attributed_nest
+; ABORT:     'inner.header' in function 'rejects_opaque_attributed_nest'
 ; ABORT:     Jeandle safepoint coverage verification failed

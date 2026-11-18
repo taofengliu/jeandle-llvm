@@ -3,7 +3,7 @@
 
 ; IndVarSimplify can widen a Java int induction to i64 while the backedge deopt
 ; state still needs the Java local as a trunc of the latch-carried next value.
-; The cast is batch-boundary state and must be rebuilt from the outer IV.
+; The cast result is carried unchanged through a boundary PHI.
 
 declare hotspotcc void @jeandle.safepoint_poll()
 
@@ -35,15 +35,14 @@ exit:
 
 ; CHECK-LABEL: @widened_iv_with_i32_deopt(
 ; CHECK:       loop.outer.latch:
-; CHECK:         %local.next.outer = trunc nuw nsw i64 %outer.iv.next to i32
-; CHECK-NEXT:    %local.roundtrip.outer = zext i32 %local.next.outer to i64
-; CHECK-NEXT:    call hotspotcc void @jeandle.safepoint_poll() #{{[0-9]+}}
-; CHECK-SAME:      [ "deopt"(i64 %sum.outer.next, i32 %local.next.outer, i64 %local.roundtrip.outer) ]
+; CHECK-DAG:     %local.next.poll.state = phi i32 [ %local.next, %loop ]
+; CHECK-DAG:     %local.roundtrip.poll.state = phi i64 [ %local.roundtrip, %loop ]
+; CHECK:         call hotspotcc void @jeandle.safepoint_poll() #{{[0-9]+}}
+; CHECK-SAME:      [ "deopt"(i64 %sum.outer.next, i32 %local.next.poll.state, i64 %local.roundtrip.poll.state) ]
 
 ; A loop-local cast whose input is invariant is still an inner-loop definition.
-; Rebuild it at the outer boundary instead of creating a non-LCSSA use of the
-; inner instruction.
-define void @cast_of_invariant_is_rebuilt(i64 %limit, i32 %state) "java-method" {
+; Carry its actual result through LCSSA at the outer boundary.
+define void @cast_of_invariant_is_carried(i64 %limit, i32 %state) "java-method" {
 entry:
   %nonempty = icmp sgt i64 %limit, 0
   br i1 %nonempty, label %preheader, label %exit
@@ -64,11 +63,11 @@ exit:
   ret void
 }
 
-; CHECK-LABEL: @cast_of_invariant_is_rebuilt(
+; CHECK-LABEL: @cast_of_invariant_is_carried(
 ; CHECK:       loop.outer.latch:
-; CHECK:         %state.wide.outer = zext i32 %state to i64
-; CHECK-NEXT:    call hotspotcc void @jeandle.safepoint_poll() #{{[0-9]+}}
-; CHECK-SAME:      [ "deopt"(i64 %state.wide.outer, i64 %outer.iv.next) ]
+; CHECK:         %state.wide.poll.state = phi i64 [ %state.wide, %loop ]
+; CHECK:         call hotspotcc void @jeandle.safepoint_poll() #{{[0-9]+}}
+; CHECK-SAME:      [ "deopt"(i64 %state.wide.poll.state, i64 %outer.iv.next) ]
 
 ; A self recurrence represents the same invariant local on every iteration.
 ; Materialize the preheader value directly at the relocated poll.
@@ -98,8 +97,8 @@ exit:
 ; CHECK:         call hotspotcc void @jeandle.safepoint_poll() #{{[0-9]+}}
 ; CHECK-SAME:      [ "deopt"(ptr %receiver, i64 %outer.iv.next) ]
 
-; A cast does not make current-iteration state a batch-boundary value.
-define void @cast_of_current_phi_is_rejected(i64 %limit) "java-method" {
+; Current-iteration state remains the actual value at the original poll.
+define void @cast_of_current_phi_is_carried(i64 %limit) "java-method" {
 entry:
   %nonempty = icmp sgt i64 %limit, 0
   br i1 %nonempty, label %preheader, label %exit
@@ -120,13 +119,13 @@ exit:
   ret void
 }
 
-; CHECK-LABEL: @cast_of_current_phi_is_rejected(
-; CHECK-NOT:   outer
-; CHECK:       call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 %local.current) ]
+; CHECK-LABEL: @cast_of_current_phi_is_carried(
+; CHECK:       loop.outer.latch:
+; CHECK:       %local.current.poll.state = phi i32 [ %local.current, %loop ]
+; CHECK:       call hotspotcc void @jeandle.safepoint_poll() #{{[0-9]+}} [ "deopt"(i32 %local.current.poll.state) ]
 
-; A cast of an arbitrary body value is still not reconstructible from the
-; outer recurrences.
-define void @cast_of_body_value_is_rejected(i64 %limit) "java-method" {
+; Arbitrary body values need no reconstruction from outer recurrences.
+define void @cast_of_body_value_is_carried(i64 %limit) "java-method" {
 entry:
   %nonempty = icmp sgt i64 %limit, 0
   br i1 %nonempty, label %preheader, label %exit
@@ -148,8 +147,9 @@ exit:
   ret void
 }
 
-; CHECK-LABEL: @cast_of_body_value_is_rejected(
-; CHECK-NOT:   outer
-; CHECK:       call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 %local.body) ]
+; CHECK-LABEL: @cast_of_body_value_is_carried(
+; CHECK:       loop.outer.latch:
+; CHECK:       %local.body.poll.state = phi i32 [ %local.body, %loop ]
+; CHECK:       call hotspotcc void @jeandle.safepoint_poll() #{{[0-9]+}} [ "deopt"(i32 %local.body.poll.state) ]
 
 !java-method-compilation = !{}

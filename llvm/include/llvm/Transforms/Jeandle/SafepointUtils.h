@@ -12,6 +12,7 @@
 #define LLVM_TRANSFORMS_JEANDLE_SAFEPOINTUTILS_H
 
 #include "llvm/ADT/APInt.h"
+#include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include <cstdint>
@@ -25,6 +26,7 @@ class Instruction;
 class CallInst;
 class Loop;
 class LoopInfo;
+class MemorySSA;
 class PHINode;
 class SCEV;
 class SCEVAddRecExpr;
@@ -38,6 +40,9 @@ bool isSafepointPoll(const Instruction &I);
 bool isSafepoint(const Instruction &I);
 bool isGuaranteedSafepointCall(const Instruction &I);
 
+// The source poll and the continuing backedge observe the same memory state.
+bool canRelocateSafepointPoll(CallInst &Poll, Loop &L, MemorySSA &MSSA);
+
 uint64_t getLoopStripMiningIter();
 bool isSafepointEliminationEnabled();
 bool isStripMiningEnabled();
@@ -48,46 +53,66 @@ bool backedgeCountProvablyLessThan(Loop &L, uint64_t ExclusiveLimit,
 
 struct LoopSafepointFacts {
   bool IsWithinBudget = false;
-  bool IsIntCountedEquivalent = false;
+  bool IsWithinIntBackedgeLimit = false;
   bool HasGuaranteedCallCoverage = false;
   bool HasOwnDominatingPoll = false;
 
   static LoopSafepointFacts get(Loop &L, ScalarEvolution &SE);
-  static LoopSafepointFacts get(Loop &L, LoopInfo &LI, DominatorTree &DT,
-                                ScalarEvolution &SE);
 };
-
-// A guaranteed-safepoint call in a block dominating the latch is reached on
-// every iteration, so the loop needs no back-edge poll of its own (C2's
-// _has_call / "Then no need for a safept!").
-bool hasGuaranteedCallCoverage(Loop &L, DominatorTree &DT);
-
-bool isEmptyLoopPollDeletionCandidate(Loop &L, LoopInfo &LI, DominatorTree &DT,
-                                      ScalarEvolution &SE);
-
-// The ancestor-chain verdict for a loop's polls, computed once per loop
-// instead of once per poll (the ancestors and their facts do not change
-// across a loop's polls). A poll in the loop is required iff some uncovered
-// ancestor has no latch, or the poll's block dominates an uncovered
-// ancestor's latch.
-struct AncestorPollRequirements {
-  bool AnyLatchlessUncoveredAncestor = false;
-  SmallVector<BasicBlock *, 4> Latches;
-
-  bool isRequired(const CallInst &Poll, DominatorTree &DT) const;
-};
-
-AncestorPollRequirements computeAncestorPollRequirements(Loop &L, LoopInfo &LI,
-                                                         DominatorTree &DT,
-                                                         ScalarEvolution &SE);
 
 using RequiredPolls = SmallPtrSet<CallInst *, 8>;
 
-// Phase 1 (C2 IdealLoopTree::check_safepts). Process loops innermost-first:
-// for each loop, decide whether it already reaches a safepoint every iteration
-// (insert into HasSfpt) and record sub-loop polls an enclosing loop depends on
-// (insert into Required). Pure analysis — does not mutate the IR.
-void analyzeLoop(Loop &L, LoopInfo &LI, DominatorTree &DT,
+// A function-pass invocation owns the budget; CFG mutations discard the
+// epoch-local caches without replenishing the total work allowance.
+class SafepointWorkBudget {
+  uint64_t Remaining;
+  bool Exhausted = false;
+
+public:
+  SafepointWorkBudget();
+  bool spend(uint64_t Work = 1);
+  bool checkDepth(Loop &L);
+  bool exhausted() const { return Exhausted; }
+};
+
+class SafepointLoopAnalysis {
+  struct Coverage {
+    bool Calls = false;
+    bool Covered = false;
+    RequiredPolls Polls;
+  };
+  DenseMap<Loop *, Coverage> CoverageCache;
+  DenseMap<Loop *, LoopSafepointFacts> FactsCache;
+  DenseMap<Loop *, bool> EmptyCache;
+  Coverage &getCoverage(Loop &L);
+
+public:
+  LoopInfo &LI;
+  DominatorTree &DT;
+  ScalarEvolution &SE;
+  SafepointWorkBudget &Work;
+  SafepointLoopAnalysis(LoopInfo &LI, DominatorTree &DT, ScalarEvolution &SE,
+                        SafepointWorkBudget &Work)
+      : LI(LI), DT(DT), SE(SE), Work(Work) {}
+  bool checkLoop(Loop &L);
+  bool hasCoverage(Loop &L, bool CallsOnly = false);
+  const RequiredPolls &requiredPolls(Loop &L);
+  LoopSafepointFacts getFacts(Loop &L);
+  bool isEmptyLoopCandidate(Loop &L);
+};
+
+// Polls selected on ancestor backedge paths. An incomplete analysis requires
+// every poll to survive; consumers must not use partial negative results.
+struct AncestorPollRequirements {
+  RequiredPolls Polls;
+  bool Complete = true;
+  bool isRequired(const CallInst &Poll, DominatorTree &DT) const;
+};
+
+AncestorPollRequirements
+computeAncestorPollRequirements(Loop &L, SafepointLoopAnalysis &Analysis);
+
+void analyzeLoop(Loop &L, SafepointLoopAnalysis &Analysis,
                  SmallPtrSetImpl<Loop *> &HasSfpt, RequiredPolls &Required);
 
 // Phase 2 (C2 remove_safepoints keep_one). The latch-closest poll this loop
@@ -102,13 +127,11 @@ CallInst *findKeepOne(Loop &L, LoopInfo &LI, DominatorTree &DT,
 // jeandle.strip-mined-poll call-site attribute.
 bool isStripMinedPoll(const Instruction &I);
 
-// A loop is the poll-free, batch-bounded inner of a strip-mined nest iff its
-// parent loop's latch holds a strip-mined poll (isStripMinedPoll). The marker
-// travels with the relocated poll, so it cannot outlive the coverage it
-// certifies. Callers are the passes adjacent to SafepointStripMining in the
-// pipeline (after-strip-mining deletion and the coverage verifier), which
-// trust the marker; anything later must not rely on it.
+// Locate a candidate nest; this attribute is not a bound proof.
 bool isMarkedStripMinedInner(Loop &L);
+
+// Revalidate the current counter or counted clamp and the outer poll.
+bool isBoundedStripMinedInner(Loop &L, ScalarEvolution &SE, DominatorTree &DT);
 
 constexpr unsigned StripMineStrideOverflowWidenBits = 64;
 

@@ -190,9 +190,12 @@ exit:
 ; CHECK-DAG:   loop.outer.latch:
 
 ; CHECK-LABEL: @runtime_inclusive_decreasing_current_phi_deopt(
-; CHECK-NOT:   inclusive.no_wrap
-; CHECK-NOT:   inclusive.slow
-; CHECK:       call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 %iv) ]
+; CHECK:       inclusive.no_wrap
+; CHECK:       loop.inclusive.slow:
+; CHECK:       call hotspotcc void @jeandle.safepoint_poll() [ "deopt"(i32 %iv.inclusive.slow) ]
+; CHECK:       loop.outer.latch:
+; CHECK:       %iv.poll.state = phi i32 [ %iv, %loop ]
+; CHECK:       call hotspotcc void @jeandle.safepoint_poll() #{{[0-9]+}} [ "deopt"(i32 %iv.poll.state) ]
 
 ; PIPELINE-LABEL: @runtime_inclusive_decreasing_i32(
 ; PIPELINE:       %inclusive.no_wrap = icmp sgt i32 %inclusive.limit.fr, -2147483648

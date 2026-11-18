@@ -25,6 +25,7 @@ add_llvm_component_library(LLVMJeandleTransforms
   SafepointPollElimination.cpp
   SafepointPollNormalization.cpp
   SafepointStripMining.cpp
+  SafepointBudgetStripMining.cpp
   SafepointUtils.cpp
   TLSPointerRewrite.cpp
   TypeCheckElimination.cpp
