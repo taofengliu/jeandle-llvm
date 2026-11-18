@@ -506,11 +506,10 @@ llvm::jeandle::LoopSafepointFacts::get(Loop &L, ScalarEvolution &SE) {
   uint64_t Budget = getLoopStripMiningIter();
   Facts.IsWithinBudget =
       Budget != 0 && backedgeCountProvablyLessThan(L, Budget, SE);
-  // This numerical approximation accepts loops whose maximum backedge count
-  // is strictly below INT_MAX. It intentionally does not infer countedness
-  // from the induction-variable type or loop shape.
+  // Accept at most the full 32-bit iteration range without inferring a
+  // Java induction type from the current (possibly widened) LLVM type.
   Facts.IsWithinIntBackedgeLimit =
-      backedgeCountProvablyLessThan(L, INT_MAX, SE);
+      backedgeCountProvablyLessThan(L, UINT32_MAX, SE);
   return Facts;
 }
 
@@ -519,9 +518,10 @@ namespace {
 // Cut the reverse search at a safepoint, and never cross the header into a
 // previous iteration. A visited block is shared by all latches, so merged
 // backedges and nested cycles do not multiply the work.
-bool scanBackedgePaths(Loop &L, bool CallsOnly,
-                       jeandle::SafepointWorkBudget &Work,
-                       jeandle::RequiredPolls *Polls = nullptr) {
+bool scanBackedgePaths(Loop &L, jeandle::SafepointWorkBudget &Work,
+                       const jeandle::RequiredPolls *Accepted = nullptr,
+                       const jeandle::RequiredPolls *Excluded = nullptr,
+                       jeandle::RequiredPolls *Selected = nullptr) {
   SmallVector<BasicBlock *, 8> Worklist;
   L.getLoopLatches(Worklist);
   if (Worklist.empty())
@@ -536,18 +536,20 @@ bool scanBackedgePaths(Loop &L, bool CallsOnly,
       return false;
     if (llvm::any_of(*BB, jeandle::isGuaranteedSafepointCall))
       continue;
-    if (!CallsOnly) {
-      CallInst *Poll = nullptr;
-      for (Instruction &I : llvm::reverse(*BB))
-        if (jeandle::isSafepointPoll(I)) {
-          Poll = cast<CallInst>(&I);
+    CallInst *Poll = nullptr;
+    for (Instruction &I : llvm::reverse(*BB))
+      if (jeandle::isSafepointPoll(I)) {
+        auto *P = cast<CallInst>(&I);
+        if ((!Accepted || Accepted->contains(P)) &&
+            (!Excluded || !Excluded->contains(P))) {
+          Poll = P;
           break;
         }
-      if (Poll) {
-        if (Polls)
-          Polls->insert(Poll);
-        continue;
       }
+    if (Poll) {
+      if (Selected)
+        Selected->insert(Poll);
+      continue;
     }
     if (BB == L.getHeader()) {
       Covered = false;
@@ -575,9 +577,9 @@ jeandle::SafepointLoopAnalysis::Coverage &
 jeandle::SafepointLoopAnalysis::getCoverage(Loop &L) {
   auto [It, Inserted] = CoverageCache.try_emplace(&L);
   if (Inserted && checkLoop(L)) {
-    It->second.Calls = scanBackedgePaths(L, true, Work);
-    It->second.Covered = It->second.Calls ||
-                         scanBackedgePaths(L, false, Work, &It->second.Polls);
+    RequiredPolls NoPolls;
+    It->second.Calls = scanBackedgePaths(L, Work, &NoPolls);
+    It->second.Covered = It->second.Calls || scanBackedgePaths(L, Work);
   }
   return It->second;
 }
@@ -587,18 +589,72 @@ bool jeandle::SafepointLoopAnalysis::hasCoverage(Loop &L, bool CallsOnly) {
   return !Work.exhausted() && (CallsOnly ? C.Calls : C.Covered);
 }
 
-const jeandle::RequiredPolls &
-jeandle::SafepointLoopAnalysis::requiredPolls(Loop &L) {
-  return getCoverage(L).Polls;
+bool jeandle::SafepointLoopAnalysis::isExempt(Loop &L) {
+  if (isBoundedStripMinedInner(L, SE, DT))
+    return true;
+  auto Facts = getFacts(L);
+  return (L.isInnermost() && Facts.IsWithinBudget) ||
+         (!isMarkedStripMinedInner(L) && !isStripMiningEnabled() &&
+          Facts.IsWithinIntBackedgeLimit);
+}
+
+bool jeandle::SafepointLoopAnalysis::hasIndependentCoverage(
+    Loop &L, const RequiredPolls &Excluded) {
+  return checkLoop(L) && scanBackedgePaths(L, Work, nullptr, &Excluded) &&
+         !Work.exhausted();
+}
+
+bool jeandle::SafepointLoopAnalysis::retainPolls(Loop &L,
+                                                 RequiredPolls &Retained) {
+  if (!checkLoop(L))
+    return false;
+  if (isExempt(L))
+    return !Work.exhausted();
+  // Descendant polls already retained for their own backedges may cover all
+  // parent paths. In particular, a necessarily entered child can make every
+  // poll owned by its parent redundant.
+  if (scanBackedgePaths(L, Work, &Retained))
+    return !Work.exhausted();
+  // Prefer a dominating poll that an ancestor cannot do without even when
+  // every other source poll remains. This preserves an early header poll
+  // when a later latch poll would miss an ancestor's zero-trip child exit.
+  RequiredPolls Preferred;
+  for (BasicBlock *BB : L.blocks()) {
+    if (LI.getLoopFor(BB) != &L)
+      continue;
+    if (!Work.spend(BB->size()))
+      return false;
+    for (Instruction &I : *BB) {
+      if (!isSafepointPoll(I))
+        continue;
+      auto *Poll = cast<CallInst>(&I);
+      RequiredPolls Excluded{Poll};
+      for (Loop *Parent = L.getParentLoop(); Parent;
+           Parent = Parent->getParentLoop())
+        if (!isExempt(*Parent) && !hasIndependentCoverage(*Parent, Excluded)) {
+          Preferred.insert(Poll);
+          break;
+        }
+    }
+  }
+  if (CallInst *Keeper = findKeepOne(L, LI, DT, Preferred)) {
+    if (Work.exhausted())
+      return false;
+    Retained.insert(Keeper);
+    return true;
+  }
+  RequiredPolls Selected;
+  if (!scanBackedgePaths(L, Work, nullptr, nullptr, &Selected) ||
+      Work.exhausted())
+    return false;
+  Retained.insert_range(Selected);
+  return true;
 }
 
 jeandle::LoopSafepointFacts jeandle::SafepointLoopAnalysis::getFacts(Loop &L) {
   auto [It, Inserted] = FactsCache.try_emplace(&L);
   if (Inserted && checkLoop(L)) {
     It->second = LoopSafepointFacts::get(L, SE);
-    It->second.HasGuaranteedCallCoverage = hasCoverage(L, true);
-    RequiredPolls Empty;
-    It->second.HasOwnDominatingPoll = findKeepOne(L, LI, DT, Empty) != nullptr;
   }
   return It->second;
 }
@@ -615,36 +671,26 @@ jeandle::computeAncestorPollRequirements(Loop &L, SafepointLoopAnalysis &A) {
     Requirements.Complete = false;
     return Requirements;
   }
-  for (Loop *Ancestor = L.getParentLoop(); Ancestor;
-       Ancestor = Ancestor->getParentLoop()) {
-    auto Facts = A.getFacts(*Ancestor);
-    if ((Ancestor->isInnermost() && Facts.IsWithinBudget) ||
-        (!isStripMiningEnabled() && Facts.IsWithinIntBackedgeLimit) ||
-        Facts.HasGuaranteedCallCoverage || Facts.HasOwnDominatingPoll)
-      continue;
-    const RequiredPolls &Polls = A.requiredPolls(*Ancestor);
-    if (!A.Work.spend(Polls.size())) {
+  RequiredPolls Excluded;
+  for (BasicBlock *BB : L.blocks()) {
+    if (!A.Work.spend(BB->size())) {
       Requirements.Complete = false;
       return Requirements;
     }
-    for (CallInst *Poll : Polls)
-      Requirements.Polls.insert(Poll);
+    for (Instruction &I : *BB)
+      if (isSafepointPoll(I))
+        Excluded.insert(cast<CallInst>(&I));
+  }
+  for (Loop *Ancestor = L.getParentLoop(); Ancestor;
+       Ancestor = Ancestor->getParentLoop()) {
+    if (!A.isExempt(*Ancestor) &&
+        !A.hasIndependentCoverage(*Ancestor, Excluded)) {
+      Requirements.Polls.insert_range(Excluded);
+      break;
+    }
   }
   Requirements.Complete = !A.Work.exhausted();
   return Requirements;
-}
-
-void jeandle::analyzeLoop(Loop &L, SafepointLoopAnalysis &A,
-                          SmallPtrSetImpl<Loop *> &HasSfpt,
-                          RequiredPolls &Required) {
-  if (A.hasCoverage(L, true)) {
-    HasSfpt.insert(&L);
-    return;
-  }
-  if (A.getFacts(L).HasOwnDominatingPoll)
-    return;
-  for (CallInst *Poll : A.requiredPolls(L))
-    Required.insert(Poll);
 }
 
 // Phase 2 keeper selection (C2 remove_safepoints keep_one idom-path keeper).

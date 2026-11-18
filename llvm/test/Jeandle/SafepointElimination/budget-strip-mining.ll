@@ -55,9 +55,13 @@ exit:
 }
 
 ; CHECK-LABEL: @poll_before_store(
-; CHECK-NOT: .batch
-; CHECK: call hotspotcc void @jeandle.safepoint_poll()
+; CHECK: batch.outer:
+; CHECK: header.fast:
+; CHECK-NOT: call hotspotcc void @jeandle.safepoint_poll
 ; CHECK: store i32 1
+; CHECK: header:
+; CHECK: call hotspotcc void @jeandle.safepoint_poll()
+; CHECK-NEXT: store i32 1
 ; OFF-LABEL: @poll_before_store(
 ; OFF-NOT: .batch
 ; OFF: call hotspotcc void @jeandle.safepoint_poll()

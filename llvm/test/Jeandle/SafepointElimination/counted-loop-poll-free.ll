@@ -28,9 +28,8 @@ exit:
 ; Pre-test (while-form) loop with a runtime bound and no nuw/nsw on the IV
 ; increment, as the Java frontend emits it: the exit test compares the
 ; PRE-inc IV and the latch increments. SCEV's symbolic max backedge-taken
-; count is smax(0, n) with constant max exactly INT_MAX, so it does not satisfy
-; the strict < INT_MAX threshold and must retain its poll. The post-inc shape
-; above has max BTC n-1 < INT_MAX and remains poll-free.
+; count is smax(0, n) with constant max exactly INT_MAX, below the full
+; 32-bit iteration-range threshold even though its LLVM update has no flags.
 define void @pretest_counted(i32 %n) "java-method" {
 entry:
   br label %loop.header
@@ -71,6 +70,6 @@ exit:
 ; CHECK-LABEL: @unbounded_counted(
 ; CHECK-NOT:   call hotspotcc void @jeandle.safepoint_poll
 ; CHECK-LABEL: @pretest_counted(
-; CHECK:       call hotspotcc void @jeandle.safepoint_poll()
+; CHECK-NOT:   call hotspotcc void @jeandle.safepoint_poll
 ; CHECK-LABEL: @bounded_counted(
 ; CHECK-NOT:   call hotspotcc void @jeandle.safepoint_poll

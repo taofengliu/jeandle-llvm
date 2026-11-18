@@ -36,8 +36,6 @@ using namespace llvm;
 
 namespace {
 
-using jeandle::analyzeLoop;
-using jeandle::findKeepOne;
 using jeandle::isSafepoint;
 using jeandle::isSafepointPoll;
 using jeandle::RequiredPolls;
@@ -117,114 +115,35 @@ bool collapseRedundantPolls(BasicBlock &BB) {
   return Changed;
 }
 
-// ===--------------------------------------------------------------------===//
-// Two-phase loop safepoint elimination (C2 check_safepts + remove_safepoints)
-//
-// Phase 1 (analyzeLoop) computes, without mutating the IR, each loop's coverage
-// state — whether it already reaches a safepoint every iteration and so need
-// not keep its own poll (C2's _has_sfpt) — and records polls that an enclosing
-// loop depends on (C2's _required_safept). Phase 2
-// (deleteLoopPolls) erases polls from each loop based on that state. Splitting
-// analysis from mutation mirrors C2 and avoids the ordering hazards of erasing
-// polls while still walking the loop tree.
-// ===--------------------------------------------------------------------===//
-
-// Phase 2 (C2 remove_safepoints + is_deleteable_safept + counted_loop's
-// keep_one decision). A loop with a provable small trip count, a strip-mined
-// inner (marked via the relocated poll's attribute), or one already covered
-// (HasSfpt) drops all its own deleteable polls;
-// otherwise it keeps one dominating poll (prune gate: no dominating keeper ⇒
-// delete nothing).
-static bool deleteLoopPolls(Loop &L, LoopInfo &LI, DominatorTree &DT,
-                            ScalarEvolution &SE,
-                            const SmallPtrSetImpl<Loop *> &HasSfpt,
-                            const RequiredPolls &Required,
+// Apply only after the entire loop tree has a complete retention plan. Each
+// poll belongs to exactly one loop, including polls selected by ancestors.
+static bool deleteLoopPolls(Loop &L, LoopInfo &LI,
+                            const RequiredPolls &Retained,
                             SafepointPollEliminationMode Mode) {
-  SmallVector<CallInst *, 4> OwnPolls;
+  bool Changed = false;
+  [[maybe_unused]] unsigned Total = 0, Kept = 0;
   for (BasicBlock *BB : L.blocks()) {
     if (LI.getLoopFor(BB) != &L)
       continue;
-    for (Instruction &I : *BB)
-      if (isSafepointPoll(I))
-        OwnPolls.push_back(cast<CallInst>(&I));
-  }
-  if (OwnPolls.empty())
-    return false;
-
-  BasicBlock *Latch = L.getLoopLatch();
-  if (!Latch && !HasSfpt.contains(&L)) {
-    LLVM_DEBUG(dbgs() << "  poll-elimination<" << modeName(Mode) << "> loop "
-                      << L.getHeader()->getName()
-                      << ": keep-all (multi-latch loop)\n");
-    return false;
-  }
-
-  auto IsDeleteable = [&](CallInst *P) { return !Required.contains(P); };
-
-  jeandle::LoopSafepointFacts Facts = jeandle::LoopSafepointFacts::get(L, SE);
-  const char *Reason = nullptr;
-  if (jeandle::isBoundedStripMinedInner(L, SE, DT))
-    Reason = "strip-mined-inner";
-  else if (L.isInnermost() && Facts.IsWithinBudget)
-    Reason = "within-budget"; // short loop: trip count bounds time-to-safepoint
-  else if (HasSfpt.contains(&L))
-    Reason = "call-covered"; // call/sub-loop coverage reaches a safepoint
-  else if (!jeandle::isStripMiningEnabled() && Facts.IsWithinIntBackedgeLimit)
-    Reason = "int-counted-no-strip-mining"; // bounded trip => C2 T_INT
-  bool DeleteAll = Reason != nullptr;
-
-  if (DeleteAll) {
-    bool Changed = false;
-    [[maybe_unused]] unsigned Erased = 0;
-    for (CallInst *P : OwnPolls) {
-      if (IsDeleteable(P)) {
-        P->eraseFromParent();
-        Changed = true;
-        ++Erased;
-      } else {
-        LLVM_DEBUG(dbgs() << "    poll-elimination: kept ancestor-required "
-                             "poll in "
-                          << P->getParent()->getName() << "\n");
+    for (Instruction &I : make_early_inc_range(*BB)) {
+      if (!isSafepointPoll(I))
+        continue;
+      ++Total;
+      if (Retained.contains(cast<CallInst>(&I))) {
+        ++Kept;
+        continue;
       }
-    }
-    LLVM_DEBUG(dbgs() << "  poll-elimination<" << modeName(Mode) << "> loop "
-                      << L.getHeader()->getName() << ": delete-all (" << Reason
-                      << "), erased " << Erased << " of " << OwnPolls.size()
-                      << " poll(s)\n");
-    if (Changed)
-      SE.forgetLoop(&L);
-    return Changed;
-  }
-
-  // keep-one: retain one dominating poll, erase the rest.
-  CallInst *Keep = findKeepOne(L, LI, DT, Required);
-  if (!Keep) {
-    // no single poll dominates all paths — prune gate
-    LLVM_DEBUG(dbgs() << "  poll-elimination<" << modeName(Mode) << "> loop "
-                      << L.getHeader()->getName()
-                      << ": keep-all (no dominating keeper)\n");
-    return false;
-  }
-  bool Changed = false;
-  [[maybe_unused]] unsigned Erased = 0;
-  for (CallInst *P : OwnPolls)
-    if (P != Keep && IsDeleteable(P)) {
-      P->eraseFromParent();
+      I.eraseFromParent();
       Changed = true;
-      ++Erased;
     }
-  LLVM_DEBUG(dbgs() << "  poll-elimination<" << modeName(Mode) << "> loop "
-                    << L.getHeader()->getName() << ": keep-one (keeper in "
-                    << Keep->getParent()->getName() << "), erased " << Erased
-                    << " of " << OwnPolls.size() << " poll(s)\n");
+  }
+  LLVM_DEBUG(if (Total) dbgs()
+             << "  poll-elimination<" << modeName(Mode) << "> loop "
+             << L.getHeader()->getName() << ": retained-poll-cut (kept " << Kept
+             << " of " << Total << ")\n");
   return Changed;
 }
 
-// Complete loop-tree poll deletion (C2 check_safepts over every loop
-// + remove_safepoints), shared by Early when strip mining is disabled and
-// AfterStripMining after CFG surgery. It analyzes coverage state
-// innermost-first (so a sub-loop's state is settled
-// before enclosing loops read it), then deletes per the analyzed state.
 struct EmptyLoopExitValueCheck {
   PHINode *Phi;
   Value *OriginalValue;
@@ -421,8 +340,8 @@ void applyEmptyLoopPollRemovalPlan(const EmptyLoopPollRemovalPlan &Plan,
   deleteDeadLoop(Plan.L, &DT, &SE, &LI);
 }
 
-static bool completeLoopPollDeletion(Function &F, LoopInfo &LI,
-                                     DominatorTree &DT, ScalarEvolution &SE,
+static bool completeLoopPollDeletion(LoopInfo &LI, DominatorTree &DT,
+                                     ScalarEvolution &SE,
                                      SafepointPollEliminationMode Mode,
                                      bool DeferEmptyLoopDeletion) {
   jeandle::SafepointWorkBudget Work;
@@ -440,18 +359,29 @@ static bool completeLoopPollDeletion(Function &F, LoopInfo &LI,
     }
   }
 
-  SmallPtrSet<Loop *, 8> HasSfpt;
-  RequiredPolls Required;
+  RequiredPolls Retained;
+  // Empty-loop deletion is a separate atomic transaction. Until it succeeds,
+  // keep its polls available to the ancestor coverage plan.
+  for (Loop *L : DeferredEmptyLoops)
+    for (BasicBlock *BB : L->blocks()) {
+      if (LI.getLoopFor(BB) != L)
+        continue;
+      if (!Work.spend(BB->size()))
+        return false;
+      for (Instruction &I : *BB)
+        if (isSafepointPoll(I))
+          Retained.insert(cast<CallInst>(&I));
+    }
   for (Loop *L : llvm::reverse(Loops))
-    analyzeLoop(*L, A, HasSfpt, Required);
+    if (!DeferredEmptyLoops.contains(L) && !A.retainPolls(*L, Retained))
+      return false;
   if (Work.exhausted())
     return false;
 
   bool Changed = false;
   for (Loop *L : llvm::reverse(Loops)) {
-    if (DeferredEmptyLoops.contains(L))
-      continue;
-    Changed |= deleteLoopPolls(*L, LI, DT, SE, HasSfpt, Required, Mode);
+    if (!DeferredEmptyLoops.contains(L))
+      Changed |= deleteLoopPolls(*L, LI, Retained, Mode);
   }
   return Changed;
 }
@@ -537,6 +467,10 @@ PreservedAnalyses SafepointPollElimination::run(Function &F,
           continue;
         applyEmptyLoopPollRemovalPlan(Plan, LI, DT, SE);
         Changed = LocalChanged = true;
+        // Ancestor coverage may depend on a sibling's polls. Rebuild the
+        // analysis and plans after each committed deletion before consuming
+        // another proof made against the previous CFG.
+        break;
       }
     }
     return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
@@ -546,7 +480,7 @@ PreservedAnalyses SafepointPollElimination::run(Function &F,
     auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
     auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
     bool Changed =
-        completeLoopPollDeletion(F, LI, DT, SE, Mode, DeferEmptyLoopDeletion);
+        completeLoopPollDeletion(LI, DT, SE, Mode, DeferEmptyLoopDeletion);
     return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
   }
 
@@ -560,7 +494,7 @@ PreservedAnalyses SafepointPollElimination::run(Function &F,
     auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
     auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
     Changed |=
-        completeLoopPollDeletion(F, LI, DT, SE, Mode, DeferEmptyLoopDeletion);
+        completeLoopPollDeletion(LI, DT, SE, Mode, DeferEmptyLoopDeletion);
   }
 
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();

@@ -64,18 +64,7 @@ static bool isLoopCovered(Loop &L, ScalarEvolution &SE, DominatorTree &DT,
   if (Latches.empty())
     return false;
 
-  if (jeandle::isBoundedStripMinedInner(L, SE, DT))
-    return true;
-
-  if (A.hasCoverage(L))
-    return true;
-
-  jeandle::LoopSafepointFacts Facts = jeandle::LoopSafepointFacts::get(L, SE);
-  if (!jeandle::isMarkedStripMinedInner(L) &&
-      !jeandle::isStripMiningEnabled() && Facts.IsWithinIntBackedgeLimit)
-    return true;
-
-  return L.isInnermost() && Facts.IsWithinBudget;
+  return A.hasCoverage(L) || A.isExempt(L);
 }
 
 } // namespace

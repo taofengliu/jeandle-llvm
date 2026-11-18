@@ -54,8 +54,6 @@ bool backedgeCountProvablyLessThan(Loop &L, uint64_t ExclusiveLimit,
 struct LoopSafepointFacts {
   bool IsWithinBudget = false;
   bool IsWithinIntBackedgeLimit = false;
-  bool HasGuaranteedCallCoverage = false;
-  bool HasOwnDominatingPoll = false;
 
   static LoopSafepointFacts get(Loop &L, ScalarEvolution &SE);
 };
@@ -79,7 +77,6 @@ class SafepointLoopAnalysis {
   struct Coverage {
     bool Calls = false;
     bool Covered = false;
-    RequiredPolls Polls;
   };
   DenseMap<Loop *, Coverage> CoverageCache;
   DenseMap<Loop *, LoopSafepointFacts> FactsCache;
@@ -96,7 +93,12 @@ public:
       : LI(LI), DT(DT), SE(SE), Work(Work) {}
   bool checkLoop(Loop &L);
   bool hasCoverage(Loop &L, bool CallsOnly = false);
-  const RequiredPolls &requiredPolls(Loop &L);
+  // Numerical exemptions and all-path coverage use the current loop shape.
+  bool isExempt(Loop &L);
+  bool hasIndependentCoverage(Loop &L, const RequiredPolls &Excluded);
+  // Grow a whole-tree retention plan without changing the IR. Failure makes
+  // the entire deletion plan unusable, including earlier successful loops.
+  bool retainPolls(Loop &L, RequiredPolls &Retained);
   LoopSafepointFacts getFacts(Loop &L);
   bool isEmptyLoopCandidate(Loop &L);
 };
@@ -111,9 +113,6 @@ struct AncestorPollRequirements {
 
 AncestorPollRequirements
 computeAncestorPollRequirements(Loop &L, SafepointLoopAnalysis &Analysis);
-
-void analyzeLoop(Loop &L, SafepointLoopAnalysis &Analysis,
-                 SmallPtrSetImpl<Loop *> &HasSfpt, RequiredPolls &Required);
 
 // Phase 2 (C2 remove_safepoints keep_one). The latch-closest poll this loop
 // owns on the dominator chain, preferring one an ancestor requires (it must

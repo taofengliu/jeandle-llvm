@@ -141,7 +141,8 @@ exit:
 ; BUDGET:       call hotspotcc void @jeandle.safepoint_poll()
 
 ; In a pre-test loop, the latch-to-header edge is taken once per body
-; iteration. INT_MAX-1 backedges satisfy the strict INT_MAX threshold.
+; iteration. Counts on either side of INT_MAX satisfy the full unsigned
+; 32-bit iteration-range policy.
 define void @pretest_i32_below_int_max(ptr %sink) "java-method" {
 entry:
   br label %header
@@ -164,7 +165,7 @@ exit:
 ; INT-LABEL: @pretest_i32_below_int_max(
 ; INT-NOT:   call hotspotcc void @jeandle.safepoint_poll
 
-; INT_MAX backedges are equal to the exclusive threshold and retain coverage.
+; INT_MAX backedges remain below the UINT32_MAX exclusive threshold.
 define void @pretest_i32_at_int_max(ptr %sink) "java-method" {
 entry:
   br label %header
@@ -185,7 +186,7 @@ exit:
 }
 
 ; INT-LABEL: @pretest_i32_at_int_max(
-; INT:       call hotspotcc void @jeandle.safepoint_poll()
+; INT-NOT:   call hotspotcc void @jeandle.safepoint_poll
 
 ; IsIntCountedEquivalent remains a numerical threshold rather than an IV-type
 ; recognizer: an i64 count below INT_MAX is accepted.
@@ -211,7 +212,7 @@ exit:
 ; INT-LABEL: @pretest_i64_below_int_max(
 ; INT-NOT:   call hotspotcc void @jeandle.safepoint_poll
 
-; The same i64 shape at INT_MAX is rejected without truncating the limit.
+; The same proven i64 bound is accepted independently of the IV type.
 define void @pretest_i64_at_int_max(ptr %sink) "java-method" {
 entry:
   br label %header
@@ -232,6 +233,6 @@ exit:
 }
 
 ; INT-LABEL: @pretest_i64_at_int_max(
-; INT:       call hotspotcc void @jeandle.safepoint_poll()
+; INT-NOT:   call hotspotcc void @jeandle.safepoint_poll
 
 !java-method-compilation = !{}

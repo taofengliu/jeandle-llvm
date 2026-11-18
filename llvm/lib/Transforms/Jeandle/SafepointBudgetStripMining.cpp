@@ -15,12 +15,16 @@
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/MemorySSA.h"
 #include "llvm/Analysis/ScalarEvolution.h"
+#include "llvm/IR/CFG.h"
 #include "llvm/IR/Dominators.h"
 #include "llvm/IR/IRBuilder.h"
 #include "llvm/IR/Jeandle/Attributes.h"
 #include "llvm/IR/Jeandle/JeandleUtils.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/Jeandle/SafepointUtils.h"
+#include "llvm/Transforms/Utils/BasicBlockUtils.h"
+#include "llvm/Transforms/Utils/Cloning.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
 
 using namespace llvm;
@@ -28,6 +32,17 @@ using namespace llvm;
 #define DEBUG_TYPE "safepoint-budget-strip-mining"
 
 namespace {
+
+constexpr StringLiteral CloneCostMetadata =
+    "jeandle.safepoint.clone.instructions";
+
+cl::opt<unsigned> MaxLoopCloneInstructions(
+    "jeandle-safepoint-max-loop-clone-instructions", cl::Hidden, cl::init(128),
+    cl::desc("Maximum source instructions copied for a polling batch."));
+cl::opt<unsigned> MaxFunctionCloneInstructions(
+    "jeandle-safepoint-max-function-clone-instructions", cl::Hidden,
+    cl::init(512),
+    cl::desc("Cumulative polling-batch clone budget per function."));
 
 CallInst *findMovablePoll(Loop &L, LoopInfo &LI, DominatorTree &DT,
                           ScalarEvolution &SE, MemorySSA &MSSA,
@@ -144,6 +159,170 @@ void wrapLoop(Loop &L, CallInst &Poll, uint64_t Budget) {
   Latch->getTerminator()->replaceSuccessorWith(Header, Check);
 }
 
+// A clone plan is read-only until every structural, coverage and growth check
+// succeeds. The original blocks will execute one complete polling iteration.
+struct PollingIterationPlan {
+  Loop *Source;
+  unsigned Instructions;
+};
+
+std::optional<PollingIterationPlan>
+planPollingIteration(Loop &L, jeandle::SafepointLoopAnalysis &A,
+                     unsigned RemainingCloneBudget) {
+  if (!L.isInnermost() || !L.isLoopSimplifyForm() || !L.isLCSSAForm(A.DT) ||
+      !L.getLoopLatch() || !L.isSafeToClone() ||
+      !isa<BranchInst>(L.getLoopLatch()->getTerminator()) ||
+      jeandle::isMarkedStripMinedInner(L) || A.isExempt(L) ||
+      A.hasCoverage(L, true) || !A.hasCoverage(L) || A.isEmptyLoopCandidate(L))
+    return std::nullopt;
+
+  if (llvm::count(successors(L.getLoopLatch()), L.getHeader()) != 1)
+    return std::nullopt;
+  unsigned Instructions = 0;
+  bool HasPoll = false;
+  for (BasicBlock *BB : L.blocks()) {
+    if (BB->isEHPad() || BB->hasAddressTaken())
+      return std::nullopt;
+    for (Instruction &I : *BB) {
+      if (!A.Work.spend())
+        return std::nullopt;
+      if (!I.isDebugOrPseudoInst() &&
+          (++Instructions > MaxLoopCloneInstructions ||
+           Instructions > RemainingCloneBudget))
+        return std::nullopt;
+      if (I.getType()->isTokenTy() ||
+          (I.isTerminator() && !isa<BranchInst, SwitchInst>(&I)))
+        return std::nullopt;
+      for (Value *Operand : I.operands())
+        if (Operand->getType()->isTokenTy())
+          return std::nullopt;
+      auto *CB = dyn_cast<CallBase>(&I);
+      if (!CB)
+        continue;
+      if (!isa<CallInst>(CB) || CB->isConvergent() || CB->cannotDuplicate() ||
+          CB->hasFnAttr(Attribute::ReturnsTwice) ||
+          CB->hasFnAttr(jeandle::Attribute::StatepointID))
+        return std::nullopt;
+      if (jeandle::isSafepointPoll(I)) {
+        if (!CB->arg_empty() || !CB->use_empty())
+          return std::nullopt;
+        HasPoll = true;
+      }
+    }
+  }
+  SmallVector<BasicBlock *, 4> Exits;
+  L.getUniqueExitBlocks(Exits);
+  if (!HasPoll ||
+      llvm::any_of(Exits, [](BasicBlock *BB) { return BB->isEHPad(); }))
+    return std::nullopt;
+
+  // A fast natural exit can skip the polling iteration completely. Every
+  // ancestor must therefore have coverage independent of all source polls.
+  auto Requirements = jeandle::computeAncestorPollRequirements(L, A);
+  if (!Requirements.Complete || !Requirements.Polls.empty())
+    return std::nullopt;
+  return PollingIterationPlan{&L, Instructions};
+}
+
+void clonePollingIteration(const PollingIterationPlan &Plan, uint64_t Budget,
+                           LoopInfo &LI, DominatorTree &DT) {
+  Loop &L = *Plan.Source;
+  BasicBlock *Header = L.getHeader();
+  BasicBlock *Latch = L.getLoopLatch();
+  BasicBlock *Preheader = L.getLoopPreheader();
+  Function *F = Header->getParent();
+  LLVMContext &C = F->getContext();
+
+  struct CarriedState {
+    PHINode *Phi;
+    Value *Initial;
+    Value *Next;
+  };
+  SmallVector<CarriedState, 8> State;
+  for (PHINode &Phi : Header->phis())
+    State.push_back({&Phi, Phi.getIncomingValueForBlock(Preheader),
+                     Phi.getIncomingValueForBlock(Latch)});
+  SmallVector<BasicBlock *, 8> SourceBlocks(L.blocks());
+  SmallVector<MDNode *, 4> NoAliasScopes;
+  identifyNoAliasScopesToClone(SourceBlocks, NoAliasScopes);
+
+  // The cloning utility copies its entire preheader. Hoisted loads, stores
+  // and calls must stay outside the new outer loop and execute only once.
+  // Keep LI/DT valid through this split and the cloning utility's updates.
+  BasicBlock *Outer = SplitBlock(Preheader, Preheader->getTerminator(), &DT,
+                                 &LI, nullptr, "batch.outer");
+  ValueToValueMapTy VMap;
+  SmallVector<BasicBlock *, 8> ClonedBlocks;
+  cloneLoopWithPreheader(Header, Outer, &L, VMap, ".fast", &LI, &DT,
+                         ClonedBlocks);
+  remapInstructionsInBlocks(ClonedBlocks, VMap);
+  cloneAndAdaptNoAliasScopes(NoAliasScopes, ClonedBlocks, C, "fast");
+  auto Mapped = [&](Value *V) -> Value * {
+    auto It = VMap.find(V);
+    return It == VMap.end() ? V : static_cast<Value *>(It->second);
+  };
+  auto *FastHeader = cast<BasicBlock>(Mapped(Header));
+  auto *FastLatch = cast<BasicBlock>(Mapped(Latch));
+  auto *FastPreheader = cast<BasicBlock>(Mapped(Outer));
+
+  // From here on, LI/DT are deliberately not queried. Rebuild immediately
+  // after the batch of CFG edits, before forming LCSSA or finding candidates.
+  for (BasicBlock *BB : SourceBlocks) {
+    SmallPtrSet<BasicBlock *, 4> Seen;
+    for (BasicBlock *Exit : successors(BB)) {
+      if (VMap.count(Exit) || !Seen.insert(Exit).second)
+        continue;
+      for (PHINode &Phi : Exit->phis()) {
+        unsigned IncomingCount = Phi.getNumIncomingValues();
+        for (unsigned I = 0; I != IncomingCount; ++I)
+          if (Phi.getIncomingBlock(I) == BB)
+            Phi.addIncoming(Mapped(Phi.getIncomingValue(I)),
+                            cast<BasicBlock>(Mapped(BB)));
+      }
+    }
+  }
+
+  BasicBlock *Check = BasicBlock::Create(C, "batch.check", F);
+  for (const CarriedState &S : State) {
+    auto *OuterPhi =
+        PHINode::Create(S.Phi->getType(), 2, S.Phi->getName() + ".batch",
+                        Outer->getTerminator()->getIterator());
+    OuterPhi->addIncoming(S.Initial, Preheader);
+    OuterPhi->addIncoming(S.Next, Latch);
+    auto *FastPhi = cast<PHINode>(Mapped(S.Phi));
+    FastPhi->setIncomingValue(FastPhi->getBasicBlockIndex(FastPreheader),
+                              OuterPhi);
+    FastPhi->replaceIncomingBlockWith(FastLatch, Check);
+    // Capture by incoming-edge role, including self and mutually cyclic PHIs.
+    // This is the state after the last fast iteration, at the beginning of
+    // the complete original iteration, not that iteration's next state.
+    S.Phi->removeIncomingValue(S.Phi->getBasicBlockIndex(Latch), false);
+    S.Phi->setIncomingBlock(0, Check);
+    S.Phi->setIncomingValue(0, Mapped(S.Next));
+  }
+
+  auto *Tick = PHINode::Create(Type::getInt64Ty(C), 2, "batch.tick",
+                               FastHeader->begin());
+  Tick->addIncoming(ConstantInt::get(Tick->getType(), 0), FastPreheader);
+  IRBuilder<> B(Check);
+  auto *NextTick = cast<BinaryOperator>(B.CreateAdd(
+      Tick, ConstantInt::get(Tick->getType(), 1), "batch.tick.next"));
+  NextTick->setHasNoUnsignedWrap();
+  NextTick->setHasNoSignedWrap(Budget - 1 <= INT64_MAX);
+  Tick->addIncoming(NextTick, Check);
+  Value *More = B.CreateICmpULT(
+      NextTick, ConstantInt::get(Tick->getType(), Budget - 1), "batch.more");
+  B.CreateCondBr(More, FastHeader, Header);
+
+  for (BasicBlock *BB : ClonedBlocks)
+    for (Instruction &I : make_early_inc_range(*BB))
+      if (jeandle::isSafepointPoll(I))
+        I.eraseFromParent();
+  Outer->getTerminator()->replaceSuccessorWith(Header, FastPreheader);
+  FastLatch->getTerminator()->replaceSuccessorWith(FastHeader, Check);
+  Latch->getTerminator()->replaceSuccessorWith(Header, Outer);
+}
+
 } // namespace
 
 PreservedAnalyses SafepointBudgetStripMining::run(Function &F,
@@ -155,6 +334,18 @@ PreservedAnalyses SafepointBudgetStripMining::run(Function &F,
 
   jeandle::SafepointWorkBudget Work;
   bool Changed = false;
+  unsigned ClonedInstructions = 0;
+  // Keep growth accounting across repeated pass invocations. This metadata
+  // limits code size; it never substitutes for a fast-loop bound proof.
+  if (MDNode *Cost = F.getMetadata(CloneCostMetadata)) {
+    auto *Count = Cost->getNumOperands() == 1
+                      ? mdconst::dyn_extract<ConstantInt>(Cost->getOperand(0))
+                      : nullptr;
+    ClonedInstructions =
+        Count ? std::min<uint64_t>(MaxFunctionCloneInstructions,
+                                   Count->getValue().getLimitedValue())
+              : MaxFunctionCloneInstructions.getValue();
+  }
   // Candidate identities survive CFG rebuilding. No SCEV or MemorySSA query is
   // made after a mutation; even sibling loops may share exit or memory state.
   SmallPtrSet<BasicBlock *, 16> Examined;
@@ -171,6 +362,7 @@ PreservedAnalyses SafepointBudgetStripMining::run(Function &F,
     jeandle::SafepointLoopAnalysis A(LI, DT, SE, Work);
     Loop *Candidate = nullptr;
     CallInst *Poll = nullptr;
+    std::optional<PollingIterationPlan> ClonePlan;
     for (Loop *L : LI.getLoopsInPreorder()) {
       if (!Examined.insert(L->getHeader()).second)
         continue;
@@ -188,13 +380,29 @@ PreservedAnalyses SafepointBudgetStripMining::run(Function &F,
         Candidate = L;
         break;
       }
+      ClonePlan = planPollingIteration(
+          *L, A, MaxFunctionCloneInstructions - ClonedInstructions);
+      if (ClonePlan) {
+        Candidate = L;
+        break;
+      }
     }
     if (!Candidate || Work.exhausted())
       break;
     LLVM_DEBUG(dbgs() << "  bounded-counter batch: "
                       << Candidate->getHeader()->getName() << " in "
                       << F.getName() << "\n");
-    wrapLoop(*Candidate, *Poll, Budget);
+    if (Poll) {
+      wrapLoop(*Candidate, *Poll, Budget);
+    } else {
+      clonePollingIteration(*ClonePlan, Budget, LI, DT);
+      ClonedInstructions += ClonePlan->Instructions;
+      F.setMetadata(
+          CloneCostMetadata,
+          MDNode::get(F.getContext(), ConstantAsMetadata::get(ConstantInt::get(
+                                          Type::getInt64Ty(F.getContext()),
+                                          ClonedInstructions))));
+    }
     Changed = true;
     AM.invalidate(F, PreservedAnalyses::none());
     auto &NewDT = AM.getResult<DominatorTreeAnalysis>(F);

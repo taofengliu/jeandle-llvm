@@ -2,7 +2,8 @@
 
 ; Nested loops: the outer loop has two own polls (header + latch) and dedups
 ; to the latch one; the inner loop's single poll belongs to the inner loop and
-; must be neither counted as outer coverage nor deleted by the outer dedup.
+; necessarily entered inner loop covers the outer loop, so it is the only
+; poll retained by the whole-tree plan.
 ; Non-counted loops (runtime-flag exits) so this exercises keep-one.
 
 declare hotspotcc void @jeandle.safepoint_poll()
@@ -35,4 +36,4 @@ exit:
 ; CHECK:       inner.header:
 ; CHECK:         call hotspotcc void @jeandle.safepoint_poll()
 ; CHECK:       outer.latch:
-; CHECK-NEXT:    call hotspotcc void @jeandle.safepoint_poll()
+; CHECK-NOT:     call hotspotcc void @jeandle.safepoint_poll()

@@ -4,6 +4,7 @@
 ; RUN: opt -passes='loop-simplify,lcssa,safepoint-budget-strip-mining,safepoint-poll-elimination<after-strip-mining>,verify<jeandle-safepoint-coverage>' -jeandle-loop-strip-mining-iter=2 -jeandle-verify-safepoint-coverage=fatal -verify-each -S %s | FileCheck %s
 
 ; CHECK-LABEL: @branch_descendant(
+; CHECK-NOT: .fast
 ; CHECK: inner.header:
 ; CHECK: call hotspotcc void @jeandle.safepoint_poll()
 ; CHECK: call.arm:
