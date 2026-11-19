@@ -109,10 +109,16 @@ bool llvm::jeandle::isGuaranteedSafepointCall(const Instruction &I) {
       CB->hasFnAttr(Attribute::NotGuaranteedSafepoint) ||
       CB->hasFnAttr("gc-leaf-function"))
     return false;
-  if (const Function *Callee = CB->getCalledFunction())
+  if (const Function *Callee = CB->getCalledFunction()) {
+    // A deopt bundle describes state, not whether the successful path polls.
+    // In particular, llvm.experimental.guard does not service requests.
+    if (Callee->isIntrinsic() &&
+        Callee->getIntrinsicID() != Intrinsic::experimental_deoptimize)
+      return false;
     if (Callee->hasFnAttribute(Attribute::NotGuaranteedSafepoint) ||
         Callee->hasFnAttribute("gc-leaf-function"))
       return false;
+  }
   return true;
 }
 

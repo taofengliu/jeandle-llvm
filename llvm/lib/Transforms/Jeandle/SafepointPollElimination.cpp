@@ -17,6 +17,7 @@
 #include "llvm/Analysis/LoopInfo.h"
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
+#include "llvm/Analysis/ValueTracking.h"
 #include "llvm/IR/BasicBlock.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/Constants.h"
@@ -25,6 +26,7 @@
 #include "llvm/IR/Instructions.h"
 #include "llvm/IR/Jeandle/JeandleUtils.h"
 #include "llvm/IR/Jeandle/Metadata.h"
+#include "llvm/Support/CommandLine.h"
 #include "llvm/Support/Debug.h"
 #include "llvm/Transforms/Jeandle/SafepointUtils.h"
 #include "llvm/Transforms/Utils/LoopUtils.h"
@@ -40,6 +42,10 @@ using jeandle::isSafepoint;
 using jeandle::isSafepointPoll;
 using jeandle::RequiredPolls;
 
+static cl::opt<bool> EnableBranchPollCoalescing(
+    "jeandle-enable-branch-poll-coalescing", cl::Hidden, cl::init(false),
+    cl::desc("Allow poll coalescing across branches and merges before O3."));
+
 [[maybe_unused]] StringRef modeName(SafepointPollEliminationMode Mode) {
   switch (Mode) {
   case SafepointPollEliminationMode::Early:
@@ -52,67 +58,102 @@ using jeandle::RequiredPolls;
   llvm_unreachable("unknown SafepointPollEliminationMode");
 }
 
-// Collapse redundant polls within a block. A basic block is straight-line
-// control: once entered, every instruction up to the terminator executes, so
-// any safepoint later in the block is guaranteed to run after an earlier one.
-// A safepoint request that arrives after the earlier poll is therefore caught
-// by the later safepoint, making the earlier poll redundant. Each poll's deopt
-// state is self-contained, so dropping the earlier poll loses nothing. This
-// generalizes C2's SafePointNode::Identity patterns A/B (back-to-back poll,
-// poll-after-call) to "earlier poll with any later safepoint in the same
-// block". A "later safepoint" is a poll or a *guaranteed*-safepoint call (C2
-// Pattern B's `guaranteed_safepoint()` gate, callnode.cpp:1330): a leaf/alloc/
-// lock fast path carries deopt STATE but never catches a request, so it does
-// not make an earlier poll redundant. Deopt calls are never deleted (they do
-// real work); only `jeandle.safepoint_poll` calls are removed.
-bool collapseRedundantPolls(BasicBlock &BB) {
-  // The last poll or guaranteed-safepoint call in the block catches every
-  // request an earlier poll would have caught, so every poll strictly before it
-  // is redundant. Find that last safepoint, then erase the polls that precede
-  // it.
-  Instruction *LastSafepoint = nullptr;
-  bool hasGuaranteedSafepoint = false;
-  for (Instruction &I : BB) {
-    if (isSafepoint(I) && !isSafepointPoll(I)) {
-      hasGuaranteedSafepoint = true;
-      break;
+// Keep proofs within one loop iteration and one ownership region. Later loop
+// deletion or strip mining can then change a child without invalidating an
+// outside poll's replacement. Cutting backedges also prevents circular proofs.
+bool canPropagateCoverage(BasicBlock *From, BasicBlock *To, LoopInfo &LI,
+                          DominatorTree &DT) {
+  if (LI.getLoopFor(From) != LI.getLoopFor(To) || DT.dominates(To, From))
+    return false;
+  if (EnableBranchPollCoalescing)
+    return true;
+  // Retain branch-local side effects by default. Removing them can expose
+  // speculation of both arms and lengthen dependent computations after O3.
+  // A returning invoke still covers its unique normal continuation.
+  if (To->getSinglePredecessor() != From)
+    return false;
+  if (auto *Invoke = dyn_cast<InvokeInst>(From->getTerminator()))
+    return Invoke->getNormalDest() == To;
+  // A terminating deoptimization side exit remains a control-flow barrier
+  // after polls are removed, so it does not expose speculation of both arms.
+  if (auto *Branch = dyn_cast<BranchInst>(From->getTerminator()))
+    if (Branch->isConditional()) {
+      unsigned OtherIndex = Branch->getSuccessor(0) == To ? 1 : 0;
+      BasicBlock *Other = Branch->getSuccessor(OtherIndex);
+      return Other->getTerminatingDeoptimizeCall() != nullptr;
     }
+  return From->getSingleSuccessor() == To;
+}
 
-    if (isSafepointPoll(I))
-      LastSafepoint = &I;
-  }
-
-  bool Changed = false;
-
-  if (hasGuaranteedSafepoint) {
-    // Delete all safepoint polls.
-    for (Instruction &I : llvm::make_early_inc_range(BB)) {
-      if (isSafepointPoll(I)) {
-        auto *P = cast<CallInst>(&I);
-        LLVM_DEBUG(dbgs() << "  collapse: erased a redundant poll in "
-                          << BB.getName() << "\n");
-        P->eraseFromParent();
-        Changed = true;
+bool collapseRedundantPolls(Function &F, LoopInfo &LI, DominatorTree &DT,
+                            bool NonLoopOnly) {
+  jeandle::SafepointWorkBudget Work;
+  DenseMap<BasicBlock *, bool> CallsAtExit;
+  SmallPtrSet<CallInst *, 16> CallCovered;
+  ReversePostOrderTraversal<Function *> RPOT(&F);
+  // Only calls, which are never deleted, generate forward coverage. Using
+  // candidate polls in both directions could make their proofs depend on one
+  // another and delete every poll on an acyclic path.
+  for (BasicBlock *BB : RPOT) {
+    if (!Work.spend(BB->size() + pred_size(BB) + 1))
+      return false;
+    bool Covered = !pred_empty(BB) &&
+                   llvm::all_of(predecessors(BB), [&](BasicBlock *Pred) {
+                     return canPropagateCoverage(Pred, BB, LI, DT) &&
+                            CallsAtExit.lookup(Pred);
+                   });
+    for (Instruction &I : *BB) {
+      if (jeandle::isGuaranteedSafepointCall(I)) {
+        Covered = true;
+      } else if (isSafepointPoll(I)) {
+        if (Covered)
+          CallCovered.insert(cast<CallInst>(&I));
+      } else if (!isGuaranteedToTransferExecutionToSuccessor(&I)) {
+        Covered = false;
       }
     }
-    return Changed;
+    CallsAtExit[BB] = Covered;
   }
 
-  if (!LastSafepoint)
-    return Changed;
+  DenseMap<BasicBlock *, bool> SafepointsAtEntry;
+  SmallVector<CallInst *, 16> Redundant;
+  // Postorder visits successors before predecessors, except at cut backedges.
+  // A deleted poll depends only on later retained cuts or immutable calls;
+  // therefore the complete deletion plan cannot contain a dependency cycle.
+  for (BasicBlock *BB : post_order(&F)) {
+    if (!Work.spend(BB->size() + succ_size(BB) + 1))
+      return false;
+    bool Covered =
+        !succ_empty(BB) && llvm::all_of(successors(BB), [&](BasicBlock *Succ) {
+          return canPropagateCoverage(BB, Succ, LI, DT) &&
+                 SafepointsAtEntry.lookup(Succ);
+        });
+    bool Eligible = !NonLoopOnly || !LI.getLoopFor(BB);
+    for (Instruction &I : llvm::reverse(*BB)) {
+      if (isSafepointPoll(I)) {
+        auto *Poll = cast<CallInst>(&I);
+        // The marked outer poll also locates the inner loop's bound proof.
+        if (Eligible && !jeandle::isStripMinedPoll(I) &&
+            (Covered || CallCovered.contains(Poll)))
+          Redundant.push_back(Poll);
+        else
+          Covered = true;
+      } else if (jeandle::isGuaranteedSafepointCall(I)) {
+        Covered = true;
+      } else if (!isGuaranteedToTransferExecutionToSuccessor(&I)) {
+        Covered = false;
+      }
+    }
+    SafepointsAtEntry[BB] = Covered;
+  }
 
-  for (Instruction &I : llvm::make_early_inc_range(BB)) {
-    if (&I == LastSafepoint)
-      break;
-    if (!isSafepointPoll(I))
-      continue;
-    auto *P = cast<CallInst>(&I);
+  // Budget exhaustion above leaves the entire source poll set untouched.
+  for (CallInst *Poll : Redundant) {
     LLVM_DEBUG(dbgs() << "  collapse: erased a redundant poll in "
-                      << BB.getName() << "\n");
-    P->eraseFromParent();
-    Changed = true;
+                      << Poll->getParent()->getName() << "\n");
+    Poll->eraseFromParent();
   }
-  return Changed;
+  return !Redundant.empty();
 }
 
 // Apply only after the entire loop tree has a complete retention plan. Each
@@ -129,7 +170,9 @@ static bool deleteLoopPolls(Loop &L, LoopInfo &LI,
       if (!isSafepointPoll(I))
         continue;
       ++Total;
-      if (Retained.contains(cast<CallInst>(&I))) {
+      // The outer poll also identifies the strip-mined inner bound proof.
+      if (Retained.contains(cast<CallInst>(&I)) ||
+          jeandle::isStripMinedPoll(I)) {
         ++Kept;
         continue;
       }
@@ -473,6 +516,7 @@ PreservedAnalyses SafepointPollElimination::run(Function &F,
         break;
       }
     }
+    Changed |= collapseRedundantPolls(F, LI, DT, false);
     return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
   }
 
@@ -481,21 +525,19 @@ PreservedAnalyses SafepointPollElimination::run(Function &F,
     auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
     bool Changed =
         completeLoopPollDeletion(LI, DT, SE, Mode, DeferEmptyLoopDeletion);
+    Changed |= collapseRedundantPolls(F, LI, DT, false);
     return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
   }
 
   assert(Mode == SafepointPollEliminationMode::Early);
   bool Changed = false;
-  for (BasicBlock &BB : F)
-    if (!LI.getLoopFor(&BB))
-      Changed |= collapseRedundantPolls(BB);
-
+  auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
   if (!jeandle::isStripMiningEnabled()) {
-    auto &DT = AM.getResult<DominatorTreeAnalysis>(F);
     auto &SE = AM.getResult<ScalarEvolutionAnalysis>(F);
     Changed |=
         completeLoopPollDeletion(LI, DT, SE, Mode, DeferEmptyLoopDeletion);
   }
 
+  Changed |= collapseRedundantPolls(F, LI, DT, jeandle::isStripMiningEnabled());
   return Changed ? PreservedAnalyses::none() : PreservedAnalyses::all();
 }
