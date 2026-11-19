@@ -1,0 +1,13 @@
+IsOkToInline -1 10 101 = true
+IsOkToInline -1 20 102 = true
+IsOkToInline 0 1 103 = true
+IsOkToInline 1 2 103 = true
+IsOkToInline 2 3 104 = true
+IsOkToInline 3 3 104 = true
+RecordInlineResult -1 10 101 0 = true
+RecordInlineResult -1 20 102 0 = true
+RecordInlineResult 0 1 103 0 = true
+RecordInlineResult 1 2 103 0 = true
+RecordInlineResult 2 3 104 0 = true
+RecordInlineResult 3 3 104 0 = true
+RecordInliningComplete = true

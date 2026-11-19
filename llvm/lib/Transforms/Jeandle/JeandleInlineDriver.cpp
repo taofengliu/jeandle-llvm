@@ -74,6 +74,59 @@ static void eraseInlineScopeIDs(Function &RootFunction) {
   }
 }
 
+static bool
+specializeExceptionHandlerQueries(Function &RootFunction,
+                                  ArrayRef<JeandleInlineScope> InlineScopes) {
+  if (!RootFunction.getParent()->getNamedMetadata(
+          jeandle::Metadata::JavaMethodCompilation))
+    return false;
+
+  SmallVector<CallInst *, 8> Queries;
+  for (Instruction &I : instructions(RootFunction)) {
+    auto *CI = dyn_cast<CallInst>(&I);
+    if (CI && CI->getCalledFunction() &&
+        CI->getCalledFunction()->getName() == "jeandle.has_exception_handler")
+      Queries.push_back(CI);
+  }
+
+  for (CallInst *Query : Queries) {
+    assert(Query->arg_empty() && Query->getType()->isIntegerTy(1) &&
+           "invalid exception handler query");
+    int ScopeID = -1;
+    if (MDNode *MD = Query->getMetadata(jeandle::Metadata::InlineScopeID)) {
+      if (MD->getNumOperands() != 1)
+        report_fatal_error("invalid exception handler query scope");
+      auto *Scope =
+          mdconst::dyn_extract_or_null<ConstantInt>(MD->getOperand(0));
+      if (!Scope || !Scope->getType()->isIntegerTy(32))
+        report_fatal_error("invalid exception handler query scope");
+      ScopeID = static_cast<int>(Scope->getSExtValue());
+    }
+
+    // Match GraphKit::has_ex_handler: any method in this inline chain counts,
+    // regardless of whether a handler covers the current bytecode.
+    bool HasHandler = false;
+    while (true) {
+      if (ScopeID < -1 ||
+          (ScopeID >= 0 && unsigned(ScopeID) >= InlineScopes.size()))
+        report_fatal_error("invalid exception handler query scope");
+      Function *Method =
+          ScopeID == -1 ? &RootFunction : InlineScopes[ScopeID].first;
+      if (Method->hasFnAttribute(
+              jeandle::Attribute::JavaHasExceptionHandlers)) {
+        HasHandler = true;
+        break;
+      }
+      if (ScopeID == -1)
+        break;
+      ScopeID = InlineScopes[ScopeID].second;
+    }
+    Query->replaceAllUsesWith(ConstantInt::get(Query->getType(), HasHandler));
+    Query->eraseFromParent();
+  }
+  return !Queries.empty();
+}
+
 static bool specializeCallerClass(Function &RootFunction,
                                   ArrayRef<JeandleInlineScope> InlineScopes) {
   Module &M = *RootFunction.getParent();
@@ -282,11 +335,15 @@ PreservedAnalyses JeandleInlineDriver::run(Module &M,
                                     std::move(InlineResult.PA));
     }
 
-    // Only root copies have committed caller scopes. Keep cached inlinee
-    // definitions unchanged so another caller can reuse their stack query.
-    bool SpecializedCaller =
-        RootFunction && specializeCallerClass(*RootFunction, InlineScopes);
-    if (SpecializedCaller) {
+    // Resolve scope queries before cleanup can merge calls from different
+    // inline chains. Cached inlinee definitions remain caller-independent.
+    bool SpecializedCalls = false;
+    if (RootFunction) {
+      SpecializedCalls =
+          specializeExceptionHandlerQueries(*RootFunction, InlineScopes);
+      SpecializedCalls |= specializeCallerClass(*RootFunction, InlineScopes);
+    }
+    if (SpecializedCalls) {
       FunctionAnalysisManager &FAM =
           MAM.getResult<FunctionAnalysisManagerModuleProxy>(M).getManager();
       FAM.invalidate(*RootFunction, PreservedAnalyses::none());
@@ -297,7 +354,7 @@ PreservedAnalyses JeandleInlineDriver::run(Module &M,
       Changed = true;
     }
 
-    if (RoundChanged || SpecializedCaller) {
+    if (RoundChanged || SpecializedCalls) {
       // Lower phase-0 JavaOp call sites exposed by the previous inline round's
       // inlining.
       PreservedAnalyses JavaOpLowerPA = JavaOperationLower(0).run(M, MAM);

@@ -26,6 +26,9 @@ public:
 
   static constexpr const char *JavaAccessorMethod = "java-accessor-method";
 
+  static constexpr const char *JavaHasExceptionHandlers =
+      "java-has-exception-handlers";
+
   /// Java type attributes attached to function parameters, function returns,
   /// and call/invoke returns.
   static constexpr const char *JavaKlass = "java-klass";
